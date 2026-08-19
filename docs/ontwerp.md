@@ -361,3 +361,61 @@ Vanaf `simple_sensor` moet erbij: WiFi, webserver, webhook, ping.
 
 Het tweede lijstje is kleiner en bevat niets dat het mesh raakt. Het eerste
 lijstje is precies het lijstje dat `simple_sensor` al af heeft.
+
+---
+
+# Kunnen de sensoren hun naam uit de web-GUI krijgen? (19 augustus 2026)
+
+Namen als "router", "google", "donotica" instellen in de webinterface: ja. Maar
+**het telemetriepakket kan die naam niet dragen**, en dat is een beperking van
+het formaat en niet van onze code.
+
+## Waarom niet
+
+CayenneLPP is een reeks drietallen: kanaalnummer, type, waarde. Er is geen
+naamveld. MeshCore heeft er ook niets voor: het enige wat bestaat is
+`TELEM_CHANNEL_SELF 1` (`src/helpers/SensorManager.h:10`) en een oplopende
+`next_available_channel` (`EnvironmentSensorManager.h:20`). Kanalen zijn getallen.
+
+Een node die telemetrie opvraagt ziet dus:
+
+    kanaal 3, LPP_SWITCH, 1
+    kanaal 3, LPP_GENERIC_SENSOR, 12
+
+en niet "google is bereikbaar in 12 ms".
+
+## Waar de namen dan wel langs komen
+
+Drie wegen, en ze vullen elkaar aan:
+
+1. **De DM-opdrachten.** `list` geeft naam én toestand in leesbare tekst. Dit is
+   de natuurlijke plek voor namen, en het is een extra reden dat die interface er
+   moet zijn — niet als gemak, maar omdat het de enige weg is waarlangs een naam
+   over het mesh gaat.
+2. **Een CLI-opdracht** die de koppeling kanaal → naam teruggeeft, zodat een
+   opvragende node die één keer ophaalt en bewaart. Dat is hoe MeshManager het
+   met repeaters doet.
+3. **De webinterface en de webhook** gebruiken namen direct; daar speelt het
+   formaat geen rol.
+
+## De valkuil: kanaalnummers moeten onveranderlijk zijn
+
+Dit is het belangrijkste van deze sectie.
+
+Als een opvragende node de koppeling "kanaal 3 = google" bewaart, en er wordt
+later een monitor verwijderd waarna de rest opschuift, dan wijst die bewaarde
+koppeling **stil** naar de verkeerde dienst. Geen foutmelding, alleen verkeerde
+cijfers op een dashboard.
+
+Dat is precies de foutklasse die MeshManager twee keer gekost heeft: het
+verdict dat op het verkeerde pakket gestempeld werd, en het MQTT-topic dat
+berekend werd in plaats van onthouden.
+
+**Regel: een monitor krijgt bij aanmaken een kanaalnummer en houdt dat voor
+altijd. Nummers van verwijderde monitors worden niet hergebruikt.** Onthouden,
+niet herberekenen. Dat kost één veld in de opslag en het voorkomt een storing
+die zich voordoet als "de cijfers kloppen niet helemaal".
+
+Kanaal 1 blijft `TELEM_CHANNEL_SELF` (de node zelf: voeding, batterij), dus
+monitors beginnen bij 2. Met 16 monitors in één pakket als bovengrens is er ruimte
+tot kanaal 17.
