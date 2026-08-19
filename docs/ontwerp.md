@@ -508,3 +508,76 @@ moet krijgen. **Ja.**
 
 De prijs is dat wie deze node als contact had, hem opnieuw moet toevoegen. Voor
 een bewakingsnode is dat juist gedrag: het is een ander apparaat geworden.
+
+---
+
+# Kalibratiemeting voeding, 19 augustus 2026
+
+Gemeten aan de echte node (`192.168.110.160`), niet uit een datasheet. Ruwe reeks
+in `docs/meting-voeding-2026-08-19.log`.
+
+## Resultaten
+
+| toestand | spanning | stabiliteit |
+|---|---|---|
+| batterij, onder belasting | **4,034 V** | 7 van 8 metingen identiek |
+| USB, lader klaar | **4,139 V** | 5 van 5 identiek |
+| USB, actief aan het laden | **4,209–4,226 V** | licht variabel |
+
+De USB-kant is dus een **bereik**, geen punt: 4,139 als de lader klaar is,
+4,21–4,23 terwijl hij laadt. Wie op één USB-meting een drempel baseert, kiest de
+verkeerde.
+
+## Waarom de drempel toch werkt
+
+De 4,034 V is de batterij **onder belasting**. De node trekt stroom, dus de
+klemspanning zakt; op USB vult de lader die belasting aan en blijft de rail hoog.
+Dat is een fysisch verschil en geen meetgeluk — en het wordt *groter* als de
+batterij ouder wordt en zijn inwendige weerstand stijgt.
+
+**Drempel rond 4,09 V**, met:
+- twee grenzen (Schmitt): onder 4,09 → batterij, boven 4,12 → netspanning
+- een wachttijd van ongeveer een minuut na een overgang, want daar zit een
+  insteltransiënt van ~50 mV (4,052 → 4,087 → 4,034 in de eerste minuut)
+- drempels als **instelling**, niet als constante
+- de **ruwe spanning ook als sensor** (`LPP_VOLTAGE`, 2 byte), zodat de drempel
+  later uit echte historiek bijgesteld kan worden zonder te flashen
+
+## De belangrijkste bevinding gaat niet over spanning
+
+Op batterij werd de node onbereikbaar over WiFi. Verloop:
+
+1. uittrekken → korte hapering, daarna ~5 minuten bereikbaar met **31% verlies**
+   (5 van 16 metingen kwamen niet aan)
+2. daarna volledig weg, negen opeenvolgende mislukte metingen
+3. seriële console gaf de oorzaak: `WiFi disconnected (reason 202)` —
+   `WIFI_REASON_AUTH_FAIL`. Niet zwak bereik: rssi was -52
+4. **USB er weer in bracht hem niet terug.** Pas een harde reset (veroorzaakt
+   door het openen van COM4, wat DTR schakelt) herstelde de verbinding
+
+Gevolgen voor het ontwerp, alle drie gemeten en niet aangenomen:
+
+- **Waarschuwingen moeten over LoRa.** Juist tijdens een stroomstoring is de
+  netwerkweg het minst betrouwbaar. Een webhook van Uptime Kuma kan deze node dan
+  per definitie niet bereiken, dus de eigen controles zijn geen luxe maar de kern.
+- **Er moet een wifi-waakhond komen.** Na N minuten zonder verbinding een
+  volledige herverbinding forceren, en lukt dat niet, de WiFi-stapel of de node
+  herstarten. Zonder dat blijft een node na een storing onbereikbaar terwijl
+  alles weer werkt. Dit is een echte zwakte in de huidige firmware.
+- **De wifi-sensor meet iets anders dan gedacht.** Niet "mijn eigen stroom is
+  weg" — de node bleef leven op batterij — maar "mijn router is stroom kwijt".
+  Bij een echte stroomstoring gebeurt allebei, dus WiFi blijft het snelle signaal
+  en de spanning de bevestiging.
+
+## Wat deze meting over mijn eigen aannames zei
+
+Drie keer bijgesteld, en dat is de reden om te meten:
+
+1. "USB leest boven 4,2 V, dus drempel op 4,2" — **fout**: USB met klaarstaande
+   lader leest 4,139.
+2. "De spreiding van 53 mV is ruis, dus gebruik variantie in plaats van niveau" —
+   **fout**: dat was een insteltransiënt van de eerste minuut; daarna staat het
+   niveau muurvast en discrimineert het prima.
+3. "Hij is van het netwerk af, dus WiFi valt weg met de stroom" — **te snel**,
+   op basis van één ontbrekende meting. Hij bleef eerst nog minuten bereikbaar.
+   De echte reden kwam pas uit de seriële console.
