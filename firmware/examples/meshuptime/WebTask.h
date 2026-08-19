@@ -31,6 +31,7 @@
  */
 class WifiTask;
 class MonitorSensors;
+class SensorMesh;
 class WebServer;   // vooruit verklaard: WebServer.h hoort niet in deze header
 
 class WebTask {
@@ -44,6 +45,17 @@ public:
    * geldig en is de koppeling één regel die je ziet staan. */
   void setMonitors(MonitorSensors* monitors) { _mon = monitors; }
 
+  /* De MESHLAAG, voor het toegangsbeheer. Langs dezelfde weg en om dezelfde
+   * reden als setMonitors(): main.cpp is de enige plek die zowel de webtaak als
+   * de mesh kent, en zonder deze aanroep werkt de pagina wel maar antwoordt
+   * /acl.json met 503 en de reden erbij -- zichtbaar in plaats van stil.
+   *
+   * SensorMesh en niet ClientACL: het slot (acl.strict), de buurtlijst en de
+   * gedeelde sleutels horen bij de mesh. Een webserver die zelf in ClientACL zou
+   * schrijven, zou de gedeelde sleutel moeten uitrekenen en de uitgestelde
+   * flashschrijving moeten kennen -- twee dingen die de mesh al doet. */
+  void setAcl(SensorMesh* mesh) { _acl = mesh; }
+
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
   void loop();
 
@@ -52,6 +64,7 @@ public:
 private:
   WifiTask*       _wifi = nullptr;
   MonitorSensors* _mon = nullptr;
+  SensorMesh*     _acl = nullptr;
   WebServer*      _server = nullptr;
   const char*     _fw = "";
   bool            _serving = false;
@@ -66,6 +79,15 @@ private:
   void handleMonAdd();
   void handleMonDel();
 
+  /* Toegangsbeheer. Eén GET met de hele stand en drie POSTs die er iets aan
+   * veranderen; net als bij de monitors gaat er niets veranderends via GET. Bij
+   * een toegangslijst weegt dat zwaarder dan bij een monitor: een GET die
+   * leesrecht uitdeelt is een link die iemand kan sturen. */
+  void handleAclJson();
+  void handleAclSet();
+  void handleAclDel();
+  void handleAclStrict();
+
   /* Schrijft het monitoroverzicht in buf achter positie n en geeft de nieuwe
    * positie terug. Apart van handleStatus() omdat die anders één functie van
    * honderd regels wordt met twee onderwerpen erin. */
@@ -77,6 +99,10 @@ private:
   friend void web_route_hook();
   friend void web_route_monadd();
   friend void web_route_mondel();
+  friend void web_route_acljson();
+  friend void web_route_aclset();
+  friend void web_route_acldel();
+  friend void web_route_aclstrict();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

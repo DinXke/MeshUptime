@@ -4,6 +4,7 @@
 #include <Mesh.h>
 
 #include "TimeSeriesData.h"
+#include "NeighbourList.h"
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
 #include <InternalFileSystem.h>
@@ -81,6 +82,48 @@ public:
 
   float getTelemValue(uint8_t channel, uint8_t type);
 
+  /* ---------------------- toegangsbeheer, voor de webinterface -------------
+   *
+   * WAAROM DIT HIER STAAT EN NIET IN WebTask: de toegangslijst en het slot dat
+   * hem afdwingt horen bij de mesh en niet bij de webserver. De webinterface is
+   * één van de bedieningswegen (de andere zijn 'setperm' en 'set acl.strict'
+   * over serieel of over een DM); zou het beheer in WebTask zitten, dan had een
+   * node zonder wifi geen toegangsbeheer. Deze methoden zijn daarom publiek en
+   * WebTask krijgt alleen een pointer.
+   *
+   * HET SLOT (acl.strict). Staat hij AAN, dan antwoordt handleRequest op een
+   * telemetrieverzoek alleen aan een afzender met minstens leesrecht. Staat hij
+   * UIT, dan blijft het gedrag van upstream: iedereen op het mesh mag alles
+   * uitlezen. UIT is de standaard, met opzet -- bij het flashen mag een werkende
+   * opstelling zichzelf niet buitensluiten. De webinterface zegt in dat geval
+   * met zoveel woorden dat de deur open staat.
+   */
+  bool getAclStrict() const { return acl_strict != 0; }
+  void setAclStrict(bool on);
+
+  int  getAclCount() { return acl.getNumClients(); }
+  ClientInfo* getAclEntry(int idx) { return acl.getClientByIdx(idx); }
+
+  /* Rechten van één ingang zetten. perms == 0 verwijdert de ingang.
+   *
+   * Een VOLLEDIGE sleutel is verplicht bij toevoegen of wijzigen, en dat is geen
+   * strengheid maar rekenkunde: de gedeelde sleutel wordt uit de volle publieke
+   * sleutel berekend (calcSharedSecret), dus met een prefix kan deze node
+   * eenvoudig niet met de tegenpartij praten. Bij VERWIJDEREN mag een prefix
+   * wel -- zie aclRemove().
+   */
+  bool aclSetPerms(const uint8_t* pubkey, uint8_t perms);
+
+  /* Verwijderen mag op een prefix van minstens 'min_len' byte, omdat de lijst
+   * die MeshCore zelf over het mesh teruggeeft (REQ_TYPE_GET_ACCESS_LIST) ook
+   * maar 6 byte per ingang draagt. Geeft false als de prefix op MEER dan één
+   * ingang past: stil de verkeerde ingang wissen is de fout die je pas merkt
+   * als de juiste node niets meer krijgt. */
+  bool aclRemove(const uint8_t* pubkey, int key_len);
+  int  aclCountMatching(const uint8_t* pubkey, int key_len);
+
+  const NeighbourList& getNeighbours() const { return neighbours; }
+
 protected:
   // current telemetry data queries
   float getVoltage(uint8_t channel) { return getTelemValue(channel, LPP_VOLTAGE); }
@@ -123,6 +166,7 @@ protected:
   bool getCADEnabled() const override;
   int getAGCResetInterval() const override;
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
+  void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) override;
   int searchPeersByHash(const uint8_t* hash) override;
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
@@ -137,6 +181,12 @@ private:
   NodePrefs _prefs;
   ClientACL  acl;
   CommonCLI _cli;
+  /* Het slot. NIET in NodePrefs: die struct staat in src/helpers/CommonCLI.h en
+   * is van upstream; een veld erbij zetten raakt elke andere rol en het formaat
+   * van /new_prefs. Eén byte in een eigen bestandje is hier het goedkoopste
+   * eerlijke antwoord. */
+  uint8_t   acl_strict;
+  NeighbourList neighbours;
   uint8_t reply_data[MAX_PACKET_PAYLOAD];
   unsigned long dirty_contacts_expiry;
   CayenneLPP telemetry;
@@ -152,6 +202,9 @@ private:
   float pending_bw;
   uint8_t pending_sf;
   uint8_t pending_cr;
+
+  void loadAclStrict();
+  void saveAclStrict();
 
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleRequest(uint8_t perms, uint32_t sender_timestamp, uint8_t req_type, uint8_t* payload, size_t payload_len);

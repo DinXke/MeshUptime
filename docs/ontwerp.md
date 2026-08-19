@@ -914,3 +914,71 @@ opende: ik zette `admin:meshcore@` in de URL, en `fetch()` weigert een relatieve
 URL te herleiden tegen een adres met inloggegevens erin. Zonder die gegevens in
 de URL vult de pagina zich normaal. Opgeschreven omdat het er precies uitzag als
 een echte fout.
+
+---
+
+# Toegangsbeheer op publieke sleutel (20 augustus 2026)
+
+    RAM:   22,1%  (72.344 van 327.680)
+    Flash: 38,1%  (1.272.989)
+    pagina: 22.415 byte in PROGMEM
+
+Drie secties erbij: "Toegang" met de ACL-tabel, "Sleutel toevoegen", en "In de
+buurt gehoord". Routes `GET /acl.json`, `POST /acl`, `POST /acl/del`,
+`POST /acl/strict`, alles achter de bestaande Basic-auth en niets veranderends
+via GET.
+
+Op het toestel nagemeten: slot OPEN (standaard), één ACL-ingang met rechten 3.
+
+## Een correctie op wat hier eerder stond
+
+Er stond dat **elke** node op het mesh de sensoren kon uitlezen. Dat was te sterk.
+
+Het gat in `handleRequest` was echt: `perms` werd genegeerd, dus zelfs een ingang
+met alleen alarmrecht kon alles opvragen. Maar het is niet de weg waarlangs een
+tweede node zes kanalen zag: alleen nodes die **al in de ACL staan** bereiken
+`onPeerDataRecv`, want `searchPeersByHash` zoekt niets anders af.
+
+De weg naar binnen is `handleLoginReq` met het beheerderswachtwoord — en dat
+voegt een node automatisch als **beheerder** toe, ook met het slot dicht.
+
+## Daarom is het wachtwoord de eigenlijke beveiliging
+
+`ADMIN_PASSWORD` staat in de bouwvlaggen op `"password"`. Wie dat weet, logt over
+het mesh in, wordt beheerder, en heeft niet alleen de sensoren maar de hele CLI.
+
+**Het slot en het wachtwoord zijn samen één beveiliging, niet twee.** `acl.strict`
+aanzetten zonder het wachtwoord te wijzigen is een deur op slot doen naast een
+open raam. Zet `set password <...>` over de seriële console — de opgeslagen
+waarde gaat voor op de gebakken, zoals bij WiFi.
+
+## Keuzes van de agent die scherper zijn dan de opdracht
+
+- **Geweigerde toegang is stilte, geen leeg antwoord.** `return 0`, de bestaande
+  weg voor "geen antwoord". Een leeg antwoord kost zendtijd per geweigerd verzoek,
+  en niets belet een vrager elke seconde te vragen — dan is de weigering zelf een
+  manier om de duty cycle op te maken. Bovendien leest "nul sensoren" in een app
+  als een kapotte sensor en niet als een gesloten deur.
+- **Adverts worden opgevangen in `onAdvertRecv()`**, de bestaande virtuele haak,
+  dus geen patch in `src/`. Die plek omdat hij ná de ed25519-controle draait: de
+  sleutel is dan bewijsbaar van de afzender, wat de voorwaarde is om hem als
+  keuzelijst voor de ACL te gebruiken. En ná `wasSeen()`, dus geen dubbele
+  ingangen van doorgegeven adverts.
+- **SNR en niet RSSI**, met het aantal hops erbij. `mesh::Packet` bewaart alleen
+  `_snr`; RSSI bestaat alleen live in de radio, en flood-pakketten gaan met een
+  scorevertraging in de wachtrij — dan hoort dat register al bij een later
+  pakket. In de proef scheidde dat twee nodes met dezelfde naam precies zoals
+  bedoeld: 0 hop met -11,5 tegen 2 hop met -19,8.
+- **Een prefix mag bij wissen, niet bij toevoegen.** Toevoegen vraagt 64
+  hextekens, want het gedeelde geheim wordt uit de volle publieke sleutel
+  gerekend — een prefix-ingang zou een ingang zijn waarmee niet te praten valt,
+  en een prefix is te vervalsen door sleutelparen te grinden. Wissen mag vanaf 6
+  byte en weigert zodra de prefix op meer dan één ingang past.
+- **De buurtlijst voegt samen op sleutel** in plaats van strikt FIFO: een echte
+  ring zou na twaalf adverts van één drukke buur twaalf keer diezelfde buur tonen.
+- **Het slot schrijft direct naar flash**, ACL-wijzigingen met vertraging. Wie het
+  slot dichtzet en meteen herstart, moet hem dicht aantreffen; de ACL wordt bij
+  elk padbericht van een beheerder vies en hoort dus wél uitgesteld te worden.
+- **De buurtlijst staat niet in SPIFFS.** Hij beschrijft wat er nu in de lucht is;
+  een bewaarde versie zou beweren dat een node in de buurt is die er al een week
+  niet meer is.

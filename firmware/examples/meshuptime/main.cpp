@@ -231,6 +231,14 @@ void setup() {
       wifi_task.begin(WIFI_SSID, WIFI_PWD);
     }
     web_task.begin(&wifi_task, FIRMWARE_VERSION);
+    /* Zonder deze regel compileert alles en werkt de pagina, maar antwoordt
+     * /acl.json met 503 en blijft het toegangsdeel leeg met de reden erin. Om
+     * dezelfde reden als bij setMonitors() staat de koppeling hier: main.cpp is
+     * de enige plek die zowel de webtaak als de mesh kent.
+     *
+     * NA the_mesh.begin(), en dat is geen stijl maar noodzaak: begin() leest de
+     * toegangslijst en de stand van het slot uit SPIFFS. */
+    web_task.setAcl(&the_mesh);
   }
   #ifdef HAS_MONITOR_SENSORS
     /* main.cpp is de enige plek die zowel de wifi-taak als de sensoren kent;
@@ -241,6 +249,10 @@ void setup() {
      * webserver is de enige plek die de kanaalkaart kan tonen, want CayenneLPP
      * draagt geen namen. */
     web_task.setMonitors(&sensors);
+    /* Na the_mesh.begin(fs): die leest de ACL en de stand van het slot uit
+     * SPIFFS. Zonder deze regel werkt de pagina maar antwoordt /acl.json met
+     * 503 en de reden erin. */
+    web_task.setAcl(&the_mesh);
   #endif
 #endif
 

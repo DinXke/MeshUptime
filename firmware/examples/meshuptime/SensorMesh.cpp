@@ -73,6 +73,33 @@ static File openAppend(FILESYSTEM* _fs, const char* fname) {
   #endif
 }
 
+/* Zelfde vorm als openAppend hierboven en als ClientACL::openWrite: de drie
+ * platformen willen elk hun eigen vlaggen, en dat staat liever één keer hier dan
+ * verspreid over de aanroepplekken. */
+static File openTruncate(FILESYSTEM* _fs, const char* fname) {
+  #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+    _fs->remove(fname);
+    return _fs->open(fname, FILE_O_WRITE);
+  #elif defined(RP2040_PLATFORM)
+    return _fs->open(fname, "w");
+  #else
+    return _fs->open(fname, "w", true);
+  #endif
+}
+
+/* Het slot staat in een eigen bestandje van één teken. Een eigen bestand en geen
+ * veld in NodePrefs, want NodePrefs is van upstream (src/helpers/CommonCLI.h) en
+ * wordt door alle rollen gedeeld.
+ *
+ * ONTBREEKT HET BESTAND, DAN IS HET SLOT UIT. Dat is het geval bij een verse
+ * flash en bij een gewiste opslag, en het is met opzet de veilige kant van de
+ * verkeerde kant op: een node die na het flashen zijn eigen beheerder buitensluit
+ * is niet meer te bereiken, en dan is er ook geen webinterface om het slot weer
+ * open te zetten. Een open deur die zich als open deur presenteert is een keuze;
+ * de webinterface zegt het er dus bij.
+ */
+#define ACL_STRICT_PATH   "/acl_strict"
+
 static uint8_t getDataSize(uint8_t type) {
     switch (type) {
       case LPP_GPS:
@@ -173,7 +200,35 @@ static uint8_t putFloat(uint8_t * dest, float value, uint8_t size, uint32_t mult
 uint8_t SensorMesh::handleRequest(uint8_t perms, uint32_t sender_timestamp, uint8_t req_type, uint8_t* payload, size_t payload_len) {
   memcpy(reply_data, &sender_timestamp, 4);   // reflect sender_timestamp back in response packet (kind of like a 'tag')
 
-  if (req_type == REQ_TYPE_GET_TELEMETRY_DATA) {  // allow all
+  if (req_type == REQ_TYPE_GET_TELEMETRY_DATA) {
+    /* HIER STOND "allow all", EN DAT WAS GEEN OPMERKING MAAR HET GEDRAG.
+     *
+     * De parameter 'perms' kwam binnen en werd niet gebruikt. Het enige masker
+     * dat wél werkte is perm_mask hieronder, en dat is het masker van de VRAGER:
+     * het zegt welke kanalen hij wil ONTVANGEN, niet welke hij mag zien. Gevolg:
+     * elke node op het mesh kon alle sensoren uitlezen. Nagemeten -- een tweede
+     * node zag zes kanalen zonder dat hier iets was ingesteld.
+     *
+     * WAAROM DE WEIGERING EEN STILTE IS en niet een leeg antwoord: 0 teruggeven
+     * is in deze klasse al de weg voor "geen antwoord", en onze aanroeper
+     * (onPeerDataRecv) stuurt dan niets en werkt from->last_timestamp niet bij.
+     * Een leeg antwoord zou wel airtime kosten -- per geweigerd verzoek, en er
+     * is niets dat een vrager belet elke seconde te vragen. Dan is de weigering
+     * zelf een manier om de zendtijd van deze node op te maken, en de radio gaat
+     * voor. Daar komt bij dat een leeg antwoord in een app als "nul sensoren"
+     * verschijnt, en dat leest als een kapotte sensor in plaats van als een
+     * gesloten deur. Stilte is niet te onderscheiden van buiten bereik, en dat
+     * is precies wat een vrager zonder recht hoort te zien.
+     *
+     * De grens is dezelfde als bij REQ_TYPE_GET_AVG_MIN_MAX hieronder: minstens
+     * PERM_ACL_READ_ONLY. Twee verzoeken over dezelfde gegevens met twee
+     * verschillende drempels zouden ooit uit elkaar lopen.
+     */
+    if (acl_strict && (perms & PERM_ACL_ROLE_MASK) < PERM_ACL_READ_ONLY) {
+      MESH_DEBUG_PRINTLN("handleRequest: telemetry refused, perms=%02X", (uint32_t)perms);
+      return 0;
+    }
+
     uint8_t perm_mask = ~(payload[0]);    // NEW: first reserved byte (of 4), is now inverse mask to apply to permissions
 
     telemetry.reset();
@@ -330,6 +385,26 @@ int SensorMesh::getAGCResetInterval() const {
   return ((int)_prefs.agc_reset_interval) * 4000;   // milliseconds
 }
 
+/* LET OP -- DIT IS DE ANDERE DEUR, EN ACL.STRICT DOET HIER NIETS.
+ *
+ * Wie het juiste beheerderswachtwoord meestuurt wordt hieronder met putClient()
+ * AAN DE TOEGANGSLIJST TOEGEVOEGD, als beheerder, en heeft daarmee leesrecht --
+ * ook met het slot aan. Dat is gedrag van upstream en het is met opzet zo: zonder
+ * die weg is een node na een herstel van de opslag niet meer in te richten.
+ *
+ * Het gevolg is wel dat het slot en het wachtwoord samen één beveiliging zijn en
+ * niet twee. Staat ADMIN_PASSWORD nog op de gebakken standaardwaarde
+ * ("password"), dan is het slot dichtzetten hetzelfde als de deur op slot doen en
+ * de sleutel onder de mat leggen. De webinterface zegt dat er met zoveel woorden
+ * bij; zet het wachtwoord met 'set password <...>' voordat je op het slot
+ * vertrouwt.
+ *
+ * DIT IS OOK HET ANTWOORD OP "hoe zag die tweede node zes kanalen". Alleen nodes
+ * die in de toegangslijst staan bereiken onPeerDataRecv (searchPeersByHash zoekt
+ * niets anders af), dus die node stond er al in -- hij was hier binnengekomen. Wat
+ * handleRequest fout deed is een tweede gat naast dit: het negeerde de ROL, dus
+ * ook een ingang met alleen alarmrecht kon alles uitlezen.
+ */
 uint8_t SensorMesh::handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood) {
   ClientInfo* client;
   if (data[0] == 0) {   // blank password, just check if sender is in ACL
@@ -416,6 +491,27 @@ void SensorMesh::handleCommand(uint32_t sender_timestamp, char* command, char* r
         strcpy(reply, "Err - bad pubkey");
       }
     }
+  } else if (strcmp(command, "get acl.strict") == 0) {
+    /* Wel over het mesh bereikbaar, in tegenstelling tot 'get acl' hieronder:
+     * het antwoord is één teken en dus geen buffervraag, en wie op afstand het
+     * slot mag zetten moet ook kunnen zien of het al dicht is. Alleen een
+     * beheerder komt hier -- onPeerDataRecv laat CLI-tekst alleen door voor
+     * from->isAdmin(). */
+    strcpy(reply, acl_strict ? "1" : "0");
+  } else if (memcmp(command, "set acl.strict ", 15) == 0) {
+    /* Als CommonCLI-instelling en niet als iets nieuws, want dan staat hij waar
+     * iemand hem zoekt. De WAARDE is één teken; de noot in main.cpp over
+     * 'sensor list' en ongebonden sprintf gaat over LANGE waarden, en dit is de
+     * kortst mogelijke. Een publieke sleutel van 64 hextekens zou daar wél tegen
+     * de rand lopen, en die hoort dus via de webinterface en niet hierlangs. */
+    const char* v = &command[15];
+    while (*v == ' ') v++;
+    if (*v == '0' || *v == '1') {
+      setAclStrict(*v == '1');
+      sprintf(reply, "OK - acl.strict=%d", (int)acl_strict);
+    } else {
+      strcpy(reply, "Err - 0 of 1");
+    }
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
     Serial.println("ACL:");
     for (int i = 0; i < acl.getNumClients(); i++) {
@@ -478,6 +574,134 @@ void SensorMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, con
       if (reply) sendFlood(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
     }
   }
+}
+
+/* WAAROM HET OPVANGEN VAN ADVERTS HIER GEBEURT.
+ *
+ * mesh::Mesh biedt onAdvertRecv() als virtuele haak; de basisklasse doet er zelf
+ * niets mee. Mesh::onRecvPacket roept hem aan op precies de goede plek, en dat is
+ * geen toeval maar drie eigenschappen die deze lijst nodig heeft:
+ *
+ *  1. NA de handtekeningcontrole. Een advert draagt een ed25519-handtekening over
+ *     (pub_key + tijdstempel + app_data), en die is op dit punt geverifieerd. Dat
+ *     is de hele reden dat deze lijst als KEUZELIJST voor de toegangslijst mag
+ *     dienen: de sleutel is bewijsbaar van de afzender. Eerder in de keten
+ *     opvangen zou betekenen dat iedereen een willekeurige sleutel in dit
+ *     lijstje kan schuiven, en dan nodig je met één klik een vreemde uit.
+ *  2. NA _tables->wasSeen(). Een advert dat door drie buren wordt doorgegeven
+ *     komt hier één keer langs en niet vier keer.
+ *  3. Eigen adverts zijn er al uitgefilterd (self_id.matches).
+ *
+ * En het belangrijkste: het is een HAAK, dus de basisklasse hoeft niet gepatcht
+ * te worden. Dit project draait op een checkout van upstream MeshCore; elke
+ * regel in src/ die we veranderen, moeten we bij elke tag opnieuw aanbrengen.
+ *
+ * SNR EN NIET RSSI, en dat is een gemeten beperking. mesh::Packet bewaart alleen
+ * _snr (Dispatcher::checkRecv zet dat bij ontvangst). RSSI is er alleen live uit
+ * de radio via _radio->getLastRSSI(), en flood-pakketten worden met een
+ * score-vertraging in de wachtrij gezet voordat ze hier aankomen -- dan hoort die
+ * registerwaarde al bij een LATER pakket. Een verkeerd getal is erger dan geen
+ * getal, dus staat er SNR. Dat is bovendien het getal dat MeshCore zelf
+ * overal gebruikt (path_snrs, het antwoord op NODE_DISCOVER).
+ *
+ * 'hops' erbij, want dat maakt het verschil tussen "deze buur hoor ik zelf" (0)
+ * en "deze node ken ik via een omweg". Voor het onderscheiden van twee
+ * gelijknamige nodes is dat samen met de SNR het bruikbaarste dat er is.
+ */
+void SensorMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
+                              const uint8_t* app_data, size_t app_data_len) {
+  AdvertDataParser parser(app_data, app_data_len);
+
+  neighbours.noteAdvert(id.pub_key,
+                        (parser.isValid() && parser.hasName()) ? parser.getName() : NULL,
+                        parser.isValid() ? parser.getType() : ADV_TYPE_NONE,
+                        packet->_snr,
+                        packet->getPathHashCount(),
+                        getRTCClock()->getCurrentTime());
+}
+
+void SensorMesh::loadAclStrict() {
+  acl_strict = 0;
+  if (_fs == NULL || !_fs->exists(ACL_STRICT_PATH)) return;
+#if defined(RP2040_PLATFORM)
+  File f = _fs->open(ACL_STRICT_PATH, "r");
+#else
+  File f = _fs->open(ACL_STRICT_PATH);
+#endif
+  if (!f) return;
+  char c = 0;
+  if (f.read((uint8_t *) &c, 1) == 1 && c == '1') acl_strict = 1;
+  f.close();
+}
+
+void SensorMesh::saveAclStrict() {
+  if (_fs == NULL) return;
+  File f = openTruncate(_fs, ACL_STRICT_PATH);
+  if (!f) return;
+  uint8_t c = acl_strict ? '1' : '0';
+  f.write(&c, 1);
+  f.close();
+}
+
+/* Meteen schrijven en NIET via dirty_contacts_expiry.
+ *
+ * Dat patroon bestaat omdat de toegangslijst bij elk padbericht van een
+ * beheerder vies wordt -- tientallen keren per dag, en dan wil je niet tientallen
+ * keren naar flash. Het slot verandert alleen als een mens erop klikt, dus is er
+ * niets uit te stellen. En uitstellen zou hier gevaarlijk zijn: wie het slot
+ * dichtzet en de node meteen herstart, moet hem dicht aantreffen.
+ */
+void SensorMesh::setAclStrict(bool on) {
+  uint8_t v = on ? 1 : 0;
+  if (v == acl_strict) return;   // niets te doen, en dus ook niets te schrijven
+  acl_strict = v;
+  saveAclStrict();
+}
+
+bool SensorMesh::aclSetPerms(const uint8_t* pubkey, uint8_t perms) {
+  if (perms == 0) return aclRemove(pubkey, PUB_KEY_SIZE);
+
+  if ((perms & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) {
+    /* Alleen waarschuwingen, geen leesrecht. ClientACL::applyPermissions zou
+     * deze ingang VERWIJDEREN -- daar betekent de gastenrol "weg ermee". Hier
+     * betekent hij iets anders: mag gewaarschuwd worden, mag niet uitlezen. Dat
+     * is een zinnig recht (denk aan een telefoon die alleen alarm hoeft te
+     * krijgen) en het is de reden dat deze paar regels naast applyPermissions
+     * staan in plaats van erdoor. permissions is niet nul, dus ClientACL::save()
+     * bewaart de ingang gewoon. */
+    mesh::Identity id(pubkey);
+    ClientInfo* c = acl.putClient(id, 0);
+    if (c == NULL) return false;
+    c->permissions = perms;
+    self_id.calcSharedSecret(c->shared_secret, pubkey);
+  } else {
+    /* Dezelfde weg als de CLI-opdracht 'setperm': één zeef, niet twee. */
+    if (!acl.applyPermissions(self_id, pubkey, PUB_KEY_SIZE, perms)) return false;
+  }
+
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);   // trigger acl.save()
+  return true;
+}
+
+int SensorMesh::aclCountMatching(const uint8_t* pubkey, int key_len) {
+  if (key_len <= 0 || key_len > PUB_KEY_SIZE) return 0;
+  int n = 0;
+  for (int i = 0; i < acl.getNumClients(); i++) {
+    auto c = acl.getClientByIdx(i);
+    if (c->permissions == 0) continue;   // reeds verwijderde ingang
+    if (memcmp(c->id.pub_key, pubkey, key_len) == 0) n++;
+  }
+  return n;
+}
+
+bool SensorMesh::aclRemove(const uint8_t* pubkey, int key_len) {
+  if (aclCountMatching(pubkey, key_len) != 1) return false;   // niets, of meer dan één
+
+  /* perms 0 is bij applyPermissions de gastenrol, en dat verwijdert de ingang uit
+   * clients[] -- ook op een prefix. Precies wat we hier willen. */
+  if (!acl.applyPermissions(self_id, pubkey, key_len, 0)) return false;
+  dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+  return true;
 }
 
 int SensorMesh::searchPeersByHash(const uint8_t* hash) {
@@ -711,6 +935,7 @@ SensorMesh::SensorMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millise
 {
   next_local_advert = next_flood_advert = 0;
   dirty_contacts_expiry = 0;
+  acl_strict = 0;   // slot standaard uit; begin() leest de opgeslagen stand
   last_read_time = 0;
   num_alert_tasks = 0;
   set_radio_at = revert_radio_at = 0;
@@ -752,6 +977,7 @@ void SensorMesh::begin(FILESYSTEM* fs) {
   _cli.loadPrefs(_fs);
 
   acl.load(_fs, self_id);
+  loadAclStrict();
   region_map.load(_fs);
 
   // establish default-scope

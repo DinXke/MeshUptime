@@ -1,6 +1,7 @@
 #include "WebTask.h"
 #include "WifiTask.h"
 #include "MonitorSensors.h"
+#include "SensorMesh.h"
 
 #include <WebServer.h>
 #include <WiFi.h>
@@ -59,6 +60,42 @@
 static char g_json[3072];
 #define JSON_TAIL  240      /* ruimte die altijd vrij blijft voor één regel + "]}" */
 
+/* EEN EIGEN BUFFER VOOR /acl.json, en niet g_json erbij.
+ *
+ * Twee redenen. De maat: een toegangslijst draagt VOLLEDIGE publieke sleutels,
+ * en dat is 64 hextekens per regel -- dat past niet in de marge van g_json.
+ * En het tempo: de pagina haalt status.json elke 5 seconden op omdat metingen
+ * veranderen, maar een toegangslijst verandert alleen als er iemand op klikt.
+ * Die twee in één antwoord proppen zou 4 kB per 5 seconden over de wifi sturen
+ * voor gegevens die stilstaan.
+ *
+ * DE MAAT, NAGEREKEND:
+ *   vaste velden ("strict", "max", de tellers)                    ~   80 byte
+ *   MAX_CLIENTS (20) ingangen:
+ *     {"k":"<64 hex>","n":"<47>","p":255,"a":4294967295,"hb":1}   20 x ~ 165
+ *   MAX_NEIGHBOURS (12) buren, idem plus signaal en hops:
+ *     {"k":"<64>","n":"<47>","t":4,"h":63,"s":"-20.2",
+ *      "a":4294967295,"c":4294967295,"in":1}                      12 x ~ 185
+ *                                                                 ----------
+ *                                                                  ~ 4520
+ *
+ * De 47 is geen schatting: de naam gaat door jsonEscape() naar een buffer van
+ * NB_JSON_NAME byte, en die kapt af. Zonder die grens zou een naam van 23
+ * tekens die volledig uit aanhalingstekens bestaat 6x zo lang worden en klopt
+ * de rekensom niet meer. 6144 geeft ruim 1,5 kB marge, en de lus kapt bovendien
+ * af zodra er minder dan ACL_TAIL over is -- een half JSON-document maakt de
+ * pagina stuk op een plek waar niemand de oorzaak zoekt.
+ */
+static char g_acl[6144];
+#define ACL_TAIL  320       /* ruimte die altijd vrij blijft voor één regel + "]}" */
+
+/* De rekensom hierboven is geen decoratie. MAX_CLIENTS (20) en MAX_NEIGHBOURS
+ * (12) zijn met een bouwvlag te verhogen -- platformio.local.ini zet nu al
+ * MAX_CONTACTS=32 -- en dan moet g_acl mee. Dit dwingt dat af bij het compileren
+ * in plaats van bij het eerste stil afgekapte antwoord op een node in het veld. */
+static_assert(80 + MAX_CLIENTS * 165 + MAX_NEIGHBOURS * 185 + ACL_TAIL <= sizeof(g_acl),
+              "g_acl te klein voor MAX_CLIENTS/MAX_NEIGHBOURS -- zie de rekensom hierboven");
+
 static char g_ssid_shown[33] = {0};   // alleen om te tonen; nooit het wachtwoord
 
 /* Eén WebServer, statisch. Geen new/malloc; de klasse houdt er een pointer
@@ -77,6 +114,10 @@ void web_route_wifi()   { if (g_self) g_self->handleWifi(); }
 void web_route_hook()   { if (g_self) g_self->handleHook(); }
 void web_route_monadd() { if (g_self) g_self->handleMonAdd(); }
 void web_route_mondel() { if (g_self) g_self->handleMonDel(); }
+void web_route_acljson()   { if (g_self) g_self->handleAclJson(); }
+void web_route_aclset()    { if (g_self) g_self->handleAclSet(); }
+void web_route_acldel()    { if (g_self) g_self->handleAclDel(); }
+void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -243,7 +284,33 @@ td button{margin:0;padding:.15rem .5rem;font-size:.62rem;color:var(--red);
 background:transparent;border-color:var(--border)}
 td button:hover{border-color:var(--red);filter:none}
 .ok{color:var(--accent)}.bad{color:var(--red)}
-#msg{font-family:var(--mono);font-size:.8rem;min-height:1.2rem;margin-top:.5rem}
+#msg,#kmsg{font-family:var(--mono);font-size:.8rem;min-height:1.2rem;
+margin-top:.5rem}
+/* Vinkjes horen NIET in de hoofdletterstijl van de andere labels: die stijl is
+   voor kopjes boven een invoerveld, en hier is de tekst het label zelf. */
+label.cb{flex:0 0 auto;font-family:var(--sans);font-size:.9rem;
+text-transform:none;letter-spacing:normal;color:var(--text);margin:0;
+display:flex;align-items:center;gap:.35rem;cursor:pointer}
+label.cb input{width:auto;margin:0}
+/* Een sleutel van 64 hextekens past nergens. De eerste en laatste tekens zijn
+   wat iemand vergelijkt; de volle waarde zit in title= en in het klembord. */
+td.key{font-family:var(--mono);font-size:.8rem;white-space:nowrap;cursor:copy}
+/* HET SLOT. De open stand is GEEL EN NIET STIL: een open deur die zich als open
+   deur presenteert is een keuze, een open deur die eruitziet als een gesloten
+   deur is een fout. Daarom is dit een banner en geen vinkje ergens rechts. */
+.lock{border:1px solid var(--border);border-radius:10px;padding:.85rem 1rem;
+display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;margin-bottom:.8rem}
+.lock.open{border-color:var(--amber);background:linear-gradient(90deg,
+rgba(255,180,84,.1),transparent 75%)}
+.lock.shut{border-color:var(--accent);background:linear-gradient(90deg,
+rgba(53,224,140,.08),transparent 75%)}
+.lock .t{flex:1 1 18rem;font-size:.9rem}
+.lock .t b{font-family:var(--mono);text-transform:uppercase;letter-spacing:.1em;
+font-size:.7rem;display:block;margin-bottom:.2rem}
+.lock.open .t b{color:var(--amber)}.lock.shut .t b{color:var(--accent)}
+.lock button{margin:0;flex:0 0 auto}
+.lock.shut button{color:var(--text);background:transparent;
+border-color:var(--border)}
 </style></head><body>
 
 <h1>MeshUptime<span id="sub">bewaking &middot; heltec v3</span></h1>
@@ -287,6 +354,61 @@ uit (minimaal 90&nbsp;s), dan wordt de toestand onbekend en gaat er een
 waarschuwing over het mesh. Een onbekende naam op <code>/hook</code> maakt de
 dienst zelf aan en antwoordt met het kanaal dat hij kreeg.</p>
 </form></div>
+
+<h2>Toegang &mdash; wie mag de sensoren uitlezen</h2>
+<div id="lock"></div>
+<p class="why"><b>Waarom hier een slot zit:</b> een telemetrieverzoek over het
+mesh werd tot nu toe door <i>iedereen</i> beantwoord. Het rechtenveld kwam wel
+binnen maar werd niet gebruikt; het enige masker dat werkte was dat van de vrager
+zelf, en dat zegt alleen welke kanalen hij wil <i>ontvangen</i>. Met het slot aan
+antwoordt deze node alleen aan een sleutel die hieronder staat &mdash; de rest
+krijgt <b>geen antwoord</b>, en niet een leeg antwoord: een weigering mag geen
+zendtijd kosten, anders is zij zelf een manier om de radio bezig te houden.</p>
+
+<div class="card pad0"><table id="al"></table></div>
+<p class="note"><b>Rechten:</b>
+<span class="c-on">lezen</span> = mag telemetrie opvragen &middot;
+<span class="c-warn">alarm</span> = krijgt waarschuwingen toegestuurd &middot;
+<span class="c-off">beheer</span> = mag ook instellingen wijzigen en
+CLI-opdrachten sturen. Beheer omvat lezen. <b>Laatst actief</b> is vluchtig: na
+een herstart staat elke ingang op <i>nooit</i> tot hij weer iets doet.<br>
+Een node die met het beheerderswachtwoord inlogt, komt hier <b>zelf</b> in te
+staan als beheerder &mdash; ook met het slot aan. Wie het slot dichtzet en het
+wachtwoord op de standaardwaarde laat, heeft de deur op slot en de sleutel onder
+de mat.</p>
+
+<h2>Sleutel toevoegen</h2>
+<div class="card"><form id="ka">
+<label>Publieke sleutel (64 hextekens)<input name="key" maxlength="64"
+minlength="64" pattern="[0-9a-fA-F]{64}" required
+placeholder="a1b2c3&hellip;"></label>
+<div class="row" style="margin-top:.6rem">
+<label class="cb"><input type="checkbox" name="rd" checked> lezen</label>
+<label class="cb"><input type="checkbox" name="alerts"> alarm</label>
+<label class="cb"><input type="checkbox" name="admin"> beheer</label>
+</div>
+<button>Toevoegen</button>
+<div id="kmsg"></div>
+<p class="note">De <b>volledige</b> sleutel is nodig, geen prefix. De gedeelde
+sleutel waarmee deze node met de tegenpartij praat wordt uit de hele publieke
+sleutel gerekend &mdash; uit een prefix is hij niet te berekenen, dus een ingang
+op een prefix zou een ingang zijn waarmee niet te praten is. En een prefix is te
+vervalsen: wie sleutelparen blijft maken tot de eerste bytes overeenkomen, erft
+het recht dat jij aan iemand anders gaf. Bij <b>wissen</b> mag een prefix wel
+&mdash; dat is omkeerbaar, en de node weigert als de prefix op meer dan één
+ingang past.</p>
+</form></div>
+
+<h2>In de buurt gehoord</h2>
+<div class="card pad0"><table id="nb"></table></div>
+<p class="note">Wat hier staat is <b>niet bewaard</b> en verdwijnt bij een
+herstart: het is een bewering over het heden. Een bewaarde lijst zou beweren dat
+een node in de buurt is die er al een week niet meer is.<br>
+<b>SNR</b> en <b>hop</b> staan erbij om twee gelijknamige nodes te scheiden:
+<code>0</code> hop is een node die deze node zelf hoort, hoger is via een omweg,
+en de hoogste SNR is meestal die van jou. Alleen adverts met een geldige
+<b>ondertekening</b> komen in deze lijst, dus de sleutel is bewijsbaar van de
+afzender.</p>
 
 <h2>WiFi</h2>
 <div class="card"><form method="post" action="/wifi">
@@ -354,11 +476,123 @@ b.onclick=function(){if(confirm("Monitor '"+m.n+"' verwijderen?\n\nKanaal "+m.ch
 
 function say(t,ok){var m=document.getElementById("msg");
 m.className=ok?"ok":"bad";m.textContent=t}
+function say2(t,ok){var m=document.getElementById("kmsg");
+m.className=ok?"ok":"bad";m.textContent=t}
 
 function post(u,b){return fetch(u,{method:"POST",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
 .then(function(r){return r.text().then(function(t){
 say(t.trim(),r.ok);if(r.ok){u2()}})})}
+
+/* Aparte post voor het toegangsdeel: eigen meldregel en eigen verversing, want
+   status.json en acl.json zijn twee antwoorden met twee tempo's. */
+function post3(u,b){return fetch(u,{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.text().then(function(t){
+say2(t.trim(),r.ok);u3()})})}
+
+/* ---- toegangsbeheer ---- */
+var AT=["?","chat","repeater","kamer","sensor"];
+function atype(t){return AT[t]||("type "+t)}
+function shortkey(k){return k.slice(0,8)+"…"+k.slice(-4)}
+function age(a){if(a<0){return"nooit"}if(a<60){return a+"s"}
+if(a<3600){return Math.floor(a/60)+"m"}return hms(a)}
+
+/* Eén cel met de sleutel: afgekort in beeld, volledig in title= en met één klik
+   naar het klembord. De volle waarde MOET bereikbaar zijn -- dat is het enige
+   waarmee iemand op een andere node kan controleren dat dit de juiste node is. */
+function keycell(r,k){var c=r.insertCell();c.className="key";
+c.textContent=shortkey(k);c.title=k+"  (klik om te kopieren)";
+c.onclick=function(){if(navigator.clipboard){navigator.clipboard.writeText(k);
+say2("sleutel gekopieerd",1)}};return c}
+
+/* Eén vinkje. Stuurt de HELE nieuwe stand terug en niet alleen het veranderde
+   veld: rechten zijn samen één byte, en een POST die maar één bit beschrijft
+   zou de andere twee moeten raden. */
+function perm(r,d,k,st,f){var c=r.insertCell();
+var b=document.createElement("input");b.type="checkbox";b.checked=!!st[f];
+b.title=d;b.onchange=function(){
+var q={rd:st.rd,al:st.al,ad:st.ad};q[f]=b.checked?1:0;
+if(!q.rd&&!q.al&&!q.ad){b.checked=true;
+say2("het laatste recht kan niet uit; gebruik 'wis' om de ingang te verwijderen",
+0);return}
+post3("acl","key="+k+"&rd="+q.rd+"&alerts="+q.al+"&admin="+q.ad)};
+c.appendChild(b);return c}
+
+function lock(d){var e=document.getElementById("lock");
+var open=!d.strict;
+e.className="lock "+(open?"open":"shut");
+e.innerHTML='<div class="t"><b>'+(open?"slot uit":"slot aan")+"</b>"+
+(open?"Elke node op het mesh mag de sensoren van deze node uitlezen, ook een "+
+"node die hieronder niet staat. De lijst hieronder bepaalt dan alleen wie "+
+"waarschuwingen krijgt en wie mag beheren.":
+"Alleen de sleutels hieronder met leesrecht krijgen antwoord op een "+
+"telemetrieverzoek. De rest krijgt niets: geen leeg antwoord, maar stilte.")+
+"</div>";
+var b=document.createElement("button");
+b.textContent=open?"slot aanzetten":"slot uitzetten";
+b.onclick=function(){if(open&&!confirm("Slot aanzetten?\n\nAlleen sleutels met "+
+"leesrecht krijgen daarna nog telemetrie. Staat jouw eigen app er niet bij, dan "+
+"stopt die met werken.")){return}
+post3("acl/strict","on="+(open?1:0))};
+e.appendChild(b)}
+
+var AH=[["sleutel",""],["naam",""],["lezen",""],["alarm",""],["beheer",""],
+["rechten","num"],["laatst actief","num"],["",""]];
+
+function acltab(d){var e=document.getElementById("al");e.innerHTML="";
+var hr=e.insertRow();AH.forEach(function(x){var h=document.createElement("th");
+h.textContent=x[0];h.className=x[1];hr.appendChild(h)});
+var L=d.acl||[];
+if(!L.length){var r=e.insertRow(),c=r.insertCell();c.colSpan=AH.length;
+c.className="c-warn";c.textContent=d.strict?
+"leeg EN het slot staat aan: niemand kan de sensoren uitlezen":
+"leeg: nog geen enkele node toegelaten";return}
+L.forEach(function(a){var r=e.insertRow();
+keycell(r,a.k);
+var c=r.insertCell();c.className="nm";c.textContent=a.n||"–";
+/* De rol zit in de onderste twee bits (0=gast, 1=lezen, 3=beheer); alarm is
+   een los bit. Een vinkje uitzetten stuurt de HELE nieuwe stand terug, want het
+   rechtenveld is één byte en geen drie losse instellingen. */
+var role=a.p&3,st={rd:role>=1?1:0,al:(a.p&192)?1:0,ad:role==3?1:0};
+perm(r,"mag telemetrie opvragen",a.k,st,"rd");
+perm(r,"krijgt waarschuwingen",a.k,st,"al");
+perm(r,"mag beheren (omvat lezen)",a.k,st,"ad");
+c=r.insertCell();c.className="num";c.textContent="0x"+
+("0"+a.p.toString(16)).slice(-2).toUpperCase();
+c=r.insertCell();c.className="num";c.textContent=age(a.a);
+c=r.insertCell();var b=document.createElement("button");b.textContent="wis";
+b.onclick=function(){if(confirm("Sleutel "+shortkey(a.k)+" verwijderen?"))
+{post3("acl/del","key="+a.k)}};c.appendChild(b)})}
+
+var NH=[["sleutel",""],["naam",""],["soort",""],["hop","num"],["snr","num"],
+["gehoord","num"],["adverts","num"],["",""]];
+
+function nbtab(d){var e=document.getElementById("nb");e.innerHTML="";
+var hr=e.insertRow();NH.forEach(function(x){var h=document.createElement("th");
+h.textContent=x[0];h.className=x[1];hr.appendChild(h)});
+var L=(d.nb||[]).slice().sort(function(x,y){return x.a-y.a});
+if(!L.length){var r=e.insertRow(),c=r.insertCell();c.colSpan=NH.length;
+c.className="c-unk";c.textContent=
+"nog niets gehoord (adverts komen met minuten tussenruimte)";return}
+L.forEach(function(m){var r=e.insertRow();
+keycell(r,m.k);
+var c=r.insertCell();c.className="nm";c.textContent=m.n||"–";
+c=r.insertCell();c.textContent=atype(m.t);
+c=r.insertCell();c.className="num";c.textContent=m.h;
+c=r.insertCell();c.className="num";c.textContent=m.s;
+c=r.insertCell();c.className="num";c.textContent=age(m.a);
+c=r.insertCell();c.className="num";c.textContent=m.c;
+c=r.insertCell();
+if(m.in){c.className="c-on";c.textContent="in lijst"}else{
+var b=document.createElement("button");b.textContent="+ lezen";
+b.style.color="var(--accent)";
+b.onclick=function(){post3("acl","key="+m.k+"&rd=1&alerts=0&admin=0")};
+c.appendChild(b)}})}
+
+function u3(){fetch("acl.json").then(function(r){
+if(!r.ok){return r.text().then(function(t){say2(t.trim(),0)})}
+return r.json().then(function(d){lock(d);acltab(d);nbtab(d)})})}
 
 function u2(){fetch("status.json").then(function(r){return r.json()})
 .then(function(d){tiles(d);table(d);
@@ -373,7 +607,18 @@ post("monitor","name="+encodeURIComponent(f["name"].value)+
 "&host="+encodeURIComponent(f["host"].value)+
 "&int="+encodeURIComponent(f["int"].value))};
 
+document.getElementById("ka").onsubmit=function(ev){ev.preventDefault();
+var f=ev.target.elements;
+post3("acl","key="+encodeURIComponent(f["key"].value.trim())+
+"&rd="+(f["rd"].checked?1:0)+"&alerts="+(f["alerts"].checked?1:0)+
+"&admin="+(f["admin"].checked?1:0)).then(function(){f["key"].value=""})};
+
+/* Twee tempo's, met opzet. Metingen veranderen per minuut, dus die elke 5 s.
+   De toegangslijst verandert alleen als er iemand klikt; de buurtlijst groeit
+   met de tussenruimte van adverts (minuten). Elke 20 s is daarvoor ruim, en het
+   scheelt 4 kB per verversing over de wifi. */
 u2();setInterval(u2,5000);
+u3();setInterval(u3,20000);
 </script></body></html>)HTML";
 
 /* -------------------------------- opslag ---------------------------------- */
@@ -444,6 +689,14 @@ void WebTask::routes() {
    * hier niet omkeerbaar, want het kanaal komt niet terug. */
   _server->on("/monitor", HTTP_POST, web_route_monadd);
   _server->on("/monitor/del", HTTP_POST, web_route_mondel);
+  /* Toegangsbeheer. Om dezelfde reden alleen POST, en hier nog een graadje
+   * scherper: een GET die leesrecht uitdeelt is een link die iemand kan sturen,
+   * en een browser die hem voorlaadt deelt het recht uit zonder dat er iemand
+   * geklikt heeft. */
+  _server->on("/acl.json", HTTP_GET, web_route_acljson);
+  _server->on("/acl", HTTP_POST, web_route_aclset);
+  _server->on("/acl/del", HTTP_POST, web_route_acldel);
+  _server->on("/acl/strict", HTTP_POST, web_route_aclstrict);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -825,4 +1078,296 @@ void WebTask::handleMonDel() {
   char msg[96];
   snprintf(msg, sizeof(msg), "ok %s verwijderd; kanaal blijft vergeven\n", name);
   _server->send(200, "text/plain", msg);
+}
+
+/* ----------------------------- toegangsbeheer ----------------------------- */
+
+/* De naam gaat ontsnapt EN AFGEKAPT in het antwoord. Ontsnapt omdat een naam uit
+ * een advert komt en dus alles kan bevatten -- een enkel aanhalingsteken in een
+ * nodenaam zou het hele document ongeldig maken, en dan blijft de pagina leeg
+ * zonder dat er iets in de logs staat. Afgekapt omdat de maat van g_acl anders
+ * niet na te rekenen is: jsonEscape() kan een teken tot zes tekens maken. */
+#define NB_JSON_NAME  48
+
+/* Een publieke sleutel uit een tekstveld. Geeft het aantal BYTES terug, of 0 bij
+ * afkeuring.
+ *
+ * DE KEURING IS STREKER DAN mesh::Utils::fromHex, met reden: die controleert
+ * alleen de LENGTE en rekent een niet-hexteken stil om naar nul (zie hexVal in
+ * src/Utils.cpp). Een sleutel met een typefout zou dus stil een ANDERE sleutel
+ * worden -- en dan staat er een ingang in de lijst die op niemand past en waarvan
+ * niemand begrijpt waarom hij niets doet. Utils::isHexChar is wel de zeef van
+ * upstream; die gebruiken we per teken.
+ *
+ * Een oneven aantal tekens is een fout en geen halve byte: iemand die 63 tekens
+ * plakt heeft één teken verloren, en dan is stil afronden het verkeerde antwoord.
+ */
+static int parseHexKey(const char* hex, uint8_t* out, int out_max) {
+  int len = strlen(hex);
+  if (len == 0 || (len & 1) || len > out_max * 2) return 0;
+  for (int i = 0; i < len; i++) {
+    if (!mesh::Utils::isHexChar(hex[i])) return 0;
+  }
+  if (!mesh::Utils::fromHex(out, len / 2, hex)) return 0;
+  return len / 2;
+}
+
+/* Ouderdom in seconden, of -1 voor "nooit".
+ *
+ * last_activity in ClientInfo is VLUCHTIG -- ClientACL::load() zet hem niet
+ * terug, want hij staat niet in /s_contacts. Na een herstart is hij dus 0 voor
+ * elke ingang, en dat is precies "sinds de herstart niets gedaan". Dat als "50
+ * jaar geleden" tonen zou een leugen zijn; -1 wordt op de pagina "nooit". */
+static long ageOf(uint32_t stamp, uint32_t now) {
+  if (stamp == 0) return -1;
+  if (now <= stamp) return 0;   // klok is verzet, of net gebeurd
+  return (long)(now - stamp);
+}
+
+void WebTask::handleAclJson() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain",
+        "meshlaag niet gekoppeld: voeg in main.cpp setup() toe: "
+        "web_task.setAcl(&the_mesh);\n");
+    return;
+  }
+
+  const NeighbourList& nb = _acl->getNeighbours();
+  /* De klok van de MESH en niet millis(): last_activity en heard_at staan in
+   * RTC-seconden, en die twee mag je niet met elkaar verrekenen. */
+  const uint32_t now = _acl->getRTCClock()->getCurrentTime();
+
+  int n = snprintf(g_acl, sizeof(g_acl),
+      "{\"strict\":%d,\"max\":%d,\"nbmax\":%d,\"acl\":[",
+      _acl->getAclStrict() ? 1 : 0, MAX_CLIENTS, MAX_NEIGHBOURS);
+
+  char key[PUB_KEY_SIZE*2 + 1];
+  char esc[NB_JSON_NAME];
+  bool first = true;
+
+  for (int i = 0; i < _acl->getAclCount(); i++) {
+    ClientInfo* c = _acl->getAclEntry(i);
+    if (c->permissions == 0) continue;   // verwijderde ingang
+    if ((size_t)n > sizeof(g_acl) - ACL_TAIL) break;
+
+    /* toHex() schrijft 2 tekens per byte PLUS een afsluitende nul, dus precies
+     * de 65 byte van 'key'. */
+    mesh::Utils::toHex(key, c->id.pub_key, PUB_KEY_SIZE);
+
+    /* De NAAM komt uit de buurtlijst, want ClientInfo draagt er geen. Dat is
+     * geen gemak: zonder naam is deze tabel een rij van 64-tekenige hexsleutels
+     * en dan kiest niemand de juiste. Staat de node niet (meer) in de buurt,
+     * dan blijft de naam leeg -- en dat is de waarheid: wij weten hem niet. */
+    const NeighbourEntry* e = nb.find(c->id.pub_key, PUB_KEY_SIZE);
+    jsonEscape(e != NULL ? e->name : "", esc, sizeof(esc));
+
+    n += snprintf(g_acl + n, sizeof(g_acl) - n,
+        "%s{\"k\":\"%s\",\"n\":\"%s\",\"p\":%u,\"a\":%ld}",
+        first ? "" : ",", key, esc, (unsigned)c->permissions,
+        ageOf(c->last_activity, now));
+    first = false;
+  }
+
+  n += snprintf(g_acl + n, sizeof(g_acl) - n, "],\"nb\":[");
+  first = true;
+
+  for (int i = 0; i < nb.getNumEntries(); i++) {
+    const NeighbourEntry* e = nb.getEntryByIdx(i);
+    if ((size_t)n > sizeof(g_acl) - ACL_TAIL) break;
+
+    mesh::Utils::toHex(key, e->pub_key, PUB_KEY_SIZE);
+    jsonEscape(e->name, esc, sizeof(esc));
+
+    /* "in": staat deze buur al in de toegangslijst? De pagina kan dat niet zelf
+     * bepalen zonder beide lijsten te vergelijken, en dan zou zij de knop
+     * "leesrecht geven" aanbieden voor een node die het al heeft. */
+    n += snprintf(g_acl + n, sizeof(g_acl) - n,
+        "%s{\"k\":\"%s\",\"n\":\"%s\",\"t\":%u,\"h\":%u,\"s\":\"%.1f\","
+        "\"a\":%ld,\"c\":%lu,\"in\":%d}",
+        first ? "" : ",", key, esc, (unsigned)e->adv_type, (unsigned)e->hops,
+        ((float)e->snr4) / 4.0f,
+        ageOf(e->heard_at, now), (unsigned long)e->count,
+        _acl->aclCountMatching(e->pub_key, PUB_KEY_SIZE) > 0 ? 1 : 0);
+    first = false;
+  }
+
+  strlcat(g_acl, "]}", sizeof(g_acl));
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_acl);
+}
+
+/* POST /acl  (key, rd, alerts, admin)
+ *
+ * DE VOLLEDIGE SLEUTEL IS HIER VERPLICHT, en dat is rekenkunde en geen
+ * strengheid. De gedeelde sleutel waarmee deze node met de tegenpartij praat
+ * wordt uit de VOLLE publieke sleutel berekend (calcSharedSecret); uit een
+ * prefix valt hij niet te berekenen, dus een ingang op een prefix zou een ingang
+ * zijn waarmee niet te praten is. ClientACL::applyPermissions weigert een
+ * gedeeltelijke sleutel om precies die reden ook zelf.
+ *
+ * En er is een tweede reden, die ook zou gelden als het rekenkundig wél kon: een
+ * prefix is te vervalsen. Wie sleutelparen blijft aanmaken tot er een is waarvan
+ * de eerste zes byte overeenkomen met de prefix in jouw lijst, ERFT het recht dat
+ * jij aan iemand anders gaf. Zes byte is daarvoor niet genoeg werk. Bij
+ * VERWIJDEREN mag een prefix wel -- daar is de fout omkeerbaar en daar weigeren
+ * we bovendien als de prefix op meer dan één ingang past.
+ */
+void WebTask::handleAclSet() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain", "meshlaag niet gekoppeld");
+    return;
+  }
+
+  char hex[PUB_KEY_SIZE*2 + 8];   // ruim, zodat te lang wordt AFGEKEURD en niet stil afgekapt
+  if (!getArg(*_server, "key", hex, sizeof(hex)) || hex[0] == 0) {
+    _server->send(400, "text/plain", "sleutel ontbreekt\n");
+    return;
+  }
+
+  uint8_t pubkey[PUB_KEY_SIZE];
+  int key_len = parseHexKey(hex, pubkey, PUB_KEY_SIZE);
+  if (key_len == 0) {
+    _server->send(400, "text/plain",
+        "sleutel: alleen hextekens, en een even aantal (hoogstens 64)\n");
+    return;
+  }
+  if (key_len != PUB_KEY_SIZE) {
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "sleutel: %d van de %d byte; toevoegen vraagt de VOLLEDIGE sleutel "
+        "(64 hextekens)\n", key_len, PUB_KEY_SIZE);
+    _server->send(400, "text/plain", msg);
+    return;
+  }
+
+  /* De rol is een getal en geen verzameling vinkjes: PERM_ACL_ROLE_MASK zijn
+   * twee bits met vier standen. Beheerder mag alles wat lezen mag, dus is
+   * 'admin' zonder 'rd' geen tegenstrijdigheid maar gewoon de hoogste rol. */
+  char v[4];
+  const bool rd     = getArg(*_server, "rd", v, sizeof(v))     && v[0] == '1';
+  const bool admin  = getArg(*_server, "admin", v, sizeof(v))  && v[0] == '1';
+  const bool alerts = getArg(*_server, "alerts", v, sizeof(v)) && v[0] == '1';
+
+  uint8_t perms = admin ? PERM_ACL_ADMIN : (rd ? PERM_ACL_READ_ONLY : PERM_ACL_GUEST);
+  if (alerts) perms |= (PERM_RECV_ALERTS_LO | PERM_RECV_ALERTS_HI);
+
+  if (perms == 0) {
+    /* Geen enkel recht is geen ingang. Dat zou aclSetPerms() als verwijderen
+     * uitvoeren, en stil iets weggooien terwijl iemand "opslaan" bedoelde is
+     * precies het soort verrassing dat hier niet hoort. */
+    _server->send(400, "text/plain",
+        "geen enkel recht aangevinkt; gebruik 'wis' om een ingang te "
+        "verwijderen\n");
+    return;
+  }
+
+  if (!_acl->aclSetPerms(pubkey, perms)) {
+    _server->send(503, "text/plain", "toegangslijst vol of sleutel geweigerd\n");
+    return;
+  }
+
+  char msg[96];
+  snprintf(msg, sizeof(msg), "ok rechten %02X gezet\n", (unsigned)perms);
+  _server->send(200, "text/plain", msg);
+}
+
+/* POST /acl/del  (key)
+ *
+ * Een prefix mag hier, vanaf 6 byte (12 hextekens). Dat is de lengte die MeshCore
+ * zelf over het mesh teruggeeft bij REQ_TYPE_GET_ACCESS_LIST, dus het is de
+ * lengte waarmee iemand hier redelijkerwijs aankomt. EEN PREFIX IS MINDER VEILIG
+ * dan een volle sleutel -- twee sleutels kunnen op hun eerste zes byte
+ * overeenkomen -- en daarom weigert aclRemove() zodra de prefix op meer dan één
+ * ingang past. Verwijderen is bovendien de omkeerbare kant: opnieuw toevoegen kan,
+ * en dat vraagt dan wél de volle sleutel.
+ */
+void WebTask::handleAclDel() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain", "meshlaag niet gekoppeld");
+    return;
+  }
+
+  char hex[PUB_KEY_SIZE*2 + 8];
+  if (!getArg(*_server, "key", hex, sizeof(hex)) || hex[0] == 0) {
+    _server->send(400, "text/plain", "sleutel ontbreekt\n");
+    return;
+  }
+
+  uint8_t pubkey[PUB_KEY_SIZE];
+  int key_len = parseHexKey(hex, pubkey, PUB_KEY_SIZE);
+  if (key_len < 6) {
+    _server->send(400, "text/plain",
+        "sleutel: hextekens, even aantal, minstens 12 (6 byte)\n");
+    return;
+  }
+
+  int matches = _acl->aclCountMatching(pubkey, key_len);
+  if (matches == 0) {
+    _server->send(404, "text/plain", "geen ingang met die sleutel\n");
+    return;
+  }
+  if (matches > 1) {
+    char msg[112];
+    snprintf(msg, sizeof(msg),
+        "%d ingangen beginnen met deze %d byte; geef meer tekens\n",
+        matches, key_len);
+    _server->send(409, "text/plain", msg);
+    return;
+  }
+
+  if (!_acl->aclRemove(pubkey, key_len)) {
+    _server->send(500, "text/plain", "verwijderen mislukt\n");
+    return;
+  }
+  _server->send(200, "text/plain", "ok ingang verwijderd\n");
+}
+
+/* POST /acl/strict  (on=0|1)
+ *
+ * Het slot zelf. Het antwoord zegt met zoveel woorden wat de nieuwe stand
+ * betekent, want dit is de ene knop op deze pagina waarvan de gevolgen niet in
+ * de tabel eronder te zien zijn.
+ */
+void WebTask::handleAclStrict() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain", "meshlaag niet gekoppeld");
+    return;
+  }
+
+  char on[4];
+  if (!getArg(*_server, "on", on, sizeof(on)) || (on[0] != '0' && on[0] != '1')) {
+    _server->send(400, "text/plain", "on: 0 of 1\n");
+    return;
+  }
+
+  _acl->setAclStrict(on[0] == '1');
+
+  if (on[0] == '1') {
+    /* Het aantal ingangen MET leesrecht erbij, want dat is het getal waarop het
+     * misgaat: het slot dichtzetten met een lege lijst betekent dat er niemand
+     * meer kan uitlezen, en dat merk je pas als je het probeert. */
+    int readers = 0;
+    for (int i = 0; i < _acl->getAclCount(); i++) {
+      ClientInfo* c = _acl->getAclEntry(i);
+      if (c->permissions == 0) continue;
+      if ((c->permissions & PERM_ACL_ROLE_MASK) >= PERM_ACL_READ_ONLY) readers++;
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg),
+        "ok slot AAN; %d node(s) met leesrecht, de rest krijgt geen antwoord\n",
+        readers);
+    _server->send(200, "text/plain", msg);
+  } else {
+    _server->send(200, "text/plain",
+        "ok slot UIT; elke node op het mesh mag de sensoren uitlezen\n");
+  }
 }
