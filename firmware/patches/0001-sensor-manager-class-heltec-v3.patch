@@ -1,0 +1,103 @@
+MeshCore-patch: SENSOR_MANAGER_CLASS voor variants/heltec_v3
+============================================================
+
+Tegen tag companion-v1.17.0. Aanbrengen met:
+
+    cd <meshcore-kopie>
+    git apply ../MeshUptime/firmware/patches/0001-sensor-manager-class-heltec-v3.patch
+
+En in de env in platformio.local.ini:
+
+    -I examples/meshuptime
+    -D SENSOR_MANAGER_CLASS=MonitorSensors
+    -D SENSOR_MANAGER_INCLUDE='"MonitorSensors.h"'
+
+
+WAAROM DEZE PATCH NODIG IS
+--------------------------
+
+MeshUptime moet eigen gegevens (netvoeding, batterijvoeding, wifi, straks de
+ping-monitors) in het telemetriepakket zetten. Dat kan alleen vanuit een eigen
+SensorManager, en niet vanuit de toepassingscode in main.cpp:
+
+1. `SensorMesh::handleRequest()` (SensorMesh.cpp, ~regel 176) bouwt het antwoord
+   op een telemetrieverzoek zelf op. Die methode is NIET virtueel en de buffer
+   `reply_data` is private, dus een afgeleide klasse kan er niet tussen komen.
+
+2. `handleRequest()` roept `onSensorDataRead()` NIET aan -- vergelijk met de
+   periodieke ronde in `SensorMesh::loop()` (~regel 931), die dat wel doet. Wie
+   zijn sensoren in `onSensorDataRead()` zet, krijgt ze dus wel in de eigen
+   historiek maar NIET in het antwoord aan een vraagsteller. Dat is een stille
+   fout: het pakket komt aan, alleen zonder onze velden.
+
+3. `SensorManager::querySensors()` is de enige haak die in BEIDE paden loopt.
+   Daarom moet alles wat naar buiten moet daar staan -- en daarom moet de
+   `sensors`-global van een eigen klasse zijn.
+
+De global is hardgecodeerd in de variant (`EnvironmentSensorManager sensors;` in
+target.cpp, `extern EnvironmentSensorManager sensors;` in target.h). Zonder deze
+patch is er geen enkele plek waar een toepassing een andere klasse kan opgeven
+zonder de variant te forken.
+
+
+WAAROM ZO KLEIN
+---------------
+
+Drie regels vervangen en een macro met terugval toevoegen. Zonder
+SENSOR_MANAGER_CLASS bouwt de variant exact wat hij ervoor bouwde, dus het
+upstream-gedrag is ongewijzigd en de patch is kandidaat om ooit stroomopwaarts
+aan te bieden. De include loopt via een tweede macro (SENSOR_MANAGER_INCLUDE),
+zodat target.h niets over de toepassing hoeft te weten; wordt die niet gezet,
+dan wordt er ook niets extra ingelezen.
+
+De constructor van de eigen klasse moet dezelfde vorm hebben als die van
+EnvironmentSensorManager: met `LocationProvider&` als ENV_INCLUDE_GPS aan staat
+(dat is zo voor Heltec V3, zie sensor_base in platformio.ini), zonder argumenten
+als hij uit staat. MonitorSensors doet dat met dezelfde #if.
+
+diff --git a/variants/heltec_v3/target.cpp b/variants/heltec_v3/target.cpp
+index e6af466..f99b874 100644
+--- a/variants/heltec_v3/target.cpp
++++ b/variants/heltec_v3/target.cpp
+@@ -18,9 +18,9 @@ AutoDiscoverRTCClock rtc_clock(fallback_clock);
+ #if ENV_INCLUDE_GPS
+   #include <helpers/sensors/MicroNMEALocationProvider.h>
+   MicroNMEALocationProvider nmea = MicroNMEALocationProvider(Serial1, &rtc_clock);
+-  EnvironmentSensorManager sensors = EnvironmentSensorManager(nmea);
++  SENSOR_MANAGER_CLASS sensors = SENSOR_MANAGER_CLASS(nmea);
+ #else
+-  EnvironmentSensorManager sensors;
++  SENSOR_MANAGER_CLASS sensors;
+ #endif
+ 
+ #ifdef DISPLAY_CLASS
+diff --git a/variants/heltec_v3/target.h b/variants/heltec_v3/target.h
+index 2944b38..9da9b30 100644
+--- a/variants/heltec_v3/target.h
++++ b/variants/heltec_v3/target.h
+@@ -8,6 +8,16 @@
+ #include <helpers/AutoDiscoverRTCClock.h>
+ #include <helpers/SensorManager.h>
+ #include <helpers/sensors/EnvironmentSensorManager.h>
++
++// Allow an application to plug in its own SensorManager subclass.
++// Behaviour is unchanged from upstream when these macros are not set.
++#ifndef SENSOR_MANAGER_CLASS
++  #define SENSOR_MANAGER_CLASS EnvironmentSensorManager
++#endif
++#ifdef SENSOR_MANAGER_INCLUDE
++  #include SENSOR_MANAGER_INCLUDE
++#endif
++
+ #ifdef DISPLAY_CLASS
+   #include <helpers/ui/SSD1306Display.h>
+   #include <helpers/ui/MomentaryButton.h>
+@@ -16,7 +26,7 @@
+ extern HeltecV3Board board;
+ extern WRAPPER_CLASS radio_driver;
+ extern AutoDiscoverRTCClock rtc_clock;
+-extern EnvironmentSensorManager sensors;
++extern SENSOR_MANAGER_CLASS sensors;
+ 
+ #ifdef DISPLAY_CLASS
+   extern DISPLAY_CLASS display;

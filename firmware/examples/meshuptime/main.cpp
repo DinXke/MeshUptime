@@ -2,7 +2,9 @@
 
 #ifdef WIFI_SSID
   #include "WifiTask.h"
+  #include "WebTask.h"
   static WifiTask wifi_task;
+  static WebTask  web_task;
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -120,7 +122,25 @@ void setup() {
 #endif
 
 #ifdef WIFI_SSID
-  wifi_task.begin(WIFI_SSID, WIFI_PWD);
+  {
+    /* De OPGESLAGEN instelling gaat voor op de gebakken bouwvlag. Dat is een
+     * ontwerpeis en geen gemak: zo hoeft een node die naar een ander netwerk
+     * verhuist niet opnieuw geflasht te worden, en zo is een node die je
+     * weggeeft schoon te maken door de opslag te wissen. De gebakken waarde
+     * blijft het laatste redmiddel. */
+    char ssid[33], pwd[65];   // WifiTask kopieert ze, dus lokaal mag
+    if (loadWifiConfig(ssid, sizeof(ssid), pwd, sizeof(pwd))) {
+      wifi_task.begin(ssid, pwd);
+    } else {
+      wifi_task.begin(WIFI_SSID, WIFI_PWD);
+    }
+    web_task.begin(&wifi_task, FIRMWARE_VERSION);
+  }
+  #ifdef HAS_MONITOR_SENSORS
+    /* main.cpp is de enige plek die zowel de wifi-taak als de sensoren kent;
+     * daarom hier de koppeling, en niet via een global in een header. */
+    sensors.setWifiTask(&wifi_task);
+  #endif
 #endif
 
   // send out initial zero hop Advertisement to the mesh
@@ -158,6 +178,7 @@ void loop() {
   sensors.loop();
 #ifdef WIFI_SSID
   wifi_task.loop();
+  web_task.loop();
 #endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();

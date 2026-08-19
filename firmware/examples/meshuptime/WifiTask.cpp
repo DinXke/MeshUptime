@@ -1,6 +1,27 @@
 #include "WifiTask.h"
 #include <WiFi.h>
 
+/* Logging. Een waakhond die bestaat om een moeilijk te betrappen storing te
+ * repareren, moet kunnen vertellen dat hij iets gedaan heeft -- anders weet je
+ * na een week niet of hij werkt of of het probleem gewoon niet optrad. Elke
+ * toestandsovergang en elke harde reset gaat naar de console, met de reden
+ * erbij. 202 is WIFI_REASON_AUTH_FAIL; dat getal opzoeken kost anders tijd
+ * precies op het moment dat je het niet hebt. */
+#ifndef WIFI_LOG
+  #define WIFI_LOG(...) Serial.printf("[wifi] " __VA_ARGS__)
+#endif
+
+static const char* stateName(int s) {
+  switch (s) {
+    case 0: return "uit";
+    case 1: return "verbinden";
+    case 2: return "online";
+    case 3: return "opnieuw";
+    case 4: return "eigen-ap";
+  }
+  return "?";
+}
+
 /* Tijden. Bewust ruim: de radio van het mesh gaat voor, en een node die elke
  * vijf seconden zijn WiFi opnieuw opstart stoort zijn eigen LoRa-timing. */
 #define CONNECT_TIMEOUT_MS     20000
@@ -37,7 +58,12 @@ void WifiTask::begin(const char* ssid, const char* pwd) {
 }
 
 void WifiTask::setState(State s) {
-  if (_state != s) { _state = s; _state_since = millis(); }
+  if (_state != s) {
+    WIFI_LOG("%s -> %s (reden %u, mislukt %u, resets %u)\n",
+             stateName(_state), stateName(s), _last_reason, _fails, _hard_resets);
+    _state = s;
+    _state_since = millis();
+  }
 }
 
 uint32_t WifiTask::secsInState() const {
@@ -58,6 +84,8 @@ void WifiTask::startConnect() {
  * hangen waar hij niet uit kwam, ook niet toen de oorzaak weg was. */
 void WifiTask::hardReset() {
   _hard_resets++;
+  WIFI_LOG("harde reset van de radio (nr %u), laatste reden %u\n",
+           _hard_resets, _last_reason);
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
   delay(200);
@@ -69,6 +97,7 @@ void WifiTask::startAP() {
   uint64_t mac = ESP.getEfuseMac();
   snprintf(ap, sizeof(ap), "%s%02X%02X", AP_SSID_PREFIX,
            (uint8_t)(mac >> 8), (uint8_t)mac);
+  WIFI_LOG("verbinden lukt niet, eigen toegangspunt %s\n", ap);
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ap);
   setState(AP_MODE);
@@ -81,8 +110,12 @@ void WifiTask::loop() {
   /* Wegvallen opvangen, ongeacht in welke toestand we dachten te zitten. */
   if (g_dropped) {
     g_dropped = false;
-    _last_reason = g_last_reason;
+    /* Alleen een reden onthouden als we werkelijk online waren. Tijdens het
+     * associeren vuurt de ESP32 al een DISCONNECTED-event af met reden 202; dat
+     * bewaren gaf "online (reden 202)" in het log en reason=202 in status.json
+     * terwijl er niets aan de hand was. */
     if (_state == ONLINE) {
+      _last_reason = g_last_reason;
       setState(RETRYING);
       _fails = 0;
       _next_action = now + RETRY_DELAY_MS;
@@ -94,6 +127,8 @@ void WifiTask::loop() {
       if (g_got_ip || WiFi.status() == WL_CONNECTED) {
         _fails = 0; _reconnects++;
         setState(ONLINE);
+        WIFI_LOG("verbonden, rssi %d, ip %s\n",
+                 WiFi.RSSI(), WiFi.localIP().toString().c_str());
       } else if ((long)(now - _next_action) >= 0) {
         _fails++;
         if (_fails >= FAILS_BEFORE_AP) { startAP(); }

@@ -631,3 +631,74 @@ schrijft niets naar de console, dus de toestand waarin hij zit en het aantal
 harde resets zijn onzichtbaar. Bij een onderdeel dat bestaat om een moeilijk te
 betrappen storing te repareren, is dat het verkeerde soort stilte. Gaat mee in
 de volgende ronde, samen met de sensoren, want die vraagt toch een nieuwe flash.
+
+---
+
+# SensorManager en webserver werkend (19 augustus 2026)
+
+Geflasht en op het toestel nagemeten.
+
+    RAM:   18,2%  (59.664 van 327.680)
+    Flash: 36,8%  (1.229.989 van 3.342.336)
+
+    heap vrij       235.156   (was 24.844 op de oude companion)
+    grootste blok   225.268   (was 11.764)  -- 19x
+
+## Wat bewezen werkt
+
+Seriële console na het opstarten:
+
+    Sensor ID: 48D7AADE232B...        identiteit bewaard
+    [wifi] uit -> verbinden
+    [wifi] verbinden -> online
+    [wifi] verbonden, rssi -49, ip 192.168.110.160
+
+    > sensor list
+      mains.hi=4.120
+      mains.lo=4.090
+      mains.state=1
+
+`mains.state=1` op een node die aan USB hangt: de toestandsmachine en de
+gekalibreerde drempels doen op de echte hardware wat ze moeten doen.
+
+Webserver: 401 zonder inloggegevens, 200 met. `/status.json` geeft echte cijfers.
+`/hook?name=router&up=1&ms=12` wordt aanvaard, `name=slecht;naam` afgewezen met
+400, en de ingang verschijnt in `status.json`.
+
+De opdrachtvorm is **`sensor set mains.hi 4.13`**, met het `sensor`-voorvoegsel:
+de generieke get/set van CommonCLI zit daarachter en niet los.
+
+## Wat nog niet bewezen is
+
+**Dat de sensoren in een echt telemetrieantwoord staan.** De code zet ze in
+`querySensors()`, en dat is de haak die `handleRequest` aanroept — statisch
+nagekeken. Maar een end-to-end bewijs vraagt een tweede node die telemetrie
+opvraagt, en dat is nog niet gedaan. Tot dan is dit onderbouwd en niet gemeten.
+
+## Bekende gebreken, met opzet opgeschreven
+
+- **Kanaalbotsing met de basisklasse.** `EnvironmentSensorManager::querySensors()`
+  zet `next_available_channel` terug op 2 en deelt vanaf daar uit aan gevonden
+  I2C-sensoren, bovenop onze vaste 2/3/4. Deze node heeft er geen, en `begin()`
+  waarschuwt zodra er één opduikt. Niet op te lossen zonder in de basisklasse te
+  snijden, want de reset gebeurt binnen de ouder.
+- **Sensorinstellingen worden niet bewaard.** CommonCLI zet alleen `gps` terug uit
+  de voorkeuren. Een aangepaste `mains.hi` geldt tot de volgende herstart. Vraagt
+  eigen instellingenopslag.
+- **Fragmentatie door de webserver.** Het grootste vrije blok zakte van 225.268
+  naar 163.828 na het bedienen van verzoeken. Ruim genoeg, maar het cijfer om in
+  het oog te houden — het is de maat die dit project vanaf het begin bepaalde.
+- **Eén cosmetisch gebrek in de logging.** De regel bij een overgang naar online
+  print nog `(reden 0, ...)`; de reden hoort daar helemaal niet te staan. De
+  inhoudelijke fout is weg (er stond eerder misleidend 202), deze is blijven
+  staan omdat een flash voor één logregel het niet waard is.
+- **Basic-auth over gewone HTTP** stuurt het wachtwoord leesbaar over het
+  netwerk. Verdedigbaar op een eigen LAN, niet genoeg voor een node die van
+  buiten bereikbaar wordt.
+
+## Nog te doen
+
+Ping-monitors op kanaal 5 en hoger, de koppeling van `/hook` naar telemetrie en
+meshwaarschuwingen, de DM-opdrachten `list` / `get` / `status` met de knipgrens
+van 158 byte, eigen instellingenopslag, en als laatste de repeaterrol met de
+tweede identiteit.
