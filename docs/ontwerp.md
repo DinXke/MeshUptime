@@ -581,3 +581,53 @@ Drie keer bijgesteld, en dat is de reden om te meten:
 3. "Hij is van het netwerk af, dus WiFi valt weg met de stroom" — **te snel**,
    op basis van één ontbrekende meting. Hij bleef eerst nog minuten bereikbaar.
    De echte reden kwam pas uit de seriële console.
+
+---
+
+# Eerste werkende flash (19 augustus 2026)
+
+Basis `simple_sensor` plus `WifiTask`, geflasht over COM4, hash gecontroleerd.
+
+    RAM:   17,3% (56.624 van 327.680)
+    Flash: 35,2% (1.174.893 van 3.342.336)
+
+WiFi met waakhond kost **128 byte** statisch bovenop de kale basis (56.496 →
+56.624). Na de flash: `Sensor ID: 48D7AADE232B…` — dezelfde prefix als ervoor,
+dus de identiteit is bewaard. Dat is geen toeval maar hoe `upload` werkt: het
+schrijft alleen de programmapartitie, niet SPIFFS, dus `/identity/_main.id`
+bleef staan. Wil je een nieuwe sleutel, dan moet dat bestand of SPIFFS gewist
+worden — een aparte handeling, met de back-up als terugweg.
+
+Netwerk: 4 van 4 pings op hetzelfde adres 192.168.110.160.
+
+Wat hiermee weg is: poort 5000 en dus de mesh-verbinding van Home Assistant.
+Bewuste keuze.
+
+## Twee openstaande zaken uit deze ronde
+
+**Eigen telemetrie vraagt een eigen SensorManager.** Onderzocht en de twee
+makkelijke wegen zijn dicht:
+
+- `SensorMesh::handleRequest` staat niet als `virtual` en `Mesh.h` kent hem niet,
+  dus overschrijven in de app kan niet.
+- `reply_data` staat achter `private:` (`SensorMesh.h:134` en `:140`), dus de
+  buffer aanvullen kan ook niet.
+
+Belangrijker: `handleRequest` roept `onSensorDataRead()` **niet** aan (vergelijk
+`SensorMesh.cpp:172-188` met `:924-936`). Sensoren die alleen daar toegevoegd
+worden, zouden dus wel bijgehouden zijn maar **niet in het antwoord op een
+telemetrieverzoek verschijnen** — een stille fout, gevonden voordat er code was.
+
+De juiste weg is `SensorManager::querySensors()`, die in beide paden aangeroepen
+wordt. Die klasse heeft ook al een instellingen-interface
+(`getNumSettings` / `getSettingName` / `setSettingValue`), en dat is precies wat
+de monitors nodig hebben: naam, adres en interval instelbaar over serieel en over
+DM-CLI zonder eigen parser. Kosten: `sensors` is een global van concreet type in
+`variants/heltec_v3/target.{h,cpp}`, dus een patch van twee regels om er onze
+subklasse van te maken. Komt bij de patches te staan.
+
+**De waakhond heeft geen logging.** Zelf gebouwd en zelf een gebrek: `WifiTask`
+schrijft niets naar de console, dus de toestand waarin hij zit en het aantal
+harde resets zijn onzichtbaar. Bij een onderdeel dat bestaat om een moeilijk te
+betrappen storing te repareren, is dat het verkeerde soort stilte. Gaat mee in
+de volgende ronde, samen met de sensoren, want die vraagt toch een nieuwe flash.

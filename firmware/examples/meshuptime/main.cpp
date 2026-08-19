@@ -1,5 +1,10 @@
 #include "SensorMesh.h"
 
+#ifdef WIFI_SSID
+  #include "WifiTask.h"
+  static WifiTask wifi_task;
+#endif
+
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
   static UITask ui_task(display);
@@ -114,6 +119,10 @@ void setup() {
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
 #endif
 
+#ifdef WIFI_SSID
+  wifi_task.begin(WIFI_SSID, WIFI_PWD);
+#endif
+
   // send out initial zero hop Advertisement to the mesh
 #if ENABLE_ADVERT_ON_BOOT == 1
   the_mesh.sendSelfAdvertisement(16000, false);
@@ -147,6 +156,9 @@ void loop() {
 
   the_mesh.loop();
   sensors.loop();
+#ifdef WIFI_SSID
+  wifi_task.loop();
+#endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();
 #endif
