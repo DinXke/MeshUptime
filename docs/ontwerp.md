@@ -798,4 +798,50 @@ elke lange `sensor set`-waarde loopt daar over. Beide horen upstream gemeld.
   `opgeslagen (naam), nog niet als telemetrie gepubliceerd` in plaats van `ok`.
   De koppeling gaat door dezelfde kanaaltoewijzer als de ping-monitors, niet door
   een tweede.
-- Telemetrie end-to-end is nog niet door een tweede node opgevraagd.
+- ~~Telemetrie end-to-end is nog niet door een tweede node opgevraagd.~~
+  **Bevestigd op 19 augustus 2026:** een tweede node ziet zes kanalen. De keten
+  werkt, en daarmee is de stille fout die eerder gevonden werd (dat
+  `handleRequest` `onSensorDataRead()` niet aanroept, en dat sensoren dus in
+  `querySensors()` moeten staan) ook in de praktijk goed opgelost.
+
+---
+
+# De namen zijn het echte probleem, niet de kanalen (19 augustus 2026)
+
+Zes kanalen komen aan bij een tweede node. Maar de app toont per kanaal het
+**LPP-type**: `voltage`, `switch`, `genericsensor`. Geen "router", geen "google".
+
+Dat is geen fout maar de grens van het formaat, en er is geen beter type te
+kiezen. Nagekeken:
+
+| kandidaat voor pingtijd | waarom niet |
+|---|---|
+| `analoginput` | 2 byte, 0,01-resolutie -> loopt dood boven 327 ms |
+| `luminosity` | 2 byte, maar beweert "lux" en dat is onwaar |
+| `frequency` | 4 byte exact, maar beweert "hertz" |
+| **`genericsensor`** | 4 byte, multiplier 1, exacte hele getallen, en het belooft niets onwaars |
+
+`genericsensor` blijft dus. Een ander type zou geen naam geven, alleen een ander
+verkeerd woord.
+
+## Waar de namen dan wel horen
+
+1. **De webinterface** — moet de volledige kanaalkaart tonen: kanaal, naam,
+   adres, toestand. Dat is de plek waar iemand met de app ernaast op zoekt, en
+   daar stond hij nog niet.
+2. **`list` over een DM** — geeft `kanaal:naam=toestand`. De agent heeft dat
+   kanaalnummer er bewust in gezet juist omdat het formaat het niet kan dragen.
+   Werkt, maar alleen voor een admin (zie hierboven).
+3. **Een dashboard** — daar hoort de koppeling onthouden te worden. Dit is
+   precies waarom kanaalnummers onveranderlijk moeten zijn: MeshManager kan
+   "kanaal 6 = google" bewaren, en bij een verschuivend nummer zou het stil de
+   verkeerde dienst tonen.
+
+De kaart zoals hij nu is:
+
+    kanaal 1  voltage                  batterijspanning
+    kanaal 2  switch                   netvoeding
+    kanaal 3  switch                   batterijvoeding
+    kanaal 4  switch                   wifi online
+    kanaal 5  switch + genericsensor   router  (192.168.110.254)
+    kanaal 6  switch + genericsensor   google  (8.8.8.8)
