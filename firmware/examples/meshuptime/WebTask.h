@@ -19,44 +19,42 @@
  * De koppeling met WiFi loopt via een pointer die main.cpp zet. Geen globale
  * variabele in een header: main.cpp bepaalt de levensduur en de volgorde, en
  * deze klasse doet niets voordat zij die pointer heeft.
+ *
+ * DE SENSORLAAG LOOPT LANGS DEZELFDE WEG. setMonitors() krijgt de pointer naar
+ * MonitorSensors; zonder die aanroep werkt de pagina wel, maar zonder
+ * monitoroverzicht en met een /hook die 503 antwoordt met de reden erbij. Dat is
+ * met opzet zichtbaar in plaats van stil: een monitoroverzicht dat leeg blijft
+ * zonder uitleg is precies het soort raadsel dat iemand een uur kost.
+ *
+ * De pointer staat NIET als extern global in deze header. main.cpp is de enige
+ * plek die zowel de webtaak als de sensorlaag kent, en dat blijft zo.
  */
 class WifiTask;
+class MonitorSensors;
 class WebServer;   // vooruit verklaard: WebServer.h hoort niet in deze header
 
 class WebTask {
 public:
-  /* Maximaal aantal externe controles. Statisch, want dat is de eerste regel
-   * uit docs/ontwerp.md: vast maximum, vaste buffers. */
-  static const uint8_t MAX_HOOKS = 8;
-  static const uint8_t MAX_HOOK_NAME = 16;   // zonder afsluiter
-
-  /* Eén melding van buiten (Uptime Kuma) over één dienst. */
-  struct Hook {
-    char     name[MAX_HOOK_NAME + 1];
-    bool     used;
-    bool     up;
-    uint32_t ms;         // gemelde reactietijd, 0 als niet meegegeven
-    uint32_t at_millis;  // wanneer de melding binnenkwam
-  };
-
   /* firmware_version wordt alleen bewaard, niet gekopieerd: main.cpp geeft
    * FIRMWARE_VERSION mee en dat is een letterlijke tekst in flash. */
   void begin(WifiTask* wifi, const char* firmware_version);
+
+  /* De sensorlaag, voor het monitoroverzicht en voor /hook. Aparte setter en
+   * geen extra parameter aan begin(): zo blijft de bestaande aanroep in main.cpp
+   * geldig en is de koppeling één regel die je ziet staan. */
+  void setMonitors(MonitorSensors* monitors) { _mon = monitors; }
 
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
   void loop();
 
   bool isServing() const { return _serving; }
 
-  /* Voor later: MonitorSensors leest hier de gemelde toestanden uit. */
-  const Hook* hooks() const;
-  uint8_t     hookCount() const;
-
 private:
-  WifiTask*   _wifi = nullptr;
-  WebServer*  _server = nullptr;
-  const char* _fw = "";
-  bool        _serving = false;
+  WifiTask*       _wifi = nullptr;
+  MonitorSensors* _mon = nullptr;
+  WebServer*      _server = nullptr;
+  const char*     _fw = "";
+  bool            _serving = false;
 
   bool requireAuth();
   void routes();
@@ -65,11 +63,20 @@ private:
   void handleStatus();
   void handleWifi();
   void handleHook();
+  void handleMonAdd();
+  void handleMonDel();
+
+  /* Schrijft het monitoroverzicht in buf achter positie n en geeft de nieuwe
+   * positie terug. Apart van handleStatus() omdat die anders één functie van
+   * honderd regels wordt met twee onderwerpen erin. */
+  int  appendMonitors(char* buf, size_t len, int n);
 
   friend void web_route_root();
   friend void web_route_status();
   friend void web_route_wifi();
   friend void web_route_hook();
+  friend void web_route_monadd();
+  friend void web_route_mondel();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

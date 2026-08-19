@@ -33,6 +33,26 @@
 /* MON_INTERVAL_MIN/MAX/DEFAULT staan in MonitorStore.h: het inleesfilter en het
  * instellingenfilter moeten dezelfde grenzen aanhouden. */
 
+/* Het adres dat "ik ping niet zelf, ik word van buiten gemeld" betekent. Zie de
+ * uitleg bij PUSH_HOST in de header: de soort monitor zit in dit veld omdat het
+ * opslagformaat van MonitorStore geen plek voor een eigen soortveld heeft, en
+ * "-" is geen hostnaam en geen IP-adres. */
+const char MonitorSensors::PUSH_HOST[] = "-";
+
+const char* MonitorSensors::monResultText(MonResult r) {
+  switch (r) {
+    case MON_OK:           return "ok";
+    case MON_ERR_NAME:     return "naam: 1-16 tekens uit a-z A-Z 0-9 . - _";
+    case MON_ERR_HOST:     return "adres: 1-40 tekens uit a-z A-Z 0-9 . - _";
+    case MON_ERR_INTERVAL: return "interval: 10-3600 s";
+    case MON_ERR_TAKEN:    return "naam bestaat al";
+    case MON_ERR_KIND:     return "naam bestaat al als ping-monitor";
+    case MON_ERR_FULL:     return "geen vakje vrij (max 8)";
+    case MON_ERR_UNKNOWN:  return "naam bestaat niet";
+  }
+  return "onbekende fout";
+}
+
 /* ================== de uitslag van de lopende ping ==================
  *
  * In bestandsbereik en niet in de klasse; de reden staat in MonitorSensors.h
@@ -257,6 +277,11 @@ void MonitorSensors::loopMonitors() {
   if (!online) return;
   if ((long)(now - (_wifi_ok_since + WIFI_GRACE_MS)) < 0) return;   /* insteltijd */
 
+  /* Gemelde diensten laten verouderen. Staat VOOR de ping-machine en niet erin:
+   * bij deze soort komt er geen uitslag binnen om aan mee te liften, en het
+   * verstrijken van de tijd is precies de gebeurtenis waar we op letten. */
+  loopPushStale();
+
   switch (_phase) {
     case PING_RESOLVING: {
       uint8_t st = s_ping.dns_state;
@@ -328,6 +353,65 @@ void MonitorSensors::loopMonitors() {
   }
 }
 
+/* ===================== gemelde diensten laten verouderen =====================
+ *
+ * De regel staat bij PUSH_STALE_FACTOR in de header. Hier alleen de uitvoering,
+ * en één ding dat de moeite van het benoemen waard is: verouderen zet
+ * seeded op false en NIET up op false.
+ *
+ * "Onbekend" en "neer" zijn twee verschillende uitspraken. Wij weten niet dat de
+ * dienst plat ligt -- wij weten dat de MELDER niets meer zegt. Van die twee is
+ * alleen de tweede vastgesteld, en de bewaking hoort niets te beweren wat ze
+ * niet gemeten heeft. Dat de telemetrie er hetzelfde uitziet (LPP_SWITCH 0, want
+ * dat formaat kent geen "onbekend") verandert daar niets aan: de pagina, de
+ * DM-lijst en de waarschuwingstekst zeggen wel wat er echt aan de hand is.
+ */
+unsigned long MonitorSensors::monitorStaleRef(int slot) const {
+  const unsigned long blind_until = _wifi_ok_since + WIFI_GRACE_MS;
+  const unsigned long reported    = _mon[slot].last_report;
+
+  /* De latere van de twee. Zonder wifi kan /hook ons niet bereiken, dus die tijd
+   * telt niet mee als stilte van de melder. */
+  return ((long)(blind_until - reported) > 0) ? blind_until : reported;
+}
+
+uint32_t MonitorSensors::monitorStaleMs(int slot) const {
+  uint16_t period = _cfg.mons[slot].interval_s;
+  if (period == 0) period = MON_INTERVAL_DEFAULT;
+
+  uint32_t limit = (uint32_t)period * 1000UL * PUSH_STALE_FACTOR;
+  return (limit < PUSH_STALE_MIN_MS) ? PUSH_STALE_MIN_MS : limit;
+}
+
+void MonitorSensors::loopPushStale() {
+  const unsigned long now = millis();
+
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorIsPush(i)) continue;
+
+    MonState& m = _mon[i];
+
+    /* Nog nooit een melding gehad? Dan is er niets verouderd; deze dienst is
+     * simpelweg nog onbekend. Zonder deze regel zou elke herstart 90 s later een
+     * waarschuwing geven over diensten waarover we nooit iets wisten. */
+    if (m.last_report == 0) continue;
+
+    const bool over = (long)(now - (monitorStaleRef(i) + monitorStaleMs(i))) >= 0;
+    if (over == m.stale) continue;
+
+    m.stale = over;
+    if (over) {
+      /* Toestand valt weg. up blijft staan zoals hij was; hij doet niets meer
+       * zolang seeded false is, en zo is de laatste bekende stand nog te zien in
+       * de debug-uitvoer als iemand ernaar zoekt. */
+      m.seeded = false;
+      m.agree  = 0;
+      MESH_DEBUG_PRINTLN("MonitorSensors: '%s' geen melding meer binnen %lu s, toestand onbekend",
+                         _cfg.mons[i].name, (unsigned long)(monitorStaleMs(i) / 1000));
+    }
+  }
+}
+
 /* Kiest het vakje dat het langst op zijn ronde wacht. Eén ping tegelijk, dus
  * hier wordt gekozen en niet gestapeld. Het meest achterlopende vakje eerst
  * houdt de intervallen eerlijk als er meer monitors zijn dan er tijd is. */
@@ -338,6 +422,11 @@ void MonitorSensors::startNextPing() {
 
   for (int i = 0; i < MAX_MONITORS; i++) {
     if (!monitorUsed(i)) continue;
+    /* Een gemelde dienst pingen wij niet. Zou hij hier meedoen, dan werd zijn
+     * adres "-" opgezocht, dat mislukt altijd, en dan zou hij bij elke ronde als
+     * mislukking geteld worden -- twee bronnen voor één toestand, en de
+     * verkeerde zou winnen. */
+    if (monitorIsPush(i)) continue;
     long overdue = (long)(now - _mon[i].next_check);
     if (overdue >= 0 && overdue > best_overdue) {
       best = i;
@@ -530,6 +619,24 @@ uint32_t    MonitorSensors::monitorPingMs(int slot) const   { return monitorUsed
 uint32_t    MonitorSensors::monitorChecks(int slot) const   { return monitorUsed(slot) ? _mon[slot].checks : 0; }
 uint32_t    MonitorSensors::monitorFails(int slot) const    { return monitorUsed(slot) ? _mon[slot].fails : 0; }
 
+bool MonitorSensors::monitorIsPush(int slot) const {
+  return monitorUsed(slot) && strcmp(_cfg.mons[slot].host, PUSH_HOST) == 0;
+}
+
+uint32_t MonitorSensors::monitorReportAge(int slot) const {
+  if (!monitorIsPush(slot) || _mon[slot].last_report == 0) return 0;
+  return (uint32_t)((millis() - _mon[slot].last_report) / 1000);
+}
+
+uint32_t MonitorSensors::monitorStaleSecs(int slot) const {
+  if (!monitorIsPush(slot)) return 0;
+  return monitorStaleMs(slot) / 1000;
+}
+
+bool MonitorSensors::monitorIsStale(int slot) const {
+  return monitorIsPush(slot) && _mon[slot].stale;
+}
+
 bool MonitorSensors::monitorsPaused() const {
   if (!isWifiOnline()) return true;
   return (long)(millis() - (_wifi_ok_since + WIFI_GRACE_MS)) < 0;
@@ -575,8 +682,19 @@ bool MonitorSensors::monitorAlert(int slot) {
   MonState& m = _mon[slot];
 
   /* Bevestigd down, en we waren op dat moment niet blind. monitorsPaused()
-   * dekt zowel "geen wifi" als de insteltijd erna. */
-  const bool want = m.seeded && !m.up && !monitorsPaused();
+   * dekt zowel "geen wifi" als de insteltijd erna.
+   *
+   * Voor een GEMELDE dienst komt daar één geval bij: de melder is stil
+   * gevallen. Dat gaat langs DEZELFDE weg naar buiten -- monitorAlert() en
+   * monitorAlertText(), die main.cpp al aan alertIf() hangt -- en niet langs een
+   * tweede waarschuwingspad. Eén weg betekent ook dat de rem op
+   * MAX_MONITOR_ALERTS hier vanzelf voor beide gevallen geldt en dat een storing
+   * die overgaat door hetzelfde alertIf() wordt opgeruimd.
+   *
+   * Verouderd EN neer kan niet tegelijk: verouderen zet seeded op false. Van de
+   * twee is "geen melding meer" dan het nieuwste feit, en dat is ook het feit
+   * dat de ontvanger nodig heeft. */
+  const bool want = !monitorsPaused() && ((m.seeded && !m.up) || m.stale);
 
   if (!want) {
     m.alerting = false;
@@ -603,6 +721,22 @@ static char s_alert_buf[80];
 
 const char* MonitorSensors::monitorAlertText(int slot) const {
   if (!monitorUsed(slot)) { s_alert_buf[0] = 0; return s_alert_buf; }
+
+  if (monitorIsPush(slot)) {
+    /* Twee heel verschillende boodschappen, en het verschil is voor de ontvanger
+     * het halve bericht: bij het eerste ligt de DIENST plat, bij het tweede is
+     * de MELDER stil en weten wij niets. Wie dat door elkaar haalt, gaat de
+     * verkeerde kant op zoeken. Het adres staat er niet bij -- dat is "-" en zegt
+     * niets. */
+    if (_mon[slot].stale) {
+      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s: geen melding meer (>%lus)",
+               _cfg.mons[slot].name, (unsigned long)monitorStaleSecs(slot));
+    } else {
+      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s gemeld als neer",
+               _cfg.mons[slot].name);
+    }
+    return s_alert_buf;
+  }
 
   snprintf(s_alert_buf, sizeof(s_alert_buf), "%s onbereikbaar (%s)",
            _cfg.mons[slot].name, _cfg.mons[slot].host);
@@ -634,6 +768,14 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
 
     /* De monitors. Op vakjesvolgorde en dus op de volgorde waarin ze zijn
      * aangemaakt; de kanaalnummers zijn wat telt en die staan vast.
+     *
+     * Hier staat GEEN onderscheid tussen zelf gepingd en van buiten gemeld, en
+     * dat is de bedoeling: beide soorten leveren een schakelaar en, als ze op
+     * staan, een tijd in milliseconden. Een dashboard hoort niet te hoeven weten
+     * hoe wij aan onze uitslag komen. De verouderingsregel voor gemelde diensten
+     * werkt daarom via seeded (zie loopPushStale) -- dan valt zo'n vakje langs
+     * exact hetzelfde pad terug op "schakelaar 0, geen tijd" als een
+     * ping-monitor waarvan we nog niets weten.
      *
      * De pingtijd gaat alleen mee als de monitor up is. Een tijd bij een dode
      * dienst is geen meting maar een oude waarde, en wie hem toch zou tekenen
@@ -687,6 +829,16 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
  * dienst. Geen foutmelding, geen leeg veld, alleen verkeerde cijfers onder een
  * vertrouwde naam. Dat is de ergste soort fout die dit apparaat kan maken,
  * want de bewaking blijft er gezond uitzien.
+ *
+ * ER IS PRECIES EEN TOEWIJZER, VOOR BEIDE SOORTEN MONITOR.
+ *
+ * Een van buiten gemelde dienst (/hook) krijgt zijn kanaal hier, uit dezelfde
+ * pot en met dezelfde ch_ever_used-byte als een ping-monitor. Een tweede
+ * toewijzer ernaast zou na één verwijdering twee waarheden geven die uit elkaar
+ * lopen -- de een weet dat kanaal 7 vergeven is, de ander deelt hem opnieuw uit.
+ * Het onderscheid tussen de twee soorten zit in het ADRESVELD (zie PUSH_HOST) en
+ * nergens in de kanaalboekhouding, want voor een kanaalnummer maakt het niet uit
+ * waar de uitslag vandaan komt.
  *
  * Om diezelfde reden staat ch_ever_used in het opslagbestand: zonder die byte
  * zou de node na een herstart weer bij 5 beginnen uitdelen en was de hele
@@ -766,56 +918,56 @@ void MonitorSensors::markDirty() {
   _save_at = millis() + 2000;
 }
 
-/* spec = "naam,adres[,interval]". Komma's en geen spaties, omdat CommonCLI de
- * regel na "sensor set <sleutel> " op spaties splitst (CommonCLI.cpp:285) en
- * dus alleen een waarde zonder spaties doorgeeft. */
-bool MonitorSensors::addMonitor(const char* spec) {
-  char buf[MON_NAME_LEN + MON_HOST_LEN + 8];
-  StrHelper::strncpy(buf, spec, sizeof(buf));
+/* Aanmaken met losse velden. Dit is de ENIGE plek waar een monitor ontstaat: de
+ * CLI (addMonitor), de webinterface en /hook (reportMonitor) komen hier alle
+ * drie langs. Zo staan de keuring, de kanaaltoewijzing en het opschonen van de
+ * meettoestand één keer beschreven.
+ *
+ * Een adres gelijk aan PUSH_HOST maakt een GEMELDE dienst; dat werkt hier
+ * verder zonder aparte tak, want het enige verschil zit in wat er daarna met het
+ * vakje gebeurt (niet pingen, wel verouderen) en dat leest de rest van deze
+ * klasse uit monitorIsPush(). */
+MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const char* host,
+                                                       uint16_t interval_s, uint8_t* out_channel) {
+  if (out_channel != NULL) *out_channel = 0;
 
-  char* name = buf;
-  char* host = strchr(buf, ',');
-  if (host == NULL) return false;
-  *host++ = 0;
+  if (!validName(name)) return MON_ERR_NAME;
+  if (!validHost(host)) return MON_ERR_HOST;
+  if (interval_s < MON_INTERVAL_MIN || interval_s > MON_INTERVAL_MAX) return MON_ERR_INTERVAL;
 
-  char* ivl = strchr(host, ',');
-  if (ivl != NULL) *ivl++ = 0;
-
-  if (!validName(name)) return false;
-  if (!validHost(host)) return false;
-
-  int interval = (ivl != NULL && *ivl) ? atoi(ivl) : MON_INTERVAL_DEFAULT;
-  if (interval < MON_INTERVAL_MIN || interval > MON_INTERVAL_MAX) return false;
-
-  if (findByName(name) >= 0) return false;    /* naam al in gebruik */
+  if (findByName(name) >= 0) return MON_ERR_TAKEN;
 
   int slot = -1;
   for (int i = 0; i < MAX_MONITORS; i++) {
     if (_cfg.mons[i].channel == 0) { slot = i; break; }
   }
-  if (slot < 0) return false;                 /* alle acht vakjes bezet */
+  if (slot < 0) return MON_ERR_FULL;           /* alle acht vakjes bezet */
 
   uint8_t ch = allocChannel();
-  if (ch == 0) return false;
+  if (ch == 0) return MON_ERR_FULL;
 
   MonitorCfgEntry& e = _cfg.mons[slot];
   StrHelper::strncpy(e.name, name, sizeof(e.name));
   StrHelper::strncpy(e.host, host, sizeof(e.host));
-  e.interval_s = (uint16_t)interval;
+  e.interval_s = interval_s;
   e.channel    = ch;
 
   memset(&_mon[slot], 0, sizeof(_mon[slot]));
   _mon[slot].up = true;               /* nog niet 'seeded'; zie applyResult() */
-  _mon[slot].next_check = millis();   /* meteen aan de beurt */
+  _mon[slot].next_check = millis();   /* meteen aan de beurt (gemeld: ongebruikt) */
 
   markDirty();
-  MESH_DEBUG_PRINTLN("MonitorSensors: monitor '%s' -> %s op kanaal %d, elke %d s", e.name, e.host, (int)ch, interval);
-  return true;
+  MESH_DEBUG_PRINTLN("MonitorSensors: %s '%s' -> %s op kanaal %d, elke %d s",
+                     monitorIsPush(slot) ? "gemelde dienst" : "monitor",
+                     e.name, e.host, (int)ch, (int)interval_s);
+
+  if (out_channel != NULL) *out_channel = ch;
+  return MON_OK;
 }
 
-bool MonitorSensors::delMonitor(const char* name) {
+MonitorSensors::MonResult MonitorSensors::deleteMonitor(const char* name) {
   int slot = findByName(name);
-  if (slot < 0) return false;
+  if (slot < 0) return MON_ERR_UNKNOWN;
 
   /* Wordt er juist naar dit vakje gepingd? Dan die meting weggooien: de uitslag
    * hoort bij een monitor die niet meer bestaat. */
@@ -828,7 +980,111 @@ bool MonitorSensors::delMonitor(const char* name) {
 
   /* ch_ever_used blijft staan. Dat IS de afspraak: het nummer is vergeven. */
   markDirty();
-  return true;
+  return MON_OK;
+}
+
+/* Een melding van buiten. Loopt over dezelfde toewijzer, dezelfde zeef en
+ * dezelfde velden als een ping-monitor; het enige eigen werk is de klok van de
+ * verouderingsregel bijzetten.
+ *
+ * GEEN HYSTERESE HIER, en dat is een keuze en geen vergetelheid. Bij een ping
+ * meten WIJ, en één verloren ICMP-pakket is geen storing -- vandaar
+ * PINGS_TO_DOWN. Een melding is geen meting maar een UITSPRAAK van iets dat zijn
+ * eigen pogingen en time-outs al achter zich heeft (Uptime Kuma doet standaard
+ * meerdere retries voordat hij "down" meldt). Die uitspraak nog een keer
+ * uitstellen zou de reactietijd verdubbelen zonder één fout minder te maken, en
+ * zou bovendien meldingen tellen als "rondes" die van ons niet zijn.
+ */
+MonitorSensors::MonResult MonitorSensors::reportMonitor(const char* name, bool up, uint32_t ms,
+                                                       uint16_t every_s, uint8_t* out_channel) {
+  if (out_channel != NULL) *out_channel = 0;
+
+  if (!validName(name)) return MON_ERR_NAME;
+  if (every_s != 0 && (every_s < MON_INTERVAL_MIN || every_s > MON_INTERVAL_MAX)) {
+    return MON_ERR_INTERVAL;
+  }
+
+  int slot = findByName(name);
+
+  if (slot < 0) {
+    /* Nog niet bekend: aanmaken, met een kanaal uit de gewone toewijzer. Dat
+     * kanaal is vanaf nu van deze naam en wordt niet opnieuw uitgedeeld -- zie
+     * allocChannel(). Een gemelde dienst is daarin niets bijzonders. */
+    MonResult r = createMonitor(name, PUSH_HOST,
+                                every_s != 0 ? every_s : MON_INTERVAL_DEFAULT,
+                                out_channel);
+    if (r != MON_OK) return r;
+    slot = findByName(name);
+    if (slot < 0) return MON_ERR_FULL;   /* kan niet; vangnet */
+  } else {
+    /* Bestaat wel, maar pingen wij hem zelf? Dan weigeren. Twee bronnen voor één
+     * kanaal betekent dat de laatste schrijver wint en dat niemand nog kan zien
+     * welke van de twee dat was -- precies de stille fout die dit bestand op
+     * elke andere plek probeert te vermijden. */
+    if (!monitorIsPush(slot)) return MON_ERR_KIND;
+
+    if (every_s != 0 && _cfg.mons[slot].interval_s != every_s) {
+      _cfg.mons[slot].interval_s = every_s;
+      markDirty();
+    }
+    if (out_channel != NULL) *out_channel = _cfg.mons[slot].channel;
+  }
+
+  MonState& m = _mon[slot];
+
+  m.checks++;
+  if (!up) m.fails++;
+  if (up)  m.last_ms = ms;
+
+  const bool was_known = m.seeded;
+  const bool was_up    = m.up;
+
+  m.up          = up;
+  m.seeded      = true;
+  m.stale       = false;      /* er is net gemeld; de stiltetijd begint opnieuw */
+  m.agree       = 0;
+  m.last_report = millis();
+  /* millis() kan 0 zijn (eens per 49 dagen); 0 betekent hier "nog nooit gemeld",
+   * dus die ene tik schuiven we op. Kost niets en haalt een fout weg die je
+   * anders nooit terugvindt. */
+  if (m.last_report == 0) m.last_report = 1;
+
+  if (!was_known || was_up != up) {
+    MESH_DEBUG_PRINTLN("MonitorSensors: '%s' gemeld als %s (kanaal %d, %lu ms)",
+                       _cfg.mons[slot].name, up ? "up" : "DOWN",
+                       (int)_cfg.mons[slot].channel, (unsigned long)ms);
+  }
+  return MON_OK;
+}
+
+/* spec = "naam,adres[,interval]". Komma's en geen spaties, omdat CommonCLI de
+ * regel na "sensor set <sleutel> " op spaties splitst (CommonCLI.cpp:285) en
+ * dus alleen een waarde zonder spaties doorgeeft.
+ *
+ * Alleen het ONTLEDEN staat hier; de keuring en het aanmaken doet
+ * createMonitor(). Een adres van "-" maakt hier dus net zo goed een gemelde
+ * dienst als /hook dat doet -- handig om er een aan te maken (en zijn kanaal
+ * vast te leggen) voordat de melder voor het eerst iets stuurt. */
+bool MonitorSensors::addMonitor(const char* spec) {
+  char buf[MON_NAME_LEN + MON_HOST_LEN + 8];
+  StrHelper::strncpy(buf, spec, sizeof(buf));
+
+  char* name = buf;
+  char* host = strchr(buf, ',');
+  if (host == NULL) return false;
+  *host++ = 0;
+
+  char* ivl = strchr(host, ',');
+  if (ivl != NULL) *ivl++ = 0;
+
+  int interval = (ivl != NULL && *ivl) ? atoi(ivl) : MON_INTERVAL_DEFAULT;
+  if (interval < 0 || interval > 0xFFFF) return false;   /* voor de cast hieronder */
+
+  return createMonitor(name, host, (uint16_t)interval) == MON_OK;
+}
+
+bool MonitorSensors::delMonitor(const char* name) {
+  return deleteMonitor(name) == MON_OK;
 }
 
 /* ===================== instellingen =====================
@@ -872,6 +1128,13 @@ bool MonitorSensors::delMonitor(const char* name) {
  * mon.add en mon.del zijn knoppen en geen waarden. Ze staan in de lijst omdat
  * "sensor list" dan zelf vertelt hoe je een monitor toevoegt; lezen geeft de
  * verwachte vorm terug in plaats van een waarde.
+ *
+ * EEN ADRES VAN "-" (PUSH_HOST) maakt geen ping-monitor maar een GEMELDE dienst:
+ * wij pingen hem niet, /hook levert de uitslag, en hij veroudert als die uitblijft.
+ * "mon.add kuma-web,-,120" legt dus alvast naam en kanaal vast voor iets dat
+ * elke 2 minuten meldt. Datzelfde geldt de andere kant op: mon.<kanaal>.host van
+ * "-" naar een echt adres verandert de soort, en de gemeten toestand gaat daarbij
+ * weg -- die hoorde bij de andere bron.
  *
  * Anders dan bij upstream blijven deze instellingen bestaan na een herstart:
  * elke gelukte wijziging zet _dirty, en loop() schrijft ze naar SPIFFS. Zie
@@ -970,6 +1233,12 @@ const char* MonitorSensors::getSettingValue(int i) const {
        * hij naar zijn eigen wifi moet kijken en niet naar de dienst. */
       if (monitorsPaused()) {
         snprintf(s_mon_val_buf, sizeof(s_mon_val_buf), "pauze");
+      } else if (monitorIsStale(slot)) {
+        /* Eigen woord, want dit is niet hetzelfde als "?" bij het opstarten: hier
+         * WAS er een melding en die blijft nu uit. Wie dit ziet, moet naar zijn
+         * melder kijken en niet naar de dienst. */
+        snprintf(s_mon_val_buf, sizeof(s_mon_val_buf), "stil %lus",
+                 (unsigned long)monitorReportAge(slot));
       } else if (!_mon[slot].seeded) {
         snprintf(s_mon_val_buf, sizeof(s_mon_val_buf), "?");
       } else if (_mon[slot].up) {

@@ -236,6 +236,11 @@ void setup() {
     /* main.cpp is de enige plek die zowel de wifi-taak als de sensoren kent;
      * daarom hier de koppeling, en niet via een global in een header. */
     sensors.setWifiTask(&wifi_task);
+    /* Zonder deze regel compileert alles en werkt de pagina, maar toont de
+     * kanaalkaart alleen een waarschuwing en antwoordt /hook met 503. De
+     * webserver is de enige plek die de kanaalkaart kan tonen, want CayenneLPP
+     * draagt geen namen. */
+    web_task.setMonitors(&sensors);
   #endif
 #endif
 

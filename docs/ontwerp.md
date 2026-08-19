@@ -845,3 +845,72 @@ De kaart zoals hij nu is:
     kanaal 4  switch                   wifi online
     kanaal 5  switch + genericsensor   router  (192.168.110.254)
     kanaal 6  switch + genericsensor   google  (8.8.8.8)
+
+---
+
+# Kanaalkaart, vormgeving en /hook doorgekoppeld (19 augustus 2026)
+
+    RAM:   20,0%  (65.376 van 327.680)
+    Flash: 37,6%  (1.256.701)
+    pagina: 11.433 byte in PROGMEM
+
+De beheerpagina is opnieuw gebouwd in de vormtaal van MeshManager: donker als
+standaard, licht via `prefers-color-scheme`, dezelfde tokens en kaarten, maar
+**zonder externe fonts** — een node zonder internet moet zijn eigen beheerpagina
+kunnen tonen, dus alleen de systeemstapels, met mono voor de getallen.
+
+Kleuren zijn semantisch en niet decoratief. Daar kwam een veld uit dat niet
+gevraagd was maar wel nodig is: `sev`. "Aan" op kanaal 2 (netvoeding) is goed,
+"aan" op kanaal 3 (batterijvoeding) is juist een waarschuwing. Een pagina die de
+kleur uit het woord raadt, verft die twee hetzelfde en dan liegt de kleur.
+
+## Op het toestel nagemeten
+
+    VOEDING net 4.157 V   WIFI online -48 dBm   MONITORS 2/4 op
+    UPTIME 25m resets 0   VRIJE HEAP 221 kB / grootste blok 212 kB
+
+    kanaal 5  router      192.168.110.254  15 s  op    7 ms   0/100 mislukt
+    kanaal 6  google      8.8.8.8          20 s  op   18 ms   0/76
+    kanaal 7  testje      (gemeld)         60 s  stil 1541s   0/1
+    kanaal 8  uptimekuma  (gemeld)         30 s  stil 1541s   1/1
+
+`/hook?name=testje&up=1&ms=42` antwoordt nu **200** met `ok testje -> kanaal 7`:
+de aanroeper weet waar zijn dienst terechtkwam. Eerder antwoordde die route `ok`
+zonder iets te publiceren, en dat kostte een gebruiker een zoektocht naar een
+sensor die niet bestond.
+
+## Verouderen: het geval dat je juist wil weten
+
+`max(3 x meldperiode, 90 s)`. Daarna is de toestand **onbekend** en niet "neer" —
+`seeded` gaat op false, langs hetzelfde pad als een monitor waarvan we nog niets
+weten. Drie perioden omdat één gemiste melding door een herstart van de melder
+geen alarm mag zijn; ondergrens 90 s omdat drie keer de intervalondergrens korter
+is dan de jitter van een melder die zelf een time-out afwacht.
+
+En de klok loopt niet zolang onze eigen wifi weg is: dan kan `/hook` ons niet
+bereiken, dus die stilte is onze fout en niet die van de melder. Hierboven te zien
+als `stil 1541s` op twee diensten die eenmalig gemeld werden.
+
+## Eén kanaaltoewijzer, geen tweede
+
+Gemelde diensten lopen door dezelfde `allocChannel()` en dezelfde
+`ch_ever_used`-byte als de ping-monitors. Het onderscheid zit in het adresveld:
+`"-"` is geen geldige hostnaam en geen IP, dus geen echte monitor valt erin.
+Daardoor is `MonitorStore` onaangeroerd en blijft het bestandsformaat gelijk,
+terwijl naam en kanaal een herstart overleven en de vluchtige toestand nergens op
+schijf staat. `createMonitor()` is nu de enige plek waar een monitor ontstaat —
+CLI, web en `/hook` komen er alle drie langs.
+
+De oude hooktabel van acht is verwijderd. Dat was een tweede boekhouding naast de
+monitors, en twee boekhoudingen over dezelfde dingen lopen na een verwijdering
+uit elkaar.
+
+## Eén valse alarmmelding van mijn kant
+
+Bij het nakijken van de pagina in een browser kwam er een stroom
+consolefouten: *"Request cannot be constructed from a URL that includes
+credentials"*. Dat was **geen fout in de firmware** maar in hoe ik de pagina
+opende: ik zette `admin:meshcore@` in de URL, en `fetch()` weigert een relatieve
+URL te herleiden tegen een adres met inloggegevens erin. Zonder die gegevens in
+de URL vult de pagina zich normaal. Opgeschreven omdat het er precies uitzag als
+een echte fout.

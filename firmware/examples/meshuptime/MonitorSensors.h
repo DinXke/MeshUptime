@@ -39,7 +39,16 @@ class WifiTask;   // alleen als pointer nodig; de definitie staat in de .cpp
  *   2  netvoeding           LPP_SWITCH 0/1
  *   3  batterijvoeding      LPP_SWITCH 0/1  (altijd het omgekeerde van 2)
  *   4  wifi online          LPP_SWITCH 0/1
- *   5..12  ping-monitors    LPP_SWITCH 0/1 (up) + LPP_GENERIC_SENSOR (ms)
+ *   5..12  monitors         LPP_SWITCH 0/1 (up) + LPP_GENERIC_SENSOR (ms)
+ *
+ * Een monitor op 5..12 is van EEN VAN TWEE SOORTEN, en de telemetrie ziet er
+ * voor beide identiek uit -- met opzet, want een dashboard hoort niet te hoeven
+ * weten hoe wij aan onze uitslag komen:
+ *
+ *   PING    wij pingen zelf, op ons eigen interval.
+ *   GEMELD  iets van buiten (Uptime Kuma) meldt de uitslag via /hook. Wij
+ *           pingen zo'n monitor NIET; wij verouderen hem juist als de melding
+ *           uitblijft. Zie PUSH_HOST en PUSH_STALE_FACTOR hieronder.
  *
  * De ruwe spanning gaat NIET nog eens mee als addVoltage(2, ...): kanaal 1
  * heeft die al, en dubbel verzenden kost bytes zonder iets toe te voegen.
@@ -106,6 +115,81 @@ public:
    * houden we twee plaatsen vrij voor de batterij -- die kan niet wachten. */
   static const uint8_t MAX_MONITOR_ALERTS = 2;
 
+  /* ---------------- de tweede soort monitor: van buiten GEMELD ----------------
+   *
+   * WAAROM HET ADRES DE SOORT BEPAALT EN ER GEEN 'kind'-VELD IS
+   *
+   * De soort moet een herstart overleven, en het opslagbestand is van
+   * MonitorStore: één regel "m <kanaal> <interval> <naam> <adres>". Een veld
+   * erbij betekent een nieuw bestandsformaat en dus MonitorStore aanpassen. Dat
+   * hoeft niet: het adres kan de soort al dragen. Een monitor met adres "-"
+   * pingt niet -- "-" is geen geldige hostnaam en geen IP-adres, dus er is geen
+   * echte monitor die per ongeluk in deze tak valt, en oude bestanden blijven
+   * leesbaar zonder één regel aan MonitorStore.
+   *
+   * Gevolg is precies wat gewenst is voor een gemelde dienst: van hem worden
+   * alleen de NAAM en het KANAAL bewaard (en het meldritme, want dat is een
+   * instelling en geen meting). De toestand up/ms staat nergens in het bestand,
+   * want die van een gemelde dienst is per definitie vluchtig: na een herstart
+   * weten wij niets over die dienst tot de eerste nieuwe melding, en "onbekend"
+   * is dan het enige eerlijke antwoord.
+   *
+   * Het kanaal MOET wel bewaard blijven, en om dezelfde reden als bij de
+   * ping-monitors: een node die telemetrie opvraagt bewaart "kanaal 6 = google"
+   * aan zijn kant. Zie allocChannel() in de .cpp.
+   */
+  static const char PUSH_HOST[];        /* "-" */
+
+  /* VEROUDEREN VAN EEN GEMELDE DIENST
+   *
+   * Een gemelde dienst mag niet eeuwig "op" blijven staan omdat de MELDER stil
+   * is gevallen. Dat is juist het geval dat de gebruiker wil weten: als Uptime
+   * Kuma zelf plat ligt, weten wij niets meer -- en dat is niet hetzelfde als
+   * "nog steeds up".
+   *
+   * De regel: een melding is verouderd na
+   *
+   *     max(PUSH_STALE_FACTOR * meldperiode, PUSH_STALE_MIN_MS)
+   *
+   * De meldperiode is wat /hook meegeeft (&every=<s>) of anders het interval van
+   * de monitor, standaard MON_INTERVAL_DEFAULT. Drie perioden, want twee is te
+   * scherp: één gemiste melding door een herstart van de melder of een hikje in
+   * het netwerk mag geen alarm zijn. De ondergrens van 90 s zit erbij omdat de
+   * ondergrens van het interval 10 s is, en drie keer 10 s is korter dan de
+   * jitter van een melder die zelf ook nog een time-out afwacht.
+   *
+   * Verouderd is NIET "neer": de toestand wordt ONBEKEND (seeded valt weg), dus
+   * de telemetrie zet de schakelaar op 0 zonder pingtijd en de pagina toont "?".
+   * Er gaat wel een waarschuwing uit -- met een eigen tekst, zodat de ontvanger
+   * ziet dat de MELDER weg is en niet de dienst.
+   *
+   * De klok begint niet te lopen zolang wij zelf blind zijn: zonder onze WiFi
+   * kan /hook ons niet bereiken, en dan is het uitblijven van meldingen onze
+   * fout. Zie monitorStaleRef().
+   */
+  static const uint8_t  PUSH_STALE_FACTOR = 3;
+  static const uint32_t PUSH_STALE_MIN_MS = 90000;
+
+  /* Uitkomst van createMonitor() en reportMonitor(). Geen bool, omdat de
+   * webinterface en /hook een BRUIKBAAR antwoord moeten geven: "naam al in
+   * gebruik" en "alle acht vakjes vol" zijn twee verschillende dingen voor wie
+   * aan de andere kant staat, en de keuring hoort op één plek te zitten en niet
+   * half in WebTask. */
+  enum MonResult : uint8_t {
+    MON_OK = 0,
+    MON_ERR_NAME,       /* naam leeg, te lang of verkeerde tekens */
+    MON_ERR_HOST,       /* adres leeg, te lang of verkeerde tekens */
+    MON_ERR_INTERVAL,   /* buiten MON_INTERVAL_MIN..MAX */
+    MON_ERR_TAKEN,      /* naam bestaat al */
+    MON_ERR_KIND,       /* bestaat al, maar als andere soort */
+    MON_ERR_FULL,       /* geen vakje of geen kanaal meer vrij */
+    MON_ERR_UNKNOWN     /* naam bestaat niet (bij verwijderen) */
+  };
+
+  /* Waarom deze tekst hier en niet in WebTask: dan staat de reden één keer
+   * beschreven, en de seriële console kan hem later net zo goed gebruiken. */
+  static const char* monResultText(MonResult r);
+
 #if ENV_INCLUDE_GPS
   MonitorSensors(LocationProvider& location) : EnvironmentSensorManager(location) { }
 #else
@@ -149,6 +233,20 @@ public:
   uint32_t    monitorChecks(int slot) const;
   uint32_t    monitorFails(int slot) const;
 
+  /* Soort: waar als dit een van buiten GEMELDE dienst is (adres == PUSH_HOST).
+   * Voor zo'n vakje betekent monitorHost() niets en monitorInterval() de
+   * afgesproken MELDPERIODE in plaats van een pinginterval. */
+  bool     monitorIsPush(int slot) const;
+  /* Secondes sinds de laatste melding; 0 als er nog nooit een melding was of
+   * als dit geen gemelde dienst is. */
+  uint32_t monitorReportAge(int slot) const;
+  /* Na hoeveel secondes zonder melding dit vakje op onbekend gaat. 0 voor een
+   * ping-monitor. */
+  uint32_t monitorStaleSecs(int slot) const;
+  /* Is de laatste melding te oud? Dan is de toestand onbekend (monitorSeeded()
+   * geeft dan al false) EN vragen wij een waarschuwing aan. */
+  bool     monitorIsStale(int slot) const;
+
   /* Staat het pingen stil omdat WiFi weg is? Dan zijn de toestanden hierboven
    * de laatst GEMETEN waarden en niet de huidige. */
   bool monitorsPaused() const;
@@ -164,6 +262,39 @@ public:
    * alertIf() zelf -- hier staat geen eigen waarschuwingslus. */
   bool        monitorAlert(int slot);
   const char* monitorAlertText(int slot) const;
+
+  /* ---------------- beheren van buiten de sensorlaag ----------------
+   *
+   * Dezelfde twee handelingen die "sensor set mon.add" en "mon.del" doen, maar
+   * met losse velden en met een REDEN als het niet lukt. De webinterface roept
+   * deze aan; de keuring (validName/validHost/de intervalgrenzen) staat daardoor
+   * op één plek en niet ook nog eens in WebTask.
+   *
+   * out_channel is optioneel en krijgt bij MON_OK het toegewezen kanaal. Dat
+   * getal is het antwoord waar de aanroeper op zit te wachten: de naam reist
+   * niet mee in de telemetrie, het kanaalnummer wel. */
+  MonResult createMonitor(const char* name, const char* host, uint16_t interval_s,
+                          uint8_t* out_channel = NULL);
+  MonResult deleteMonitor(const char* name);
+
+  /* Een melding van buiten (/hook) doorkoppelen naar de telemetrie.
+   *
+   * Bestaat de naam nog niet, dan wordt er een GEMELDE monitor aangemaakt en
+   * krijgt hij een kanaal van dezelfde toewijzer als een ping-monitor -- er is
+   * met opzet maar één toewijzer. Bestaat de naam al als PING-monitor, dan
+   * volgt MON_ERR_KIND: twee bronnen voor één kanaal geeft twee waarheden.
+   *
+   * every_s is de meldperiode die de melder zegt aan te houden; 0 betekent
+   * "laat staan wat er stond". Hij bepaalt alleen wanneer een melding veroudert.
+   */
+  MonResult reportMonitor(const char* name, bool up, uint32_t ms,
+                          uint16_t every_s, uint8_t* out_channel = NULL);
+
+  /* De tekenzeef, publiek omdat de webinterface zijn invoer met DEZELFDE zeef
+   * moet keuren als de CLI. Een tweede, iets andere zeef is een tweede waarheid:
+   * dan komt er via het ene pad een naam binnen die het andere pad afkeurt. */
+  static bool validName(const char* s);
+  static bool validHost(const char* s);
 
 private:
   /* De toestandsmachine. Alle drie de getallen komen uit de meting van
@@ -256,6 +387,12 @@ private:
     bool          up;
     bool          seeded;        /* al ooit een uitslag gehad */
     bool          alerting;      /* wij vragen main.cpp nu om een waarschuwing */
+
+    /* Alleen voor GEMELDE diensten. Ook deze twee horen niet in MonitorCfg: ze
+     * gaan over metingen en niet over instellingen, en na een herstart weten wij
+     * per definitie niets over een gemelde dienst. */
+    unsigned long last_report;   /* millis van de laatste melding; 0 = nooit */
+    bool          stale;         /* melding te oud; toestand onbekend */
   };
   MonState _mon[MAX_MONITORS];
 
@@ -293,6 +430,17 @@ private:
   unsigned long _save_at = 0;
 
   void loopMonitors();
+  /* Laat de gemelde diensten verouderen. Aparte lus en niet in applyResult():
+   * er komt bij deze soort juist GEEN uitslag binnen, dus er is niets om aan
+   * mee te liften. */
+  void loopPushStale();
+  /* Vanaf welk moment de stiltetijd van een gemelde dienst geteld wordt: de
+   * laatste melding, of het einde van onze eigen wifi-insteltijd als die later
+   * is. Zonder dat tweede zou een wifi-storing van ons alle gemelde diensten
+   * onbekend maken zodra wij terugkomen. */
+  unsigned long monitorStaleRef(int slot) const;
+  uint32_t      monitorStaleMs(int slot) const;
+
   void startNextPing();
   void startResolve(int slot);
   void startPing(int slot);
@@ -306,7 +454,4 @@ private:
   bool    addMonitor(const char* spec);
   bool    delMonitor(const char* name);
   void    markDirty();
-
-  static bool validName(const char* s);
-  static bool validHost(const char* s);
 };
