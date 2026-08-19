@@ -1,0 +1,13 @@
+# Inloggegevens horen hier niet in. De WiFi-gegevens staan in
+# platformio.local.ini van de bouwkopie, die door MeshCore's eigen .gitignore
+# genegeerd wordt. Deze regels zijn het tweede slot: als iemand ooit een
+# local-ini of secretsbestand IN deze repo aanmaakt, blijft het buiten git.
+*.local.ini
+secrets*
+wifi.ini
+*.key
+identity/
+# Bouwrommel
+.pio/
+*.bin
+!firmware/releases/*.bin

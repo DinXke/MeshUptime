@@ -419,3 +419,92 @@ die zich voordoet als "de cijfers kloppen niet helemaal".
 Kanaal 1 blijft `TELEM_CHANNEL_SELF` (de node zelf: voeding, batterij), dus
 monitors beginnen bij 2. Met 16 monitors in één pakket als bovengrens is er ruimte
 tot kanaal 17.
+
+---
+
+# Voeding, WiFi en identiteit (19 augustus 2026)
+
+## Netspanning als sensor: wat het bord echt kan
+
+Gevraagd: `netvoeding: 0/1` en `batterijvoeding: 0/1` als twee aparte sensoren.
+Dat kan, en het kost weinig: twee keer `LPP_SWITCH` is 2 x (2 kop + 1 waarde) =
+**6 byte**.
+
+Maar er is een hardwarebeperking die eerlijk vermeld moet worden, want ik heb
+ernaar gezocht en het is er niet.
+
+`variants/heltec_v3/HeltecV3Board.h` heeft alleen `getBattMilliVolts()`: een
+ADC-meting van `PIN_VBAT_READ` via `PIN_ADC_CTRL`. Er is **geen VBUS-pin, geen
+USB-detectie en geen laadstatus** — niet in het bord, niet in
+`src/helpers/ESP32Board.h`. Gezocht op VBUS, USB, charge; nul resultaten.
+
+**Netspanning kan dus niet gemeten worden, alleen afgeleid.** Uit de
+batterijspanning:
+
+| meting | betekenis |
+|---|---|
+| ~4,15 V en hoger, stabiel | vrijwel zeker USB aangesloten (lader houdt hem daar) |
+| dalend over meerdere minuten | vrijwel zeker op batterij |
+| 3,9 V stabiel | **dubbelzinnig**: volle batterij zonder lading, of USB met inactieve lader |
+
+Die derde regel is de blinde vlek, en het is geen detail: precies bij een volle
+batterij lijkt "stroom weg" op "stroom aanwezig". Een trendmeting lost het op,
+maar heeft minuten nodig — te traag voor "de stroom is uit, waarschuw me nu".
+
+**Daarom hoort de wifi-sensor hierbij.** Valt de router weg, dan verdwijnt WiFi
+binnen seconden. WiFi weg én batterijspanning die begint te dalen is een
+stroomstoring met hoge zekerheid en met de snelheid van de eerste van de twee.
+De twee sensoren blijven apart, zoals gevraagd, maar de waarschuwing over een
+stroomstoring hoort op de combinatie te staan en niet op de spanning alleen.
+
+Wat de twee sensoren eerlijk betekenen:
+
+- `netvoeding` — afgeleid: spanning hoog of stabiel. Traag en met een blinde vlek.
+- `batterijvoeding` — afgeleid: spanning daalt. Betrouwbaarder, maar pas na enige
+  tijd.
+
+Beide krijgen in de webinterface die uitleg erbij. Een sensor die "0" toont
+terwijl niemand weet hoe zeker dat is, is erger dan geen sensor.
+
+## WiFi instellen: vier lagen
+
+1. **Bij het flashen.** `WIFI_SSID` / `WIFI_PWD` als bouwvlag. Staat in de
+   `platformio.local.ini` van de bouwkopie, die door MeshCore's `.gitignore`
+   (regel 19) genegeerd wordt — nagekeken met `git check-ignore` voordat de
+   gegevens er in gingen. De repo heeft alleen `firmware/wifi.ini.voorbeeld`
+   met plaatshouders.
+2. **Seriële console.** `CommonCLI::handleCommand` heeft al generieke `get ` en
+   `set ` (`CommonCLI.cpp:264` en `:266`), en de configuratielaag werkt met
+   `def("naam", veld)`. Twee velden toevoegen levert dus **gratis**
+   `set wifi_ssid ...` en `get wifi_ssid` op, over serieel én over DM-CLI. Geen
+   nieuwe opdrachtparser.
+3. **Eigen SSID als terugval.** Lukt verbinden niet, dan een eigen toegangspunt
+   zodat de webinterface bereikbaar blijft. Dit is nu betaalbaar: er is 270 kB
+   RAM vrij, tegen de 24 kB waarmee dit project begon.
+4. **Webinterface.** Netwerk instellen zonder kabel, met de opgeslagen waarde als
+   baas over de gebakken waarde.
+
+Die volgorde is ook de veiligheidsvolgorde: de opgeslagen instelling wint van de
+gebakken, zodat een node die van netwerk verhuist niet opnieuw geflasht hoeft te
+worden, en een node die je weggeeft schoongemaakt kan worden door de opslag te
+wissen. Let wel: **een gebakken wachtwoord is met een flashdump terug te lezen.**
+Voor een apparaat op je eigen netwerk is dat aanvaardbaar; het is geen geheim
+meer zodra iemand de node fysiek heeft.
+
+## Een nieuwe sleutel, en dat is de juiste keuze
+
+De vraag was of dit apparaat, nu het geen companion meer is, een eigen sleutelpaar
+moet krijgen. **Ja.**
+
+- Andere nodes hebben de oude sleutel opgeslagen als `ADV_TYPE_CHAT`, een
+  chatcontact. Dit apparaat wordt `ADV_TYPE_SENSOR`. Dezelfde sleutel hergebruiken
+  betekent dat er in andermans contactenlijst een chatcontact staat dat stilletjes
+  van soort verandert.
+- De oude sleutel is veilig: volledige flashdump plus de losse spiffs-partitie in
+  `MeshUptime-backup`, met `/identity/_main.id` erin en een herstelbeschrijving.
+  Er gaat niets verloren.
+- Er komt hoe dan ook een tweede sleutel bij voor de repeaterrol, met
+  botsingscontrole op de adreshash. Verse sleutels genereren zit dus al in het plan.
+
+De prijs is dat wie deze node als contact had, hem opnieuw moet toevoegen. Voor
+een bewakingsnode is dat juist gedrag: het is een ander apparaat geworden.

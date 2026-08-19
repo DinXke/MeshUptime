@@ -1,0 +1,12 @@
+; Sjabloon. Kopieer de twee -D regels naar de env:meshuptime in de
+; platformio.local.ini van je bouwkopie en vul je eigen gegevens in.
+;
+; NIET in deze repo invullen. platformio.local.ini staat in MeshCore's
+; .gitignore (regel 19) en dat is de plek waar ze horen.
+;
+; Deze waarden zijn de TERUGVAL. De opgeslagen instelling is de baas: wat je
+; via de seriele console of de webinterface zet, overschrijft dit. Zo hoeft een
+; nieuwe node niet opnieuw geflasht te worden voor een ander netwerk, en zo kan
+; een node die je weggeeft schoongemaakt worden door de opslag te wissen.
+  -D WIFI_SSID='"jouw-netwerk"'
+  -D WIFI_PWD='"jouw-wachtwoord"'
