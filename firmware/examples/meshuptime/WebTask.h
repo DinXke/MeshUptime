@@ -28,6 +28,37 @@
  *
  * De pointer staat NIET als extern global in deze header. main.cpp is de enige
  * plek die zowel de webtaak als de sensorlaag kent, en dat blijft zo.
+ *
+ * ------------------------------------------------------------------------
+ * NODEBEHEER -- WAAROM DAT HIER ZIT EN NIET IN EEN COMPANION-APP
+ *
+ * Deze node is niet met de MeshCore-companion-app te beheren, en dat zijn twee
+ * ontwerpkeuzes en geen fouten. Er zit GEEN BLE op (upstream houdt usb, ble en
+ * wifi in drie aparte envs omdat ze elkaars heap opeten), en deze firmware is op
+ * simple_sensor gebouwd en spreekt het companion-CLIENTprotocol niet.
+ *
+ * Wat de node WEL heeft is zijn CLI, en dat is precies de laag die de app zelf
+ * ook gebruikt zodra zij een repeater beheert. Vandaar de opzet hieronder: EEN
+ * route (POST /cli) die een opdracht doorgeeft aan SensorMesh::handleCommand, en
+ * daarboven knoppen en formulieren die niets anders doen dan zo'n opdrachtregel
+ * samenstellen. Er is dus geen tweede schrijfpad naast de CLI -- geen tweede
+ * keuring, geen tweede boekhouding, en geen instelling die via het web anders
+ * uitpakt dan via serieel.
+ *
+ * sender_timestamp is bij ons ALTIJD 0, net als bij de seriële console in
+ * main.cpp. Dat is geen detail: een handvol opdrachten (set freq, erase, get acl,
+ * log, stats-*) laat CommonCLI alleen op 0 door, omdat dat "de console" betekent
+ * en niet "iemand op afstand". De webinterface IS de lokale weg naar deze node --
+ * hij hangt aan hetzelfde eigen netwerk als de USB-kabel -- dus hoort hij daar
+ * aan de goede kant van die grens te staan. Zie de weigerlijst in handleCli()
+ * voor het handjevol opdrachten waar wij zelf een streep zetten.
+ *
+ * GET /cfg.json leest de huidige stand RECHTSTREEKS uit NodePrefs in plaats van
+ * dertig keer "get <veld>" over de CLI te sturen. Dat is niet luiheid maar
+ * hetzelfde motief als bij status.json: een pagina die zijn velden voorvult mag
+ * dat niet met dertig verzoeken doen op een node die tussendoor een radio moet
+ * bedienen. Schrijven gaat wel over de CLI, want daar zit de keuring en het
+ * wegschrijven naar flash.
  */
 class WifiTask;
 class MonitorSensors;
@@ -53,7 +84,15 @@ public:
    * SensorMesh en niet ClientACL: het slot (acl.strict), de buurtlijst en de
    * gedeelde sleutels horen bij de mesh. Een webserver die zelf in ClientACL zou
    * schrijven, zou de gedeelde sleutel moeten uitrekenen en de uitgestelde
-   * flashschrijving moeten kennen -- twee dingen die de mesh al doet. */
+   * flashschrijving moeten kennen -- twee dingen die de mesh al doet.
+   *
+   * DEZELFDE POINTER DRAAGT NU OOK HET NODEBEHEER. handleCommand(), NodePrefs en
+   * de eigen publieke sleutel zitten allemaal op SensorMesh, dus /cli en
+   * /cfg.json hebben niets anders nodig dan wat main.cpp hier al meegeeft. Er is
+   * daarom GEEN nieuwe regel in main.cpp nodig voor de beheerpagina; de naam van
+   * deze setter is alleen ouder dan zijn taak. Hem omdopen zou main.cpp raken en
+   * dat is de moeite van een naam niet waard -- vandaar deze noot in plaats van
+   * een tweede setter die hetzelfde veld zet. */
   void setAcl(SensorMesh* mesh) { _acl = mesh; }
 
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
@@ -79,6 +118,24 @@ private:
   void handleMonAdd();
   void handleMonDel();
 
+  /* NODEBEHEER.
+   *
+   * handleCli() is de enige route die iets aan de node verandert wat niet over
+   * de monitors of de toegangslijst gaat. Alle knoppen en alle formulieren op het
+   * beheertabblad komen hier langs met een opdrachtregel; er is geen tweede
+   * schrijfpad. handleCfgJson() is de leeskant en verandert niets.
+   *
+   * DE UITGESTELDE OPDRACHT. board.reboot() en powerOff() KOMEN NIET TERUG. Een
+   * opdracht die dat doet mag dus niet uitgevoerd worden vóór het antwoord de
+   * deur uit is, anders krijgt de browser een afgebroken verbinding en weet
+   * niemand of de herstart gelukt is of de node is omgevallen. Daarom onthoudt
+   * handleCli() zo'n opdracht en voert loop() hem een halve seconde later uit --
+   * dan is het antwoord verstuurd en heeft de TCP-stapel zijn beurt gehad. Geen
+   * delay(), alleen een tijdstip. */
+  void handleCli();
+  void handleCfgJson();
+  void runDeferred();
+
   /* Toegangsbeheer. Eén GET met de hele stand en drie POSTs die er iets aan
    * veranderen; net als bij de monitors gaat er niets veranderends via GET. Bij
    * een toegangslijst weegt dat zwaarder dan bij een monitor: een GET die
@@ -103,6 +160,8 @@ private:
   friend void web_route_aclset();
   friend void web_route_acldel();
   friend void web_route_aclstrict();
+  friend void web_route_cli();
+  friend void web_route_cfgjson();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

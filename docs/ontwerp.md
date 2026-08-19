@@ -982,3 +982,78 @@ waarde gaat voor op de gebakken, zoals bij WiFi.
 - **De buurtlijst staat niet in SPIFFS.** Hij beschrijft wat er nu in de lucht is;
   een bewaarde versie zou beweren dat een node in de buurt is die er al een week
   niet meer is.
+
+---
+
+# Volledig nodebeheer in de webinterface (20 augustus 2026)
+
+    RAM:   22,9%  (75.184 van 327.680)
+    Flash: 39,5%  (1.321.521)
+    pagina: 66.505 byte
+
+Drie tabbladen (bewaking / toegang / node) met negen inklapbare secties. Twee
+nieuwe routes: `POST /cli` (de enige schrijfweg voor nodebeheer) en
+`GET /cfg.json` (de hele stand van `NodePrefs` in één verzoek).
+
+Op het toestel nagemeten:
+
+    > ver              v1.17.0 (Build: 9 Aug 2026)
+    > advert           OK - Advert sent
+    > get name         BE-HSS-DinX-HA
+    set radio zonder confirm  ->  HTTP 409
+
+## Waarom een CLI-console en niet dertig formulieren
+
+De MeshCore-app beheert een node over dezelfde CLI. Die blootleggen geeft dus in
+één keer volledigheid, in plaats van dertig formulieren die elk apart kunnen
+verouderen. De formulieren erboven zijn gemak voor wat je vaak doet; de console
+is de garantie dat er niets ontbreekt.
+
+## Radio achter drie sloten
+
+`freq`, `bw`, `sf` en `cr` bepalen of deze node nog op hetzelfde mesh zit.
+Daarom: een vinkje dat de knop vrijgeeft, een `confirm()` die de vier oude naast
+de nieuwe waarden zet, en — het enige dat echt telt — **een servergrens die
+`set radio` en `set freq` met 409 weigert zonder `confirm=radio`**. De browser is
+niet het slot; een losse fetch of bookmarklet komt er niet langs. Ook een in de
+console getypte radio-opdracht krijgt de bevestiging, zodat typen geen sluipweg
+is. `tx` staat apart, want dat is in vergelijking ongevaarlijk.
+
+Dit is niet in strijd met de regel uit MeshManager dat radio-instellingen niet
+van afstand gewijzigd mogen worden: die gaat over een server die een verre node
+aanspreekt. Dit is de lokale weg naar de node zelf.
+
+## Monitors bewerken, en waarom dat moest
+
+Naam, adres en interval zijn per regel te bewerken; **het kanaal verandert
+nooit**. Alleen gewijzigde velden worden gestuurd, elk als
+`sensor set mon.<kanaal>.<veld>`, dus via dezelfde zeef als de CLI en zonder
+tweede schrijfpad.
+
+De reden is schaarste, en die is nu ook zichtbaar op de pagina:
+
+    mon_used=2   ch_ever=4   ch_free=4
+
+Vier van de acht nummers zijn vergeven na twee proefdiensten. Zonder bewerken
+kost elke typefout een kanaal, want een uitgedeeld nummer wordt niet hergebruikt
+zolang er nog een vrij is.
+
+Een **adreswijziging** krijgt een eigen bevestiging: hetzelfde kanaal betekent
+dan een andere dienst, de naam hoort mee te veranderen, en MeshManager moet
+bijgewerkt worden. Dat is dezelfde stille fout waarvoor de onveranderlijke
+nummering bestaat, alleen van de andere kant.
+
+## Wat deze firmware NIET kan, en dat staat nu op de pagina
+
+- `neighbors` antwoordt maar doet niets: `SensorMesh::formatNeighborsReply()`
+  geeft `"not supported"`. De echte buurtlijst staat op het toegangstabblad.
+- `log …` en `clear stats` idem — de callbacks zijn leeg in deze rol.
+- `get pass` bestaat niet; het beheerderswachtwoord is alleen te *zetten*
+  (`password <nieuw>`). De banner vergelijkt daarom met de bouwvlag en wordt
+  groen zodra het gezet is — niet weg, zodat je ziet dat het gelukt is.
+- `bw`, `sf` en `cr` hebben geen eigen `set`: alleen `set radio <f,bw,sf,cr>`.
+  Gunstig, want je kunt ze niet half zetten.
+- Geweigerd met de reden erbij: alles met `prv.key` (privésleutel over HTTP
+  zonder TLS), `start ota` (opent een eigen AP én een tweede webserver op poort
+  80 — deze pagina valt eronder weg) en `poweroff` (diepe slaap; alleen een
+  fysieke reset helpt).

@@ -1,12 +1,34 @@
 #include "WebTask.h"
 #include "WifiTask.h"
 #include "MonitorSensors.h"
+#include "MonitorStore.h"
 #include "SensorMesh.h"
 
 #include <WebServer.h>
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <esp_heap_caps.h>
+
+/* De GEBAKKEN radio-instellingen, om ze op de pagina NAAST de huidige te kunnen
+ * zetten. Dat is de kern van de waarschuwing bij freq/bw/sf/cr: een getal alleen
+ * zegt niets, "869.618 en de rest van dit mesh staat op 869.618" zegt alles.
+ *
+ * Dezelfde #ifndef-terugval als in SensorMesh.cpp, en om dezelfde reden: LORA_CR
+ * komt bij deze variant niet uit een bouwvlag en de waarde staat daar in de .cpp
+ * en niet in een header. Twee plekken met dezelfde terugval is hier minder erg
+ * dan een header aanpassen die van upstream is. */
+#ifndef LORA_FREQ
+  #define LORA_FREQ   869.618
+#endif
+#ifndef LORA_BW
+  #define LORA_BW      62.5
+#endif
+#ifndef LORA_SF
+  #define LORA_SF         8
+#endif
+#ifndef LORA_CR
+  #define LORA_CR         5
+#endif
 
 /* Inloggegevens. Uit bouwvlaggen, met een terugval zodat een verse build
  * bereikbaar is zonder dat er iets ingesteld hoeft te worden.
@@ -98,6 +120,94 @@ static_assert(80 + MAX_CLIENTS * 165 + MAX_NEIGHBOURS * 185 + ACL_TAIL <= sizeof
 
 static char g_ssid_shown[33] = {0};   // alleen om te tonen; nooit het wachtwoord
 
+/* ---------------------- buffers voor het nodebeheer ----------------------- */
+
+/* DE OPDRACHTBUFFER. 176 en niet 160, en handleCommand krijgt een MUTEERBARE
+ * char* omdat hij in de opdracht schrijft (hij hakt hem in stukken op de spaties,
+ * zie parseTextParts en de 'xx|'-prefix bovenaan SensorMesh::handleCommand). Een
+ * const char* of een String zou hier dus niet eens werken.
+ *
+ * De grens die we afdwingen is 160, dezelfde als de seriële console in main.cpp:
+ * wat daar past hoort hier te passen en omgekeerd, anders neemt het ene pad een
+ * opdracht aan die het andere afkapt. De extra 16 byte zijn er alleen zodat een
+ * TE LANGE opdracht als te lang AFGEKEURD wordt en niet stil afgekapt tot iets
+ * dat wel door de zeef komt -- afkappen midden in een waarde is precies hoe je
+ * per ongeluk 'set name MeshUptim' zet. */
+static char g_cmd[176];
+#define CLI_CMD_MAX  160
+
+/* DE ANTWOORDBUFFER, NAGEREKEND en niet geraden. De langste uitvoer die
+ * CommonCLI kan schrijven:
+ *
+ *   'sensor list <n>' -- de lus stopt pas als de schrijfpositie 134 VOORBIJ is,
+ *   dus de laatste regel begint nog op 133. Onze langste regel is
+ *   "mon.12.state=" (13) + de waarde uit s_mon_val_buf (MON_HOST_LEN-1 = 40)
+ *   + "\n"                                                     -> 133 + 54 = 187
+ *   daarna komt "... next:%d" er nog achter (hoogstens 12)      ->        199
+ *   en een 'xx|'-prefix wordt vooraan teruggekaatst (+3)        ->        202
+ *
+ *   'region ...'      -- exportTo(reply, 160), dus 160 harde grens
+ *   'get owner.info'  -- "> " plus 159 tekens                   ->        161
+ *   'set prv.key ...' -- vaste tekst (33) + 64 hextekens        ->         97
+ *
+ * 202 is dus de bovengrens en 320 geeft daar meer dan 100 byte marge boven. De
+ * fout zelf (ongebonden sprintf in CommonCLI.cpp) is niet van ons; dit is de rand
+ * dichtzetten aan de kant die we bezitten, net als main.cpp doet.
+ *
+ * NIET korter maken zonder deze som opnieuw te maken: met een buffer van 160
+ * ging de node in een LoadProhibited-panic op precies 'sensor list' met
+ * beginindex 0. */
+static char g_reply[320];
+
+/* GET /cfg.json. Eén antwoord met de hele stand van NodePrefs, hoogstens één keer
+ * per keer dat iemand het beheertabblad opent -- dus geen buffer die naast
+ * g_json of g_acl hoeft te passen in tempo, alleen in maat:
+ *
+ *   ~40 velden, gemiddeld 20 byte per veld  ("f_max_uns":255,)      ~ 800 byte
+ *   node_name (32) en owner_info (120), ontsnapt tot 6x per teken,
+ *   maar AFGEKAPT op CFG_TXT_MAX zodat de som klopt              2 x ~ 200
+ *   de eigen publieke sleutel, 64 hextekens                          ~  75
+ *                                                                 ----------
+ *                                                                  ~ 1275
+ *
+ * 1792 geeft daar ruim 500 byte marge boven. */
+static char g_cfg[1792];
+
+/* Wat er hoogstens van een tekstveld in cfg.json terechtkomt. Zonder deze grens
+ * is de maat van g_cfg niet na te rekenen: jsonEscape() kan één teken tot zes
+ * tekens maken, en owner_info mag 119 tekens lang zijn. Afkappen is hier
+ * onschuldig -- het veld is er om VOOR TE VULLEN, en wie zijn eigenaarsregel op
+ * 199 tekens ontsnapte tekens heeft staan ziet hem in de console met
+ * 'get owner.info' voluit. */
+#define CFG_TXT_MAX  200
+
+/* De UITGESTELDE OPDRACHT: alleen voor opdrachten die niet terugkomen (reboot,
+ * clkreboot). Kort, want dat is de hele verzameling; te lang zou hier betekenen
+ * dat er iets anders in staat dan bedoeld. */
+static char g_deferred[16] = {0};
+static unsigned long g_deferred_at = 0;
+
+/* Het masker van kanalen dat OOIT is uitgedeeld (bit 0 = kanaal 5).
+ *
+ * MonitorSensors houdt dit bij in _cfg.ch_ever_used, en dat veld is privé en
+ * heeft geen accessor -- MonitorSensors.* mag in deze opdracht niet aangeraakt
+ * worden, dus is er geen directe weg. Wat er WEL is: het staat in
+ * /monitors.cfg, en MonitorStore::load() is publiek. Vandaar deze twee bronnen
+ * bij elkaar geveegd:
+ *
+ *  1. bij begin() EEN keer het bestand lezen -- dat dekt kanalen die vóór deze
+ *     start al vergeven en daarna verwijderd zijn, en die zijn nergens anders
+ *     meer te zien;
+ *  2. daarna bij elke opbouw van cfg.json de kanalen die NU in gebruik zijn
+ *     erbij OR-en. Dat dekt het gat van de uitgestelde flashschrijving: een
+ *     monitor die net is aangemaakt staat twee seconden lang nog niet in het
+ *     bestand, maar zijn kanaal is meteen in gebruik.
+ *
+ * Het is dus een verzamelaar die alleen bits BIJ zet en nooit weghaalt -- want
+ * dat is ook wat ch_ever_used doet. Eén keer per start naar SPIFFS en daarna
+ * nooit meer: een verzoekpad hoort niet in flash te gaan lezen. */
+static uint8_t g_ever_mask = 0;
+
 /* Eén WebServer, statisch. Geen new/malloc; de klasse houdt er een pointer
  * naar zodat WebServer.h buiten de header blijft. */
 static WebServer g_server(WEB_PORT);
@@ -118,6 +228,8 @@ void web_route_acljson()   { if (g_self) g_self->handleAclJson(); }
 void web_route_aclset()    { if (g_self) g_self->handleAclSet(); }
 void web_route_acldel()    { if (g_self) g_self->handleAclDel(); }
 void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
+void web_route_cli()       { if (g_self) g_self->handleCli(); }
+void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -311,9 +423,121 @@ font-size:.7rem;display:block;margin-bottom:.2rem}
 .lock button{margin:0;flex:0 0 auto}
 .lock.shut button{color:var(--text);background:transparent;
 border-color:var(--border)}
+/* ------------------------------ tabbladen -------------------------------- */
+/* De pagina heeft drie onderwerpen gekregen en past niet meer op één rol. De
+   KANAALKAART is waarvoor dit apparaat bestaat, dus die staat op het eerste
+   tabblad en zakt niet meer weg onder dertig instelvelden. Tabbladen en geen
+   losse pagina's: er is één document in flash, en een tweede pagina zou een
+   tweede route en een tweede keer dezelfde CSS zijn. */
+.tabs{display:flex;gap:.35rem;margin:1rem 0 .2rem;border-bottom:1px solid
+var(--border);flex-wrap:wrap}
+.tabs button{margin:0;padding:.45rem .9rem;background:transparent;
+color:var(--muted);border:1px solid transparent;border-bottom:none;
+border-radius:8px 8px 0 0}
+.tabs button:hover{color:var(--text);filter:none}
+.tabs button.on{color:var(--accent);border-color:var(--border);
+background:var(--card);margin-bottom:-1px}
+/* Inklapbaar per groep. Dicht bij het openen, want een beheerpagina die alles
+   openslaat leest als een berg en niet als een keuze. */
+details{border:1px solid var(--border);border-radius:10px;margin:.5rem 0;
+background:var(--card)}
+details[open]{border-color:var(--cyan)}
+summary{cursor:pointer;padding:.7rem .9rem;font-family:var(--mono);
+font-size:.7rem;text-transform:uppercase;letter-spacing:.13em;color:var(--text)}
+summary:hover{color:var(--cyan)}
+summary::marker{color:var(--muted)}
+details>div{padding:0 .9rem .9rem}
+details.rf[open]{border-color:var(--red)}
+details.rf summary{color:var(--red)}
+/* ------------------------------- de console ------------------------------ */
+/* De uitvoer is een <pre> in mono en met een vaste hoogte: opdrachtuitvoer
+   heeft betekenisvolle witruimte (region-bomen, sensor list) en die mag niet
+   platgeslagen worden. Nieuwste bovenaan, want dat is waar je net op geklikt
+   hebt en dan hoef je niet te scrollen om je eigen antwoord te zien. */
+#out{font-family:var(--mono);font-size:.8rem;white-space:pre-wrap;
+word-break:break-word;margin:.7rem 0 0;padding:.7rem .8rem;height:15rem;
+overflow-y:auto;background:var(--bg);border:1px solid var(--border);
+border-radius:8px}
+#out .e{border-bottom:1px solid var(--border);padding-bottom:.45rem;
+margin-bottom:.45rem}
+#out .e:last-child{border-bottom:none}
+#out .q{color:var(--cyan)}
+#out .r{color:var(--text)}
+#out .x{color:var(--red)}
+.cmdrow{display:flex;gap:.5rem;align-items:stretch}
+.cmdrow input{margin-top:0;flex:1 1 auto}
+.cmdrow button{margin-top:0;flex:0 0 auto}
+/* Snelknoppen: één rij, allemaal even zwaar behalve de gevaarlijke. */
+.quick{display:flex;gap:.45rem;flex-wrap:wrap;margin-top:.2rem}
+.quick button{margin-top:.5rem;background:transparent;color:var(--text);
+border-color:var(--border)}
+.quick button:hover{border-color:var(--cyan);color:var(--cyan);filter:none}
+.quick button.dng{color:var(--red)}
+.quick button.dng:hover{border-color:var(--red);color:var(--red)}
+/* Een veld met zijn HUIDIGE waarde ernaast. Dat kleine getal is het hele punt
+   van een instelformulier op een node die al ergens op staat: je ziet waarvan je
+   afwijkt voordat je iets intypt. */
+.cur{font-family:var(--mono);font-size:.62rem;color:var(--cyan);
+text-transform:none;letter-spacing:0}
+.cur.dev{color:var(--amber)}
+select{width:100%;margin-top:.3rem;padding:.45rem .55rem;font-family:var(--mono);
+font-size:.9rem;color:var(--text);background:var(--bg);
+border:1px solid var(--border);border-radius:6px}
+/* ------------------------- de radiowaarschuwing --------------------------- */
+/* ROOD EN NIET AMBER, en met een eigen kader in plaats van een noot onderaan.
+   freq, bw, sf en cr bepalen of deze node nog op hetzelfde mesh zit; één
+   verkeerd getal en hij is er meteen af. Hij blijft dan over WiFi bereikbaar --
+   daarom staat deze knop er ook -- maar over LoRa hoort niemand hem nog, en dat
+   merk je pas als je op een waarschuwing zit te wachten die nooit komt. */
+.rw{border:1px solid var(--red);border-left-width:3px;border-radius:0 8px 8px 0;
+background:linear-gradient(90deg,rgba(255,92,92,.09),transparent 75%);
+padding:.75rem .9rem;font-size:.87rem;margin:.2rem 0 .9rem}
+.rw b{color:var(--red)}
+.rw .baked{font-family:var(--mono);font-size:.8rem;color:var(--text)}
+/* Twee sloten voor de radio: eerst het vinkje, dan pas de knop. Een confirm()
+   alleen is te makkelijk weg te klikken voor de enige knop op deze pagina die
+   de node van het mesh kan halen. */
+.arm{display:flex;align-items:center;gap:.5rem;margin-top:.8rem;flex-wrap:wrap}
+.arm button:disabled{opacity:.4;cursor:not-allowed}
+/* Het wachtwoordalarm. Verdwijnt zodra het opgelost is -- een waarschuwing die
+   blijft staan wordt genegeerd, en dan is de volgende ook niets meer waard. */
+.alarm{border:1px solid var(--red);border-radius:10px;padding:.85rem 1rem;
+background:linear-gradient(90deg,rgba(255,92,92,.1),transparent 75%);
+margin-bottom:.8rem;font-size:.9rem}
+.alarm b{color:var(--red);font-family:var(--mono);text-transform:uppercase;
+letter-spacing:.1em;font-size:.7rem;display:block;margin-bottom:.25rem}
+.alarm.ok{border-color:var(--accent);
+background:linear-gradient(90deg,rgba(53,224,140,.08),transparent 75%)}
+.alarm.ok b{color:var(--accent)}
+/* -------------------- monitor bewerken in de tabelregel ------------------- */
+/* De invoervelden staan IN de regel en niet in een formulier eronder, want het
+   kanaalnummer links moet in beeld blijven: dat is het enige dat niet mag
+   veranderen en het is waar de wijziging over gaat. */
+td input{margin-top:0;padding:.2rem .35rem;font-size:.8rem}
+td input.n1{width:7rem}td input.n2{width:11rem}td input.n3{width:4.5rem}
+tr.edit{background:linear-gradient(90deg,rgba(76,201,240,.07),transparent 80%)}
+td.acts{white-space:nowrap;text-align:right}
+td.acts button{margin-left:.3rem}
+td button.go{color:var(--accent)}
+td button.go:hover{border-color:var(--accent)}
+/* Kanaalbudget: drie getallen in mono, want ze horen naast elkaar gelezen te
+   worden en niet in een zin. */
+.budget{display:flex;gap:1.4rem;flex-wrap:wrap;margin-top:.7rem}
+.budget div{font-family:var(--mono);font-size:.8rem}
+.budget span{display:block;font-size:.62rem;text-transform:uppercase;
+letter-spacing:.13em;color:var(--muted)}
+.budget .lo{color:var(--amber)}.budget .no{color:var(--red)}
 </style></head><body>
 
 <h1>MeshUptime<span id="sub">bewaking &middot; heltec v3</span></h1>
+
+<nav class="tabs">
+<button class="on" data-p="1">bewaking</button>
+<button data-p="2">toegang</button>
+<button data-p="3">node</button>
+</nav>
+
+<section id="p1">
 
 <div class="tilegrid" id="t"></div>
 
@@ -337,6 +561,24 @@ Kanalen 1&ndash;4 staan vast. Een kanaal dat eenmaal is uitgedeeld wordt niet
 opnieuw gebruikt, ook niet na verwijderen: een dashboard dat &quot;kanaal 6&quot;
 bewaard heeft, mag nooit stil naar een andere dienst gaan wijzen.</p>
 
+<p class="why"><b>Waarom je een monitor BEWERKT en niet weggooit:</b> er zijn acht
+kanalen (5&nbsp;t/m&nbsp;12) en een uitgedeeld nummer komt niet terug zolang er
+nog een vrij is. Wie een naam of een adres verkeerd typt en de monitor daarom
+verwijdert, <i>verbrandt</i> een kanaal &mdash; twee typefouten kosten een kwart
+van de ruimte. Klik daarom op <b>bewerk</b>: naam, adres en interval zijn ter
+plaatse te wijzigen en het <b>kanaal blijft hetzelfde</b>.<br>
+<b>Maar let op met het ADRES.</b> Een naam wijzigen is onschuldig &mdash; die is
+voor de mens en reist niet mee in de telemetrie. Een <b>adres</b> wijzigen geeft
+hetzelfde kanaalnummer een andere <i>betekenis</i>: een dashboard dat
+&quot;kanaal&nbsp;6 = google&quot; onthouden heeft, toont daarna de metingen van
+een andere dienst onder de oude naam. Dat is precies de stille fout waarvoor die
+onveranderlijke nummering bedoeld is. Verander je het adres, verander dan ook de
+<b>naam</b> mee, en werk die naam ook bij in MeshManager &mdash; anders liegt de
+grafiek daar zonder dat er iets stuk lijkt.</p>
+
+<div class="card"><div class="budget" id="bud"></div>
+<p class="note" id="budnote"></p></div>
+
 <h2>Monitor toevoegen</h2>
 <div class="card"><form id="a">
 <div class="row">
@@ -354,6 +596,9 @@ uit (minimaal 90&nbsp;s), dan wordt de toestand onbekend en gaat er een
 waarschuwing over het mesh. Een onbekende naam op <code>/hook</code> maakt de
 dienst zelf aan en antwoordt met het kanaal dat hij kreeg.</p>
 </form></div>
+
+</section>
+<section id="p2" hidden>
 
 <h2>Toegang &mdash; wie mag de sensoren uitlezen</h2>
 <div id="lock"></div>
@@ -410,8 +655,233 @@ en de hoogste SNR is meestal die van jou. Alleen adverts met een geldige
 <b>ondertekening</b> komen in deze lijst, dus de sleutel is bewijsbaar van de
 afzender.</p>
 
-<h2>WiFi</h2>
-<div class="card"><form method="post" action="/wifi">
+</section>
+<section id="p3" hidden>
+
+<div id="pwal"></div>
+
+<h2>CLI-console</h2>
+<div class="card">
+<div class="cmdrow"><input id="ci" spellcheck="false" autocomplete="off"
+maxlength="160" placeholder="ver"><button id="cb">stuur</button></div>
+<div class="quick">
+<button data-c="ver">ver</button>
+<button data-c="clock">clock</button>
+<button data-c="clock sync">clock sync</button>
+<button data-c="advert">advert</button>
+<button data-c="advert.zerohop">advert.zerohop</button>
+<button data-c="neighbors">neighbors</button>
+<button data-c="sensor list">sensor list</button>
+<button data-c="get radio">get radio</button>
+<button class="dng" data-c="reboot">reboot</button>
+<button class="dng" data-c="erase">erase</button>
+</div>
+<div id="out"></div>
+<p class="note"><b>Dit is dezelfde CLI</b> als de seriële console en als die
+waarmee een MeshCore-app een repeater beheert. Alles wat een app kan, kan hier
+dus ook &mdash; de formulieren hieronder stellen niets anders samen dan zo'n
+regel. Wat er niet in een formulier staat, typ je hier.<br>
+<b>Opdrachten:</b> <code>advert</code> <code>advert.zerohop</code>
+<code>clock</code> <code>clock sync</code> <code>time &lt;epoch&gt;</code>
+<code>reboot</code> <code>region</code> <code>region def &lt;&hellip;&gt;</code>
+<code>region home &lt;naam&gt;</code> <code>region default &lt;naam&gt;</code>
+<code>neighbors</code> <code>ver</code> <code>board</code>
+<code>password &lt;nieuw&gt;</code> <code>setperm &lt;sleutel&gt; &lt;n&gt;</code>
+<code>erase</code> <code>log start</code> <code>log stop</code>
+<code>log erase</code> <code>clear stats</code> <code>stats-core</code>
+<code>stats-radio</code> <code>stats-packets</code>
+<code>tempradio &lt;f,bw,sf,cr,min&gt;</code> <code>io</code>.<br>
+<b>Lezen en zetten:</b> <code>get &lt;veld&gt;</code> /
+<code>set &lt;veld&gt; &lt;waarde&gt;</code> op <code>radio</code>
+(&quot;freq,bw,sf,cr&quot;) <code>freq</code> <code>tx</code> <code>af</code>
+<code>dutycycle</code> <code>name</code> <code>lat</code> <code>lon</code>
+<code>owner.info</code> <code>advert.interval</code>
+<code>flood.advert.interval</code> <code>repeat</code> <code>flood.max</code>
+<code>flood.max.unscoped</code> <code>flood.max.advert</code>
+<code>loop.detect</code> <code>rxdelay</code> <code>txdelay</code>
+<code>direct.txdelay</code> <code>multi.acks</code>
+<code>path.hash.mode</code> <code>radio.rxgain</code>
+<code>radio.fem.rxgain</code> <code>agc.reset.interval</code>
+<code>int.thresh</code> <code>cad</code> <code>allow.read.only</code>
+<code>adc.multiplier</code> <code>guest.password</code>
+<code>acl.strict</code> <code>public.key</code> <code>role</code>.<br>
+<b>Onze eigen instellingen</b> gaan via <code>sensor get &lt;sleutel&gt;</code> /
+<code>sensor set &lt;sleutel&gt; &lt;waarde&gt;</code>:
+<code>mains.hi</code> <code>mains.lo</code> <code>mains.state</code>
+<code>mon.count</code> <code>mon.add</code> <code>mon.del</code> en per kanaal
+<code>mon.&lt;kan&gt;.name</code> <code>mon.&lt;kan&gt;.host</code>
+<code>mon.&lt;kan&gt;.int</code> <code>mon.&lt;kan&gt;.state</code>. En
+<code>sensor list</code> voor de hele lijst.<br>
+<b>Drie dingen weigert deze pagina</b>, met de reden in het antwoord:
+alles met <code>prv.key</code> (de privésleutel over HTTP zonder TLS is de
+identiteit van de node weggeven), <code>start ota</code> (dat opent een eigen
+accesspoint en een TWEEDE webserver op poort&nbsp;80, dus precies deze pagina
+valt eronder weg) en <code>poweroff</code>/<code>shutdown</code> (diepe slaap:
+alleen een fysieke reset haalt hem daaruit, en dat kan niemand van hier). Die
+horen aan de seriële kabel. <code>erase</code> en <code>set radio</code> mogen
+wel, maar alleen mét de bevestiging die de knop en het formulier meesturen.<br>
+<b>En drie antwoorden wél maar doen niets</b> in deze firmware &mdash; beter hier
+te lezen dan zelf te ontdekken. <code>neighbors</code> geeft
+<i>&quot;not supported&quot;</i>: SensorMesh vult die uitvoer niet in, de échte
+buurtlijst staat op het tabblad <b>toegang</b>. <code>log&nbsp;&hellip;</code> en
+<code>clear stats</code> hangen aan lege callbacks, dus ze melden &quot;logging
+on&quot; en &quot;stats reset&quot; zonder dat er iets gebeurt. Dat is gedrag van
+de sensorrol en niet van deze pagina.</p>
+</div>
+
+<h2>Instellingen</h2>
+<p class="note">Elk formulier stuurt alleen de velden die je hebt
+<b>veranderd</b>, elk als één CLI-regel, en het antwoord komt in de console
+hierboven. De waarde die nu geldt staat naast het label; wijkt hij af van de
+gebakken standaard, dan staat die er in amber achter.</p>
+
+<details class="rf"><summary>Radio &mdash; freq / bw / sf / cr &nbsp;&middot;&nbsp; mesh-kritiek</summary><div>
+<p class="rw"><b>Deze vier bepalen of deze node nog op hetzelfde mesh zit.</b>
+Ze zijn geen instelling van de node maar een afspraak met alle andere nodes: één
+verkeerd getal en niemand hoort hem nog, en hij hoort niemand. Hij blijft dan wel
+over WiFi bereikbaar &mdash; daarom kun je het van hier terugzetten &mdash; maar
+over LoRa is hij weg, en dat merk je pas als je op een waarschuwing wacht die
+nooit komt. Een <b>herstart</b> is nodig voordat ze gaan gelden.<br>
+Gebakken in deze firmware, dus wat de rest van dit mesh naar alle
+waarschijnlijkheid gebruikt: <span class="baked" id="baked"></span><br>
+Wil je iets uitproberen zonder je vast te leggen: <code>tempradio
+&lt;freq,bw,sf,cr,minuten&gt;</code> in de console zet het TIJDELIJK en valt na
+die minuten van zichzelf terug. Dat is de veilige manier om te kijken of je nog
+gehoord wordt.</p>
+<div class="row" id="g-rf"></div>
+<div class="arm">
+<label class="cb"><input type="checkbox" id="rfarm"> ja, ik verander de
+mesh-afspraak van deze node</label>
+<button id="rfgo" disabled>set radio</button>
+</div>
+<p class="note">In het zusterproject <b>MeshManager</b> geldt de regel dat
+radio-instellingen NIET van afstand over het mesh gewijzigd mogen worden, alleen
+<code>tx</code>. Die regel gaat over een verzoek van een server naar een verre
+node: daar kun je het gevolg niet zien en niet terugdraaien. Deze pagina is de
+<b>lokale</b> weg naar de node zelf, en daar hoort het te kunnen &mdash; maar de
+gevolgen zijn dezelfde, en daarom staat de waarschuwing er wel.</p>
+</div></details>
+
+<details><summary>Zendvermogen en ontvangst</summary><div>
+<p class="note"><code>tx</code> staat met opzet <b>niet</b> bij freq/bw/sf/cr:
+zendvermogen verandert hoe VER je gehoord wordt, niet OF je gehoord wordt. Te
+laag is jammer, te hoog is onnodig airtime &mdash; maar je blijft op hetzelfde
+mesh. Hij werkt bovendien meteen, zonder herstart.</p>
+<div class="row" id="g-pwr"></div>
+<button data-g="pwr">Opslaan</button>
+</div></details>
+
+<details><summary>Aankondigen</summary><div>
+<div class="row" id="g-adv"></div>
+<button data-g="adv">Opslaan</button>
+<p class="note">Het <b>advert-interval</b> is in minuten (0 = uit, anders
+minimaal 2 en hoogstens 240); het <b>flood-advert-interval</b> in uren (0 = uit,
+anders 3 t/m 168). Een flood-advert gaat over het hele mesh en kost bij iedereen
+airtime, dus daar is zuinig zijn geen zuinigheid maar hoffelijkheid.<br>
+<b>Locatie in advert</b>: <code>none</code> stuurt niets mee,
+<code>prefs</code> de breedte/lengte hierboven, <code>share</code> de gemeten
+GPS-positie. Deze node heeft geen GPS, dus <code>prefs</code> is hier de zinnige
+stand. In de <b>eigenaarsregel</b> wordt een <code>|</code> een regeleinde.</p>
+</div></details>
+
+<details><summary>Doorsturen en filteren</summary><div>
+<div class="row" id="g-fwd"></div>
+<button data-g="fwd">Opslaan</button>
+<p class="note">Deze node is een <b>sensor</b> en geen repeater:
+<code>repeat</code> staat daarom standaard <b>uit</b>. Aanzetten maakt hem tot
+doorgeefluik en dat kost batterij en airtime &mdash; op een node die aan het net
+hangt en goed staat kan het het mesh helpen, op een node op batterij niet.<br>
+De <code>flood.max</code>-getallen zijn hop-grenzen: een pakket dat meer hops
+achter zich heeft wordt niet meer doorgestuurd. De vertragingen zijn er om te
+voorkomen dat drie nodes die hetzelfde horen ook alle drie tegelijk beginnen te
+zenden.</p>
+</div></details>
+
+<details><summary>Padhash</summary><div>
+<p class="note">Dit getal bepaalt de <b>padhash</b> die deze node in een pakket
+zet: <code>getPathHashSize() = hash_mode + 1</code>, dus <b>0</b> geeft 1 byte
+per hop, <b>1</b> geeft 2 en <b>2</b> geeft 3.<br>
+<b>De ruil.</b> Een padhash is een verkorte vingerafdruk van een node in het pad.
+Meer byte per hop maakt de kans kleiner dat twee nodes dezelfde hash hebben en
+een pakket dus de verkeerde kant op gestuurd wordt &mdash; maar elk pakket wordt
+er per hop een byte langer van, en dat is meer zendtijd voor iedereen op het
+mesh. Op een klein mesh is 1 byte ruim; op een groot mesh met veel nodes betaalt
+2 of 3 zich terug. Kies dit dus niet uit voorzichtigheid, maar naar de grootte
+van het mesh waarop je zit.<br>
+<b>Deze node stuurt zijn DM-antwoorden met dezelfde maat</b>: main.cpp geeft
+<code>path_hash_mode + 1</code> door aan DmCommands bij het opstarten. Een
+wijziging hier geldt dus pas voor de DM-kant na een <b>herstart</b>.</p>
+<div class="row" id="g-hash"></div>
+<button data-g="hash">Opslaan</button>
+</div></details>
+
+<details><summary>Overig</summary><div>
+<div class="row" id="g-misc"></div>
+<button data-g="misc">Opslaan</button>
+<p class="note"><b>cad</b> laat de radio eerst luisteren of het kanaal vrij is
+voordat hij zendt; dat kost een fractie voor elke zending maar voorkomt dat twee
+nodes elkaar overschreeuwen. <b>Interferentiedrempel</b> 0 is uit.
+<b>Gastlezen</b> hoort bij het gastwachtwoord: staat het uit, dan doet dat
+wachtwoord niets. De <b>adc-vermenigvuldiger</b> ijkt de spanningsmeting &mdash;
+en daar hangt op deze node de netvoeding/batterij-beslissing aan, dus verander
+hem niet zonder een meting ernaast. De drempels zelf zijn
+<code>mains.hi</code>/<code>mains.lo</code> via <code>sensor set</code>.<br>
+Wat hier niet staat, staat wel in de console: <code>dutycycle</code>,
+<code>powersaving</code>, <code>gps&nbsp;&hellip;</code>,
+<code>extra.sf</code>, <code>tempradio</code>, <code>neighbor.remove</code>,
+<code>setperm</code>, <code>time</code>, <code>io</code>. Die zijn met opzet geen
+formulier: ze zijn zeldzaam, of ze bestaan alleen op andere borden, en een
+formulier dat &quot;Unknown command&quot; oplevert is erger dan geen
+formulier.</p>
+</div></details>
+
+<details><summary>Regio</summary><div>
+<p class="note">Regio's zijn de <b>scopes</b> waarin een flood mag rondgaan. Ze
+zitten niet in NodePrefs maar in een eigen tabel, en die is alleen via de CLI te
+lezen &mdash; vandaar knoppen en een vrij veld in plaats van vooringevulde
+velden.<br>
+<code>region</code> toont de boom, <code>region def &lt;&hellip;&gt;</code>
+herschrijft hem in één keer (namen gescheiden door spaties, een
+<code>|</code> of <code>,</code> achter een naam springt terug naar die tak),
+<code>region home &lt;naam&gt;</code> zet waar deze node staat en
+<code>region default &lt;naam&gt;</code> de scope die hij op uitgaande pakketten
+zet. <code>region save</code> legt het vast op flash &mdash; <b>zonder die
+opdracht is de wijziging weg na een herstart</b>.</p>
+<div class="quick">
+<button data-c="region">region</button>
+<button data-c="region home">region home</button>
+<button data-c="region default">region default</button>
+<button data-c="region list allowed">region list allowed</button>
+<button data-c="region list denied">region list denied</button>
+<button data-c="region save">region save</button>
+</div>
+<div class="cmdrow" style="margin-top:.8rem">
+<input id="rgi" spellcheck="false" autocomplete="off" maxlength="140"
+placeholder="region def eu be|eu nl"><button id="rgb">stuur</button></div>
+</div></details>
+
+<details><summary>Wachtwoorden</summary><div>
+<p class="note">Het <b>beheerderswachtwoord</b> is de tweede deur naar deze node,
+naast de toegangslijst: wie het over het mesh meestuurt bij een login wordt
+automatisch in de lijst gezet <b>als beheerder</b> &mdash; ook met het slot aan
+&mdash; en heeft daarmee deze hele CLI. Het slot en dit wachtwoord zijn dus samen
+één beveiliging en niet twee.<br>
+Het <b>gastwachtwoord</b> geeft alleen leesrecht, en alleen als
+<code>allow.read.only</code> aanstaat.<br>
+Hoogstens 15 tekens (NodePrefs bewaart 16 byte). Het antwoord van de node kaatst
+het nieuwe wachtwoord terug, zodat je zeker weet wat er staat &mdash; dat staat
+dan ook in de console hierboven, dus wis die als iemand meekijkt.</p>
+<div class="row">
+<label>Beheerderswachtwoord<input id="pw1" maxlength="15" type="password"
+autocomplete="new-password" placeholder="nieuw"></label>
+<label>Gastwachtwoord<input id="pw2" maxlength="15" type="password"
+autocomplete="new-password" placeholder="nieuw"></label>
+</div>
+<button id="pwgo">Opslaan</button>
+</div></details>
+
+<details><summary>WiFi</summary><div>
+<form method="post" action="/wifi">
 <div class="row">
 <label>Netwerk (SSID)<input name="ssid" id="ssid" maxlength="32" required></label>
 <label>Wachtwoord<input name="pwd" type="password" maxlength="64"></label>
@@ -419,7 +889,36 @@ afzender.</p>
 <button>Opslaan</button>
 <p class="note">Opgeslagen instellingen gaan voor op de ingebouwde. Pas actief na
 herstart.</p>
-</form></div>
+</form>
+</div></details>
+
+<details><summary>De andere twee wegen naar deze node</summary><div>
+<p class="note"><b>1. De seriële console.</b> USB erin, 115200 baud, en je hebt
+letterlijk dezelfde opdrachten als hierboven &mdash; deze pagina stuurt ze met
+<code>sender_timestamp = 0</code> en dat betekent voor CommonCLI precies &quot;de
+console&quot;. Dit is de weg die altijd werkt, ook als de wifi weg is en ook als
+je jezelf met een radio-instelling van het mesh hebt gehaald.<br>
+<b>2. Een MeshCore-app over LoRa.</b> Deze node is <i>geen</i> companion &mdash;
+er zit geen BLE op en deze firmware spreekt het companion-clientprotocol niet.
+Maar een app kan hem beheren zoals zij een <b>repeater</b> beheert: voeg hem toe
+als contact, log in met het beheerderswachtwoord, en je krijgt dezelfde CLI over
+het mesh. Handig om te weten, want dat werkt als de wifi weg is.<br>
+Over die weg zijn een paar opdrachten met opzet <b>niet</b> beschikbaar
+(<code>set freq</code>, <code>erase</code>, <code>get acl</code>,
+<code>log</code>, <code>stats-*</code>): CommonCLI laat die alleen door met
+<code>sender_timestamp = 0</code>, dus alleen van de console. Deze pagina zit aan
+die kant van de streep, een app op afstand niet.<br>
+Deze node toevoegen als contact gaat met de publieke sleutel hieronder; hij komt
+ook in elk advert langs, dus als de app hem al gehoord heeft staat hij er al
+tussen.</p>
+<div class="row"><label>Naam<input id="idname" readonly></label></div>
+<label>Publieke sleutel<input id="idkey" readonly></label>
+<p class="note">De <b>rol</b> die deze node in zijn advert zet is
+<code>sensor</code>. Een app die op &quot;repeater&quot; filtert ziet hem dus
+niet in dat lijstje staan; zoeken op naam werkt wel.</p>
+</div></details>
+
+</section>
 
 <script>
 /* Ernst -> kleurklasse. Eén plek, want de tegels, de bolletjes en de tabel moeten
@@ -451,7 +950,30 @@ document.getElementById("t").innerHTML=h}
 var KH=[["kan","num"],["naam",""],["adres",""],["interval","num"],
 ["toestand",""],["ms","num"],["mislukt","num"],["",""]];
 
+/* HET KANAAL DAT NU BEWERKT WORDT, of 0. De tabel wordt elke 5 s opnieuw
+   opgebouwd omdat de metingen veranderen; dat mag niet gebeuren terwijl iemand in
+   een invoerveld staat te typen -- dan is zijn tekst weg zonder dat hij iets fout
+   deed. Zolang dit getal niet 0 is, laat table() de tabel staan. De TEGELS
+   verversen wel door, want die zeggen niets over deze regel. */
+var EDIT=0;
+
+/* De keuring, LETTERLIJK dezelfde als MonitorSensors::validName/validHost: alleen
+   letters, cijfers, punt, streepje en liggend streepje, 1..16 voor een naam en
+   1..40 voor een adres. Hij staat hier niet om de node te vervangen -- die keurt
+   zelf, en dat blijft de waarheid -- maar om een fout in de browser te melden in
+   plaats van er een mislukte opdracht voor over het netwerk te sturen. */
+var NM=/^[A-Za-z0-9._-]{1,16}$/, HS=/^[A-Za-z0-9._-]{1,40}$/;
+
+/* DE BUFFERGRENS VAN 'sensor set'. Upstream doet daar strcpy(tmp,&command[11])
+   in een buffer van PRV_KEY_SIZE*2+4 = 68 byte, dus alles achter "sensor set "
+   moet onder de 68 tekens blijven. Wij houden 59 aan -- de marge die de node zelf
+   ook aanhoudt -- en weigeren hier wat er niet in past in plaats van het de node
+   in te sturen. Reken maar na: "mon.12.host " is 12 tekens en een adres mag 40,
+   dus 52; het past, maar niet met veel over. */
+function fits(s){return s.length<=59}
+
 function table(d){
+if(EDIT){return}
 var e=document.getElementById("k");e.innerHTML="";
 var hr=e.insertRow();KH.forEach(function(x){var h=document.createElement("th");
 h.textContent=x[0];h.className=x[1];hr.appendChild(h)});
@@ -468,11 +990,98 @@ c.innerHTML=dot(m.sev)+m.st+(m.k=="gemeld"&&m.age?" "+m.age+"s":"");
 c=r.insertCell();c.className="num";c.textContent=m.ms?m.ms:"–";
 c=r.insertCell();c.className="num";
 c.textContent=m.k=="vast"?"–":m.f+"/"+m.c;
-c=r.insertCell();
-if(m.k!="vast"){var b=document.createElement("button");b.textContent="wis";
+c=r.insertCell();c.className="acts";
+if(m.k!="vast"){
+var eb=document.createElement("button");eb.textContent="bewerk";
+eb.className="go";eb.onclick=function(){editRow(r,m)};c.appendChild(eb);
+var b=document.createElement("button");b.textContent="wis";
 b.onclick=function(){if(confirm("Monitor '"+m.n+"' verwijderen?\n\nKanaal "+m.ch+
-" wordt daarna NIET opnieuw uitgedeeld zolang er nog een nieuw nummer vrij is."))
+" wordt daarna NIET opnieuw uitgedeeld zolang er nog een nieuw nummer vrij is."+
+"\n\nWou je alleen een typefout herstellen? Gebruik dan 'bewerk' -- dan houdt "+
+"deze dienst hetzelfde kanaal en verbrand je er geen."))
 {post("monitor/del","name="+encodeURIComponent(m.n))}};c.appendChild(b)}})}
+
+/* Een regel uit de kanaalkaart ter plaatse bewerkbaar maken.
+ *
+ * WAAROM IN DE REGEL EN NIET IN EEN FORMULIER ERONDER: het kanaalnummer staat
+ * links en moet in beeld blijven, want dat is het enige dat NIET verandert en het
+ * is waar de hele wijziging over gaat. Een formulier onderaan de pagina zou dat
+ * nummer uit het zicht halen op het moment dat het telt.
+ *
+ * DE WEG NAAR DE NODE IS DE CLI, en dat is geen omweg maar de bedoeling.
+ * 'sensor set mon.<kanaal>.name' loopt door MonitorSensors::setSettingValue en
+ * dus door validName/validHost en de intervalgrenzen -- dezelfde zeef als de
+ * seriële console en dezelfde als /monitor. Een tweede schrijfpad hierheen zou een
+ * tweede keuring zijn, en twee keuringen lopen ooit uiteen.
+ */
+function editRow(r,m){
+EDIT=m.ch;
+var cells=r.cells;
+r.className="edit";
+function inp(cell,val,max,cl){cell.textContent="";
+var i=document.createElement("input");i.value=val;i.maxLength=max;
+i.className=cl;i.spellcheck=false;cell.appendChild(i);return i}
+var iN=inp(cells[1],m.n,16,"n1");
+var iH=inp(cells[2],m.k=="gemeld"?"-":m.h,40,"n2");
+var iI=inp(cells[3],""+m.i,4,"n3");
+
+cells[7].textContent="";
+var ok=document.createElement("button");ok.textContent="opslaan";ok.className="go";
+var no=document.createElement("button");no.textContent="annuleer";
+cells[7].appendChild(ok);cells[7].appendChild(no);
+
+no.onclick=function(){EDIT=0;u2()};
+
+ok.onclick=function(){
+var nn=iN.value.trim(),nh=iH.value.trim(),ni=iI.value.trim();
+if(!NM.test(nn)){say("naam: 1-16 tekens uit letters, cijfers, . - _",0);return}
+if(!HS.test(nh)){say("adres: 1-40 tekens uit letters, cijfers, . - _ (of '-' "+
+"voor een gemelde dienst)",0);return}
+var iv=parseInt(ni,10);
+if(!(iv>=10&&iv<=3600)){say("interval: 10 t/m 3600 s",0);return}
+
+/* Het ADRES is de gevaarlijke: de naam is voor de mens, het adres bepaalt wat
+   het kanaal BETEKENT. Vandaar een eigen bevestiging, en alleen voor dit veld. */
+var oh=m.k=="gemeld"?"-":m.h;
+if(nh!=oh&&!confirm("Adres van kanaal "+m.ch+" wijzigen?\n\n"+oh+"  ->  "+nh+
+"\n\nHetzelfde kanaalnummer gaat daarmee over een ANDERE dienst. Een dashboard "+
+"dat 'kanaal "+m.ch+" = "+m.n+"' bewaard heeft, toont vanaf nu de metingen van "+
+nh+" onder die oude naam.\n\nVerander dan ook de naam mee, en werk die naam bij "+
+"in MeshManager."+
+(oh=="-"||nh=="-"?"\n\nLET OP: hiermee verandert ook de SOORT -- een adres '-' "+
+"is een van buiten gemelde dienst, een echt adres is een ping-monitor.":"")))
+{return}
+
+/* Alleen wat veranderd is, en elk veld als EEN regel. Niet alle drie altijd
+   sturen: elke gelukte 'sensor set' zet _dirty en dus een flashschrijving in de
+   wacht, en een adreswijziging gooit bovendien de gemeten toestand van dat vakje
+   weg. Wat niet veranderd is, hoort niets te veroorzaken. */
+var cmds=[];
+if(nn!=m.n)  {cmds.push("sensor set mon."+m.ch+".name "+nn)}
+if(nh!=oh)   {cmds.push("sensor set mon."+m.ch+".host "+nh)}
+if(iv!=m.i)  {cmds.push("sensor set mon."+m.ch+".int "+iv)}
+if(!cmds.length){say("niets veranderd",1);EDIT=0;u2();return}
+
+for(var i=0;i<cmds.length;i++){
+if(!fits(cmds[i].slice(11))){
+say("te lang voor de opdrachtbuffer van de node (max 59 tekens achter "+
+"'sensor set'); kort de naam of het adres in",0);return}}
+
+/* De naam MOET als eerste als hij verandert: de volgende opdrachten zoeken hun
+   vakje op KANAAL en niet op naam, dus de volgorde maakt hier eigenlijk niets uit
+   -- maar bij een mislukking is het prettiger dat de naam al klopt dan dat er een
+   nieuw adres onder een oude naam staat. */
+say("bezig...",1);
+cliSeq(cmds,function(good,bad,last){
+EDIT=0;u2();cfg();
+/* De node antwoordt op een geweigerde 'sensor set' met "can't find custom var"
+   -- dat is zijn enige foutmelding en hij zegt dus niet WAAROM. Vandaar dat het
+   antwoord hier letterlijk doorgegeven wordt en er een hint bij staat: bijna
+   altijd is het een naam die al bestaat of een waarde buiten de grenzen. */
+if(bad){say(bad+" van de "+(good+bad)+" wijzigingen geweigerd: "+last.trim()+
+" (naam al in gebruik? interval buiten 10-3600?)",0)}
+else{say(good+" wijziging(en) doorgevoerd; kanaal "+m.ch+" is niet veranderd",1)}
+})}}
 
 function say(t,ok){var m=document.getElementById("msg");
 m.className=ok?"ok":"bad";m.textContent=t}
@@ -599,6 +1208,321 @@ function u2(){fetch("status.json").then(function(r){return r.json()})
 var s=document.getElementById("ssid");if(!s.value){s.value=d.ssid}
 document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})}
 
+/* ============================== nodebeheer =============================== */
+
+/* ---- tabbladen ---- */
+/* Drie secties, één zichtbaar. Geen router en geen hash in de URL: dit is één
+   document en een herlaadde pagina hoort op het overzicht te beginnen, want dat
+   is waarvoor dit apparaat er staat. */
+var TB=document.querySelectorAll(".tabs button");
+for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
+var p=this.getAttribute("data-p");
+for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
+for(var k=1;k<=3;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+if(p=="3"){cfg()}}}
+
+/* ---- de console ---- */
+/* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
+   ongelimiteerd op een pagina die dagen open kan staan. */
+function logline(cmd,txt,ok){
+var o=document.getElementById("out");
+var e=document.createElement("div");e.className="e";
+var q=document.createElement("div");q.className="q";q.textContent="> "+cmd;
+var r=document.createElement("div");r.className=ok?"r":"x";
+r.textContent=txt&&txt.trim()?txt.trim():"(geen antwoord)";
+e.appendChild(q);e.appendChild(r);
+o.insertBefore(e,o.firstChild);
+while(o.childElementCount>40){o.removeChild(o.lastChild)}}
+
+/* EEN AFGEWEZEN OPDRACHT KOMT MET EEN 200 TERUG, en dat is met opzet: de HTTP-code
+   zegt of het VERZOEK gelukt is, niet of de node het eens was met de opdracht. Een
+   CLI antwoordt in tekst, en /cli geeft die tekst ongewijzigd door -- de console
+   moet weergeven wat de node zei en er niet zijn eigen oordeel voor zetten.
+
+   Voor de KLEUR is er wel een oordeel nodig, en dat is deze zeef. Het zijn de
+   letterlijke foutvormen van CommonCLI: "Err - ", "ERR:", "ERROR:", "Error,",
+   "Unknown command", "can't find custom var" en "??: " voor een onbekend veld. Op
+   'sensor set' is het bovendien het enige onderscheid dat er is: die antwoordt
+   "ok" of "can't find custom var" en zegt nooit waarom. */
+function isErr(t){return /^(err|error|unknown|can't|\?\?)/i.test((t||"").trim())}
+
+/* Eén opdracht. Geeft een promise met {ok,txt} terug zodat een reeks opdrachten
+   op elkaar kan wachten -- niet omdat het moet, maar omdat vijf tegelijk op een
+   node die tussendoor een radio bedient vijf keer een flashschrijving in de wacht
+   zet. Achter elkaar is hier vriendelijker dan tegelijk. */
+function cli(cmd,cf){
+var b="cmd="+encodeURIComponent(cmd);
+if(cf){b+="&confirm="+cf}
+return fetch("cli",{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.text().then(function(t){
+var ok=r.ok&&!isErr(t);logline(cmd,t,ok);return{ok:ok,txt:t}})})
+.catch(function(){logline(cmd,"geen verbinding met de node",0);
+return{ok:false,txt:"geen verbinding"}})}
+
+/* Een reeks, achter elkaar. done(gelukt, mislukt, laatste tekst). */
+function cliSeq(cmds,done){
+var list=cmds.slice(),good=0,bad=0,last="";
+function step(){
+if(!list.length){if(done){done(good,bad,last)}return}
+cli(list.shift()).then(function(res){
+if(res.ok){good++}else{bad++}last=res.txt;step()})}
+step()}
+
+function send(cmd,cf){return cli(cmd,cf)}
+
+document.getElementById("cb").onclick=function(){
+var el=document.getElementById("ci"),c=el.value.trim();
+if(!c){return}
+/* De twee onomkeerbare hier ook achter een bevestiging, ook als iemand ze
+   intypt. De node vraagt zelf niets -- een CLI kent geen 'weet je het zeker'. */
+if(/^erase\b/.test(c)&&!confirm("Bestandssysteem WISSEN?\n\nDit gooit de "+
+"monitorlijst, de toegangslijst, de wifi-instelling en de voorkeuren weg. Het "+
+"kanaalgeheugen (welk nummer al vergeven is) gaat mee. Niet omkeerbaar.")){return}
+if(/^(reboot|clkreboot)\b/.test(c)&&!confirm("Node herstarten?\n\nDe bewaking "+
+"staat een halve minuut stil en de gemeten toestanden beginnen weer op '?'."))
+{return}
+/* Ook een INGETYPTE radio-opdracht krijgt de vraag. De server weigert hem zonder
+   confirm=radio en die stuurt de console mee -- dus zonder deze vraag zou typen
+   een sluipweg om de waarschuwing heen zijn, en dan is de waarschuwing bij het
+   formulier een formaliteit in plaats van een grens. */
+var rf=/^set (radio|freq) /.test(c);
+if(rf&&!confirm("MESH-AFSPRAAK VAN DEZE NODE WIJZIGEN\n\n  "+c+"\n\nfreq, bw, sf "+
+"en cr bepalen of deze node nog op hetzelfde mesh zit. Klopt er een niet met de "+
+"rest, dan hoort niemand hem nog over LoRa en hoort hij niemand.\n\nHij blijft "+
+"over WiFi bereikbaar, dus dit is terug te zetten -- maar de bewaking is tot dan "+
+"stil. Gaat pas gelden na een herstart.\n\nHet formulier onder 'Radio' zet de "+
+"huidige en de gebakken waarde ernaast; dat is de veiligere weg.\n\nDoorgaan?"))
+{return}
+send(c,/^erase\b/.test(c)?"erase":(rf?"radio":""));
+el.value=""}
+
+document.getElementById("ci").onkeydown=function(ev){
+if(ev.key=="Enter"){document.getElementById("cb").onclick()}}
+
+/* Snelknoppen. Twee ervan staan in het rood en vragen eerst. */
+var QB=document.querySelectorAll(".quick button");
+for(var i=0;i<QB.length;i++){QB[i].onclick=function(){
+var c=this.getAttribute("data-c");
+document.getElementById("ci").value=c;
+document.getElementById("cb").onclick()}}
+
+document.getElementById("rgb").onclick=function(){
+var el=document.getElementById("rgi"),c=el.value.trim();
+if(!c){return}
+if(!/^region\b/.test(c)){c="region "+c}
+send(c).then(function(){el.value=""})}
+
+/* ---- de instelformulieren ----
+ *
+ * EEN TABEL EN GEEN DERTIG HANDGESCHREVEN VELDEN. Elk veld is
+ * [sleutel in cfg.json, label, CLI-voorvoegsel, soort], en één functie maakt er
+ * een formulier van en één functie maakt er weer opdrachtregels van. Dat houdt de
+ * pagina klein, maar belangrijker: er is precies één plek waar de koppeling
+ * tussen een veld en zijn CLI-opdracht staat. Dertig handgeschreven formulieren
+ * zijn dertig plaatsen waar die koppeling stil verkeerd kan staan.
+ *
+ * Soort: "n" = getal, "t" = tekst, "s:a|b|c" = keuzelijst.
+ */
+var GRP={
+rf:[["freq","frequentie (MHz)","","n"],["bw","bandbreedte (kHz)","","n"],
+["sf","spreading factor","","n"],["cr","coding rate","","n"]],
+pwr:[["tx","zendvermogen (dBm)","set tx","n"],
+["af","airtime-factor","set af","n"],
+["agc","agc-reset (s)","set agc.reset.interval","n"],
+["rxgain","rx boosted gain","set radio.rxgain","s:on|off"],
+["femrx","fem lna rxgain","set radio.fem.rxgain","s:on|off"]],
+adv:[["name","nodenaam","set name","t"],
+["lat","breedtegraad","set lat","n"],["lon","lengtegraad","set lon","n"],
+["advint","advert-interval (min)","set advert.interval","n"],
+["fadvint","flood-advert (uur)","set flood.advert.interval","n"],
+["advloc","locatie in advert","gps advert","s:none|prefs|share"],
+["owner","eigenaarsregel","set owner.info","t"]],
+fwd:[["repeat","doorsturen","set repeat","s:on|off"],
+["fmax","flood max hops","set flood.max","n"],
+["fmaxuns","flood max ongescoped","set flood.max.unscoped","n"],
+["fmaxadv","flood max advert","set flood.max.advert","n"],
+["loopd","lusdetectie","set loop.detect","s:off|minimal|moderate|strict"],
+["rxdelay","rx-vertraging (basis)","set rxdelay","n"],
+["txdelay","tx-vertraging flood","set txdelay","n"],
+["dtxdelay","tx-vertraging direct","set direct.txdelay","n"],
+["multiack","meervoudige acks","set multi.acks","n"]],
+hash:[["hashmode","padhash-modus","set path.hash.mode","s:0|1|2"]],
+misc:[["cad","cad voor zenden","set cad","s:on|off"],
+["intthr","interferentiedrempel","set int.thresh","n"],
+["rdonly","gastlezen toestaan","set allow.read.only","s:on|off"],
+["adcmult","adc-vermenigvuldiger","set adc.multiplier","n"]]};
+
+/* De waarde zoals hij bij het laatste ophalen was. Hierop wordt bij Opslaan
+   vergeleken, zodat er alleen gestuurd wordt wat echt veranderd is. */
+var WAS={};
+/* De besturingselementen, per groep en per sleutel. */
+var CTL={};
+
+function build(g,cfgd){
+var box=document.getElementById("g-"+g);if(!box){return}
+box.innerHTML="";CTL[g]={};
+GRP[g].forEach(function(f){
+var key=f[0],val=cfgd[key];if(val===undefined){val=""}
+val=""+val;
+WAS[g+"."+key]=val;
+var lab=document.createElement("label");
+var t=document.createTextNode(f[1]+" ");lab.appendChild(t);
+var cur=document.createElement("span");cur.className="cur";
+cur.textContent="nu: "+(val===""?"–":val);
+/* Alleen bij de radio is er een gebakken waarde om naast te leggen, en juist
+   daar is afwijken het gevaar. Amber, niet rood: afwijken kan bedoeld zijn. */
+if(g=="rf"&&cfgd.baked&&cfgd.baked[key]!==undefined&&
+(""+cfgd.baked[key])!=val){cur.className="cur dev";
+cur.textContent+=" ≠ gebakken "+cfgd.baked[key]}
+lab.appendChild(cur);
+var ctl;
+if(f[3].slice(0,2)=="s:"){
+ctl=document.createElement("select");
+f[3].slice(2).split("|").forEach(function(o){
+var op=document.createElement("option");op.value=o;op.textContent=o;
+if(o==val){op.selected=true}ctl.appendChild(op)})}
+else{ctl=document.createElement("input");ctl.spellcheck=false;
+ctl.value=val;ctl.maxLength=key=="owner"?119:(f[3]=="t"?31:12)}
+lab.appendChild(ctl);box.appendChild(lab);CTL[g][key]=ctl})}
+
+/* Wat er veranderd is, als opdrachtregels. */
+function changed(g){
+var out=[];
+GRP[g].forEach(function(f){
+var key=f[0],c=CTL[g]&&CTL[g][key];if(!c||!f[2]){return}
+var v=(""+c.value).trim();
+if(v===WAS[g+"."+key]){return}
+if(v===""){return}   /* leeg = niet bedoeld; wissen gaat met een echte waarde */
+out.push(f[2]+" "+v)});
+return out}
+
+function saveGroup(g){
+var cmds=changed(g);
+if(!cmds.length){logline("(opslaan)","niets veranderd in deze groep",1);return}
+cliSeq(cmds,function(){cfg()})}
+
+var SB=document.querySelectorAll("button[data-g]");
+for(var i=0;i<SB.length;i++){SB[i].onclick=function(){
+saveGroup(this.getAttribute("data-g"))}}
+
+/* ---- de radio: apart, en met twee sloten ----
+ *
+ * freq, bw, sf en cr gaan in EEN opdracht ('set radio f,bw,sf,cr'), want zo zet
+ * CommonCLI ze ook: er is geen 'set bw' en geen 'set sf'. Dat is hier gunstig --
+ * je kunt de vier niet half zetten en daarmee niet halverwege van het mesh
+ * vallen.
+ *
+ * Twee sloten: het vinkje ernaast moet aan (anders is de knop uit) en daarna
+ * vraagt confirm() nog een keer, met de OUDE en de NIEUWE waarde naast elkaar en
+ * met wat er gebeurt in woorden. De server zet een derde slot: POST /cli weigert
+ * 'set radio' en 'set freq' zonder confirm=radio, zodat een losse fetch of een
+ * voorgeladen link er niet bij kan.
+ */
+var RFARM=document.getElementById("rfarm");
+RFARM.onchange=function(){document.getElementById("rfgo").disabled=!RFARM.checked};
+
+document.getElementById("rfgo").onclick=function(){
+if(!RFARM.checked){return}
+var c=CTL.rf;if(!c){return}
+var v={};var keys=["freq","bw","sf","cr"];
+for(var i=0;i<keys.length;i++){
+v[keys[i]]=(""+c[keys[i]].value).trim();
+if(v[keys[i]]===""){logline("(set radio)","alle vier de velden moeten "+
+"ingevuld zijn",0);return}}
+var lines=keys.map(function(k){
+var w=WAS["rf."+k];return "  "+k+": "+w+(v[k]==w?"  (ongewijzigd)":"   ->   "+v[k])});
+if(!confirm("MESH-AFSPRAAK VAN DEZE NODE WIJZIGEN\n\n"+lines.join("\n")+
+"\n\nDit bepaalt of deze node nog op hetzelfde mesh zit. Klopt een van deze vier "+
+"niet met de rest van het mesh, dan hoort niemand hem nog en hoort hij niemand.\n\n"+
+"Hij blijft over WiFi bereikbaar, dus je kunt het van hier terugzetten -- maar "+
+"de bewaking is tot dan stil, en waarschuwingen over LoRa komen niet aan.\n\n"+
+"Gaat pas gelden na een herstart. Doorgaan?")){return}
+RFARM.checked=false;document.getElementById("rfgo").disabled=true;
+send("set radio "+v.freq+","+v.bw+","+v.sf+","+v.cr,"radio")
+.then(function(){cfg()})}
+
+/* ---- wachtwoorden ---- */
+document.getElementById("pwgo").onclick=function(){
+var a=document.getElementById("pw1"),b=document.getElementById("pw2");
+var cmds=[];
+if(a.value){cmds.push("password "+a.value)}
+if(b.value){cmds.push("set guest.password "+b.value)}
+if(!cmds.length){logline("(wachtwoord)","niets ingevuld",0);return}
+if(a.value&&!confirm("Beheerderswachtwoord wijzigen?\n\nElke app en elke node "+
+"die met het OUDE wachtwoord inlogde, moet het nieuwe krijgen. Ingangen die al "+
+"in de toegangslijst staan blijven werken -- die hebben het wachtwoord niet meer "+
+"nodig.")){return}
+cliSeq(cmds,function(){a.value="";b.value="";cfg()})}
+
+/* ---- de leeskant: één GET met de hele stand ---- */
+function cfg(){
+return fetch("cfg.json").then(function(r){
+if(!r.ok){return r.text().then(function(t){
+logline("(cfg.json)",t,0)})}
+return r.json().then(function(d){
+build("rf",d);build("pwr",d);build("adv",d);build("fwd",d);
+build("hash",d);build("misc",d);
+var bk=d.baked||{};
+document.getElementById("baked").textContent=
+bk.freq+" MHz · "+bk.bw+" kHz · sf "+bk.sf+" · cr "+bk.cr;
+document.getElementById("idname").value=d.name||"";
+document.getElementById("idkey").value=d.pubkey||"";
+pwalarm(d);budget(d)})})}
+
+/* HET WACHTWOORDALARM. Rood zolang het beheerderswachtwoord nog de gebakken
+   standaard is (of leeg), en dan GROEN als het gezet is -- niet weg. Een
+   waarschuwing die verdwijnt zodra het opgelost is leest als voortgang; een die
+   blijft staan wordt genegeerd, en dan is de volgende ook niets meer waard. Dat
+   het groene vakje er even staat is het punt: je ziet dat het gelukt is. */
+function pwalarm(d){
+var e=document.getElementById("pwal");
+if(d.pwdef||d.pwempty){
+e.className="alarm";
+e.innerHTML="<b>het beheerderswachtwoord staat nog op de standaard</b>"+
+(d.pwempty?"Het is <i>leeg</i>. ":"Het is nog de waarde die in de bouwvlag "+
+"<code>ADMIN_PASSWORD</code> staat. ")+
+"Wie die waarde kent, logt over het mesh in op deze node, wordt daarmee "+
+"<b>automatisch beheerder</b> in de toegangslijst — ook met het slot aan "+
+"— en heeft dan deze hele CLI: instellingen, radio, wissen. Het slot en dit "+
+"wachtwoord zijn samen één beveiliging en niet twee. Zet het onder "+
+"<i>Wachtwoorden</i> hieronder, of met <code>password &lt;nieuw&gt;</code> in de "+
+"console."}
+else{e.className="alarm ok";
+e.innerHTML="<b>beheerderswachtwoord is gezet</b>Het wijkt af van de gebakken "+
+"standaard. Wie over het mesh op deze node wil inloggen heeft het nodig, en "+
+"alleen dan wordt hij als beheerder in de toegangslijst gezet."}}
+
+/* HET KANAALBUDGET. Drie getallen die naast elkaar horen: hoeveel vakjes bezet
+   zijn, hoeveel nummers ooit vergeven zijn, en hoeveel er nog nieuw uit te delen
+   valt. Dat laatste getal is waar het om gaat -- het loopt terug en het komt niet
+   terug, en dat hoort iemand te zien VOORDAT hij de ruimte opmaakt. */
+function budget(d){
+var free=d.ch_free,e=document.getElementById("bud");
+var cl=free==0?"no":(free<=2?"lo":"");
+e.innerHTML="";
+[[d.mon_used+" / "+d.mon_max,"vakjes bezet",""],
+[""+d.ch_ever,"nummers ooit vergeven",""],
+[""+free,"nog nieuw uit te delen",cl]].forEach(function(x){
+var v=document.createElement("div");v.className=x[2];
+v.textContent=x[0];
+var s=document.createElement("span");s.textContent=x[1];
+v.appendChild(s);e.appendChild(v)});
+var n=document.getElementById("budnote");
+n.innerHTML="Kanaal "+d.ch_first+" t/m "+d.ch_last+", dus "+d.mon_max+" in "+
+"totaal. Een nummer dat is uitgedeeld wordt <b>niet opnieuw gebruikt</b> zolang "+
+"er nog één over is die nooit vergeven is — ook niet nadat je de "+
+"monitor verwijderd hebt. Pas als alle "+d.mon_max+" een keer op zijn, begint de "+
+"node te hergebruiken, en dan gaat een bewaarde koppeling in een dashboard "+
+"onvermijdelijk naar een andere dienst wijzen."+
+(free==0?" <b>Dat punt is nu bereikt.</b> Loop je dashboards na voordat je nog "+
+"een monitor aanmaakt.":(free<=2?" <b>Er zijn er nog "+free+".</b> Bewerk een "+
+"bestaande monitor in plaats van hem weg te gooien en opnieuw aan te maken.":""))+
+"<br>Het getal 'ooit vergeven' komt uit <code>ch_ever_used</code> in "+
+"<code>/monitors.cfg</code>, bij het opstarten gelezen, plus de kanalen die nu in "+
+"gebruik zijn. Kort na een wijziging kan het één achterlopen: die byte "+
+"wordt met twee seconden uitstel naar flash geschreven."}
+
 document.getElementById("a").onsubmit=function(ev){ev.preventDefault();
 /* f.elements[..] en niet f.name: op een formulier IS .name het name-attribuut
    van het formulier zelf en niet het veld dat zo heet. */
@@ -613,12 +1537,20 @@ post3("acl","key="+encodeURIComponent(f["key"].value.trim())+
 "&rd="+(f["rd"].checked?1:0)+"&alerts="+(f["alerts"].checked?1:0)+
 "&admin="+(f["admin"].checked?1:0)).then(function(){f["key"].value=""})};
 
-/* Twee tempo's, met opzet. Metingen veranderen per minuut, dus die elke 5 s.
+/* DRIE tempo's, met opzet. Metingen veranderen per minuut, dus die elke 5 s.
    De toegangslijst verandert alleen als er iemand klikt; de buurtlijst groeit
    met de tussenruimte van adverts (minuten). Elke 20 s is daarvoor ruim, en het
-   scheelt 4 kB per verversing over de wifi. */
+   scheelt 4 kB per verversing over de wifi.
+
+   DE INSTELLINGEN VERVERSEN NIET OP EEN KLOK. Ze veranderen alleen als iemand
+   hier op Opslaan drukt of aan de seriële console zit, en een formulier dat
+   onder je handen wordt bijgewerkt terwijl je erin typt is een formulier dat je
+   tekst weggooit. Eén keer bij het laden -- het kanaalbudget staat op het eerste
+   tabblad en moet er meteen staan -- en daarna bij het openen van het
+   beheertabblad en na elke gelukte wijziging. */
 u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
+cfg();
 </script></body></html>)HTML";
 
 /* -------------------------------- opslag ---------------------------------- */
@@ -674,6 +1606,26 @@ void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
 #endif
   }
 
+  /* De stand van de kanaaltoewijzer uit /monitors.cfg. EEN keer, hier, en nooit
+   * in een verzoekpad: dit is dezelfde afspraak als bij loadWifiConfig() -- een
+   * File-object alloceert intern, en dat mag bij het opstarten en niet per
+   * verzoek.
+   *
+   * De MonitorCfg staat op de stapel en niet statisch. Hij is ongeveer 500 byte
+   * en hij leeft één functieaanroep; begin() wordt uit setup() geroepen en daar
+   * is die ruimte er. Hem statisch maken zou 500 byte RAM kosten voor een waarde
+   * waar één byte van gebruikt wordt.
+   *
+   * Mislukt het lezen, dan blijft het masker 0 en vult cfg.json zich met wat er
+   * nu in gebruik is. Dat is een ONDERschatting van wat vergeven is, en dat is de
+   * goede kant om fout te zitten: de pagina belooft dan niet meer ruimte dan er
+   * is. Zij zegt er ook bij waar het getal op berust. */
+  {
+    MonitorCfg cfg;
+    MonitorStore::setDefaults(cfg);
+    if (MonitorStore::load(SPIFFS, cfg)) g_ever_mask = cfg.ch_ever_used;
+  }
+
   routes();
 }
 
@@ -697,10 +1649,23 @@ void WebTask::routes() {
   _server->on("/acl", HTTP_POST, web_route_aclset);
   _server->on("/acl/del", HTTP_POST, web_route_acldel);
   _server->on("/acl/strict", HTTP_POST, web_route_aclstrict);
+  /* Nodebeheer. De leeskant (/cfg.json) is een GET en verandert niets; de
+   * schrijfkant is EEN route, en die is POST-only. Dat is hier geen formaliteit:
+   * een GET /cli?cmd=erase zou een link zijn die de hele opslag wist zodra een
+   * browser hem voorlaadt, en dat is de ergste knop die dit apparaat heeft. */
+  _server->on("/cfg.json", HTTP_GET, web_route_cfgjson);
+  _server->on("/cli", HTTP_POST, web_route_cli);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
 void WebTask::loop() {
+  /* De uitgestelde opdracht eerst, en BUITEN de wifi-controle: hij is al
+   * aangenomen en al beantwoord, dus of er nu nog een netwerk is doet niet meer
+   * mee. Een aangevraagde herstart die niet doorgaat omdat de wifi tussendoor
+   * wegviel, is precies de soort halve toestand waar deze node niet in mag
+   * blijven staan. */
+  runDeferred();
+
   if (_wifi == nullptr) return;
 
   /* Alleen bedienen als er een netwerk is. In eigen-AP-modus juist WEL: dat is
@@ -1370,4 +2335,409 @@ void WebTask::handleAclStrict() {
     _server->send(200, "text/plain",
         "ok slot UIT; elke node op het mesh mag de sensoren uitlezen\n");
   }
+}
+
+/* ================================ nodebeheer ==============================
+ *
+ * WAAROM DIT EEN CONSOLE IS EN GEEN VERZAMELING ROUTES.
+ *
+ * Deze node is niet met de MeshCore-companion-app te beheren: er zit geen BLE op
+ * en deze firmware spreekt het companion-clientprotocol niet. Wat zij WEL heeft is
+ * haar CLI, en dat is dezelfde laag waarmee die app een repeater beheert. Eén
+ * route die een opdrachtregel doorgeeft levert daarom in één keer ALLES wat de app
+ * kan -- en, belangrijker, precies wat de seriële console kan, met dezelfde
+ * keuring en dezelfde grenzen. Een tweede schrijfpad met eigen keuring erlangs
+ * bouwen zou een tweede waarheid zijn, en twee waarheden lopen uiteen.
+ *
+ * De knoppen en formulieren op de pagina stellen niets anders samen dan zo'n
+ * regel. Dat is geen omweg maar het punt: wat het formulier doet, is na te lezen
+ * in de console eronder, en wie het formulier niet vertrouwt typt het zelf.
+ *
+ * sender_timestamp = 0, net als de seriële console in main.cpp. CommonCLI leest
+ * dat als "de console" en niet als "iemand op afstand", en laat er een handvol
+ * opdrachten op door die over het mesh geweigerd worden (set freq, erase, get acl,
+ * log, stats-*). Dat is hier de goede kant van de streep: deze webinterface hangt
+ * aan hetzelfde eigen netwerk als de USB-kabel. Wij zetten zelf een streep op een
+ * kleiner rijtje, hieronder, en met de reden in het antwoord.
+ */
+
+#ifndef ADMIN_PASSWORD
+  #define ADMIN_PASSWORD "password"
+#endif
+
+/* De ontsnapte teksten voor cfg.json, STATISCH en niet op de stapel. Deze handler
+ * loopt in dezelfde taak als the_mesh.loop(); daar hoort geen driekwart kilobyte
+ * aan buffers op de stapel, en op dit project is eerder al een stapeloverloop in
+ * upstream opgeruimd. Eén taak leest ze en één handler schrijft ze, dus statisch
+ * is hier ook veilig.
+ *
+ * DE MAAT IS CFG_TXT_MAX EN DE AFKAPPING GEBEURT IN jsonEscape ZELF. Die lus stopt
+ * met schrijven zolang er minder dan zeven byte over is, dus hij kapt nooit midden
+ * in een \u00xx-reeks af en laat nooit een losse backslash achter. Zelf achteraf
+ * op maat afkappen zou precies dat wel doen, en dan is het hele document ongeldig
+ * en blijft het tabblad leeg zonder dat er iets in de logs staat. */
+static char g_cfg_name[CFG_TXT_MAX];
+static char g_cfg_owner[CFG_TXT_MAX];
+static char g_cfg_raw[128];       /* owner_info (120 byte) met '\n' -> '|' */
+
+/* Prefix-vergelijking, en met opzet dezelfde losheid als CommonCLI zelf: dat doet
+ * memcmp op een vaste lengte, dus "rebootnu" herstart ook. Een strengere zeef hier
+ * zou opdrachten weigeren die de node wél zou uitvoeren -- en dan weigert de ene
+ * kant wat de andere doet. */
+static bool cmdIs(const char* cmd, const char* prefix) {
+  return memcmp(cmd, prefix, strlen(prefix)) == 0;
+}
+
+/* Een getal netjes, met achterste nullen eraf: 869.618 en niet 869.618000, 62.5 en
+ * niet 62.500.
+ *
+ * DIT IS GEEN COSMETICA. De pagina vergelijkt de huidige waarde als TEKST met de
+ * gebakken waarde om te laten zien waarvan deze node afwijkt. Zou de ene kant
+ * "62.5" schrijven en de andere "62.500", dan meldt de pagina een afwijking die er
+ * niet is -- en een waarschuwing die vals is, maakt de volgende ook niets meer
+ * waard. Beide kanten gaan daarom door deze ene functie.
+ */
+static void fmtNum(char* out, size_t len, double v, int dec) {
+  snprintf(out, len, "%.*f", dec, v);
+  char* dot = strchr(out, '.');
+  if (dot == NULL) return;
+  char* e = out + strlen(out);
+  while (e > dot && e[-1] == '0') *--e = 0;
+  if (e > out && e[-1] == '.') *--e = 0;
+}
+
+static const char* locPolicyName(uint8_t p) {
+  switch (p) {
+    case ADVERT_LOC_NONE:  return "none";
+    case ADVERT_LOC_SHARE: return "share";
+    case ADVERT_LOC_PREFS: return "prefs";
+  }
+  return "prefs";
+}
+
+static const char* loopDetectName(uint8_t l) {
+  switch (l) {
+    case LOOP_DETECT_OFF:      return "off";
+    case LOOP_DETECT_MINIMAL:  return "minimal";
+    case LOOP_DETECT_MODERATE: return "moderate";
+  }
+  return "strict";
+}
+
+/* GET /cfg.json -- de hele stand van NodePrefs in één antwoord.
+ *
+ * WAAROM NIET DERTIG KEER "get <veld>" OVER DE CLI. Dat zou het net zo goed doen
+ * en het zou zelfs consequenter zijn, maar het zijn dertig HTTP-verzoeken op een
+ * node die tussendoor een radio bedient, en elk verzoek gaat door dezelfde loop()
+ * als het meshwerk. De LEESkant mag daarom rechtstreeks in NodePrefs kijken; de
+ * SCHRIJFkant gaat wél over de CLI, want daar zit de keuring en het wegschrijven
+ * naar flash. Lezen kan niets stukmaken, schrijven wel.
+ *
+ * Er verandert hier niets, dus dit is de enige beheerroute die een GET mag zijn.
+ */
+void WebTask::handleCfgJson() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain",
+        "meshlaag niet gekoppeld: voeg in main.cpp setup() toe: "
+        "web_task.setAcl(&the_mesh);\n");
+    return;
+  }
+
+  NodePrefs* p = _acl->getNodePrefs();
+
+  /* Ontsnappen is hier niet netheid maar noodzaak: een nodenaam en een
+   * eigenaarsregel mogen alles bevatten, en één aanhalingsteken maakt het hele
+   * document ongeldig. */
+  jsonEscape(p->node_name, g_cfg_name, sizeof(g_cfg_name));
+
+  /* owner_info draagt echte regeleindes; de CLI toont en accepteert ze als '|'.
+   * Hier dezelfde omzetting, zodat wat de pagina voorvult ook terug te sturen is.
+   * Zonder die omzetting zou het formulier bij opslaan een opdracht met een
+   * regeleinde erin sturen -- en dat is geen opdrachtREGEL meer. */
+  {
+    size_t i = 0;
+    for (; p->owner_info[i] && i < sizeof(g_cfg_raw) - 1; i++) {
+      g_cfg_raw[i] = (p->owner_info[i] == '\n') ? '|' : p->owner_info[i];
+    }
+    g_cfg_raw[i] = 0;
+  }
+  jsonEscape(g_cfg_raw, g_cfg_owner, sizeof(g_cfg_owner));
+
+  char freq[16], bw[16], af[16], lat[20], lon[20];
+  char rxd[16], txd[16], dtxd[16], adc[16], bfreq[16], bbw[16];
+  fmtNum(freq, sizeof(freq), p->freq, 3);
+  fmtNum(bw,   sizeof(bw),   p->bw,   3);
+  fmtNum(af,   sizeof(af),   p->airtime_factor, 3);
+  fmtNum(lat,  sizeof(lat),  p->node_lat, 6);
+  fmtNum(lon,  sizeof(lon),  p->node_lon, 6);
+  fmtNum(rxd,  sizeof(rxd),  p->rx_delay_base, 3);
+  fmtNum(txd,  sizeof(txd),  p->tx_delay_factor, 3);
+  fmtNum(dtxd, sizeof(dtxd), p->direct_tx_delay_factor, 3);
+  fmtNum(adc,  sizeof(adc),  p->adc_multiplier, 3);
+  /* Door DEZELFDE functie als de huidige waarden -- zie de noot bij fmtNum(). */
+  fmtNum(bfreq, sizeof(bfreq), (double)LORA_FREQ, 3);
+  fmtNum(bbw,   sizeof(bbw),   (double)LORA_BW,   3);
+
+  char pubkey[PUB_KEY_SIZE*2 + 2];
+  mesh::Utils::toHex(pubkey, _acl->getSelfId().pub_key, PUB_KEY_SIZE);
+
+  /* HET KANAALBUDGET. g_ever_mask krijgt de kanalen die NU in gebruik zijn erbij:
+   * die zijn per definitie vergeven, en zo valt het gat dicht tussen een net
+   * aangemaakte monitor en de flashschrijving die twee seconden later komt. Bits
+   * gaan er alleen BIJ, nooit af -- net als bij ch_ever_used zelf. */
+  int mon_used = 0;
+  if (_mon != nullptr) {
+    mon_used = (int)_mon->getNumMonitors();
+    for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
+      uint8_t ch = _mon->monitorChannel(i);
+      if (ch >= MonitorSensors::CH_MONITOR_FIRST && ch <= MonitorSensors::CH_MONITOR_LAST) {
+        g_ever_mask |= (uint8_t)(1 << (ch - MonitorSensors::CH_MONITOR_FIRST));
+      }
+    }
+  }
+  int ever = 0;
+  for (int b = 0; b < MonitorSensors::MAX_MONITORS; b++) {
+    if (g_ever_mask & (1 << b)) ever++;
+  }
+
+  /* Twee aparte vragen en niet één. "Leeg" en "nog de gebakken waarde" zijn twee
+   * verschillende fouten met dezelfde uitkomst, en de pagina zegt ze ook
+   * verschillend -- want wie een leeg wachtwoord ziet staan denkt aan een fout in
+   * het opslaan, en wie "password" ziet staan denkt aan zichzelf. */
+  const bool pw_empty = (p->password[0] == 0);
+  const bool pw_def   = (strcmp(p->password, ADMIN_PASSWORD) == 0);
+
+  int n = snprintf(g_cfg, sizeof(g_cfg),
+      "{\"name\":\"%s\",\"owner\":\"%s\",\"pubkey\":\"%s\",\"role\":\"%s\","
+      "\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u,"
+      "\"tx\":%d,\"af\":\"%s\",\"agc\":%u,\"rxgain\":\"%s\",\"femrx\":\"%s\","
+      "\"lat\":\"%s\",\"lon\":\"%s\",\"advint\":%u,\"fadvint\":%u,"
+      "\"advloc\":\"%s\","
+      "\"repeat\":\"%s\",\"fmax\":%u,\"fmaxuns\":%u,\"fmaxadv\":%u,"
+      "\"loopd\":\"%s\",\"rxdelay\":\"%s\",\"txdelay\":\"%s\","
+      "\"dtxdelay\":\"%s\",\"multiack\":%u,\"hashmode\":%u,"
+      "\"cad\":\"%s\",\"intthr\":%u,\"rdonly\":\"%s\",\"adcmult\":\"%s\","
+      "\"pwdef\":%d,\"pwempty\":%d,"
+      "\"mon_used\":%d,\"mon_max\":%u,\"ch_first\":%u,\"ch_last\":%u,"
+      "\"ch_ever\":%d,\"ch_free\":%d,"
+      "\"baked\":{\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u}}",
+      g_cfg_name, g_cfg_owner, pubkey, _acl->getRole(),
+      freq, bw, (unsigned)p->sf, (unsigned)p->cr,
+      (int)p->tx_power_dbm, af, (unsigned)p->agc_reset_interval * 4,
+      p->rx_boosted_gain ? "on" : "off",
+      p->radio_fem_rxgain ? "on" : "off",
+      lat, lon,
+      (unsigned)p->advert_interval * 2, (unsigned)p->flood_advert_interval,
+      locPolicyName(p->advert_loc_policy),
+      p->disable_fwd ? "off" : "on",
+      (unsigned)p->flood_max, (unsigned)p->flood_max_unscoped,
+      (unsigned)p->flood_max_advert,
+      loopDetectName(p->loop_detect), rxd, txd, dtxd,
+      (unsigned)p->multi_acks, (unsigned)p->path_hash_mode,
+      p->cad_enabled ? "on" : "off", (unsigned)p->interference_threshold,
+      p->allow_read_only ? "on" : "off", adc,
+      pw_def ? 1 : 0, pw_empty ? 1 : 0,
+      mon_used, (unsigned)MonitorSensors::MAX_MONITORS,
+      (unsigned)MonitorSensors::CH_MONITOR_FIRST,
+      (unsigned)MonitorSensors::CH_MONITOR_LAST,
+      ever, (int)MonitorSensors::MAX_MONITORS - ever,
+      bfreq, bbw, (unsigned)LORA_SF, (unsigned)LORA_CR);
+
+  if (n < 0 || (size_t)n >= sizeof(g_cfg)) {   /* kan niet; vangnet */
+    _server->send(500, "text/plain", "antwoord te groot");
+    return;
+  }
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_cfg);
+}
+
+/* POST /cli   cmd=<opdracht>[&confirm=<teken>]
+ *
+ * DRIE OPDRACHTEN KOMEN HIER NIET DOOR, met de reden in het antwoord en niet stil:
+ *
+ *  - alles met prv.key. Dat is de PRIVESLEUTEL, en die gaat hier over HTTP zonder
+ *    TLS met een wachtwoord in base64 ernaast. Wie hem meeleest IS voortaan deze
+ *    node, op elke node die haar kent -- dat is niet iets wat je terugdraait door
+ *    een instelling te wijzigen. Over serieel mag het wel; daar leest niemand mee.
+ *  - start ota. Op ESP32 opent die een EIGEN accesspoint ("MeshCore-OTA") en een
+ *    TWEEDE webserver op poort 80. Precies deze pagina valt daar onder weg, en dan
+ *    is de weg waarlangs je hem startte weg. Aan de kabel is dat geen probleem.
+ *  - poweroff en shutdown. Diepe slaap zonder wektijd: alleen een fysieke reset
+ *    haalt de node daaruit, en dat kan niemand van hier. Een knop die het apparaat
+ *    onbereikbaar maakt hoort niet op een pagina die je alleen via dat apparaat
+ *    bereikt.
+ *
+ * En twee hebben een bevestiging in de POST nodig:
+ *
+ *  - set radio / set freq: confirm=radio. De pagina vraagt het al twee keer (een
+ *    vinkje en een confirm met de oude naast de nieuwe waarde), maar dat is de
+ *    BROWSER. Dit is de server, en dat is het slot dat een losse fetch, een
+ *    bookmarklet of een voorgeladen link niet omzeilt.
+ *  - erase: confirm=erase. Dat wist de monitorlijst, de toegangslijst, de
+ *    wifi-instelling en het kanaalgeheugen in één keer.
+ *
+ * Wat hier verder langskomt gaat ONGEWIJZIGD naar handleCommand. Er wordt niets
+ * herschreven, aangevuld of "verbeterd": wat je typt is wat de node krijgt, en dat
+ * is de enige manier waarop de console eronder een eerlijke weergave is van wat er
+ * gebeurd is.
+ */
+void WebTask::handleCli() {
+  if (!requireAuth()) return;
+
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain",
+        "meshlaag niet gekoppeld: voeg in main.cpp setup() toe: "
+        "web_task.setAcl(&the_mesh);\n");
+    return;
+  }
+
+  if (!getArg(*_server, "cmd", g_cmd, sizeof(g_cmd)) || g_cmd[0] == 0) {
+    _server->send(400, "text/plain", "geen opdracht\n");
+    return;
+  }
+
+  /* Regeleindes eraf: een <input> geeft ze niet, maar een script of curl wel, en
+   * handleCommand vergelijkt met memcmp -- "reboot\n" zou dan gewoon werken en
+   * "get radio\n" zou een veldnaam met een regeleinde erin opzoeken. */
+  for (char* q = g_cmd; *q; q++) if (*q == '\r' || *q == '\n') { *q = 0; break; }
+
+  /* Voorloopspaties eraf vóór onze eigen zeef. handleCommand doet dat zelf ook,
+   * maar dan zou "  erase" onze zeef langslopen en zijn zeef wél raken -- en dan
+   * weigert deze route iets dat de node alsnog uitvoert. */
+  char* cmd = g_cmd;
+  while (*cmd == ' ') cmd++;
+  if (*cmd == 0) {
+    _server->send(400, "text/plain", "geen opdracht\n");
+    return;
+  }
+
+  /* Dezelfde grens als de seriële console in main.cpp. Wat daar past hoort hier te
+   * passen en omgekeerd, anders neemt het ene pad een opdracht aan die het andere
+   * afkapt. */
+  if (strlen(cmd) > CLI_CMD_MAX) {
+    char msg[104];
+    snprintf(msg, sizeof(msg),
+        "opdracht te lang: %u tekens, hoogstens %d (net als de seriele "
+        "console)\n", (unsigned)strlen(cmd), CLI_CMD_MAX);
+    _server->send(400, "text/plain", msg);
+    return;
+  }
+
+  char cf[12];
+  if (!getArg(*_server, "confirm", cf, sizeof(cf))) cf[0] = 0;
+
+  /* ------------------------------ de weigeringen -------------------------- */
+
+  if (strstr(cmd, "prv.key") != NULL) {
+    _server->send(403, "text/plain",
+        "geweigerd: de privesleutel gaat hier over HTTP zonder TLS, met het "
+        "wachtwoord in base64 ernaast. Wie hem meeleest IS voortaan deze node. "
+        "Doe dit over de seriele console.\n");
+    return;
+  }
+  if (cmdIs(cmd, "start ota")) {
+    _server->send(403, "text/plain",
+        "geweigerd: 'start ota' opent een eigen accesspoint en een TWEEDE "
+        "webserver op poort 80 -- deze pagina valt daar onder weg. Doe dit over "
+        "de seriele console.\n");
+    return;
+  }
+  if (cmdIs(cmd, "poweroff") || cmdIs(cmd, "shutdown")) {
+    _server->send(403, "text/plain",
+        "geweigerd: diepe slaap zonder wektijd. Alleen een fysieke reset haalt de "
+        "node daaruit, en dat kan niemand van hier. Gebruik 'reboot'.\n");
+    return;
+  }
+  if (strcmp(cmd, "erase") == 0 && strcmp(cf, "erase") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd: 'erase' wist de monitorlijst, de toegangslijst, de "
+        "wifi-instelling en het kanaalgeheugen. Stuur confirm=erase mee.\n");
+    return;
+  }
+  if ((cmdIs(cmd, "set radio ") || cmdIs(cmd, "set freq "))
+      && strcmp(cf, "radio") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd: freq/bw/sf/cr bepalen of deze node nog op hetzelfde mesh zit. "
+        "Een verkeerd getal en niemand hoort hem nog over LoRa. Stuur "
+        "confirm=radio mee, of gebruik het formulier op het beheertabblad -- dat "
+        "zet de huidige en de gebakken waarde ernaast.\n");
+    return;
+  }
+
+  /* DE BUFFERGRENS VAN 'sensor set'. CommonCLI doet daar strcpy(tmp, &command[11])
+   * in een buffer van PRV_KEY_SIZE*2+4 = 68 byte. Dat is een ongebonden kopie in
+   * upstream en dus onze rand om dicht te zetten: 59 laat marge en is ruim genoeg
+   * voor het langste dat wij nodig hebben ("mon.12.host " plus een adres van 40
+   * tekens is 52). Weigeren aan deze kant is beter dan de node in een panic laten
+   * lopen op een waarde die wij zelf gestuurd hebben. */
+  if (cmdIs(cmd, "sensor set ")) {
+    size_t rest = strlen(cmd + 11);
+    if (rest > 59) {
+      char msg[112];
+      snprintf(msg, sizeof(msg),
+          "geweigerd: %u tekens achter 'sensor set', hoogstens 59 -- de "
+          "opdrachtbuffer van CommonCLI is 68 byte\n", (unsigned)rest);
+      _server->send(400, "text/plain", msg);
+      return;
+    }
+  }
+
+  /* ------------------------- de uitgestelde opdracht ---------------------- */
+
+  /* reboot en clkreboot KOMEN NIET TERUG uit handleCommand. Ze hier uitvoeren zou
+   * de verbinding afbreken vóór het antwoord verstuurd is, en dan weet niemand of
+   * de node herstart is of is omgevallen -- op een bewakingsnode is dat precies
+   * het verschil dat je wilt weten. Dus: eerst antwoorden, dan loop() een halve
+   * seconde later de opdracht laten uitvoeren. Geen delay(), alleen een tijdstip. */
+  if (cmdIs(cmd, "reboot") || cmdIs(cmd, "clkreboot")) {
+    strlcpy(g_deferred, cmd, sizeof(g_deferred));
+    g_deferred_at = millis() + 600;
+    _server->send(200, "text/plain",
+        "ok herstart aangevraagd; de node is over ongeveer 20 s weer bereikbaar. "
+        "De gemeten toestanden beginnen daarna weer op '?'.\n");
+    return;
+  }
+
+  /* ------------------------------- uitvoeren ------------------------------ */
+
+  /* handleCommand SCHRIJFT IN de opdracht (hij hakt hem op de spaties in stukken
+   * en kaatst een 'xx|'-prefix terug), vandaar een muteerbare buffer en geen
+   * String.
+   *
+   * Dat dit kan blokkeren is bekend en aanvaard: bijna elke 'set' doet
+   * savePrefs(), en een flashschrijving kost tientallen milliseconden. Dat is
+   * precies wat de seriële console ook doet, en het is een handeling die iemand
+   * met een klik aanvraagt -- niet iets dat per ronde gebeurt. De radio staat
+   * daarmee even stil; de alternatieven (een wachtrij, een tweede taak) zouden
+   * betekenen dat het antwoord niet meer bij de opdracht hoort, en dat is op een
+   * console erger dan een paar gemiste milliseconden. */
+  g_reply[0] = 0;
+  _acl->handleCommand(0, cmd, g_reply);
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "text/plain", g_reply);
+}
+
+/* De uitgestelde opdracht, uit loop(). Komt niet terug bij een herstart -- dat is
+ * precies de bedoeling. */
+void WebTask::runDeferred() {
+  if (g_deferred_at == 0) return;
+  /* Getekend verschil, zodat het ook klopt als millis() na 49 dagen overloopt. */
+  if ((long)(millis() - g_deferred_at) < 0) return;
+
+  g_deferred_at = 0;
+  if (_acl == nullptr || g_deferred[0] == 0) { g_deferred[0] = 0; return; }
+
+  /* Een eigen kopie, en g_deferred meteen leeg: handleCommand schrijft in de
+   * opdracht, en mocht hij tóch terugkomen (een onbekende opdracht) dan mag hij
+   * geen tweede keer uitgevoerd worden. */
+  char cmd[sizeof(g_deferred)];
+  strlcpy(cmd, g_deferred, sizeof(cmd));
+  g_deferred[0] = 0;
+
+  g_reply[0] = 0;
+  _acl->handleCommand(0, cmd, g_reply);
 }
