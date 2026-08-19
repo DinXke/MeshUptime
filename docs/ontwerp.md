@@ -185,3 +185,110 @@ Naast web en telemetrie ook opdrachten per DM, met 158 byte als harde vorm:
   berichten uitzenden omdat iemand `list` typte, is zendtijd van iedereen.
 - Wie mag dit? Alleen bekende contacten; dezelfde vraag als bij telemetrie, en
   nog te beslissen.
+
+---
+
+# Kan deze node tegelijk repeater zijn? (19 augustus 2026)
+
+## Ja, en het zit er al in
+
+`examples/companion_radio/MyMesh.cpp:485`
+
+    bool MyMesh::allowPacketForward(const mesh::Packet* packet) {
+      return _prefs.isRepeatEn();
+    }
+
+`allowPacketForward()` is een virtuele methode op `Mesh` en de companion
+overschrijft die al. Er is een instelling `repeat.disable_fwd` met
+`isRepeatEn()` / `setRepeatEn()`, en die is over de bestaande opdrachtinterface
+te zetten (`MyMesh.cpp:1398`). Doorsturen is dus geen tweede firmware en geen
+tweede identiteit: het is een vlag die er al staat.
+
+## Maar het doorsturen van de companion is naïef
+
+Dit is de eigenlijke waarschuwing. Vergelijk de twee versies.
+
+De companion (`NodePrefs.h:82`) — let op de weggecommentarieerde regels:
+
+    class RepeatPrefs : public ConfigSerializer {  // COPIED from CommonCLI (for now)
+      uint8_t disable_fwd = 1;
+      void structure() override {
+        def("disable", disable_fwd);
+        //def("f_max", flood_max);
+        //def("f_max_uns", flood_max_unscoped);
+        //def("f_max_adv", flood_max_advert);
+        //def("loop", loop_detect);
+      }
+    };
+
+De echte repeater (`simple_repeater/MyMesh.cpp:426`) doet zes controles:
+`disable_fwd`, `flood_max`, `flood_max_unscoped`, `flood_max_advert`, een
+regio- en transportcodecontrole, en lusdetectie in drie standen.
+
+**De companion heeft geen van die zes.** De velden bestaan niet eens in zijn
+struct. `repeat` aanzetten zoals het nu is, levert een repeater die alles
+doorstuurt wat een echte repeater juist wegfiltert, inclusief floodlussen.
+
+Dat is waar het zendtijdprobleem zit — en niet waar de vraag het vermoedde.
+
+## Zendtijd: de rollen botsen niet, het doorsturen is de kostenpost
+
+- De SX1262 heeft één modem. Ontvangen gebeurt hoe dan ook één keer; twee rollen
+  op één radio verdubbelen het ontvangen niet. Dat is gratis.
+- Zenden is de schaarse kant. Een bewakingsmelding is zeldzaam (alleen bij een
+  toestandsovergang) en kort (maximaal 158 byte). In verhouding tot wat een
+  repeater aan doorgestuurd verkeer uitzendt, is dat ruis.
+- De 1%-duty-cycle op 868 MHz wordt dus door de repeaterfunctie opgegeten, niet
+  door de bewaking. Wie zich zorgen maakt over zendtijd, moet naar `flood_max`
+  en lusdetectie kijken, niet naar het aantal sensoren.
+
+Eén echte samenloop blijft: als een melding klaarstaat terwijl de radio een
+doorgestuurd pakket uitzendt, wacht de melding. Bij een storing wil je dat niet.
+Vandaar de regel uit het ontwerp dat de radio voorgaat: de melding moet in de
+wachtrij en niet blokkerend verzonden worden, en de bezorgcontrole hierboven
+vangt op wat daardoor te laat komt.
+
+## Twee identiteiten: dat is niet wat SIREN doet
+
+Dit is een correctie op de aanname in de vraag, en het is nagekeken in de bron
+van SIREN zelf.
+
+- `firmware/examples/siren_room_server/MyMesh.cpp:260`: `self_id = rooms[0].id;`
+- `firmware/src/Mesh.cpp` regels 58, 88, 142, 197: nog steeds
+  `self_id.isHashMatch(...)`, precies zoals upstream. **Geen enkele aanpassing
+  voor meerdere identiteiten in de routering.**
+- `docs/replication-protocol.md`: *"Room 0 is the node identity layer and never
+  carries chat posts"*.
+
+SIREN heeft dus **één radio-identiteit** (room 0). De sleutels van room 1..N
+leven boven de meshlaag: ze versleutelen kamerinhoud en vullen de `room_hash` in
+de synchronisatieframes. De node antwoordt op het radioniveau op één adreshash,
+niet op meerdere.
+
+Een node die als twee aparte nodes op het mesh zichtbaar is, vraagt daarom een
+aanpassing in `src/Mesh.cpp` op vijf plaatsen (`isHashMatch` bij dest-hash, bij
+path-hash en bij flood), plus een keuze welke identiteit ECDH doet. Dat is een
+kernpatch, en we weten uit MeshStats wat een kernpatch kost: hij moet bij elke
+upstream-versie opnieuw worden aangebracht.
+
+**Advies: één identiteit.** De node kondigt zich aan met één `ADV_TYPE_*`
+(`CHAT=1`, `REPEATER=2`, `ROOM=3`, `SENSOR=4`) en doet alles: doorsturen,
+bewaken, DM-opdrachten beantwoorden, telemetrie leveren. De prijs is dat hij in
+de MeshCore-app in één lijstje staat en niet in twee. De opbrengst is geen
+kernpatch.
+
+Dit is wel een keuze die jij hoort te maken, want hij bepaalt hoe het apparaat
+er voor iedereen op het mesh uitziet.
+
+## Eén webserver voor beide rollen
+
+Beheer van bewaking én repeaterinstellingen op dezelfde webserver, in tabbladen
+of inklapbare secties. Dat volgt uit de ontwerpregel dat er geen tweede
+webserver bij komt, en het is dezelfde vorm die de repeater-GUI in MeshManager
+gekregen heeft.
+
+Voorwaarde: de vier ontbrekende repeatervelden moeten dan eerst bestaan.
+`flood_max`, `flood_max_unscoped`, `flood_max_advert` en `loop_detect` staan in
+`CommonCLI.h:141` klaar en zijn in de companion enkel uitgecommentarieerd — die
+overnemen is de eerste stap, en zonder die stap is een repeaterknop in de
+webinterface een knop die schade doet.
