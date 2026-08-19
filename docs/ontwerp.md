@@ -292,3 +292,72 @@ Voorwaarde: de vier ontbrekende repeatervelden moeten dan eerst bestaan.
 `CommonCLI.h:141` klaar en zijn in de companion enkel uitgecommentarieerd — die
 overnemen is de eerste stap, en zonder die stap is een repeaterknop in de
 webinterface een knop die schade doet.
+
+---
+
+# Twee identiteiten, of de juiste rol? (19 augustus 2026)
+
+De vraag was of één identiteit die zowel bewaakt als doorstuurt "fout loopt op
+het mesh" en de MeshCore-standaard niet volgt. Nagekeken in upstream, en het
+antwoord is het omgekeerde van wat de vraag vermoedde.
+
+## Elk niet-companion voorbeeld stuurt door met één identiteit
+
+| voorbeeld | kondigt zich aan als | stuurt door |
+|---|---|---|
+| `simple_repeater` | `ADV_TYPE_REPEATER` | ja, zes controles |
+| `simple_room_server` | `ADV_TYPE_ROOM` | ja, dezelfde controles |
+| `simple_sensor` | `ADV_TYPE_SENSOR` | ja, `disable_fwd` + `flood_max` |
+| `companion_radio` | `ADV_TYPE_CHAT` | ja, maar zonder één enkele controle |
+
+Doorsturen is in MeshCore **niet gebonden aan het advert-type**.
+`allowPacketForward()` wordt geraadpleegd wat een node ook aankondigt. Een
+identiteit die doorstuurt én een toepassing draait, is dus niet de uitzondering
+maar de regel: drie van de vier voorbeelden doen precies dat.
+
+**Wat wél fout is, is een verkeerd advert-type.** Een node die `ADV_TYPE_CHAT`
+aankondigt en andermans verkeer doorstuurt, is oneerlijk tegenover het mesh:
+niemand ziet dat hij infrastructuur is, niemand kan hem om statistieken vragen.
+Dat is de echte afwijking van de standaard — en de oplossing is niet een tweede
+identiteit, maar het juiste type aankondigen.
+
+Twee radio-identiteiten hebben in upstream **geen enkel voorbeeld**. SIREN doet
+het ook niet (zie de vorige sectie). Het vraagt een patch in `src/Mesh.cpp`.
+
+## simple_sensor is bijna letterlijk MeshUptime
+
+De belangrijkste vondst. `examples/simple_sensor` heeft al:
+
+- `ADV_TYPE_SENSOR` — precies wat dit apparaat is: het biedt sensoren aan
+- doorsturen mét beveiliging (`SensorMesh.cpp:304`), dus de repeaterstap achteraan
+  is dan een vlag omzetten en geen nieuw ontwerp
+- antwoorden op `REQ_TYPE_GET_TELEMETRY_DATA` — de virtuele telemetriesensoren
+- `TimeSeriesData.cpp/.h` — historiek op het apparaat zelf
+- `CommonCLI`, en dus `password` / `guest_password` / admin-login én CLI over DM.
+  Dat is exact het mechanisme voor "wie mag telemetrie opvragen" en voor de
+  `list` / `get` opdrachten
+- antwoord op node-discovery (`CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_SENSOR`)
+
+Wat het **niet** heeft: WiFi. En dat is de reden dat de keuze niet vanzelf gaat.
+
+## Correctie op een aanname van mij
+
+De upstream companion heeft **geen webserver**. `WIFI_SSID` in
+`companion_radio_wifi` zet `SerialWifiInterface` aan: het clientprotocol over
+TCP, zodat de MeshCore-app over WiFi kan koppelen in plaats van over BLE of USB.
+De webpagina die deze node nu heeft, was onze eigen toevoeging en staat niet in
+upstream.
+
+De webinterface moet dus op elke basis van nul gebouwd worden. Dat is geen
+argument voor of tegen een van de twee.
+
+## De afweging
+
+Vanaf `companion_radio` moeten erbij: telemetrie antwoorden, historiek,
+CommonCLI met wachtwoorden, doorstuurbeveiligingen — en de chat, contacten en
+kanalen moeten eruit.
+
+Vanaf `simple_sensor` moet erbij: WiFi, webserver, webhook, ping.
+
+Het tweede lijstje is kleiner en bevat niets dat het mesh raakt. Het eerste
+lijstje is precies het lijstje dat `simple_sensor` al af heeft.
