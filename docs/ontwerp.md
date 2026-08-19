@@ -702,3 +702,100 @@ Ping-monitors op kanaal 5 en hoger, de koppeling van `/hook` naar telemetrie en
 meshwaarschuwingen, de DM-opdrachten `list` / `get` / `status` met de knipgrens
 van 158 byte, eigen instellingenopslag, en als laatste de repeaterrol met de
 tweede identiteit.
+
+---
+
+# Ping-monitors en DM-opdrachten werkend (19 augustus 2026)
+
+    RAM:   19,4%  (63.472 van 327.680)
+    Flash: 37,2%  (1.243.797 van 3.342.336)
+
+Op het toestel nagemeten:
+
+    > sensor list
+      mains.hi=4.120     mains.lo=4.090     mains.state=1
+      mon.count=2
+      mon.5.name=router  mon.5.host=192.168.110.254  mon.5.int=15
+      mon.6.name=google  mon.6.host=8.8.8.8          mon.6.int=20
+
+    > sensor get mon.5.state   ->  up 11ms
+    > sensor get mon.6.state   ->  up 27ms
+
+Kanaal 5 en 6 toegekend, en de monitors hebben een herstart overleefd: de opslag
+in SPIFFS werkt, inclusief `ch_ever_used` zodat een nummer na een herstart niet
+opnieuw wordt uitgedeeld.
+
+Direct na het opstarten stond er `pauze` in plaats van `up`. Dat is de bedoelde
+insteltijd van 30 s nadat WiFi opkomt, niet een fout — DHCP, DNS en routes hebben
+ook even nodig. Na 45 s stonden de metingen er.
+
+## Een stack-overflow in upstream CommonCLI, over het mesh bereikbaar
+
+`sensor list` legde de node om: `Guru Meditation Error (LoadProhibited)`,
+`EXCVADDR: 0x0000000c`. Het is precies uit te rekenen.
+
+`CommonCLI.cpp:307` schrijft met **ongebonden `sprintf`** en stopt pas als de
+schrijfpositie 134 voorbij is; daarna komt er nog `... next:N` bij:
+
+    for (i = start; i < end && (dp-reply < 134); i++) {
+      sprintf(dp, "%s=%s\n", getSettingName(i), getSettingValue(i));
+      ...
+    }
+    if (i < end) sprintf(dp, "... next:%d", i);
+
+Met `mon.5.host=192.168.110.254` staat de positie na die regel op 156, en de
+elf byte van `... next:8` brengen het op **168 in een buffer van 160**. Met
+beginindex 1 eindigt het op 141 en past het net — vandaar dat alleen
+`sensor list` en `sensor list 0` omvielen en `sensor list 1` werkte. Ingesloten
+door de beginindex af te tellen van 13 naar 0.
+
+De grens van 134 veronderstelt korte waarden. Een IP-adres van 15 tekens is al
+genoeg, en een hostnaam mag bij ons 40 tekens zijn.
+
+**Dit is over het mesh bereikbaar.** `SensorMesh.cpp` gebruikt voor de mesh-CLI
+`uint8_t temp[166]` met `reply` op offset 5, dus 161 byte — dezelfde overloop,
+aan te roepen door een admin die `sensor list` als CLI-bericht stuurt.
+
+Gerepareerd aan de kant die wij bezitten: `reply[160]` → `reply[256]` in
+`main.cpp` en `temp[166]` → `temp[262]` in `SensorMesh.cpp`. Bovengrens met een
+hostnaam van 40 tekens is 134 + 53 + 12 = 199, dus 256 geeft ruimte. Na de
+reparatie loopt `sensor list` door en meldt hij `... next:8`.
+
+De eigenlijke fout zit in `src/helpers/CommonCLI.cpp` en is niet van ons. Het is
+de **tweede** in dezelfde hoek: `CommonCLI.h:258` doet
+`strcpy(tmp, &command[11])` in een buffer van 68 byte zonder lengtecontrole, dus
+elke lange `sensor set`-waarde loopt daar over. Beide horen upstream gemeld.
+
+## Wat de agents scherper zagen dan de opdracht
+
+- **Bevriezen bij wegvallende WiFi**, niet "down" melden: zonder wifi meet je je
+  eigen netwerk en niet de dienst. Kanaal 4 op 0 vertelt de lezer dat de
+  monitorwaarden oud zijn. Een DNS-fout telt wél als storing, een tekort aan onze
+  kant niet.
+- **`ch_ever_used` in het opslagbestand.** Zonder die byte begint de node na een
+  herstart weer bij kanaal 5 en geldt de afspraak dat nummers nooit hergebruikt
+  worden maar voor één stroomvoorziening.
+- **Het getal in `mon.5.host` is het kanaal, geen rangnummer** — een rangnummer
+  schuift op bij verwijderen en wijst dan stil naar een andere dienst.
+- **Herhalen op ACK** bij de DM-antwoorden: zonder dat is de keuze voor
+  `TXT_TYPE_PLAIN` (je krijgt een ACK, dus je weet of het aankwam) dode letter.
+- **De knipper had een echt lek**, gevonden met 20.000 gevallen in een
+  Python-model: 132 berichten van tot 184 byte, boven `MAX_TEXT_LEN`. De
+  slotregel werd achter het laatste stuk geplakt zonder dat er ruimte voor
+  gereserveerd was. Na reparatie 0 overtredingen, langste bericht exact 158.
+  Twaalf sensoren met naam en toestand is precies 158 byte — met de knipgrens op
+  160 was dat een bericht geweest dat na de vierde poging niet meer opnieuw te
+  versturen is.
+
+## Nog open
+
+- **De DM-opdrachten bereiken alleen een admin.** `SensorMesh::onPeerDataRecv`
+  laat tekstberichten door met `&& from->isAdmin()`. De rechtentoets in
+  DmCommands is juist maar nog niet zichtbaar; openzetten voor leescontacten is
+  het weghalen van die voorwaarde en de toets aan `isAllowed()` laten. Bewust
+  niet gedaan: rechten verruimen is een keuze van de eigenaar.
+- **`/hook` is nog niet doorgekoppeld.** Antwoordt nu eerlijk met **202** en
+  `opgeslagen (naam), nog niet als telemetrie gepubliceerd` in plaats van `ok`.
+  De koppeling gaat door dezelfde kanaaltoewijzer als de ping-monitors, niet door
+  een tweede.
+- Telemetrie end-to-end is nog niet door een tweede node opgevraagd.

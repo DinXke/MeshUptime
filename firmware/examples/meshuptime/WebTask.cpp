@@ -403,5 +403,17 @@ void WebTask::handleHook() {
   slot->ms = ms_val;
   slot->at_millis = millis();
 
-  _server->send(200, "text/plain", "ok");
+  /* Niet "ok". De melding is gekeurd en opgeslagen, maar nog NIET gepubliceerd
+   * als telemetrie en nog niet omgezet in een meshwaarschuwing -- zie de TODO
+   * boven deze functie. Een route die "ok" antwoordt terwijl ze de helft van het
+   * werk doet, laat de aanroeper denken dat het klaar is; dat is precies hoe
+   * iemand een uur kwijt is aan zoeken naar een sensor die er niet is.
+   *
+   * Let ook op wat er straks WEL gebeurt: de melding krijgt een KANAALNUMMER,
+   * geen naam. CayenneLPP draagt alleen kanaal, type en waarde -- er is geen
+   * naamveld. De naam reist over het mesh via de DM-opdracht 'list'. */
+  char msg[96];
+  snprintf(msg, sizeof(msg),
+           "opgeslagen (%s), nog niet als telemetrie gepubliceerd\n", name);
+  _server->send(202, "text/plain", msg);
 }

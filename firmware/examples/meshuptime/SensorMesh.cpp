@@ -583,7 +583,13 @@ void SensorMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_i
         // len can be > original length, but 'text' will be padded with zeroes
         data[len] = 0; // need to make a C string again, with null terminator
 
-        uint8_t temp[166];
+        /* 262 en niet 166: reply staat op offset 5, dus 161 byte, en
+         * CommonCLI's "sensor list" kan er 168 in schrijven. Diezelfde
+         * stack-overflow is hier dus OVER HET MESH bereikbaar voor een admin.
+         * Zie de noot in main.cpp. Een antwoord langer dan MAX_TEXT_LEN wordt
+         * hierna alsnog geweigerd door composeMsgPacket, dus het ergste gevolg
+         * is een uitgebleven antwoord in plaats van een omgevallen node. */
+        uint8_t temp[262];
         char *command = (char *) &data[5];
         char *reply = (char *) &temp[5];
         handleCommand(sender_timestamp, command, reply);
