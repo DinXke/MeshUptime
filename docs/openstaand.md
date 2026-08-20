@@ -261,3 +261,36 @@ Geen gebrek, maar wel het soort verrassing dat iemand een avond kost:
   firmware en sleutel staan buiten de repo in een back-up.
 - **De oude sleutel.** De node heeft een nieuw sleutelpaar; wie hem als contact
   had, moet hem opnieuw toevoegen.
+
+---
+
+## Mesh-uitlezing: verfijnde diagnose (20 aug 2026, nacht)
+
+Met seriële debug op de node BEWEZEN, en dat verandert het beeld:
+
+    [DBG] ANON_REQ ontvangen len=16 flood=1    <- login KOMT AAN
+    [DBG] login reply_len=13                     <- node ACCEPTEERT en antwoordt
+    [DBG] login-antwoord FLOOD verstuurd
+
+De node ontvangt de login, accepteert hem (in ACL-modus, leeg wachtwoord, met
+DinX-Home in de ACL) en verstuurt het antwoord. De eerdere weigering (reply_len=0)
+kwam doordat de repeater in WACHTWOORD-modus stond met een wachtwoord dat niet
+overeenkwam — opgelost door de monitor op leeg wachtwoord te zetten (act=pass met
+lege waarde), wat de juiste modus is voor een sensor.
+
+**Maar het antwoord bereikt de repeater niet** — lr blijft NOANSWER, ook na de
+flash naar repeater-firmware 2.10.0. Het is dus een retourprobleem op meshniveau,
+onafhankelijk van de firmwareversie.
+
+Aanwijzing: de twee nodes die een FLOOD-login vereisen (geen bekend pad) falen
+beide — onze node op de login-reply, Pukkelpop (eaf6f1) op het verzoek ná een
+geslaagde login. De nodes die WEL werken zijn repeaters die blijvend ingelogd zijn
+en de login overslaan (`req direct hops=0`). Vermoedelijk zit het in de
+flood-path-return: scope/transportcode van het antwoord, of timing tegen de
+login-timeout van de repeater (SERVER_RESPONSE_DELAY). Volgende stap vraagt
+seriële trace OP de repeater of een packet-capture — niet vanaf de node te zien,
+want die verstuurt aantoonbaar correct.
+
+**De IP-weg werkt wel en is nu de hoofdweg**: MeshManager leest de node over
+/status.json, met kanaalnamen. De mesh-weg is de redundante weg voor als WiFi weg
+is, en blijft open.
