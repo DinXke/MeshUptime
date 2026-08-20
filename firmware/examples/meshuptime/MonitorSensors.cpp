@@ -1606,7 +1606,13 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
   if (argc == 0) return NULL;
 
   /* ---- add <naam> <adres> [interval] ---- */
-  if (strcmp(argv[0], "add") == 0) {
+  /* strcasecmp en niet strcmp: een telefoontoetsenbord maakt van "ping" vanzelf
+   * "Ping", en de gebruiker kreeg daardoor "onbekende opdracht" terug op een
+   * commando dat bestond. list/get/status in DmCommands waren al
+   * hoofdletterongevoelig; deze vier horen dat dus ook te zijn. Alleen het
+   * COMMANDOWOORD -- namen en adressen blijven exact, want "UDM-Pro" en
+   * "udm-pro" zijn verschillende monitors. */
+  if (strcasecmp(argv[0], "add") == 0) {
     if (argc < 3) {
       snprintf(s_dm_buf, sizeof(s_dm_buf), "add <naam> <adres> [interval]");
       return s_dm_buf;
@@ -1630,7 +1636,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
   }
 
   /* ---- del <naam|kanaal> ---- */
-  if (strcmp(argv[0], "del") == 0) {
+  if (strcasecmp(argv[0], "del") == 0) {
     if (argc < 2) { snprintf(s_dm_buf, sizeof(s_dm_buf), "del <naam|kanaal>"); return s_dm_buf; }
     int slot = resolveTarget(argv[1]);
     if (slot < 0) {
@@ -1656,7 +1662,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
   }
 
   /* ---- edit <naam|kanaal> [host=..] [int=..] [naam=..] [ms=0|1] ---- */
-  if (strcmp(argv[0], "edit") == 0) {
+  if (strcasecmp(argv[0], "edit") == 0) {
     if (argc < 3) {
       snprintf(s_dm_buf, sizeof(s_dm_buf),
                "edit <naam|kanaal> [host=<adres>] [int=<s>] [naam=<nieuw>] [ms=0|1]");
@@ -1719,7 +1725,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
    * / een weigering). De echte uitslag komt via adhocReady()/adhocResultText(),
    * die DmCommands na een paar seconden ophaalt en als eigen DM stuurt. Zo blokt
    * niets: het commando keurt en start, meer niet. */
-  if (strcmp(argv[0], "ping") == 0) {
+  if (strcasecmp(argv[0], "ping") == 0) {
     if (argc < 2) { snprintf(s_dm_buf, sizeof(s_dm_buf), "ping <adres> [n]"); return s_dm_buf; }
     /* Zonder wifi meteen een eerlijk antwoord en niets starten -- pingen zou
      * onze eigen verbinding meten, niet het adres. */

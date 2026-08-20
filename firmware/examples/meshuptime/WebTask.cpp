@@ -1893,6 +1893,10 @@ function isErr(t){return /^(err|error|unknown|can't|\?\?)/i.test((t||"").trim())
    node die tussendoor een radio bedient vijf keer een flashschrijving in de wacht
    zet. Achter elkaar is hier vriendelijker dan tegelijk. */
 function cli(cmd,cf){
+/* Getypte 'ping' gaat als 'icmp' de draad op: een IPS onderweg (zie de route in
+   handleCli) doodt HTTP-bodies met kleine-letters ping+spatie. Zelfde lengte,
+   zelfde engine; alleen het woord op de draad verschilt. */
+if(/^\s*ping(\s|$)/i.test(cmd)){cmd=cmd.replace(/^\s*ping/i,"icmp")}
 var b="cmd="+encodeURIComponent(cmd);
 if(cf){b+="&confirm="+cf}
 return fetch("cli",{method:"POST",
@@ -3737,7 +3741,19 @@ void WebTask::handleCli() {
    * antwoorden "gestart" en de uitslag verschijnt daarna in /status.json, precies
    * zoals de pagina hem toont. Wie geen sensorlaag heeft, valt door naar de
    * gewone afhandeling (die dan "Unknown command" geeft). */
-  if ((cmdIs(cmd, "ping ") || strcmp(cmd, "ping") == 0) && _mon != nullptr) {
+  /* OOK 'icmp' als draad-alias, en dit is GEMETEN noodzaak en geen sier: een
+   * IPS op het netwerk van de gebruiker (UDM Pro, Intrusion Prevention) reset
+   * elke HTTP-verbinding waarvan de body exact kleine-letters "ping" plus
+   * witruimte bevat -- de klassieke command-injection-signatuur. Getest op
+   * 20-8-2026: 'pinx 8.8.8.8' en 'PING 8.8.8.8' bereikten de node (200),
+   * 'ping 8.8.8.8' werd op het pad gedood; vanaf een ander netwerksegment kwam
+   * dezelfde opdracht wel aan. De console-JS herschrijft een getypte ping
+   * daarom naar icmp voordat hij de draad op gaat; beide woorden zijn 4 tekens,
+   * dus cmd+4 blijft kloppen. Over de DM (LoRa, versleuteld) blijft het gewoon
+   * 'ping' -- daar kijkt geen middlebox mee. */
+  if ((cmdIs(cmd, "ping ") || strcmp(cmd, "ping") == 0 ||
+       cmdIs(cmd, "icmp ") || strcmp(cmd, "icmp") == 0 ||
+       cmdIs(cmd, "Ping ") || cmdIs(cmd, "PING ")) && _mon != nullptr) {
     const char* arg = cmd + 4;
     while (*arg == ' ') arg++;
     char host[MON_HOST_LEN + 4]; host[0] = 0;

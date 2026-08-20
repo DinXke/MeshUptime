@@ -314,3 +314,20 @@ Ze staan hier omdat ze elke ronde opnieuw de doorslag hebben gegeven.
 6. Eén zeef per soort invoer. Twee zeven die 99% hetzelfde doen, geven ooit een
    naam die het ene pad aanneemt en het andere weigert — en dat vind je alleen
    door beide paden naast elkaar te proberen.
+
+## Waarom de webconsole 'icmp' over de draad stuurt als jij 'ping' typt (20 aug 2026)
+
+Een IPS in het netwerk van de eigenaar (UDM Pro, Intrusion Prevention) reset elke
+HTTP-verbinding waarvan de body exact kleine-letters `ping` plus witruimte bevat --
+de klassieke command-injection-signatuur. Gemeten, niet vermoed: `pinx 8.8.8.8` en
+`PING 8.8.8.8` bereikten de node (200), `ping 8.8.8.8` stierf op het pad, en vanaf
+een ander netwerksegment kwam exact dezelfde opdracht wel aan en draaide de ping
+gewoon (`3/3 ok`).
+
+De keuze: niet de gebruiker zijn IPS laten herconfigureren, maar het woord op de
+draad veranderen. De console-JS herschrijft een getypte `ping` naar `icmp` voor het
+verzenden; de node accepteert beide (zelfde lengte, zelfde route, zelfde engine).
+Over de DM (LoRa, versleuteld) blijft het `ping`, want daar kijkt geen middlebox
+mee. Een beveiligingsdoos die je eigen beheerverkeer sloopt is een omgevingsfeit;
+er stil omheen werken met een alias is goedkoper dan documentatie die zegt "zet je
+IPS uit".
