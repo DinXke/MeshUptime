@@ -99,6 +99,14 @@ protected:
    * verschuiven als er een monitor verdwijnt. Kost ongeveer 1,7 kB, want elke
    * Trigger draagt een tekstbuffer van MAX_PACKET_PAYLOAD. */
   Trigger monitor_down[MonitorSensors::MAX_MONITORS];
+  /* De herstelmeldingen, de vaste-kanaalmeldingen en het testbericht lopen langs
+   * hetzelfde alertIf() als de storingen, dus met dezelfde ACK-bezorgcontrole en
+   * geen tweede verzendweg. Een Trigger per vakje/soort, want dat verband mag
+   * niet verschuiven als er een monitor verdwijnt. */
+  Trigger monitor_up[MonitorSensors::MAX_MONITORS];
+  Trigger fixed_down[MonitorSensors::FIXED_ALERT_COUNT];
+  Trigger fixed_up[MonitorSensors::FIXED_ALERT_COUNT];
+  Trigger alert_test;
   TimeSeriesData  battery_data;
 
   void onSensorDataRead() override {
@@ -114,7 +122,16 @@ protected:
     for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
       alertIf(sensors.monitorAlert(i), monitor_down[i], LOW_PRI_ALERT,
               sensors.monitorAlertText(i));
+      alertIf(sensors.recoverAlert(i), monitor_up[i],  LOW_PRI_ALERT,
+              sensors.recoverAlertText(i));
     }
+    for (int k = 0; k < MonitorSensors::FIXED_ALERT_COUNT; k++) {
+      alertIf(sensors.fixedAlert(k),        fixed_down[k], LOW_PRI_ALERT,
+              sensors.fixedAlertText(k));
+      alertIf(sensors.fixedRecoverAlert(k), fixed_up[k],   LOW_PRI_ALERT,
+              sensors.fixedRecoverAlertText(k));
+    }
+    alertIf(sensors.testAlert(), alert_test, LOW_PRI_ALERT, sensors.testAlertText());
   }
 
   int querySeriesData(uint32_t start_secs_ago, uint32_t end_secs_ago, MinMaxAvg dest[], int max_num) override {
@@ -128,6 +145,10 @@ protected:
 
   void onAckRecv(mesh::Packet* packet, uint32_t ack_crc) override {
     if (dm.onAck(ack_crc)) { packet->markDoNotRetransmit(); return; }
+    /* Het testbericht telt zijn bevestigingen zelf, zodat "verstuurd naar N" en
+     * "bevestigd M/N" uit elkaar gehouden worden -- dat verschil is de hele reden
+     * dat een testbericht bestaat. */
+    sensors.noteAlertAck(ack_crc, alert_test.expected_acks, alert_test.attempt);
     SensorMesh::onAckRecv(packet, ack_crc);
   }
 

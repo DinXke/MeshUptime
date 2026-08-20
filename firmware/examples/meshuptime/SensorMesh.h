@@ -69,8 +69,43 @@ public:
   void eraseLogFile() override { }
   void dumpLogFile() override { }
   void setTxPower(int8_t power_dbm) override;
+  /* Was "not supported", en dat was zonde: de gegevens BESTAAN. De buurtring
+   * die voor het toegangsbeheer gebouwd is (NeighbourList, gevuld uit
+   * onAdvertRecv) houdt precies bij wie er langskomt. Alleen de verbinding
+   * ontbrak, dus een knop die er wel was gaf een antwoord dat niets zei.
+   *
+   * De uitvoer is HARD BEGRENSD en dat is geen zuinigheid: CommonCLI schrijft
+   * met sprintf zonder grens, de seriele buffer is 256 byte en de mesh-CLI heeft
+   * 257 (temp[262] met reply op offset 5). Twaalf buren van ~34 tekens zijn
+   * 400 byte, dus zonder rem is dit een stack-overflow -- precies de fout die
+   * 'sensor list' hier eerder veroorzaakte. Wat niet past wordt geteld en
+   * gemeld, in plaats van stil weggelaten. */
   void formatNeighborsReply(char *reply) override {
-    strcpy(reply, "not supported");
+    const int LIMIT = 200;              // ruim onder de kleinste buffer (256)
+    int n = neighbours.getNumEntries();
+    if (n == 0) {
+      strcpy(reply, "nog geen adverts gehoord");
+      return;
+    }
+    uint32_t now = getRTCClock()->getCurrentTime();
+    int p = snprintf(reply, LIMIT, "%d gehoord:", n);
+    int shown = 0;
+    for (int i = 0; i < n; i++) {
+      const NeighbourEntry* e = neighbours.getEntryByIdx(i);
+      if (e == NULL) continue;
+      char hex[9];
+      mesh::Utils::toHex(hex, e->pub_key, 4);
+      /* Naam kan leeg zijn als het advert er geen droeg; dan alleen de prefix,
+       * want een lege plek in een lijst leest als een fout. */
+      int w = snprintf(reply + p, LIMIT - p, " %s%s%s %d.%dq %uh %us;",
+                       hex, e->name[0] ? "/" : "", e->name,
+                       e->snr4 / 4, (e->snr4 < 0 ? -e->snr4 : e->snr4) % 4 * 25,
+                       (unsigned) e->hops,
+                       (unsigned) (now > e->heard_at ? now - e->heard_at : 0));
+      if (w < 0 || p + w >= LIMIT - 18) break;   // 18 = ruimte voor de slotregel
+      p += w; shown++;
+    }
+    if (shown < n) snprintf(reply + p, LIMIT - p, " (+%d niet vermeld)", n - shown);
   }
   void formatStatsReply(char *reply) override;
   void formatRadioStatsReply(char *reply) override;
@@ -173,6 +208,49 @@ protected:
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onControlDataRecv(mesh::Packet* packet) override;
   void onAckRecv(mesh::Packet* packet, uint32_t ack_crc) override;
+
+  /* Zonder deze override gaf 'region save' altijd 'Err - save failed'.
+   *
+   * CommonCLI roept _callbacks->saveRegions() aan, en de basisklasse heeft daar
+   * alleen een stub die false teruggeeft. SensorMesh HAD al een region_map en
+   * laadde die ook (region_map.load(_fs) in begin()), maar kon hem niet
+   * wegschrijven -- dus een gewijzigde regiokaart was na een herstart weg. Dit is
+   * dezelfde eenregelaar die simple_repeater al had (MyMesh.cpp:1131).
+   *
+   * Let op wat er WEL werkte: 'region home' en 'region default' staan in
+   * NodePrefs, en savePrefs() loopt in CommonCLI vóór saveRegions(). Die twee
+   * bleven dus bewaard terwijl de opdracht een fout meldde -- een foutmelding
+   * die maar de helft van de waarheid vertelde.
+   *
+   * Nog niet geïmplementeerd: startRegionsLoad(), waar 'region load' op wacht.
+   * Die vraagt een tijdelijke kaart en een laadstapel (zie MyMesh.cpp:1124) en
+   * hoort bij het INLEZEN van een regioboom, niet bij bewaren. Blijft dus stil
+   * niets doen; dat is een apart gat en het staat hier zodat het vindbaar is. */
+  bool saveRegions() override { return region_map.save(_fs); }
+
+  /* Zonder deze override deed 'region default <naam>' niets aan de UITGAANDE
+   * pakketten.
+   *
+   * default_scope is de transportsleutel die bij het verzenden gebruikt wordt, en
+   * die werd alleen in begin() berekend (zie de twee getTransportKeysFor-aanroepen
+   * daar). CommonCLI meldt een gewijzigde standaardregio via deze callback, maar
+   * de basisklasse heeft er een 'no op' voor -- dus de regiokaart klopte wel en
+   * de sleutel niet, en de node zond ongescoped verder tot de volgende herstart.
+   *
+   * Zo zag het eruit van buiten: waarnemers als CoreScope toonden onze node zonder
+   * scope terwijl elke andere node #be had. Geen foutmelding, geen aanwijzing --
+   * alleen een leeg vakje in andermans lijst. Dat is precies de foutklasse waar
+   * dit project vol van staat: een instelling die geaccepteerd wordt en niet
+   * doorwerkt.
+   *
+   * Dit is dezelfde drieregelaar die simple_repeater al had (MyMesh.cpp:1135). */
+  void onDefaultRegionChanged(const RegionEntry* r) override {
+    if (r) {
+      region_map.getTransportKeysFor(*r, &default_scope, 1);
+    } else {
+      memset(default_scope.key, 0, sizeof(default_scope.key));
+    }
+  }
   virtual bool handleIncomingMsg(ClientInfo& from, uint32_t timestamp, uint8_t* data, uint8_t flags, size_t len);
   void sendAckTo(const ClientInfo& dest, uint32_t ack_hash, uint8_t path_hash_size=1);
 private:

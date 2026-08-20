@@ -2,9 +2,9 @@
 
 #include <Mesh.h>   /* alleen voor MESH_DEBUG_PRINTLN */
 
-/* Ruim genomen: de langste regel is "m 12 86400 zestien-tekens. " plus een
- * adres van 40 tekens = 62 tekens. 96 laat plek voor een veld erbij zonder dat
- * een oud bestand ineens afgekapt lijkt. */
+/* Ruim genomen: de langste regel is "m 36 3600 zestien-tekens. " plus een adres
+ * van 40 tekens plus de ping-vlag = 70 tekens. 96 laat plek voor nog een veld
+ * zonder dat een oud bestand ineens afgekapt lijkt. */
 #define MON_LINE_MAX  96
 
 /* De drempels uit docs/meting-voeding-2026-08-19.log; dezelfde getallen als in
@@ -17,6 +17,12 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
   cfg.mains_hi = MON_DEFAULT_HI;
   cfg.mains_lo = MON_DEFAULT_LO;
   cfg.ch_ever_used = 0;
+  /* Herstelmeldingen standaard AAN. Zonder die melding krijg je "onbereikbaar"
+   * en daarna nooit meer iets, en dan is "het is opgelost" niet te onderscheiden
+   * van "de node is gestopt met melden". Wie het niet wil, zet het uit -- maar de
+   * standaard hoort de stand te zijn die het minste stilte oplevert. */
+  cfg.recover_alerts = 1;
+  cfg.rhold_s = MON_RHOLD_DEFAULT;
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
 }
@@ -100,8 +106,8 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       break;
     }
 
-    char* parts[5];
-    int n = splitTokens(line, parts, 5);
+    char* parts[6];
+    int n = splitTokens(line, parts, 6);
     if (n < 2) continue;               /* onvolledige regel: overslaan */
 
     if (strcmp(parts[0], "hi") == 0) {
@@ -109,15 +115,33 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
     } else if (strcmp(parts[0], "lo") == 0) {
       staged.mains_lo = atof(parts[1]);
     } else if (strcmp(parts[0], "ever") == 0) {
-      staged.ch_ever_used = (uint8_t)atoi(parts[1]);
+      /* strtoul en niet atoi: met 32 kanalen loopt dit masker tot 2^32-1 en atoi
+       * geeft een int. Een bestand van vóór deze wijziging draagt hier een
+       * waarde 0..255 en blijft dus gewoon leesbaar. */
+      staged.ch_ever_used = (uint32_t)strtoul(parts[1], NULL, 10);
+    } else if (strcmp(parts[0], "rec") == 0) {
+      staged.recover_alerts = atoi(parts[1]) ? 1 : 0;
+    } else if (strcmp(parts[0], "rhold") == 0) {
+      /* Buiten de grenzen: de standaard en niet de waarde uit het bestand. Een
+       * rustperiode van een dag zou een herstelmelding stil afschaffen. */
+      int v = atoi(parts[1]);
+      staged.rhold_s = (v >= MON_RHOLD_MIN && v <= MON_RHOLD_MAX)
+                     ? (uint16_t)v : MON_RHOLD_DEFAULT;
     } else if (strcmp(parts[0], "m") == 0) {
-      /* m <kanaal> <interval> <naam> <adres> */
+      /* m <kanaal> <interval> <naam> <adres> [<pingtijd 0|1>]
+       *
+       * Het zesde veld is OPTIONEEL, en dat is geen luiheid: een bestand dat door
+       * een eerdere versie geschreven is heeft het niet, en dan is 1 het juiste
+       * antwoord -- die versie stuurde de pingtijd altijd mee, dus zo verandert er
+       * na een firmware-update niets aan wat er over het mesh gaat. Een monitor
+       * die stil ophoudt met het sturen van zijn pingtijd is precies het soort
+       * verandering waar een dashboard op stukloopt. */
       if (n < 5) continue;
       if (num_mons >= MON_MAX_MONITORS) continue;
 
       int ch  = atoi(parts[1]);
       int ivl = atoi(parts[2]);
-      if (ch < 5 || ch > 4 + MON_MAX_MONITORS) continue;   /* buiten 5..12 */
+      if (ch < 5 || ch > 4 + MON_MAX_MONITORS) continue;   /* buiten 5..36 */
       if (ivl < MON_INTERVAL_MIN || ivl > MON_INTERVAL_MAX) continue;
 
       MonitorCfgEntry& e = staged.mons[num_mons];
@@ -125,6 +149,7 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       e.interval_s = (uint16_t)ivl;
       strncpy(e.name, parts[3], MON_NAME_LEN - 1); e.name[MON_NAME_LEN - 1] = 0;
       strncpy(e.host, parts[4], MON_HOST_LEN - 1); e.host[MON_HOST_LEN - 1] = 0;
+      e.send_ms    = (n >= 6) ? (atoi(parts[5]) ? 1 : 0) : 1;
       num_mons++;
     }
     /* Onbekende sleutel: stil overslaan, zodat een nieuwer bestand op oude
@@ -162,11 +187,11 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
    * repareert een bestand dat met een oudere versie zonder "ever" is
    * geschreven. */
   for (int i = 0; i < num_mons; i++) {
-    staged.ch_ever_used |= (uint8_t)(1 << (staged.mons[i].channel - 5));
+    staged.ch_ever_used |= ((uint32_t)1 << (staged.mons[i].channel - 5));
   }
 
   cfg = staged;
-  MESH_DEBUG_PRINTLN("MonitorStore: %d monitor(s) ingelezen, hi=%.3f lo=%.3f", num_mons, cfg.mains_hi, cfg.mains_lo);
+  MESH_DEBUG_PRINTLN("MonitorStore: %d monitor(s) ingelezen, hi=%.3f lo=%.3f, herstelmelding %s (rust %us)", num_mons, cfg.mains_hi, cfg.mains_lo, cfg.recover_alerts ? "aan" : "uit", (unsigned)cfg.rhold_s);
   return true;
 }
 
@@ -185,16 +210,21 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "#MU1\n");
   f.write((const uint8_t*)line, len);
 
-  len = snprintf(line, sizeof(line), "hi %.3f\nlo %.3f\never %u\n",
-                 cfg.mains_hi, cfg.mains_lo, (unsigned)cfg.ch_ever_used);
+  len = snprintf(line, sizeof(line), "hi %.3f\nlo %.3f\never %lu\n",
+                 cfg.mains_hi, cfg.mains_lo, (unsigned long)cfg.ch_ever_used);
   f.write((const uint8_t*)line, len);
 
   for (int i = 0; i < MON_MAX_MONITORS; i++) {
     const MonitorCfgEntry& e = cfg.mons[i];
     if (e.channel == 0) continue;
 
-    len = snprintf(line, sizeof(line), "m %u %u %s %s\n",
-                   (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host);
+    /* De ping-vlag gaat ALTIJD mee bij het schrijven, ook als hij 1 is. Alleen
+     * bij het LEZEN is hij optioneel (voor oudere bestanden). Zo staat er na één
+     * schrijfronde een expliciete waarde in het bestand en hoeft niemand te
+     * raden wat de standaard was toen dit weggeschreven werd. */
+    len = snprintf(line, sizeof(line), "m %u %u %s %s %u\n",
+                   (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host,
+                   (unsigned)(e.send_ms ? 1 : 0));
     if (f.write((const uint8_t*)line, len) != (size_t)len) {
       /* Schijf vol of stuk: het kladbestand is nu onbetrouwbaar, dus laten we
        * de bestaande .cfg met rust. */

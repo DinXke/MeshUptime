@@ -66,21 +66,45 @@
  * vaste velden plus één regel per kanaal:
  *
  *   vaste velden (fw, wifi, ip, rssi, ... ssid van 32 tekens)     ~ 300 byte
- *   4 vaste kanalen, korte namen en adressen                      4 x  ~130
- *   8 monitorvakjes, in het duurste geval:
- *     {"ch":12,"n":"<16 tekens>","h":"<40 tekens>","i":3600,"st":"pauze",
+ *   het budget-, simulatie- en testblok ("tb"/"sim"/"test")        ~ 370
+ *   4 vaste kanalen, korte namen en adressen                      4 x  ~210
+ *   MON_MAX_MONITORS (32) vakjes, in het duurste geval:
+ *     {"ch":36,"n":"<16 tekens>","h":"<40 tekens>","i":3600,"st":"pauze",
  *      "ms":4294967295,"f":4294967295,"c":4294967295,"k":"gemeld",
- *      "age":4294967295,"sev":"warn"}                             8 x  ~190
+ *      "age":4294967295,"sev":"warn","si":33,"sm":"down","sl":3600,
+ *      "tms":1,"tb":9,"drop":0}                                   32 x  ~235
  *   de uitleg bij een ontbrekende sensorlaag ("monwarn")           ~ 130
  *                                                                 ----------
- *                                                                  ~ 2470
+ *                                                                  ~ 9160
  *
- * 3072 geeft daar ruim 600 byte marge boven, en de lus kapt bovendien af zodra
- * er minder dan JSON_TAIL byte over is -- want een half JSON-document maakt de
- * pagina stuk op een plek waar niemand de oorzaak zoekt.
+ * DAAROM 10240. Dat is een grote sprong en die is verdiend door twee
+ * wijzigingen die elkaar versterken: MON_MAX_MONITORS is van 8 naar 32 gegaan, en
+ * elke regel draagt nu ook zijn simulatiestand en zijn bytekosten.
+ *
+ * WAAROM NIET AFKAPPEN IN PLAATS VAN GROEIEN. Dat is precies de fout die dit
+ * antwoord juist moet helpen voorkomen: een monitor die stil uit de LIJST valt
+ * is even onzichtbaar als een monitor die stil uit de TELEMETRIE valt. De lus
+ * kapt nog steeds af als het onverwacht toch niet past -- een half JSON-document
+ * maakt de pagina leeg zonder spoor in de logs -- maar met deze maat gebeurt dat
+ * bij 32 volle monitors niet.
+ *
+ * DE PRIJS, en die hoort hier te staan: dit antwoord wordt elke 5 seconden
+ * opgehaald, dus bij 32 monitors is dat ~9 kB per 5 s over de wifi. Dat is op een
+ * eigen netwerk te doen, maar het is wel de reden waarom /acl.json indertijd een
+ * eigen antwoord met een eigen tempo kreeg. Wordt dit ooit krap, dan is de
+ * volgende stap dezelfde: de monitorlijst uit status.json halen en apart en
+ * langzamer ophalen, met alleen de METINGEN op 5 s.
  */
-static char g_json[3072];
-#define JSON_TAIL  240      /* ruimte die altijd vrij blijft voor één regel + "]}" */
+static char g_json[10240];
+#define JSON_TAIL  320      /* ruimte die altijd vrij blijft voor één regel + "]}" */
+
+/* Dwingt de rekensom hierboven af bij het compileren in plaats van bij het eerste
+ * stil afgekapte antwoord op een node in het veld -- net als de static_assert bij
+ * g_acl. MON_MAX_MONITORS is met een bouwvlag te verhogen; dan moet deze buffer
+ * mee. */
+static_assert(300 + 370 + 4 * 210 + MON_MAX_MONITORS * 235 + 130 + JSON_TAIL
+              <= sizeof(g_json),
+              "g_json te klein voor MON_MAX_MONITORS -- zie de rekensom hierboven");
 
 /* EEN EIGEN BUFFER VOOR /acl.json, en niet g_json erbij.
  *
@@ -206,7 +230,7 @@ static unsigned long g_deferred_at = 0;
  * Het is dus een verzamelaar die alleen bits BIJ zet en nooit weghaalt -- want
  * dat is ook wat ch_ever_used doet. Eén keer per start naar SPIFFS en daarna
  * nooit meer: een verzoekpad hoort niet in flash te gaan lezen. */
-static uint8_t g_ever_mask = 0;
+static uint32_t g_ever_mask = 0;
 
 /* Eén WebServer, statisch. Geen new/malloc; de klasse houdt er een pointer
  * naar zodat WebServer.h buiten de header blijft. */
@@ -230,6 +254,9 @@ void web_route_acldel()    { if (g_self) g_self->handleAclDel(); }
 void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
 void web_route_cli()       { if (g_self) g_self->handleCli(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
+void web_route_sim()       { if (g_self) g_self->handleSim(); }
+void web_route_simclear()  { if (g_self) g_self->handleSimClear(); }
+void web_route_alerttest() { if (g_self) g_self->handleAlertTest(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -318,16 +345,63 @@ static const char* wifiStateName(const WifiTask* w) {
 static const char PAGE_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
 <html lang="nl"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MeshUptime</title><style>
+<title>MeshUptime</title>
+<script>
+/* HET THEMA VOOR HET EERSTE RENDEREN. In de kop en niet onderaan bij de rest van
+   het script, en dat is de hele reden dat dit hier staat: een keuze die pas na
+   het laden gezet wordt, geeft bij elke verversing een flits van het verkeerde
+   thema. Dat is precies het detail waar een themaknop op stukloopt.
+
+   Het attribuut komt op het ROOT-element. Dat is met opzet: de tabellen en de
+   tegels worden door JavaScript herbouwd bij elke verversing, en alles wat op die
+   elementen staat is dan weg. Het root-element wordt nooit herbouwd -- dezelfde
+   les als bij de knoppen die hun handler kwijtraakten.
+
+   In een try, want localStorage kan geweigerd worden (privacystand van de
+   browser). Dan valt het gewoon terug op de systeemstand in plaats van de pagina
+   stuk te maken op een voorkeur. */
+try{var t=localStorage.getItem("mu-theme");
+if(t=="light"||t=="dark"){document.documentElement.setAttribute("data-theme",t)}}
+catch(e){}
+</script>
+<style>
+/* DE DRIE THEMASTANDEN.
+ *
+ *   systeem (standaard)  geen data-theme; volgt prefers-color-scheme
+ *   licht                data-theme="light"
+ *   donker               data-theme="dark"
+ *
+ * DONKER STAAT OP :root en is dus de basis; licht komt er twee keer bovenop, en
+ * die twee keer is geen slordigheid maar het gevolg van hoe CSS werkt: een
+ * media-query en een attribuutselector zijn niet in één regel te combineren
+ * zonder :has() of een bouwstap, en dit document heeft geen bouwstap. De twee
+ * blokken staan daarom pal onder elkaar, zodat een kleur die in het ene verandert
+ * meteen naast het andere staat.
+ *
+ * De :not([data-theme="dark"]) in de media-query is het scharnier van het geheel:
+ * zonder die uitzondering zou een browser die op licht staat de EXPLICIETE
+ * donkerkeuze overrulen, en dan doet de knop de helft van de tijd niets. */
 :root{
 --bg:#0b0f14;--card:#121a23;--border:#1e2b3a;--text:#d7e2ea;--muted:#7d8fa0;
 --accent:#35e08c;--amber:#ffb454;--cyan:#4cc9f0;--red:#ff5c5c;
 --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 --mono:ui-monospace,"Cascadia Code",Consolas,monospace}
-@media (prefers-color-scheme:light){:root{
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
 --bg:#eef3f1;--card:#ffffff;--border:#d2ddd7;--text:#16241d;--muted:#5b6b63;
 --accent:#0e9c60;--amber:#b8741a;--cyan:#0b7fa8;--red:#cf3b3b}}
+:root[data-theme="light"]{
+--bg:#eef3f1;--card:#ffffff;--border:#d2ddd7;--text:#16241d;--muted:#5b6b63;
+--accent:#0e9c60;--amber:#b8741a;--cyan:#0b7fa8;--red:#cf3b3b}
 *{box-sizing:border-box}
+/* De kop met de themaknop ernaast. De knop staat rechtsboven, in de vorm van de
+   andere knoppen op deze pagina, en toont WELKE stand actief is -- een knop die
+   alleen een symbool toont laat je raden of je in de systeemstand zit of in een
+   afgedwongen stand die er nu net hetzelfde uitziet. */
+.top{display:flex;align-items:flex-start;gap:1rem}
+.top h1{flex:1 1 auto}
+.top button{margin:0;flex:0 0 auto;background:transparent;color:var(--muted);
+border-color:var(--border)}
+.top button:hover{color:var(--cyan);border-color:var(--cyan);filter:none}
 body{font-family:var(--sans);font-size:15px;line-height:1.45;margin:0;
 padding:1.2rem;max-width:62rem;color:var(--text);background:var(--bg)}
 h1{font-size:1.15rem;letter-spacing:.02em;margin:0 0 .15rem}
@@ -341,7 +415,7 @@ var(--card);border:1px solid var(--border);border-radius:10px;padding:1rem}
    ZIJ, binnen haar eigen kaart -- en niet de hele pagina, want een body die
    horizontaal scrollt maakt alle andere tekst onleesbaar. */
 .card.pad0{padding:.35rem .25rem;overflow-x:auto}
-.card.pad0 table{min-width:34rem}
+.card.pad0 table{min-width:44rem}
 .tilegrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));
 gap:.65rem}
 .tile{background:linear-gradient(180deg,rgba(255,255,255,.025),transparent 55%),
@@ -395,9 +469,19 @@ button:hover{filter:brightness(1.1)}
 td button{margin:0;padding:.15rem .5rem;font-size:.62rem;color:var(--red);
 background:transparent;border-color:var(--border)}
 td button:hover{border-color:var(--red);filter:none}
+td button:disabled{opacity:.45;cursor:not-allowed}
 .ok{color:var(--accent)}.bad{color:var(--red)}
-#msg,#kmsg{font-family:var(--mono);font-size:.8rem;min-height:1.2rem;
+#msg,#kmsg,#tmsg{font-family:var(--mono);font-size:.8rem;min-height:1.2rem;
 margin-top:.5rem}
+/* DE MELDREGEL ONDER DE RIJ DIE BEWERKT WORDT.
+   Dit is de reparatie van een gemelde fout: een afgekeurde naam ("UDM Pro" --
+   een spatie mag niet) meldde zich in #msg, en dat vakje hoort bij het
+   formulier 'Monitor toevoegen' zeven honderd pixels lager. De knop deed dus
+   wel wat, maar het antwoord stond buiten beeld -- en een knop waarvan je het
+   antwoord niet ziet, is voor wie erop klikt een knop die niets doet. De
+   melding hoort waar de klik was: in een eigen regel direct onder de rij. */
+tr.emsg td{padding:.35rem .6rem;font-family:var(--mono);font-size:.78rem;
+white-space:normal}
 /* Vinkjes horen NIET in de hoofdletterstijl van de andere labels: die stijl is
    voor kopjes boven een invoerveld, en hier is de tekst het label zelf. */
 label.cb{flex:0 0 auto;font-family:var(--sans);font-size:.9rem;
@@ -520,6 +604,51 @@ td.acts{white-space:nowrap;text-align:right}
 td.acts button{margin-left:.3rem}
 td button.go{color:var(--accent)}
 td button.go:hover{border-color:var(--accent)}
+/* ---------------------- simuleren en testen ------------------------------- */
+/* AMBER, EN OVERAL DEZELFDE AMBER. Een gesimuleerde sensor is noch goed noch
+   stuk: hij zegt niets over de dienst, hij zegt dat wij iets beweren. Groen zou
+   'in orde' suggereren en rood 'stuk'; beide zijn een leugen over een test.
+   Dezelfde kleur als 'pauze' en 'stil', en dat is consequent: dat zijn ook de
+   standen waarin de tabel niet de werkelijkheid van de dienst toont. */
+.sb{border:1px solid var(--amber);border-radius:10px;padding:.85rem 1rem;
+display:flex;gap:.9rem;align-items:center;flex-wrap:wrap;margin:.2rem 0 .9rem;
+background:linear-gradient(90deg,rgba(255,180,84,.12),transparent 75%)}
+.sb .t{flex:1 1 20rem;font-size:.9rem}
+.sb .t b{font-family:var(--mono);text-transform:uppercase;letter-spacing:.1em;
+font-size:.7rem;display:block;margin-bottom:.2rem;color:var(--amber)}
+.sb button{margin:0;flex:0 0 auto}
+/* De cel met de simulatiestand. De knoppen zijn klein en zonder kleur zolang er
+   niets geforceerd staat -- ze horen niet om aandacht te vragen. Zodra er wél
+   iets staat, is de cel amber en staat de resterende tijd erbij: dat getal is
+   het antwoord op de enige vraag die dan telt, namelijk wanneer deze monitor
+   weer de waarheid vertelt. */
+td.sim{white-space:nowrap;font-family:var(--mono);font-size:.72rem}
+td.sim button{margin:0 .15rem 0 0;font-size:.6rem;color:var(--muted)}
+td.sim button:hover{border-color:var(--amber);color:var(--amber)}
+td.sim .lft{color:var(--amber)}
+tr.simrow{background:linear-gradient(90deg,rgba(255,180,84,.09),transparent 80%)}
+tr.simrow td:first-child{box-shadow:inset 3px 0 0 var(--amber)}
+/* De aflevering van het testbericht: verstuurd en aangekomen NAAST elkaar, want
+   het verschil tussen die twee is de hele reden dat er op ACK's gelet wordt. Een
+   getal onder het andere zou ze als twee losse feiten laten lezen. */
+.deliv{display:flex;gap:1.4rem;flex-wrap:wrap;margin-top:.7rem}
+.deliv div{font-family:var(--mono);font-size:.8rem}
+.deliv span{display:block;font-size:.62rem;text-transform:uppercase;
+letter-spacing:.13em;color:var(--muted)}
+.deliv .part{color:var(--amber)}.deliv .none{color:var(--red)}
+.deliv .all{color:var(--accent)}
+/* DE BUDGETBALK. Eén beeld van 180 byte, met het vaste deel apart: dat is het
+   deel waar je niets aan kunt doen, en dat hoort te zien te zijn voordat iemand
+   zich afvraagt waarom er maar 156 byte voor hem is. Amber vanaf 15 byte over
+   (minder dan twee monitors), rood bij vol -- dezelfde drempels als bij het
+   kanaalbudget eronder, want het is dezelfde soort schaarste. */
+.bar{display:flex;height:.85rem;border-radius:5px;overflow:hidden;
+border:1px solid var(--border);background:var(--bg);margin-top:.2rem}
+.bar i{display:block;height:100%}
+.bar .b-fix{background:var(--muted)}
+.bar .b-mon{background:var(--accent)}
+.bar .b-lo{background:var(--amber)}
+.bar .b-no{background:var(--red)}
 /* Kanaalbudget: drie getallen in mono, want ze horen naast elkaar gelezen te
    worden en niet in een zin. */
 .budget{display:flex;gap:1.4rem;flex-wrap:wrap;margin-top:.7rem}
@@ -529,7 +658,10 @@ letter-spacing:.13em;color:var(--muted)}
 .budget .lo{color:var(--amber)}.budget .no{color:var(--red)}
 </style></head><body>
 
+<div class="top">
 <h1>MeshUptime<span id="sub">bewaking &middot; heltec v3</span></h1>
+<button id="thm" title="Wissel licht/donker thema">thema</button>
+</div>
 
 <nav class="tabs">
 <button class="on" data-p="1">bewaking</button>
@@ -539,6 +671,7 @@ letter-spacing:.13em;color:var(--muted)}
 
 <section id="p1">
 
+<div id="simban"></div>
 <div class="tilegrid" id="t"></div>
 
 <h2>Monitoroverzicht &mdash; de kanaalkaart</h2>
@@ -550,6 +683,7 @@ Deze tabel <i>is</i> de koppeling tussen kanaalnummer en dienst; leg hem naast j
 app. Over het mesh is dezelfde lijst op te vragen met de DM-opdracht
 <code>list</code>, en over serieel met <code>sensor list</code>.</p>
 <div class="card pad0"><table id="k"></table></div>
+<div id="tmsg"></div>
 <p class="note"><b>Toestand:</b>
 <span class="c-on">op</span> / <span class="c-off">neer</span> gemeten &middot;
 <span class="c-warn">pauze</span> = onze wifi is weg, dus dit is de laatst gemeten
@@ -561,12 +695,12 @@ Kanalen 1&ndash;4 staan vast. Een kanaal dat eenmaal is uitgedeeld wordt niet
 opnieuw gebruikt, ook niet na verwijderen: een dashboard dat &quot;kanaal 6&quot;
 bewaard heeft, mag nooit stil naar een andere dienst gaan wijzen.</p>
 
-<p class="why"><b>Waarom je een monitor BEWERKT en niet weggooit:</b> er zijn acht
-kanalen (5&nbsp;t/m&nbsp;12) en een uitgedeeld nummer komt niet terug zolang er
-nog een vrij is. Wie een naam of een adres verkeerd typt en de monitor daarom
-verwijdert, <i>verbrandt</i> een kanaal &mdash; twee typefouten kosten een kwart
-van de ruimte. Klik daarom op <b>bewerk</b>: naam, adres en interval zijn ter
-plaatse te wijzigen en het <b>kanaal blijft hetzelfde</b>.<br>
+<p class="why"><b>Waarom je een monitor BEWERKT en niet weggooit:</b> de
+kanaalnummers (5&nbsp;t/m&nbsp;36) worden <b>nooit hergebruikt</b> zolang er nog
+een nummer is dat nooit vergeven is. Wie een naam of een adres verkeerd typt en
+de monitor daarom verwijdert, <i>verbrandt</i> een kanaal &mdash; het nummer
+blijft vergeven en komt niet terug. Klik daarom op <b>bewerk</b>: naam, adres en
+interval zijn ter plaatse te wijzigen en het <b>kanaal blijft hetzelfde</b>.<br>
 <b>Maar let op met het ADRES.</b> Een naam wijzigen is onschuldig &mdash; die is
 voor de mens en reist niet mee in de telemetrie. Een <b>adres</b> wijzigen geeft
 hetzelfde kanaalnummer een andere <i>betekenis</i>: een dashboard dat
@@ -578,6 +712,114 @@ grafiek daar zonder dat er iets stuk lijkt.</p>
 
 <div class="card"><div class="budget" id="bud"></div>
 <p class="note" id="budnote"></p></div>
+
+<h2>Het bytebudget van de telemetrie</h2>
+<p class="why"><b>Het aantal monitors is niet de grens &mdash; de bytes zijn de
+grens.</b> De telemetrie van deze node gaat als CayenneLPP in één pakket van
+<b>180 byte</b>, en daar moet alles in: de batterijspanning, de GPS als die
+aanstaat, de drie vaste kanalen en dan de monitors. Een monitor kost <b>9
+byte</b> als zijn pingtijd meegaat en <b>3 byte</b> als alleen zijn
+op/neer-schakelaar meegaat. Er passen er dus zeventien of ruim vijftig,
+afhankelijk van hoe je ze zet &mdash; en daarom staat hier een budget en niet een
+maximum.<br>
+<b>Waarom dit zichtbaar is:</b> wie zijn achttiende monitor toevoegt en daarna
+merkt dat er willekeurig een paar kanalen uit zijn telemetrie verdwenen zijn,
+heeft geen foutmelding gekregen maar wel verkeerde gegevens op zijn dashboard.
+De node <b>weigert</b> daarom een monitor die er niet meer in past, en wat er
+tegen alle verwachting toch buiten valt staat in de kolom <b>byte</b> in het
+rood.<br>
+<b>&quot;ms uit&quot; betekent niet dat er niet gemeten wordt.</b> De pingtijd
+wordt gewoon gemeten en blijft hier, in <code>sensor list</code> en in de
+DM-lijst te zien; hij gaat alleen niet meer over het mesh. Dat zijn twee heel
+verschillende dingen &mdash; wie ze verwart, gaat een sensor repareren die
+werkt.</p>
+
+<div class="card"><div class="bar" id="tbar"></div>
+<div class="budget" id="tbud"></div>
+<p class="note" id="tbnote"></p></div>
+
+<h2>Waarschuwingen simuleren en testen</h2>
+<p class="why"><b>Waarom dit er is:</b> de waarschuwingen van deze node zijn
+gebouwd maar zijn nog nooit afgegaan. Een node die pas bij een echte storing voor
+het eerst een bericht stuurt, is een node waarvan niemand weet <i>of</i> dat
+bericht aankomt &mdash; en dan blijkt dat op het slechtste moment. Hiermee is dat
+vooraf te weten.<br>
+<b>Het gaat door het echte pad.</b> Een forcering verandert wat de sensorlaag
+<i>teruggeeft</i>; daarna doet dezelfde <code>alertIf()</code> zijn werk als bij
+een echte storing: een echt DM-pakket, dezelfde keuze van ontvangers op het
+<b>alarm</b>-recht, echte pogingen en echte ACK's. Er is met opzet géén tweede
+verzendweg en géén nepbericht &mdash; dan zou deze pagina zichzelf testen in
+plaats van het systeem. De forcering staat om dezelfde reden óók in de
+<b>telemetrie</b>: een dashboard aan de andere kant hoort hetzelfde te zien.<br>
+<b>Reken op maximaal een minuut.</b> Waarschuwingen worden alleen bij de
+periodieke leesronde beoordeeld (elke 60&nbsp;s), en die ronde is precies het
+pad dat we willen testen. Een knop die sneller was, was een andere weg.</p>
+
+<div class="card">
+<div class="row">
+<label>Vervaltijd van een forcering (s)<input id="simsecs" type="number"
+min="30" max="3600" value="600"><span class="cur">30 t/m 3600; een forcering
+kan niet blijven staan</span></label>
+<label>Rust voor een herstelmelding (s)<input id="rhold" type="number"
+min="0" max="3600" value="120"><span class="cur" id="rholdcur">nu: –</span></label>
+</div>
+<div class="row" style="margin-top:.6rem">
+<label class="cb"><input type="checkbox" id="recon"> ook melden als iets weer
+<b>werkt</b></label>
+</div>
+<div class="quick">
+<button id="rgo">herstelmelding opslaan</button>
+<button id="tgo">testbericht sturen</button>
+<button id="sclr">alles vrijgeven</button>
+</div>
+<div id="smsg"></div>
+<div class="deliv" id="deliv"></div>
+<p class="note"><b>Herstelmeldingen &mdash; waarom die er horen te zijn.</b>
+<code>alertIf()</code> stuurt een bericht bij het BEGIN van een storing en doet
+bij het einde alleen zijn Trigger opruimen. Zonder herstelmelding krijg je dus
+&quot;router onbereikbaar&quot; en daarna nooit meer iets &mdash; en dan is
+&quot;het is opgelost&quot; niet te onderscheiden van &quot;de node is zelf
+gestopt met melden&quot;. Dat tweede is precies het geval dat je wil weten. De
+melding zegt er de <b>duur</b> bij (&quot;weer bereikbaar na 4 min&quot;), want
+dat is het enige wat zo'n bericht boven een geruststelling uittilt.<br>
+<b>Drie remmen zitten erop.</b> Er gaat alleen een herstelmelding uit als er
+werkelijk een <i>storingsmelding</i> de deur uit is geweest &mdash; een dienst
+die even wegviel zonder dat iemand er iets van hoorde, levert geen &quot;weer
+bereikbaar&quot; op. De dienst moet de <b>rust</b> hierboven aaneengesloten op
+zijn: zonder die drempel stuurt een dienst die elke minuut op en neer gaat elke
+minuut twee berichten, en dat is de ergste vorm van een alarmsysteem &mdash; het
+leert mensen om meldingen te negeren. En een herstelmelding gaat altijd met
+<b>lage</b> prioriteit (één poging per ontvanger in plaats van vier): een
+gemiste &quot;het werkt weer&quot; is hinderlijk, een gemiste &quot;het is
+stuk&quot; is erger.<br>
+<b>Een gemelde dienst die uit &quot;stil&quot; terugkomt</b> krijgt een eigen
+tekst: die was <i>onbekend</i> en niet neer, dus dan meldt de node dat de
+<i>melder</i> weer meldt en niet dat een dienst hersteld is.<br>
+<b>Elke forcering loopt van zichzelf af</b>, en dat is geen
+gemak maar de belangrijkste regel hier. Een forcering die blijft staan zet die
+monitor stil uit: hij meldt dan niet meer wat er echt gebeurt en niemand ziet
+dat. Een node die na een test in testmodus blijft hangen is erger dan een node
+zonder testknop. Bij het aflopen valt hij terug op de waarde die ondertussen
+gewoon gemeten is &mdash; de meting wordt nooit overschreven, alleen
+overstemd.<br>
+<b>De rem, en waarom hij er is.</b> Elke simulatie kost echte zendtijd op een
+band die je met anderen deelt. Daarom hoogstens <b>één testbericht per
+minuut</b> en hoogstens <b>twee forceringen tegelijk</b>. Dat tweede getal is
+niet willekeurig: de wachtrij voor waarschuwingen heeft vier plaatsen en de
+batterijbewaking gebruikt er twee. Zouden er meer simulaties tegelijk mogen, dan
+zou een <i>echte</i> batterijwaarschuwing stil overgeslagen worden &mdash; de
+test mag de bewaking nooit verdringen.<br>
+<b>Verstuurd is niet aangekomen.</b> Daarom staan hierboven twee getallen en
+niet één. <i>Ontvangers</i> is naar hoeveel sleutels met het alarmrecht het
+bericht gaat; <i>bevestigd</i> is hoeveel er een ACK terugstuurden. Zijn die
+niet gelijk, dan is er iemand die je waarschuwingen niet krijgt &mdash; en dat
+is precies wat je wil weten vóórdat er iets stuk is. De teller zegt
+<i>minstens</i>: een ACK die pas aankomt nadat de node al naar de volgende
+ontvanger gestuurd heeft, is niet meer te herkennen.<br>
+<b>Niets hiervan overleeft een herstart.</b> De simulatiestand staat alleen in
+RAM en met opzet niet in de opslag: een node die na een stroomstoring in
+testmodus opstart, zwijgt over een echte storing.</p>
+</div>
 
 <h2>Monitor toevoegen</h2>
 <div class="card"><form id="a">
@@ -921,6 +1163,45 @@ niet in dat lijstje staan; zoeken op naam werkt wel.</p>
 </section>
 
 <script>
+/* ============================ het thema ==================================
+ *
+ * Drie standen, één knop die er rondloopt: systeem -> licht -> donker -> systeem.
+ * Dezelfde drie als in de repeater-webinterface en in MeshManager.
+ *
+ * IN localStorage EN NIET OP DE NODE, en dat is een ontwerpkeuze: dit is een
+ * voorkeur van de BROWSER die ernaar kijkt en niet van het apparaat. Twee mensen
+ * die dezelfde node openen mogen een andere keuze hebben, en een themaknop hoort
+ * geen flashschrijving op een bewakingsnode te kosten.
+ *
+ * De stand zelf wordt al in de KOP gezet, vóór het eerste renderen; hier staat
+ * alleen het omzetten en het label. Zie de opmerking bij dat stukje script. */
+var THEMES=["system","light","dark"];
+var THNAME={system:"systeem",light:"licht",dark:"donker"};
+
+function thGet(){try{var t=localStorage.getItem("mu-theme");
+return(t=="light"||t=="dark")?t:"system"}catch(e){return"system"}}
+
+function thApply(t){
+var el=document.documentElement;
+/* De SYSTEEMSTAND is het ONTBREKEN van het attribuut en niet een derde waarde.
+   Zo is er precies één manier waarop de media-query weer aan het woord komt, en
+   kan er geen stand bestaan die noch systeem noch expliciet is. */
+if(t=="system"){el.removeAttribute("data-theme")}
+else{el.setAttribute("data-theme",t)}
+try{if(t=="system"){localStorage.removeItem("mu-theme")}
+else{localStorage.setItem("mu-theme",t)}}catch(e){}
+var b=document.getElementById("thm");
+b.textContent=THNAME[t];
+b.title="Thema: "+THNAME[t]+(t=="system"?
+" (volgt de instelling van je toestel)":" (afgedwongen)")+
+" — klik om te wisselen"}
+
+document.getElementById("thm").onclick=function(){
+var i=THEMES.indexOf(thGet());
+thApply(THEMES[(i+1)%THEMES.length])}
+
+thApply(thGet());
+
 /* Ernst -> kleurklasse. Eén plek, want de tegels, de bolletjes en de tabel moeten
    dezelfde betekenis aan dezelfde kleur geven. De ernst komt uit /status.json en
    wordt hier NIET uit de toestandstekst geraden: "aan" betekent op kanaal 2 iets
@@ -948,7 +1229,15 @@ var h="";t.forEach(function(x){h+='<div class="tile"><div class="k">'+x[0]+
 document.getElementById("t").innerHTML=h}
 
 var KH=[["kan","num"],["naam",""],["adres",""],["interval","num"],
-["toestand",""],["ms","num"],["mislukt","num"],["",""]];
+["toestand",""],["ms","num"],["mislukt","num"],["byte","num"],["simulatie",""],
+["",""]];
+
+/* De kolommen waarvan de PLAATS ergens anders gebruikt wordt. Als getal en niet
+   als aanname: editRow() schrijft in de knoppencel, en elke keer dat er een kolom
+   tussen komt schuift die op. Een hard geschreven 7 op vier plaatsen is precies
+   hoe zo'n uitbreiding stil de verkeerde cel leegmaakt -- dat scheelde bij de
+   kolom 'simulatie' weinig en bij 'byte' opnieuw. */
+var CBYTE=7, CSIM=8, CACTS=9;
 
 /* HET KANAAL DAT NU BEWERKT WORDT, of 0. De tabel wordt elke 5 s opnieuw
    opgebouwd omdat de metingen veranderen; dat mag niet gebeuren terwijl iemand in
@@ -972,6 +1261,131 @@ var NM=/^[A-Za-z0-9._-]{1,16}$/, HS=/^[A-Za-z0-9._-]{1,40}$/;
    dus 52; het past, maar niet met veel over. */
 function fits(s){return s.length<=59}
 
+/* ---- WAAR EEN MELDING OVER DE KANAALTABEL TERECHTKOMT ----
+ *
+ * Er zijn twee plaatsen, en het onderscheid is niet cosmetisch:
+ *
+ *  rowsay()  -- "ik weiger dit te versturen". Een eigen regel DIRECT onder de
+ *               rij die bewerkt wordt, dus precies waar de klik was. De
+ *               bewerkmodus blijft staan, dus deze regel leeft even lang als
+ *               het probleem. Dit is de reparatie van de gemelde fout: die
+ *               meldingen stonden in #msg, onderaan het formulier 'Monitor
+ *               toevoegen', ver buiten beeld.
+ *  tsay()    -- "dit heeft de node geantwoord". Onder de tabel, want op dat
+ *               moment is de bewerkmodus voorbij en wordt de tabel herbouwd --
+ *               een melding IN de tabel zou door die herbouw gewist worden
+ *               precies op het moment dat hij iets te zeggen heeft.
+ */
+function rowsay(r,txt,ok){
+var nx=r.nextElementSibling;
+if(!nx||nx.className!="emsg"){
+var tr=document.createElement("tr");tr.className="emsg";
+tr.insertCell().colSpan=KH.length;
+r.parentNode.insertBefore(tr,nx);nx=tr}
+var td=nx.cells[0];
+td.className=ok?"ok":"bad";
+td.textContent=txt;
+return nx}
+
+function rowsayClear(r){
+var nx=r.nextElementSibling;
+if(nx&&nx.className=="emsg"){nx.parentNode.removeChild(nx)}}
+
+function tsay(txt,ok){var m=document.getElementById("tmsg");
+m.className=ok?"ok":"bad";m.textContent=txt}
+
+/* De knoppencel van één rij. EEN functie, want twee plekken bouwen hem: de
+   herbouw van de tabel en het ANNULEREN van een bewerking -- en die tweede moet
+   de rij meteen terugzetten en niet wachten op het volgende status.json. */
+/* ---- DE BYTECEL ----
+ *
+ * Wat deze monitor in het telemetriepakket kost, en de knop om dat van 9 naar 3
+ * te brengen. Die knop staat IN de tabel en niet in een instellingenformulier,
+ * want de vraag "welke van mijn monitors kan er zonder pingtijd" is een vraag die
+ * je rij voor rij beantwoordt, met de bytes en de gemeten tijd ernaast.
+ *
+ * VIEL HIJ BUITEN HET PAKKET, dan is dat het enige dat deze cel nog zegt, in
+ * rood. Dat is de fout die dit hele budget moet voorkomen: een monitor die stil
+ * uit de telemetrie verdwijnt, staat er wel op de pagina en niet op het
+ * dashboard, en dan zoekt iemand een uur in de verkeerde hoek.
+ */
+function byteCell(c,m){
+c.textContent="";c.className="num";
+if(m.drop){
+c.className="num c-off";
+c.textContent=m.tb+"b !";
+c.title="Deze monitor PASTE NIET in het laatste telemetriepakket en staat dus "+
+"niet in de gegevens die over het mesh gaan. Zet bij deze of bij een andere "+
+"monitor de pingtijd uit om ruimte te maken.";
+return}
+if(m.tms<0){c.textContent=m.tb+"b";c.className="num";return}
+var s=document.createElement("span");
+s.textContent=m.tb+"b ";
+c.appendChild(s);
+var b=document.createElement("button");
+b.textContent=m.tms?"ms aan":"ms uit";
+if(!m.tms){b.className="go"}
+b.title=m.tms?
+"De pingtijd gaat nu mee over het mesh (9 byte). Uitzetten maakt er 3 byte van; "+
+"de tijd wordt dan nog steeds GEMETEN en blijft hier zichtbaar, hij gaat alleen "+
+"de ether niet meer in.":
+"Alleen de schakelaar gaat mee (3 byte). Aanzetten stuurt ook de pingtijd mee "+
+"(9 byte) -- als het budget dat toelaat.";
+b.onclick=function(){
+/* De volle 'sensor set' over de CLI, net als de andere monitorvelden: daar zit
+   de keuring en daar zit het wegschrijven naar flash. */
+tsay("bezig...",1);
+cliSeq(["sensor set mon."+m.ch+".ms "+(m.tms?0:1)],function(good,bad,last){
+if(bad){tsay("geweigerd: "+last.trim()+" (past de pingtijd nog in het budget?)",0)}
+else{tsay("kanaal "+m.ch+": pingtijd "+(m.tms?"gaat niet meer":"gaat weer")+
+" mee over het mesh",1)}
+u2()})};
+c.appendChild(b)}
+
+/* ---- DE SIMULATIECEL ----
+ *
+ * Twee standen, en met opzet niet drie knoppen naast elkaar:
+ *
+ *  niets geforceerd -> twee kleine, kleurloze knopjes 'op' en 'neer'. Ze horen
+ *                      geen aandacht te vragen; dit is niet de knop waarvoor dit
+ *                      apparaat er staat.
+ *  wel geforceerd   -> de stand in amber, de RESTERENDE TIJD erbij, en één knop
+ *                      'vrij'. Die tijd is dan het antwoord op de enige vraag die
+ *                      telt: wanneer vertelt deze monitor weer de waarheid?
+ *
+ * Kanaal 1 heeft si == -1: dat kanaal is van SensorMesh zelf en niet van ons, dus
+ * daar valt niets te forceren. Een streepje en geen knop, want een knop die niets
+ * doet is erger dan geen knop.
+ */
+function simCell(c,m){
+c.textContent="";c.className="sim";
+if(m.si===undefined||m.si<0){c.textContent="–";return}
+function b(txt,mode,ttl){var x=document.createElement("button");
+x.textContent=txt;x.title=ttl;
+x.onclick=function(){postsim(m.si,mode)};c.appendChild(x)}
+if(m.sm=="off"){
+b("op","up","forceer de goede stand -- hiermee test je dat een lopende "+
+"waarschuwing OPGERUIMD wordt");
+b("neer","down","forceer de slechte stand -- hiermee gaat er een echte "+
+"waarschuwing over het mesh, gemarkeerd als test");
+return}
+var s=document.createElement("span");s.className="lft";
+s.textContent=(m.sm=="up"?"op":"neer")+" · "+(m.sl?m.sl+"s":"–")+" ";
+c.appendChild(s);
+b("vrij","off","hef de forcering nu op en val terug op de meting")}
+
+function actsCell(c,r,m){
+c.textContent="";c.className="acts";
+if(m.k=="vast"){return}
+var eb=document.createElement("button");eb.textContent="bewerk";
+eb.className="go";eb.onclick=function(){editRow(r,m)};c.appendChild(eb);
+var b=document.createElement("button");b.textContent="wis";
+b.onclick=function(){if(confirm("Monitor '"+m.n+"' verwijderen?\n\nKanaal "+m.ch+
+" wordt daarna NIET opnieuw uitgedeeld zolang er nog een nieuw nummer vrij is."+
+"\n\nWou je alleen een typefout herstellen? Gebruik dan 'bewerk' -- dan houdt "+
+"deze dienst hetzelfde kanaal en verbrand je er geen."))
+{post("monitor/del","name="+encodeURIComponent(m.n))}};c.appendChild(b)}
+
 function table(d){
 if(EDIT){return}
 var e=document.getElementById("k");e.innerHTML="";
@@ -980,7 +1394,10 @@ h.textContent=x[0];h.className=x[1];hr.appendChild(h)});
 if(d.monwarn){var r=e.insertRow(),c=r.insertCell();c.colSpan=KH.length;
 c.className="bad";c.textContent=d.monwarn;return}
 (d.mon||[]).forEach(function(m){
-var r=e.insertRow();if(m.k=="vast"){r.className="fix"}
+var r=e.insertRow();
+/* De simulatietint gaat VOOR op de 'fix'-stijl: bij een geforceerde regel is het
+   feit dat er iets geforceerd staat belangrijker dan dat het een vast kanaal is. */
+r.className=m.sm&&m.sm!="off"?"simrow":(m.k=="vast"?"fix":"");
 var c=r.insertCell();c.className="num";c.textContent=m.ch;
 c=r.insertCell();c.className="nm";c.textContent=m.n;
 c=r.insertCell();c.textContent=m.h;
@@ -990,16 +1407,9 @@ c.innerHTML=dot(m.sev)+m.st+(m.k=="gemeld"&&m.age?" "+m.age+"s":"");
 c=r.insertCell();c.className="num";c.textContent=m.ms?m.ms:"–";
 c=r.insertCell();c.className="num";
 c.textContent=m.k=="vast"?"–":m.f+"/"+m.c;
-c=r.insertCell();c.className="acts";
-if(m.k!="vast"){
-var eb=document.createElement("button");eb.textContent="bewerk";
-eb.className="go";eb.onclick=function(){editRow(r,m)};c.appendChild(eb);
-var b=document.createElement("button");b.textContent="wis";
-b.onclick=function(){if(confirm("Monitor '"+m.n+"' verwijderen?\n\nKanaal "+m.ch+
-" wordt daarna NIET opnieuw uitgedeeld zolang er nog een nieuw nummer vrij is."+
-"\n\nWou je alleen een typefout herstellen? Gebruik dan 'bewerk' -- dan houdt "+
-"deze dienst hetzelfde kanaal en verbrand je er geen."))
-{post("monitor/del","name="+encodeURIComponent(m.n))}};c.appendChild(b)}})}
+byteCell(r.insertCell(),m);
+simCell(r.insertCell(),m);
+actsCell(r.insertCell(),r,m)})}
 
 /* Een regel uit de kanaalkaart ter plaatse bewerkbaar maken.
  *
@@ -1013,11 +1423,32 @@ b.onclick=function(){if(confirm("Monitor '"+m.n+"' verwijderen?\n\nKanaal "+m.ch
  * dus door validName/validHost en de intervalgrenzen -- dezelfde zeef als de
  * seriële console en dezelfde als /monitor. Een tweede schrijfpad hierheen zou een
  * tweede keuring zijn, en twee keuringen lopen ooit uiteen.
+ *
+ * GEMETEN FOUT, HIER GEREPAREERD -- twee dingen, want ze zagen er hetzelfde uit:
+ *
+ *  1. OPSLAAN leek niets te doen bij een afgekeurde invoer. Hij deed wel wat: de
+ *     naam "UDM Pro" bevat een spatie, de zeef weigerde hem, en de reden werd in
+ *     #msg gezet -- het meldvakje van het formulier 'Monitor toevoegen', bij een
+ *     opengeklapte pagina zo'n 700 pixels onder de tabel. Wie op een knop klikt
+ *     en geen antwoord ziet, heeft een knop die niets doet. Alle meldingen van
+ *     deze knop gaan nu naar rowsay(), een regel direct onder de rij zelf.
+ *  2. ANNULEER zette de rij pas terug NA het volgende status.json. Dat is een
+ *     netwerkronde op een node die tussendoor een radio bedient, en mislukt die
+ *     ronde dan blijft de rij in bewerkmodus staan zonder dat er iets gebeurt.
+ *     Annuleren is een plaatselijke handeling en hoort geen netwerk nodig te
+ *     hebben: hij zet de rij nu meteen terug uit de gegevens die er al zijn.
+ *
+ * De knoppen zaten dus WEL aan een handler; dat is nagemeten in een browser
+ * (typeof onclick == "function", elementFromPoint gaf de knop zelf, EDIT werd 5).
+ * Een gedelegeerde handler op de tabel zou dit niet gerepareerd hebben, en de
+ * verversing van 5 s bleek de rij ook niet te overschrijven -- table() stapt er
+ * uit zolang EDIT staat. Daarom is die opzet gebleven.
  */
 function editRow(r,m){
 EDIT=m.ch;
 var cells=r.cells;
 r.className="edit";
+rowsayClear(r);
 function inp(cell,val,max,cl){cell.textContent="";
 var i=document.createElement("input");i.value=val;i.maxLength=max;
 i.className=cl;i.spellcheck=false;cell.appendChild(i);return i}
@@ -1025,20 +1456,41 @@ var iN=inp(cells[1],m.n,16,"n1");
 var iH=inp(cells[2],m.k=="gemeld"?"-":m.h,40,"n2");
 var iI=inp(cells[3],""+m.i,4,"n3");
 
-cells[7].textContent="";
+cells[CACTS].textContent="";
 var ok=document.createElement("button");ok.textContent="opslaan";ok.className="go";
 var no=document.createElement("button");no.textContent="annuleer";
-cells[7].appendChild(ok);cells[7].appendChild(no);
+cells[CACTS].appendChild(ok);cells[CACTS].appendChild(no);
 
-no.onclick=function(){EDIT=0;u2()};
+/* METEEN terugzetten, zonder netwerk. De drie velden komen uit de momentopname
+   waarmee deze rij gebouwd is; de eerstvolgende verversing zet er daarna de
+   verse meting weer in. */
+no.onclick=function(){
+rowsayClear(r);
+cells[1].textContent=m.n;
+cells[2].textContent=m.h;
+cells[3].textContent=m.i?m.i+" s":"–";
+r.className=m.k=="vast"?"fix":"";
+actsCell(cells[CACTS],r,m);
+EDIT=0;
+u2()};
 
 ok.onclick=function(){
 var nn=iN.value.trim(),nh=iH.value.trim(),ni=iI.value.trim();
-if(!NM.test(nn)){say("naam: 1-16 tekens uit letters, cijfers, . - _",0);return}
-if(!HS.test(nh)){say("adres: 1-40 tekens uit letters, cijfers, . - _ (of '-' "+
+/* De spatie apart benoemd, want dat is de fout die in de praktijk gemaakt wordt:
+   "UDM Pro" is een naam die een mens logisch vindt en die de node weigert. Een
+   zeef die alleen zijn eigen regel opdreunt laat de gebruiker zelf zoeken welk
+   teken hij bedoelt. */
+if(!NM.test(nn)){rowsay(r,/\s/.test(nn)?
+"naam: een SPATIE mag niet -- gebruik bijvoorbeeld "+nn.replace(/\s+/g,"-")+
+" of "+nn.replace(/\s+/g,"").toLowerCase()+
+" (toegestaan: 1-16 tekens uit letters, cijfers, . - _)":
+"naam: 1-16 tekens uit letters, cijfers, . - _",0);return}
+if(!HS.test(nh)){rowsay(r,/\s/.test(nh)?
+"adres: een SPATIE mag niet in een adres":
+"adres: 1-40 tekens uit letters, cijfers, . - _ (of '-' "+
 "voor een gemelde dienst)",0);return}
 var iv=parseInt(ni,10);
-if(!(iv>=10&&iv<=3600)){say("interval: 10 t/m 3600 s",0);return}
+if(!(iv>=10&&iv<=3600)){rowsay(r,"interval: 10 t/m 3600 s",0);return}
 
 /* Het ADRES is de gevaarlijke: de naam is voor de mens, het adres bepaalt wat
    het kanaal BETEKENT. Vandaar een eigen bevestiging, en alleen voor dit veld. */
@@ -1060,27 +1512,35 @@ var cmds=[];
 if(nn!=m.n)  {cmds.push("sensor set mon."+m.ch+".name "+nn)}
 if(nh!=oh)   {cmds.push("sensor set mon."+m.ch+".host "+nh)}
 if(iv!=m.i)  {cmds.push("sensor set mon."+m.ch+".int "+iv)}
-if(!cmds.length){say("niets veranderd",1);EDIT=0;u2();return}
+if(!cmds.length){tsay("niets veranderd aan kanaal "+m.ch,1);
+no.onclick();return}
 
 for(var i=0;i<cmds.length;i++){
 if(!fits(cmds[i].slice(11))){
-say("te lang voor de opdrachtbuffer van de node (max 59 tekens achter "+
+rowsay(r,"te lang voor de opdrachtbuffer van de node (max 59 tekens achter "+
 "'sensor set'); kort de naam of het adres in",0);return}}
+
+/* De knoppen op slot zolang de reeks loopt. Twee keer klikken zou twee reeksen
+   'sensor set' sturen, en elke gelukte set zet een flashschrijving in de wacht. */
+ok.disabled=true;no.disabled=true;
+rowsay(r,"bezig met "+cmds.length+" wijziging(en)...",1);
 
 /* De naam MOET als eerste als hij verandert: de volgende opdrachten zoeken hun
    vakje op KANAAL en niet op naam, dus de volgorde maakt hier eigenlijk niets uit
    -- maar bij een mislukking is het prettiger dat de naam al klopt dan dat er een
    nieuw adres onder een oude naam staat. */
-say("bezig...",1);
 cliSeq(cmds,function(good,bad,last){
-EDIT=0;u2();cfg();
+/* De uitslag gaat naar tsay() en niet naar rowsay(): EDIT gaat hier op 0 en dan
+   herbouwt u2() de hele tabel, inclusief de meldregel. Onder de tabel blijft de
+   uitslag staan -- en juist die wil je lezen. */
+EDIT=0;rowsayClear(r);u2();cfg();
 /* De node antwoordt op een geweigerde 'sensor set' met "can't find custom var"
    -- dat is zijn enige foutmelding en hij zegt dus niet WAAROM. Vandaar dat het
    antwoord hier letterlijk doorgegeven wordt en er een hint bij staat: bijna
    altijd is het een naam die al bestaat of een waarde buiten de grenzen. */
-if(bad){say(bad+" van de "+(good+bad)+" wijzigingen geweigerd: "+last.trim()+
+if(bad){tsay(bad+" van de "+(good+bad)+" wijzigingen geweigerd: "+last.trim()+
 " (naam al in gebruik? interval buiten 10-3600?)",0)}
-else{say(good+" wijziging(en) doorgevoerd; kanaal "+m.ch+" is niet veranderd",1)}
+else{tsay(good+" wijziging(en) doorgevoerd; kanaal "+m.ch+" is niet veranderd",1)}
 })}}
 
 function say(t,ok){var m=document.getElementById("msg");
@@ -1092,6 +1552,136 @@ function post(u,b){return fetch(u,{method:"POST",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
 .then(function(r){return r.text().then(function(t){
 say(t.trim(),r.ok);if(r.ok){u2()}})})}
+
+/* ---- simuleren en testen ----
+ *
+ * EIGEN MELDREGEL (#smsg), en dat is de les uit de gerepareerde bewerkfout: een
+ * antwoord hoort te staan bij de knop waarop geklikt is. Niet bij een ander
+ * formulier, en niet zeven honderd pixels lager.
+ *
+ * De ANTWOORDTEKST VAN DE NODE gaat letterlijk door. Die teksten leggen uit
+ * waarom iets geweigerd is -- "er staan al 2 forceringen", "te snel achter
+ * elkaar", "geen enkele ingang heeft het alarmrecht" -- en daarover is de node de
+ * waarheid. Een eigen vertaling hier zou een tweede lijst redenen zijn, en twee
+ * lijsten lopen uiteen.
+ */
+function ssay(t,ok){var m=document.getElementById("smsg");
+m.className=ok?"ok":"bad";m.textContent=t}
+
+function secsNow(){var v=parseInt(document.getElementById("simsecs").value,10);
+return(v>=30&&v<=3600)?v:600}
+
+function psim(u,b){return fetch(u,{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.text().then(function(t){ssay(t.trim(),r.ok);u2()})})
+.catch(function(){ssay("geen verbinding met de node",0)})}
+
+function postsim(i,mode){
+return psim("sim","i="+i+"&m="+mode+"&secs="+secsNow())}
+
+/* DE BANNER. Amber en niet stil, om precies dezelfde reden als bij het slot van
+   de toegangslijst: een node die iets anders meldt dan hij meet mag zich niet
+   voordoen als een node die gewoon meet. Hij staat bovenaan het tabblad, boven de
+   tegels, want dit is wat je als eerste moet weten voordat je naar de cijfers
+   eronder kijkt. Zonder forcering staat er niets -- een banner die er altijd staat
+   wordt niet meer gelezen. */
+function simban(d){
+var e=document.getElementById("simban");
+var s=d.sim||{n:0,max:2};
+if(!s.n){e.innerHTML="";e.className="";return}
+var lft=0;
+(d.mon||[]).forEach(function(m){if(m.sl>lft){lft=m.sl}});
+e.className="sb";
+e.innerHTML='<div class="t"><b>'+s.n+" van "+s.max+" sensoren gesimuleerd</b>"+
+"Deze node meldt op die kanalen <b>niet wat hij meet</b> &mdash; niet in de tabel "+
+"hieronder, niet in de telemetrie en niet in zijn waarschuwingen. De langste "+
+"forcering valt over <b>"+(lft?lft+" s":"enkele seconden")+"</b> van zichzelf "+
+"terug op de meting.</div>";
+var b=document.createElement("button");b.textContent="alles vrijgeven";
+b.onclick=function(){psim("sim/clear","")};
+e.appendChild(b)}
+
+/* HET BYTEBUDGET, live. Een balk en vier getallen.
+ *
+ * De balk toont het VASTE deel in grijs en de monitors in groen (amber bij weinig
+ * ruimte, rood bij vol). Dat grijze stuk is er niet voor de sier: het is het deel
+ * waar niemand iets aan kan doen, en zonder dat onderscheid vraagt iemand zich af
+ * waarom er van 180 byte maar 156 voor hem is. Zet hij GPS aan, dan schuift dat
+ * grijze stuk 11 byte op -- en dan is meteen te zien waar die byte heen zijn.
+ */
+function tbud(d){
+var b=d.tb;if(!b){return}
+TB=b;
+var bar=document.getElementById("tbar");
+var cls=b.left==0?"b-no":(b.left<15?"b-lo":"b-mon");
+var fp=Math.round(b.fixed*100/b.total), mp=Math.round(b.mons*100/b.total);
+/* AFKAPPEN OP 100%, want 'used' KAN boven 'total' liggen: de monitors staan er
+   met hun duurste stand in, en querySensors kapt pas bij het echte inpakken af.
+   Zonder deze grens loopt de balk over zijn eigen rand heen en ziet 190 byte er
+   net zo uit als 180 -- precies het onderscheid dat hij moet tonen. */
+if(fp>100){fp=100}
+if(fp+mp>100){mp=100-fp}
+bar.innerHTML="";
+function seg(w,c,t){if(w<=0){return}var i=document.createElement("i");
+i.style.width=w+"%";i.className=c;i.title=t;bar.appendChild(i)}
+seg(fp,"b-fix","vast: "+b.fixed+" byte (spanning, GPS als die aanstaat, en de "+
+"drie vaste kanalen)");
+seg(mp,cls,"monitors: "+b.mons+" byte");
+
+var e=document.getElementById("tbud");e.innerHTML="";
+[[b.used+" / "+b.total,"byte gebruikt",""],
+[""+b.left,"byte vrij",b.left==0?"no":(b.left<15?"lo":"")],
+[""+b.fixed,"vast (niet vrij te maken)",""],
+[b.nms+" × 9b","met pingtijd",""]].forEach(function(x){
+var v=document.createElement("div");v.className=x[2];v.textContent=x[0];
+var s=document.createElement("span");s.textContent=x[1];
+v.appendChild(s);e.appendChild(v)});
+
+/* HOEVEEL ER NOG BIJ KUNNEN, in twee getallen. Dat is de vraag die iemand
+   werkelijk heeft, en "34 byte vrij" is daar het antwoord niet op. */
+var fit9=Math.floor(b.left/9), fit3=Math.floor(b.left/3);
+var n=document.getElementById("tbnote");
+n.innerHTML="Er is <b>"+b.left+" byte</b> vrij: dat is nog <b>"+fit9+"</b> "+
+"monitor(s) mét pingtijd of <b>"+fit3+"</b> zonder."+
+(b.drop?" <b class=\"bad\">"+b.drop+" monitor(s) vielen bij de laatste "+
+"uitlezing BUITEN het pakket</b> en staan dus niet in de telemetrie &mdash; zie "+
+"de rode getallen in de kolom <i>byte</i>. Zet bij een paar monitors de pingtijd "+
+"uit; dat maakt per stuk 6 byte vrij.":"")+
+(b.left==0&&!b.drop?" <b>Het pakket is vol.</b> Een monitor erbij wordt "+
+"geweigerd, en dat is met opzet: stil afkappen zou verkeerde gegevens op je "+
+"dashboard geven.":"")+
+"<br>Het vaste deel is <b>"+b.fixed+" byte</b>: "+b.base+" byte van de "+
+"basislaag (batterijspanning, en 11 byte extra zodra <b>GPS</b> aanstaat) plus "+
+"3 &times; 3 byte voor de kanalen 2, 3 en 4."+
+(b.meas?"":" <b>Dit getal is nog niet gemeten</b> &mdash; het is de bekende "+
+"ondergrens tot de eerste leesronde (hoogstens 60 s na het opstarten) en kan "+
+"daarna hoger blijken.")}
+
+/* DE AFLEVERING VAN HET TESTBERICHT. Drie getallen naast elkaar, en het middelste
+   is waar het om gaat: 'bevestigd' naast 'ontvangers'. Zijn ze niet gelijk, dan
+   krijgt iemand je waarschuwingen niet -- en dat hoort niet groen te zijn. */
+function deliv(d){
+var e=document.getElementById("deliv"),t=d.test;
+e.innerHTML="";
+if(!t||t.st=="niets"){
+var v=document.createElement("div");v.className="";
+v.textContent=(t&&t.rcnow?t.rcnow:0)+" ontvanger(s) klaar";
+var sp=document.createElement("span");
+sp.textContent="nog geen test gedaan";v.appendChild(sp);e.appendChild(v);return}
+var cl=t.ack>=t.rc?"all":(t.ack?"part":"none");
+var st=t.st=="wacht"?"aangevraagd, wacht op de leesronde":
+(t.st=="bezig"?"onderweg":"klaar");
+[[""+t.rc,"verstuurd naar",""],
+[t.ack+" / "+t.rc,"bevestigd met een ack",t.st=="klaar"?cl:"part"],
+[st,"test #"+t.seq+", "+t.age+"s geleden",""]].forEach(function(x){
+var v=document.createElement("div");v.className=x[2];v.textContent=x[0];
+var sp=document.createElement("span");sp.textContent=x[1];
+v.appendChild(sp);e.appendChild(v)});
+if(t.st=="klaar"&&t.ack<t.rc){
+var w=document.createElement("div");w.className="none";
+w.textContent="!";var sp=document.createElement("span");
+sp.textContent=(t.rc-t.ack)+" ontvanger(s) bevestigden niet";
+w.appendChild(sp);e.appendChild(w)}}
 
 /* Aparte post voor het toegangsdeel: eigen meldregel en eigen verversing, want
    status.json en acl.json zijn twee antwoorden met twee tempo's. */
@@ -1203,10 +1793,17 @@ function u3(){fetch("acl.json").then(function(r){
 if(!r.ok){return r.text().then(function(t){say2(t.trim(),0)})}
 return r.json().then(function(d){lock(d);acltab(d);nbtab(d)})})}
 
-function u2(){fetch("status.json").then(function(r){return r.json()})
-.then(function(d){tiles(d);table(d);
+function u2(){return fetch("status.json").then(function(r){return r.json()})
+.then(function(d){tiles(d);simban(d);table(d);tbud(d);deliv(d);recui(d);
 var s=document.getElementById("ssid");if(!s.value){s.value=d.ssid}
-document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})}
+document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})
+/* EEN MISLUKTE VERVERSING MOET ZICH MELDEN. Zonder deze tak bleef de pagina
+   staan met gegevens van een minuut geleden alsof het het heden was, en de fout
+   verdween in een afgewezen promise die niemand ziet. Een tabel die stilstaat is
+   niet te onderscheiden van een node waar niets gebeurt -- en dat is precies het
+   verschil dat deze pagina moet tonen. */
+.catch(function(){tsay("geen verbinding met de node -- wat hieronder staat is de "+
+"laatst ontvangen stand en niet het heden",0)})}
 
 /* ============================== nodebeheer =============================== */
 
@@ -1523,13 +2120,76 @@ n.innerHTML="Kanaal "+d.ch_first+" t/m "+d.ch_last+", dus "+d.mon_max+" in "+
 "gebruik zijn. Kort na een wijziging kan het één achterlopen: die byte "+
 "wordt met twee seconden uitstel naar flash geschreven."}
 
+/* De laatst bekende budgetstand, om VOOR het versturen te kunnen zeggen dat het
+   niet past. De node weigert het zelf ook (createMonitor -> MON_ERR_BYTES); dit is
+   gemak en niet het slot. Maar het is wel het gemak dat telt: een melding vóór de
+   klik voorkomt een kanaal dat voor niets vergeven wordt. */
+var TB=null;
+
 document.getElementById("a").onsubmit=function(ev){ev.preventDefault();
 /* f.elements[..] en niet f.name: op een formulier IS .name het name-attribuut
    van het formulier zelf en niet het veld dat zo heet. */
 var f=ev.target.elements;
+/* Een NIEUWE monitor wordt met pingtijd aangemaakt en kost dus 9 byte. */
+if(TB&&TB.left<9){
+say("past niet meer in het telemetriepakket: er is "+TB.left+" byte vrij en een "+
+"nieuwe monitor kost 9 byte (schakelaar 3 + pingtijd 6). Zet in de tabel "+
+"hierboven bij "+Math.ceil((9-TB.left)/6)+" monitor(s) de pingtijd uit -- dat "+
+"maakt per stuk 6 byte vrij -- of verwijder een monitor.",0);
+return}
 post("monitor","name="+encodeURIComponent(f["name"].value)+
 "&host="+encodeURIComponent(f["host"].value)+
 "&int="+encodeURIComponent(f["int"].value))};
+
+/* ---- de twee knoppen van het simulatiedeel ----
+ *
+ * Het TESTBERICHT vraagt eerst. Niet omdat het gevaarlijk is, maar omdat het
+ * zendtijd kost op een band die met anderen gedeeld wordt, en omdat het bij
+ * iedereen met het alarmrecht een melding op de telefoon geeft. Wie dat per
+ * ongeluk doet, heeft een paar mensen wakker gemaakt voor niets. */
+document.getElementById("tgo").onclick=function(){
+if(!confirm("Testbericht sturen?\n\nEr gaat een ECHT bericht over het mesh naar "+
+"iedereen met het alarmrecht -- gemarkeerd als test, maar het geeft wel een "+
+"melding op hun telefoon. Het kost zendtijd op een gedeelde band, en het gaat de "+
+"deur uit bij de volgende leesronde (hoogstens 60 s).\n\nDoorgaan?")){return}
+ssay("bezig...",1);
+psim("alert/test","")}
+
+document.getElementById("sclr").onclick=function(){psim("sim/clear","")}
+
+/* De herstelmelding gaat over de CLI en niet over een eigen route, om dezelfde
+   reden als de monitorvelden: daar zit de keuring en daar zit het wegschrijven
+   naar flash. Een tweede schrijfpad zou een tweede keuring zijn.
+
+   ALLEEN WAT VERANDERD IS, want elke gelukte 'sensor set' zet een
+   flashschrijving in de wacht. WASREC houdt de laatst ontvangen stand bij. */
+var WASREC={on:null,hold:null};
+document.getElementById("rgo").onclick=function(){
+var on=document.getElementById("recon").checked?1:0;
+var h=parseInt(document.getElementById("rhold").value,10);
+if(!(h>=0&&h<=3600)){ssay("rust: 0 t/m 3600 s",0);return}
+var cmds=[];
+if(WASREC.on===null||on!=WASREC.on){cmds.push("sensor set alert.recover "+on)}
+if(WASREC.hold===null||h!=WASREC.hold){cmds.push("sensor set alert.rhold "+h)}
+if(!cmds.length){ssay("niets veranderd",1);return}
+ssay("bezig...",1);
+cliSeq(cmds,function(good,bad,last){
+if(bad){ssay(bad+" van de "+(good+bad)+" geweigerd: "+last.trim(),0)}
+else{ssay("herstelmelding "+(on?"aan":"uit")+", rust "+h+" s",1)}
+u2()})}
+
+/* De twee velden bijwerken uit status.json -- maar NIET terwijl iemand erin
+   bezig is. Daarom alleen als de waarde nog overeenkomt met wat er het laatst
+   uit de node kwam; wie iets getypt heeft, houdt zijn tekst. Dezelfde regel als
+   bij het bewerken van een tabelregel, en om dezelfde reden. */
+function recui(d){
+var r=d.rec;if(!r){return}
+var cb=document.getElementById("recon"),hf=document.getElementById("rhold");
+if(WASREC.on===null||cb.checked==(WASREC.on==1)){cb.checked=r.on==1}
+if(WASREC.hold===null||hf.value==""+WASREC.hold){hf.value=r.hold}
+WASREC.on=r.on;WASREC.hold=r.hold;
+document.getElementById("rholdcur").textContent=
+"nu: "+(r.on?"aan":"uit")+", rust "+r.hold+" s"+(r.hold?"":" (meteen melden)")}
 
 document.getElementById("ka").onsubmit=function(ev){ev.preventDefault();
 var f=ev.target.elements;
@@ -1655,6 +2315,13 @@ void WebTask::routes() {
    * browser hem voorlaadt, en dat is de ergste knop die dit apparaat heeft. */
   _server->on("/cfg.json", HTTP_GET, web_route_cfgjson);
   _server->on("/cli", HTTP_POST, web_route_cli);
+  /* Simuleren en testen. POST-only, en hier om twee redenen: een GET die een
+   * sensor forceert is een link waarmee iemand de bewaking van een kanaal
+   * uitzet, en een GET die een testbericht stuurt is een link die zendtijd kost
+   * bij elke prefetch. Beide gebeuren zonder dat er iemand geklikt heeft. */
+  _server->on("/sim", HTTP_POST, web_route_sim);
+  _server->on("/sim/clear", HTTP_POST, web_route_simclear);
+  _server->on("/alert/test", HTTP_POST, web_route_alerttest);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -1713,6 +2380,26 @@ void WebTask::handleRoot() {
   _server->send_P(200, "text/html", PAGE_HTML);
 }
 
+/* De naam van een simulatiestand in JSON. Eén plek, want de pagina vergelijkt op
+ * deze woorden en de server schrijft ze -- twee lijstjes die uiteen kunnen lopen
+ * is precies hoe een tabel stil de verkeerde kleur krijgt. */
+static const char* simModeName(MonitorSensors::SimMode m) {
+  switch (m) {
+    case MonitorSensors::SIM_UP:   return "up";
+    case MonitorSensors::SIM_DOWN: return "down";
+    default:                       return "off";
+  }
+}
+
+static const char* testStateName(MonitorSensors::TestState s) {
+  switch (s) {
+    case MonitorSensors::TEST_PENDING: return "wacht";
+    case MonitorSensors::TEST_SENDING: return "bezig";
+    case MonitorSensors::TEST_DONE:    return "klaar";
+    default:                           return "niets";
+  }
+}
+
 void WebTask::handleStatus() {
   if (!requireAuth()) return;
 
@@ -1720,11 +2407,65 @@ void WebTask::handleStatus() {
   char esc[80];
   jsonEscape(g_ssid_shown, esc, sizeof(esc));
 
+  /* HET SIMULATIE- EN TESTBLOK. Apart samengesteld en niet in de grote snprintf
+   * hieronder: zonder sensorlaag bestaat het niet, en een veld dat er soms wel en
+   * soms niet is, moet de pagina per keer kunnen zien. Een leeg blok is hier het
+   * eerlijke antwoord -- de banner blijft dan weg omdat er niets te melden is.
+   *
+   * "rc" is het aantal ontvangers van de TEST en "rcnow" hoeveel er nu zijn. Die
+   * twee staan er beide, want ze kunnen verschillen: wie tussen twee tests een
+   * alarmrecht weghaalt, moet niet denken dat de oude uitslag nog geldt. */
+  /* HET BYTEBUDGET, in elk status.json en niet alleen bij het toevoegen.
+   *
+   * Het hoort LIVE te zijn omdat het live verandert: een monitor die op komt gaat
+   * van 3 naar 9 byte, en iemand die GPS aanzet verliest er in één keer 11. Een
+   * getal dat alleen bij het aanmaken berekend wordt, klopt precies niet op het
+   * moment dat het telt. "meas" zegt of het vaste deel al echt gemeten is; tot de
+   * eerste leesronde staat er de bekende ondergrens en zegt de pagina dat erbij. */
+  char budblk[200];
+  budblk[0] = 0;
+  if (_mon != nullptr) {
+    MonitorSensors::TelemBudget b;
+    _mon->telemBudget(b);
+    snprintf(budblk, sizeof(budblk),
+        "\"tb\":{\"total\":%u,\"base\":%u,\"fixed\":%u,\"mons\":%u,\"used\":%u,"
+        "\"left\":%u,\"nms\":%u,\"drop\":%u,\"meas\":%d,\"sw\":%u,\"gen\":%u},",
+        (unsigned)b.total, (unsigned)b.base, (unsigned)b.fixed, (unsigned)b.mons,
+        (unsigned)b.used, (unsigned)b.left, (unsigned)b.num_ms, (unsigned)b.dropped,
+        b.measured ? 1 : 0,
+        (unsigned)MonitorSensors::TELEM_BYTES_SWITCH_PUB,
+        (unsigned)MonitorSensors::TELEM_BYTES_GENERIC_PUB);
+  }
+
+  char simblk[260];
+  simblk[0] = 0;
+  if (_mon != nullptr) {
+    snprintf(simblk, sizeof(simblk),
+        "\"sim\":{\"n\":%u,\"max\":%u,\"secs\":%u,\"min\":%u,\"lim\":%u},"
+        "\"rec\":{\"on\":%d,\"hold\":%u},"
+        "\"test\":{\"st\":\"%s\",\"seq\":%u,\"rc\":%u,\"ack\":%u,\"age\":%lu,"
+        "\"wait\":%lu,\"rcnow\":%u},",
+        (unsigned)_mon->simActiveCount(),
+        (unsigned)MonitorSensors::MAX_SIM_ACTIVE,
+        (unsigned)MonitorSensors::SIM_SECS_DEFAULT,
+        (unsigned)MonitorSensors::SIM_SECS_MIN,
+        (unsigned)MonitorSensors::SIM_SECS_MAX,
+        _mon->recoverEnabled() ? 1 : 0,
+        (unsigned)_mon->recoverHoldSecs(),
+        testStateName(_mon->testState()),
+        (unsigned)_mon->testSeq(),
+        (unsigned)_mon->testRecipients(),
+        (unsigned)_mon->testAcks(),
+        (unsigned long)_mon->testAgeSecs(),
+        (unsigned long)_mon->testWaitSecs(),
+        (unsigned)countAlertRecipients());
+  }
+
   int n = snprintf(g_json, sizeof(g_json),
       "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"rssi\":%d,"
       "\"reason\":%u,\"reconnects\":%lu,\"resets\":%lu,\"uptime\":%lu,"
       "\"heap\":%lu,\"largest\":%lu,\"ssid\":\"%s\","
-      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,\"mon\":[",
+      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s\"mon\":[",
       _fw, wifiStateName(_wifi),
       ip[0], ip[1], ip[2], ip[3],
       (int)WiFi.RSSI(),
@@ -1741,7 +2482,8 @@ void WebTask::handleStatus() {
        * 0.000 zijn voor de pagina het teken dat er niets te tonen is. */
       _mon != nullptr ? (_mon->isMains() ? 1 : 0) : -1,
       _mon != nullptr ? _mon->lastVolts() : 0.0f,
-      _mon != nullptr && _mon->monitorsPaused() ? 1 : 0);
+      _mon != nullptr && _mon->monitorsPaused() ? 1 : 0,
+      budblk, simblk);
 
   if (n < 0 || (size_t)n >= sizeof(g_json)) {   /* kan niet; vangnet */
     _server->send(500, "text/plain", "antwoord te groot");
@@ -1796,20 +2538,51 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
      * kanalen, want ze zeggen hetzelfde met het omgekeerde woord. */
     const char* pw_sev = _mon->isMains() ? "ok" : "warn";
 
+    /* DE SIMULATIEVELDEN, op ELKE regel.
+     *
+     *   "si" = sensornummer voor POST /sim; -1 betekent "hier valt niets te
+     *          forceren" en dat geldt alleen voor kanaal 1, dat van SensorMesh
+     *          zelf is en niet van ons.
+     *   "sm" = off / up / down
+     *   "sl" = seconden tot het van zichzelf vervalt
+     *
+     * Kanaal 2 en 3 dragen HETZELFDE sensornummer, en dat is geen slordigheid:
+     * het is één meting met twee namen (zie MonitorSensors.h). Beide regels
+     * kleuren daardoor samen amber, en een klik op de een doet hetzelfde als een
+     * klik op de ander -- wat klopt, want "netvoeding weg" en "op batterij" zijn
+     * hetzelfde feit. */
+    const MonitorSensors::SimMode pw_sim = _mon->simMode(MonitorSensors::SIM_POWER);
+    const MonitorSensors::SimMode wf_sim = _mon->simMode(MonitorSensors::SIM_WIFI);
+
     n += snprintf(buf + n, len - n,
+        /* tms == -1 op een vast kanaal: daar valt geen pingtijd uit te zetten.
+         * De velden staan er toch, zodat de pagina niet per regel hoeft te
+         * kijken of ze bestaan -- dezelfde afspraak als bij de andere velden van
+         * de vaste vier. "tb" is wel echt: die 4 en die 3 byte gaan van hetzelfde
+         * budget af als een monitor. */
         "{\"ch\":1,\"n\":\"spanning\",\"h\":\"batterij\",\"i\":0,\"st\":\"%s\","
-        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"unk\"},"
+        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"unk\","
+        "\"si\":-1,\"sm\":\"off\",\"sl\":0,\"tms\":-1,\"tb\":4,\"drop\":0},"
         "{\"ch\":%u,\"n\":\"netvoeding\",\"h\":\"klemspanning\",\"i\":0,\"st\":\"%s\","
-        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\"},"
+        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\","
+        "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":-1,\"tb\":3,\"drop\":0},"
         "{\"ch\":%u,\"n\":\"batterijvoeding\",\"h\":\"klemspanning\",\"i\":0,\"st\":\"%s\","
-        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\"},"
+        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\","
+        "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":-1,\"tb\":3,\"drop\":0},"
         "{\"ch\":%u,\"n\":\"wifi\",\"h\":\"deze node\",\"i\":0,\"st\":\"%s\","
-        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\"}",
+        "\"ms\":0,\"f\":0,\"c\":0,\"k\":\"vast\",\"age\":0,\"sev\":\"%s\","
+        "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":-1,\"tb\":3,\"drop\":0}",
         volts,
         (unsigned)MonitorSensors::CH_MAINS,   _mon->isMains() ? "aan" : "uit", pw_sev,
+        (unsigned)MonitorSensors::SIM_POWER, simModeName(pw_sim),
+        (unsigned long)_mon->simSecsLeft(MonitorSensors::SIM_POWER),
         (unsigned)MonitorSensors::CH_BATTERY, _mon->isMains() ? "uit" : "aan", pw_sev,
+        (unsigned)MonitorSensors::SIM_POWER, simModeName(pw_sim),
+        (unsigned long)_mon->simSecsLeft(MonitorSensors::SIM_POWER),
         (unsigned)MonitorSensors::CH_WIFI,    _mon->isWifiOnline() ? "online" : "weg",
-        _mon->isWifiOnline() ? "ok" : "bad");
+        _mon->isWifiOnline() ? "ok" : "bad",
+        (unsigned)MonitorSensors::SIM_WIFI, simModeName(wf_sim),
+        (unsigned long)_mon->simSecsLeft(MonitorSensors::SIM_WIFI));
 
     const bool paused = _mon->monitorsPaused();
 
@@ -1830,9 +2603,22 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
        * "pauze" en "stil" zijn amber en niet rood, want ze zeggen niet dat een
        * dienst stuk is -- ze zeggen dat WIJ het niet weten. Rood is voorbehouden
        * aan wat is vastgesteld. */
+      const uint8_t sidx = (uint8_t)MonitorSensors::simIndexOfSlot(i);
+      const MonitorSensors::SimMode sm = _mon->simMode(sidx);
+
       const char* st;
       const char* sev;
-      if (paused)                      { st = "pauze"; sev = "warn"; }
+      /* EEN GEFORCEERD VAKJE GAAT VOOR OP DE PAUZE, en om dezelfde reden als in
+       * monitorAlert(): "pauze" is een uitspraak over een MEETPOGING, en er wordt
+       * hier niet gemeten maar beweerd. Zou de pauze voorgaan, dan zou een
+       * simulatie op een node met wifi-problemen als "pauze" op de pagina staan
+       * terwijl er wel degelijk een waarschuwing de deur uit is -- de tabel zou
+       * dan iets anders zeggen dan het bericht op de telefoon. */
+      if (sm != MonitorSensors::SIM_OFF) {
+        st  = (sm == MonitorSensors::SIM_UP) ? "op" : "neer";
+        sev = (sm == MonitorSensors::SIM_UP) ? "ok" : "bad";
+      }
+      else if (paused)                  { st = "pauze"; sev = "warn"; }
       else if (_mon->monitorIsStale(i)) { st = "stil";  sev = "warn"; }
       else if (!_mon->monitorSeeded(i)) { st = "?";     sev = "unk";  }
       else if (_mon->monitorIsUp(i))    { st = "op";    sev = "ok";   }
@@ -1840,7 +2626,8 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
 
       n += snprintf(buf + n, len - n,
           ",{\"ch\":%u,\"n\":\"%s\",\"h\":\"%s\",\"i\":%u,\"st\":\"%s\","
-          "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\"}",
+          "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\","
+          "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d}",
           (unsigned)_mon->monitorChannel(i),
           _mon->monitorName(i),
           push ? "(gemeld)" : _mon->monitorHost(i),
@@ -1851,7 +2638,17 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           (unsigned long)_mon->monitorChecks(i),
           push ? "gemeld" : "ping",
           (unsigned long)_mon->monitorReportAge(i),
-          sev);
+          sev,
+          (unsigned)sidx, simModeName(sm),
+          (unsigned long)_mon->simSecsLeft(sidx),
+          /* tms = gaat de pingtijd de ether in, tb = wat dit vakje in het pakket
+           * kost, drop = viel hij bij de laatste uitlezing BUITEN het pakket.
+           * Dat laatste is het veld waar het om gaat: een monitor die stil uit de
+           * telemetrie verdwijnt, is de fout die dit project al twee keer gekost
+           * heeft. Nu staat hij in het antwoord en dus op de pagina. */
+          _mon->monitorSendsMs(i) ? 1 : 0,
+          (unsigned)_mon->monitorTelemBytes(i),
+          _mon->monitorDropped(i) ? 1 : 0);
     }
   }
 
@@ -2042,6 +2839,189 @@ void WebTask::handleMonDel() {
 
   char msg[96];
   snprintf(msg, sizeof(msg), "ok %s verwijderd; kanaal blijft vergeven\n", name);
+  _server->send(200, "text/plain", msg);
+}
+
+/* ======================= simuleren en testen ==========================
+ *
+ * Waarom dit bestaat staat in MonitorSensors.h bij SIMULEREN. Kort: de
+ * waarschuwingen zijn gebouwd maar nog nooit afgegaan, en een node waarvan
+ * niemand weet of zijn bericht aankomt, ontdekt dat op het slechtste moment.
+ *
+ * Wat hier NIET staat is een tweede verzendweg. Een forcering verandert wat de
+ * sensorlaag TERUGGEEFT, en alertIf() in main.cpp doet daarna gewoon zijn werk --
+ * echt pakket, echte contactkeuze, echte ACK's. Zou hier een nepbericht
+ * samengesteld worden, dan testte deze pagina zichzelf.
+ */
+
+/* Antwoord op een SimResult. 400 voor verkeerde invoer, 409 voor "er loopt al
+ * iets" en 429 voor de rem -- die code betekent letterlijk "te veel verzoeken",
+ * en dat is precies wat de rem tegenhoudt. Een script dat hierop een 429 ziet
+ * weet dat het later moet terugkomen; op een 400 zou het opnieuw dezelfde fout
+ * maken. */
+static int httpCodeFor(MonitorSensors::SimResult r) {
+  switch (r) {
+    case MonitorSensors::SIM_OK:        return 200;
+    case MonitorSensors::SIM_ERR_BUSY:  return 409;
+    case MonitorSensors::SIM_ERR_FULL:
+    case MonitorSensors::SIM_ERR_GAP:   return 429;
+    default:                            return 400;
+  }
+}
+
+uint8_t WebTask::countAlertRecipients() const {
+  if (_acl == nullptr) return 0;
+  uint8_t n = 0;
+  const int cnt = _acl->getAclCount();
+  for (int i = 0; i < cnt; i++) {
+    ClientInfo* c = _acl->getAclEntry(i);
+    /* PERM_RECV_ALERTS_LO en niet _HI: monitorwaarschuwingen en het testbericht
+     * gaan als LOW_PRI_ALERT de deur uit (zie main.cpp), en alertIf() kiest zijn
+     * contacten op precies dit bit. Wie hier op _HI zou tellen, zou een getal
+     * tonen dat niets met de aflevering te maken heeft. */
+    if (c != nullptr && (c->permissions & PERM_RECV_ALERTS_LO)) n++;
+  }
+  return n;
+}
+
+/* POST /sim  (i=<sensornummer>, m=off|up|down, secs=<30..3600>)
+ *
+ * Eén sensor forceren of vrijgeven. De vervaltijd is verplicht in de zin dat er
+ * altijd één is: geen waarde betekent SIM_SECS_DEFAULT, en er bestaat geen stand
+ * "voor altijd". Zie de header van MonitorSensors: een forcering die blijft
+ * staan zet een monitor stil uit, en dat is erger dan geen testknop hebben.
+ */
+void WebTask::handleSim() {
+  if (!requireAuth()) return;
+
+  if (_mon == nullptr) {
+    _server->send(503, "text/plain", "sensorlaag niet gekoppeld");
+    return;
+  }
+
+  unsigned long idx = 0;
+  if (!getUInt(*_server, "i", 0, MonitorSensors::SIM_COUNT - 1, 0, &idx)) {
+    _server->send(400, "text/plain",
+                  MonitorSensors::simResultText(MonitorSensors::SIM_ERR_INDEX));
+    return;
+  }
+
+  char mode[8];
+  getArg(*_server, "m", mode, sizeof(mode));
+  MonitorSensors::SimMode m;
+  if (strcmp(mode, "up") == 0)        m = MonitorSensors::SIM_UP;
+  else if (strcmp(mode, "down") == 0) m = MonitorSensors::SIM_DOWN;
+  else if (strcmp(mode, "off") == 0)  m = MonitorSensors::SIM_OFF;
+  else {
+    _server->send(400, "text/plain", "m: up, down of off\n");
+    return;
+  }
+
+  unsigned long secs = 0;
+  if (!getUInt(*_server, "secs", MonitorSensors::SIM_SECS_MIN,
+               MonitorSensors::SIM_SECS_MAX,
+               MonitorSensors::SIM_SECS_DEFAULT, &secs)) {
+    _server->send(400, "text/plain",
+                  MonitorSensors::simResultText(MonitorSensors::SIM_ERR_SECS));
+    return;
+  }
+
+  MonitorSensors::SimResult r = _mon->simSet((uint8_t)idx, m, (uint16_t)secs);
+  if (r != MonitorSensors::SIM_OK) {
+    _server->send(httpCodeFor(r), "text/plain", MonitorSensors::simResultText(r));
+    return;
+  }
+
+  char msg[160];
+  if (m == MonitorSensors::SIM_OFF) {
+    snprintf(msg, sizeof(msg), "sensor %lu terug op de meting\n", idx);
+  } else {
+    /* De vervaltijd staat IN het antwoord, en niet alleen op de pagina. Wie dit
+     * met een script doet moet ook weten wanneer het van zichzelf ophoudt. */
+    snprintf(msg, sizeof(msg),
+             "sensor %lu geforceerd op '%s' voor %lus; daarna vanzelf terug naar "
+             "de meting. De waarschuwing gaat bij de volgende leesronde uit "
+             "(hoogstens 60s).\n",
+             idx, m == MonitorSensors::SIM_UP ? "op" : "neer", secs);
+  }
+  _server->send(200, "text/plain", msg);
+}
+
+/* POST /sim/clear -- alles in één keer terug naar de meting.
+ *
+ * Deze knop is er omdat hij er moet zijn: wie twijfelt of er nog iets geforceerd
+ * staat, hoort dat met één klik zeker te kunnen weten in plaats van tien regels
+ * na te lopen. Er zit geen rem op en geen bevestiging: terug naar de waarheid is
+ * de handeling die je nooit wil vertragen. */
+void WebTask::handleSimClear() {
+  if (!requireAuth()) return;
+
+  if (_mon == nullptr) {
+    _server->send(503, "text/plain", "sensorlaag niet gekoppeld");
+    return;
+  }
+
+  const uint8_t was = _mon->simActiveCount();
+  _mon->simClearAll();
+
+  char msg[96];
+  snprintf(msg, sizeof(msg), "%u forcering(en) opgeheven; alles staat weer op de "
+                             "meting\n", (unsigned)was);
+  _server->send(200, "text/plain", msg);
+}
+
+/* POST /alert/test -- één kort testbericht naar de alarmontvangers.
+ *
+ * VERSTUURD IS NIET AANGEKOMEN. Het antwoord zegt daarom naar hoeveel ontvangers
+ * het gaat en niet dat het gelukt is; wat er van de bezorging bekend is komt
+ * daarna in /status.json binnen, want ACK's hebben tijd nodig. Die twee dingen
+ * door elkaar halen is precies waarom er op ACK's gelet wordt.
+ */
+void WebTask::handleAlertTest() {
+  if (!requireAuth()) return;
+
+  if (_mon == nullptr) {
+    _server->send(503, "text/plain", "sensorlaag niet gekoppeld");
+    return;
+  }
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain",
+        "meshlaag niet gekoppeld: voeg in main.cpp setup() toe: "
+        "web_task.setAcl(&the_mesh);\n");
+    return;
+  }
+
+  const uint8_t rc = countAlertRecipients();
+
+  /* GEEN ONTVANGERS IS EEN FOUT EN GEEN GELUKTE TEST. Zonder deze tak zou de
+   * knop "verstuurd naar 0 ontvangers" melden en dat leest als succes -- terwijl
+   * het antwoord op de vraag "komen mijn waarschuwingen aan" dan nee is, en de
+   * oorzaak precies hier zichtbaar was. De zendtijd wordt ook niet verbruikt. */
+  if (rc == 0) {
+    _server->send(412, "text/plain",
+        "geen enkele ingang heeft het alarmrecht, dus een waarschuwing van deze "
+        "node komt nergens aan. Zet op het tabblad 'toegang' het vinkje 'alarm' "
+        "aan bij minstens een sleutel.\n");
+    return;
+  }
+
+  MonitorSensors::SimResult r = _mon->testRequest(rc);
+  if (r != MonitorSensors::SIM_OK) {
+    char msg[160];
+    snprintf(msg, sizeof(msg), "%s (nog %lus te wachten)\n",
+             MonitorSensors::simResultText(r),
+             (unsigned long)_mon->testWaitSecs());
+    _server->send(httpCodeFor(r), "text/plain", msg);
+    return;
+  }
+
+  char msg[200];
+  snprintf(msg, sizeof(msg),
+           "testbericht #%u aangevraagd voor %u ontvanger(s). Hij gaat de deur "
+           "uit bij de volgende leesronde (hoogstens 60s) -- dat is geen "
+           "vertraging maar hetzelfde pad als een echte waarschuwing. Bevestigde "
+           "aflevering komt hieronder te staan.\n",
+           (unsigned)_mon->testSeq(), (unsigned)rc);
   _server->send(200, "text/plain", msg);
 }
 
@@ -2493,13 +3473,16 @@ void WebTask::handleCfgJson() {
     for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
       uint8_t ch = _mon->monitorChannel(i);
       if (ch >= MonitorSensors::CH_MONITOR_FIRST && ch <= MonitorSensors::CH_MONITOR_LAST) {
-        g_ever_mask |= (uint8_t)(1 << (ch - MonitorSensors::CH_MONITOR_FIRST));
+        g_ever_mask |= ((uint32_t)1 << (ch - MonitorSensors::CH_MONITOR_FIRST));
       }
     }
   }
   int ever = 0;
   for (int b = 0; b < MonitorSensors::MAX_MONITORS; b++) {
-    if (g_ever_mask & (1 << b)) ever++;
+    /* (uint32_t)1 en niet 1: met 32 kanalen is bit 31 de laatste, en 1 << 31 op
+     * een int is ongedefinieerd gedrag. Dat compileert zonder klacht en levert
+     * daarna stil een verkeerde telling op. */
+    if (g_ever_mask & ((uint32_t)1 << b)) ever++;
   }
 
   /* Twee aparte vragen en niet één. "Leeg" en "nog de gebakken waarde" zijn twee

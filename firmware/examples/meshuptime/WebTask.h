@@ -118,6 +118,36 @@ private:
   void handleMonAdd();
   void handleMonDel();
 
+  /* SIMULEREN EN TESTEN VAN WAARSCHUWINGEN.
+   *
+   * Drie POSTs en geen enkele GET, en dat is hier geen formaliteit: een GET die
+   * een sensor forceert is een link die iemand kan sturen, en een browser die hem
+   * voorlaadt zet de bewaking van een kanaal uit zonder dat er iemand geklikt
+   * heeft. Een GET die een testbericht stuurt kost bovendien zendtijd op een
+   * gedeelde band bij elke keer dat een linkchecker langskomt.
+   *
+   * DE KEURING ZIT HIER NIET. De grenzen -- de vervaltijd, hoeveel forceringen
+   * tegelijk, hoe vaak een testbericht -- zijn eigenschappen van de sensorlaag en
+   * niet van de webserver; ze staan in MonitorSensors::simSet() en
+   * testRequest(). Deze drie functies lezen argumenten en zetten een SimResult om
+   * in een HTTP-code, precies zoals handleMonAdd() dat met MonResult doet. Zo is
+   * er één plek waar de rem zit, en niet een halve in de browser en een halve
+   * hier.
+   *
+   * handleAlertTest() telt wél zelf de ONTVANGERS: dat is de toegangslijst en die
+   * hangt aan de meshlaag (_acl), niet aan de sensorlaag. MonitorSensors krijgt
+   * het getal mee en bewaart het bij de uitslag, zodat "naar hoeveel verstuurd"
+   * en "hoeveel bevestigd" over dezelfde test gaan -- ook als er ondertussen
+   * iemand aan de lijst sleutelt. */
+  void handleSim();
+  void handleSimClear();
+  void handleAlertTest();
+
+  /* Hoeveel ingangen op dit moment waarschuwingen krijgen (PERM_RECV_ALERTS_LO).
+   * Staat hier omdat zowel /status.json als /alert/test het getal nodig heeft, en
+   * twee keer dezelfde lus is ooit twee verschillende antwoorden. */
+  uint8_t countAlertRecipients() const;
+
   /* NODEBEHEER.
    *
    * handleCli() is de enige route die iets aan de node verandert wat niet over
@@ -162,6 +192,9 @@ private:
   friend void web_route_aclstrict();
   friend void web_route_cli();
   friend void web_route_cfgjson();
+  friend void web_route_sim();
+  friend void web_route_simclear();
+  friend void web_route_alerttest();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

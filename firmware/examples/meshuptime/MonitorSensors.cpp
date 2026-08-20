@@ -47,8 +47,13 @@ const char* MonitorSensors::monResultText(MonResult r) {
     case MON_ERR_INTERVAL: return "interval: 10-3600 s";
     case MON_ERR_TAKEN:    return "naam bestaat al";
     case MON_ERR_KIND:     return "naam bestaat al als ping-monitor";
-    case MON_ERR_FULL:     return "geen vakje vrij (max 8)";
+    case MON_ERR_FULL:     return "geen vakje vrij (max 32)";
     case MON_ERR_UNKNOWN:  return "naam bestaat niet";
+    /* De uitweg staat IN de melding. "vol" laat iemand zoeken; "zet bij een paar
+     * monitors de pingtijd uit" is een handeling. */
+    case MON_ERR_BYTES:    return "past niet in het telemetriepakket van 180 byte;"
+                                  " zet bij een of meer monitors de pingtijd uit"
+                                  " (3 byte in plaats van 9) of verwijder er een";
   }
   return "onbekende fout";
 }
@@ -128,6 +133,19 @@ bool MonitorSensors::begin() {
   MonitorStore::load(SPIFFS, _cfg);
 
   memset(_mon, 0, sizeof(_mon));
+
+  /* Geen forceringen na een start, en dat is geen initialisatiehygiëne maar de
+   * ontwerpeis uit de header: een node die na een stroomstoring in testmodus
+   * opstart zwijgt over een echte storing. Omdat de simulatiestand alleen in RAM
+   * staat, is dit het enige dat er voor nodig is. */
+  memset(_sim, 0, sizeof(_sim));
+  memset(_fixed_alerting, 0, sizeof(_fixed_alerting));
+  memset(_fixed_down_sent, 0, sizeof(_fixed_down_sent));
+  memset(_fixed_down_since, 0, sizeof(_fixed_down_since));
+  memset(_fixed_up_since, 0, sizeof(_fixed_up_since));
+  memset(_fixed_rec_until, 0, sizeof(_fixed_rec_until));
+  memset(_fixed_rec_alerting, 0, sizeof(_fixed_rec_alerting));
+
   unsigned long now = millis();
   for (int i = 0; i < MAX_MONITORS; i++) {
     /* up begint op 'waar' zonder 'seeded': zolang er nog geen uitslag is, is
@@ -163,6 +181,27 @@ void MonitorSensors::loop() {
   }
 
   loopMonitors();
+
+  /* OP EEN TIK VAN 250 ms EN NIET ELKE RONDE.
+   *
+   * loop() draait duizenden keren per seconde, en deze drie lopen samen door 32
+   * monitorvakjes plus de vaste kanalen. Per ronde is dat niets; duizenden keren
+   * per seconde niets is meetbare rekentijd op een kern die óók de LoRa-radio
+   * bedient, en de radio gaat voor. Alles waar deze drie op letten wordt in
+   * SECONDEN gemeten -- een vervaltijd, een rustperiode, een venster van 45 s --
+   * dus een nauwkeurigheid van 250 ms verandert geen enkel besluit.
+   *
+   * NA loopMonitors(): een forcering die nu vervalt hoort niet nog een ronde mee
+   * te doen. En binnen de tik loopSim() vóór loopRecovery(), want een forcering
+   * die net vervallen is moet in dezelfde tik alweer met de GEMETEN waarde geteld
+   * worden -- anders wacht het herstelvenster op een forcering die er niet meer
+   * is. */
+  if ((long)(now - _next_tick) >= 0) {
+    _next_tick = now + TICK_MS;
+    loopSim();
+    loopTest();
+    loopRecovery();
+  }
 
   /* Wegschrijven gebeurt uitgesteld en nooit tijdens een ping. Een SPIFFS-
    * schrijfronde kost tientallen milliseconden; die wachten we liever af op een
@@ -219,8 +258,35 @@ void MonitorSensors::samplePower() {
   }
 }
 
-bool MonitorSensors::isWifiOnline() const {
+/* De GEMETEN wifi-toestand. Alleen de ping-machine en monitorsPaused() gebruiken
+ * deze; zie de uitleg bij SIMULEREN in de header voor waarom die twee juist niet
+ * naar de gesimuleerde waarde mogen kijken. */
+bool MonitorSensors::wifiReallyOnline() const {
   return _wifi != NULL && _wifi->isOnline();
+}
+
+/* De GERAPPORTEERDE toestanden. Deze twee gaan naar de telemetrie, de pagina, de
+ * DM-lijst en de waarschuwingen, en dus horen zij de forcering te volgen -- als
+ * de een iets anders zegt dan de ander, is de simulatie zelf een bron van
+ * verwarring in plaats van een test.
+ *
+ * Geen millis() hier: het verlopen van een forcering doet loopSim(), zodat deze
+ * twee niets anders zijn dan een veld lezen. Ze worden uit querySensors() en uit
+ * de webserver aangeroepen en horen geen tijd of toestand te kennen. */
+bool MonitorSensors::isMains() const {
+  switch (_sim[SIM_POWER].mode) {
+    case SIM_UP:   return true;    /* netvoeding aan, batterijvoeding uit */
+    case SIM_DOWN: return false;   /* op batterij -- de slechte stand */
+    default:       return _mains;
+  }
+}
+
+bool MonitorSensors::isWifiOnline() const {
+  switch (_sim[SIM_WIFI].mode) {
+    case SIM_UP:   return true;
+    case SIM_DOWN: return false;
+    default:       return wifiReallyOnline();
+  }
 }
 
 /* ===================== de ping-bewaking =====================
@@ -252,7 +318,11 @@ bool MonitorSensors::isWifiOnline() const {
  * dienst die down is terwijl wij blind zijn, is niet vastgesteld.
  */
 void MonitorSensors::loopMonitors() {
-  const bool online = isWifiOnline();
+  /* wifiReallyOnline() en niet isWifiOnline(): de ping-machine hangt aan de
+   * ECHTE verbinding. Zie de uitleg bij SIMULEREN in de header -- "wifi neer"
+   * forceren mag niet stil de hele bewaking uitzetten, en "wifi op" forceren mag
+   * niet acht monitors laten pingen over een verbinding die er niet is. */
+  const bool online = wifiReallyOnline();
   unsigned long now = millis();
 
   if (online != _wifi_was_online) {
@@ -260,7 +330,7 @@ void MonitorSensors::loopMonitors() {
 
     if (online) {
       _wifi_ok_since = now;
-      /* Opnieuw uitsmeren: anders staan na de insteltijd alle acht monitors
+      /* Opnieuw uitsmeren: anders staan na de insteltijd alle monitors
        * tegelijk klaar en dringen ze achter elkaar in de rij. */
       for (int i = 0; i < MAX_MONITORS; i++) {
         _mon[i].next_check = now + WIFI_GRACE_MS + (unsigned long)i * PING_GAP_MS;
@@ -613,8 +683,36 @@ uint8_t     MonitorSensors::monitorChannel(int slot) const  { return monitorUsed
 const char* MonitorSensors::monitorName(int slot) const     { return monitorUsed(slot) ? _cfg.mons[slot].name : ""; }
 const char* MonitorSensors::monitorHost(int slot) const     { return monitorUsed(slot) ? _cfg.mons[slot].host : ""; }
 uint16_t    MonitorSensors::monitorInterval(int slot) const  { return monitorUsed(slot) ? _cfg.mons[slot].interval_s : 0; }
-bool        MonitorSensors::monitorIsUp(int slot) const     { return monitorUsed(slot) && _mon[slot].seeded && _mon[slot].up; }
-bool        MonitorSensors::monitorSeeded(int slot) const   { return monitorUsed(slot) && _mon[slot].seeded; }
+
+/* DEZE TWEE ZIJN HET HELE SIMULATIEPAD voor de monitors.
+ *
+ * Staat er een forcering op dit vakje, dan geven zij de geforceerde stand; de
+ * gemeten stand in _mon[slot] blijft ongemoeid en loopt eronder door, zodat het
+ * aflopen van de forcering terugvalt op een ACTUELE waarde en niet op de waarde
+ * van een minuut geleden.
+ *
+ * Omdat alles wat naar buiten gaat langs deze twee loopt -- querySensors(),
+ * monitorAlert(), de pagina, de DM-lijst -- hoeft er nergens anders iets van de
+ * simulatie te weten. Dat is de bedoeling: één plek waar de forcering wordt
+ * toegepast betekent dat er geen pad kan zijn dat hem overslaat.
+ *
+ * Een geforceerd vakje is per definitie 'seeded': er IS een mening, hij komt
+ * alleen niet uit een ping. */
+bool MonitorSensors::monitorIsUp(int slot) const {
+  if (!monitorUsed(slot)) return false;
+  switch (_sim[SIM_MON_FIRST + slot].mode) {
+    case SIM_UP:   return true;
+    case SIM_DOWN: return false;
+    default:       return _mon[slot].seeded && _mon[slot].up;
+  }
+}
+
+bool MonitorSensors::monitorSeeded(int slot) const {
+  if (!monitorUsed(slot)) return false;
+  if (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF) return true;
+  return _mon[slot].seeded;
+}
+
 uint32_t    MonitorSensors::monitorPingMs(int slot) const   { return monitorUsed(slot) ? _mon[slot].last_ms : 0; }
 uint32_t    MonitorSensors::monitorChecks(int slot) const   { return monitorUsed(slot) ? _mon[slot].checks : 0; }
 uint32_t    MonitorSensors::monitorFails(int slot) const    { return monitorUsed(slot) ? _mon[slot].fails : 0; }
@@ -633,12 +731,20 @@ uint32_t MonitorSensors::monitorStaleSecs(int slot) const {
   return monitorStaleMs(slot) / 1000;
 }
 
+/* Een geforceerd vakje is nooit 'stil': er IS een mening over deze dienst, hij
+ * komt alleen niet van de melder. Zonder deze uitzondering zou een gemelde
+ * dienst die geforceerd op 'op' staat tegelijk "op" en "geen melding meer"
+ * kunnen zijn, en dat zijn twee waarheden over hetzelfde kanaal. */
 bool MonitorSensors::monitorIsStale(int slot) const {
-  return monitorIsPush(slot) && _mon[slot].stale;
+  if (!monitorIsPush(slot)) return false;
+  if (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF) return false;
+  return _mon[slot].stale;
 }
 
+/* Ook hier de ECHTE wifi: "pauze" is een uitspraak over of wij hebben kunnen
+ * meten, en dat hangt aan de verbinding en niet aan wat wij erover melden. */
 bool MonitorSensors::monitorsPaused() const {
-  if (!isWifiOnline()) return true;
+  if (!wifiReallyOnline()) return true;
   return (long)(millis() - (_wifi_ok_since + WIFI_GRACE_MS)) < 0;
 }
 
@@ -681,6 +787,31 @@ bool MonitorSensors::monitorAlert(int slot) {
 
   MonState& m = _mon[slot];
 
+  /* ---- EEN FORCERING KOMT HIER HET ECHTE PAD BINNEN ----
+   *
+   * En dat is de hele truc: de voorwaarde is de GEFORCEERDE stand, en de rest --
+   * het versturen, de contactkeuze op PERM_RECV_ALERTS_*, de pogingen, de ACK's,
+   * het opruimen bij "herstel" -- doet alertIf() in main.cpp precies zoals bij
+   * een echte storing. Er is geen tak hieronder die weet dat dit een test is.
+   *
+   * DE PAUZEREGEL GELDT HIER NIET, en dat is met opzet. monitorsPaused() zegt
+   * "wij hebben niet kunnen meten", en dat is een uitspraak over een meting. Een
+   * forcering is geen meting maar een bewering, en die blijft geldig terwijl onze
+   * wifi weg is -- LoRa staat daar los van, dus de waarschuwing kan gewoon de
+   * deur uit. Zou de pauze hier wel gelden, dan zou een test op een node met
+   * wifi-problemen stil niets doen, precies wanneer je hem nodig hebt. */
+  const uint8_t sim = _sim[SIM_MON_FIRST + slot].mode;
+  if (sim != SIM_OFF) {
+    if (sim == SIM_UP) { m.alerting = false; return false; }
+    if (m.alerting) return true;
+    if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+    m.alerting = true;
+    noteDownSent(m.down_sent, m.down_since);
+    m.was_stale = false;
+    m.was_sim   = true;
+    return true;
+  }
+
   /* Bevestigd down, en we waren op dat moment niet blind. monitorsPaused()
    * dekt zowel "geen wifi" als de insteltijd erna.
    *
@@ -702,9 +833,7 @@ bool MonitorSensors::monitorAlert(int slot) {
   }
   if (m.alerting) return true;    /* loopt al; niet nog eens gaan tellen */
 
-  uint8_t active = 0;
-  for (int i = 0; i < MAX_MONITORS; i++) if (_mon[i].alerting) active++;
-  if (active >= MAX_MONITOR_ALERTS) {
+  if (alertsActive() >= MAX_MONITOR_ALERTS) {
     /* Rem, geen verlies: zodra er een plaats vrijkomt komt deze monitor bij
      * een volgende leesronde aan de beurt, want de voorwaarde blijft waar
      * zolang hij down is. */
@@ -712,15 +841,61 @@ bool MonitorSensors::monitorAlert(int slot) {
   }
 
   m.alerting = true;
+  /* HIER wordt vastgelegd dat wij deze storing GEMELD hebben, en niet alleen dat
+   * hij bestond. Dat is voorwaarde 1 van de herstelmelding (zie de header): een
+   * dienst die wegviel zonder dat er ooit iemand iets van hoorde, hoort geen
+   * "weer bereikbaar" op te leveren. */
+  noteDownSent(m.down_sent, m.down_since);
+  m.was_stale = m.stale;
+  m.was_sim   = false;
   return true;
 }
 
 /* Vaste buffer. alertIf() kopieert de tekst meteen in de Trigger, dus hij hoeft
- * maar tot het einde van die aanroep te bestaan. */
-static char s_alert_buf[80];
+ * maar tot het einde van die aanroep te bestaan.
+ *
+ * 160 EN NIET 80, nagerekend. De langste tekst is een gesimuleerde ping-monitor:
+ *
+ *   SIM_MARK  "TEST "                                            5
+ *   naam                                    MON_NAME_LEN-1  =   16
+ *   " onbereikbaar ("  + ")"                                     17
+ *   adres                                   MON_HOST_LEN-1  =   40
+ *   SIM_TAIL  " -- dit is een SIMULATIE, geen echte storing"      45
+ *                                                              ----
+ *                                                               123
+ *
+ * 160 geeft daar 37 byte marge boven. De bovengrens die ECHT telt zit in
+ * SensorMesh::sendAlert: die schrijft 5 + strlen(text) in een pakket van
+ * MAX_PACKET_PAYLOAD (184), dus 179 tekens is het absolute plafond. 160 blijft
+ * daaronder, ook als deze buffer helemaal vol staat. */
+static char s_alert_buf[160];
+
+/* HET MERKTEKEN EN DE UITLEG, op één plek.
+ *
+ * Wie een bericht op zijn telefoon krijgt moet ZONDER NADENKEN zien of dit een
+ * test is of dat zijn router echt uit staat. Daarom twee dingen en niet één: een
+ * merkteken vooraan (dat zie je in de meldingsbalk, waar de tekst wordt
+ * afgekapt) EN een uitleg in gewone taal achteraan (dat lees je als je het
+ * bericht opent). Een merkteken alleen is een geheimtaal die je moet kennen; een
+ * uitleg alleen staat te ver naar achteren om op tijd te helpen. */
+static const char SIM_MARK[] = "TEST ";
+static const char SIM_TAIL[] = " -- dit is een SIMULATIE, geen echte storing";
 
 const char* MonitorSensors::monitorAlertText(int slot) const {
   if (!monitorUsed(slot)) { s_alert_buf[0] = 0; return s_alert_buf; }
+
+  /* Gesimuleerd? Dan gaat de gewone tekst tussen het merkteken en de uitleg. Het
+   * middenstuk is hetzelfde als bij een echte storing, en dat is de bedoeling:
+   * de ontvanger leest dezelfde melding en ziet erbij dat hij niet echt is. */
+  const bool sim = _sim[SIM_MON_FIRST + slot].mode != SIM_OFF;
+  if (sim) {
+    snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s %s (%s)%s",
+             SIM_MARK, _cfg.mons[slot].name,
+             monitorIsPush(slot) ? "gemeld als neer" : "onbereikbaar",
+             monitorIsPush(slot) ? "gemeld" : _cfg.mons[slot].host,
+             SIM_TAIL);
+    return s_alert_buf;
+  }
 
   if (monitorIsPush(slot)) {
     /* Twee heel verschillende boodschappen, en het verschil is voor de ontvanger
@@ -743,12 +918,623 @@ const char* MonitorSensors::monitorAlertText(int slot) const {
   return s_alert_buf;
 }
 
+/* ===================== het bytebudget =====================
+ *
+ * De uitleg staat in de header bij HET BYTEBUDGET VAN DE TELEMETRIE. Kort: de
+ * echte grens zijn bytes en niet monitors, en dat getal hoort zichtbaar te zijn
+ * VOORDAT iemand de ruimte opmaakt.
+ */
+
+bool MonitorSensors::monitorSendsMs(int slot) const {
+  return monitorUsed(slot) && _cfg.mons[slot].send_ms != 0;
+}
+
+/* Wat dit vakje in het pakket kost.
+ *
+ * DE DUURSTE STAND EN NIET DE HUIDIGE. Een monitor die nu neer is kost 3 byte,
+ * want zonder 'up' gaat er geen pingtijd mee -- maar zodra hij weer op komt kost
+ * hij 9. Zou het budget op de huidige stand rekenen, dan beloofde de pagina
+ * ruimte die verdwijnt op het moment dat alles weer werkt. Dat is de verkeerde
+ * kant om fout te zitten: er zou dan precies bij HERSTEL afgekapt worden, dus op
+ * het moment dat het dashboard weer moet gaan kloppen. */
+uint8_t MonitorSensors::monitorTelemBytes(int slot) const {
+  if (!monitorUsed(slot)) return 0;
+  return TELEM_BYTES_SWITCH_PUB
+       + (_cfg.mons[slot].send_ms ? TELEM_BYTES_GENERIC_PUB : 0);
+}
+
+bool MonitorSensors::monitorDropped(int slot) const {
+  if (slot < 0 || slot >= MAX_MONITORS) return false;
+  return (_telem_dropped & ((uint32_t)1 << slot)) != 0;
+}
+
+void MonitorSensors::telemBudget(TelemBudget& out) const {
+  memset(&out, 0, sizeof(out));
+  out.total    = TELEM_BUDGET;
+  out.base     = _telem_base;
+  out.measured = _telem_measured;
+
+  /* De drie vaste schakelaars van deze klasse: netvoeding, batterijvoeding,
+   * wifi. Die staan er altijd, ook als er geen enkele monitor is. */
+  const uint16_t fixed = (uint16_t)_telem_base + 3 * TELEM_BYTES_SWITCH_PUB;
+  out.fixed = fixed > 255 ? 255 : (uint8_t)fixed;
+
+  uint16_t mons = 0;
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorUsed(i)) continue;
+    mons += monitorTelemBytes(i);
+    if (_cfg.mons[i].send_ms) out.num_ms++;
+    if (monitorDropped(i)) out.dropped++;
+  }
+  out.mons = mons > 255 ? 255 : (uint8_t)mons;
+
+  const uint16_t used = fixed + mons;
+  out.used = used > 255 ? 255 : (uint8_t)used;
+  out.left = used >= out.total ? 0 : (uint8_t)(out.total - used);
+}
+
+bool MonitorSensors::telemFits(uint8_t extra_bytes) const {
+  TelemBudget b;
+  telemBudget(b);
+  return (uint16_t)b.used + extra_bytes <= (uint16_t)b.total;
+}
+
+/* ===================== herstelmeldingen =====================
+ *
+ * Waarom dit bestaat en welke drie voorwaarden er gelden, staat in de header bij
+ * HERSTELMELDINGEN. Hier staat het uitvoerende deel.
+ */
+
+/* "Wij hebben deze storing gemeld." Eén regel, maar wel een eigen functie: hij
+ * wordt op vier plaatsen gezet (monitor, gesimuleerde monitor, en de twee vaste
+ * kanalen) en het moment waarop down_since gezet wordt bepaalt de duur in het
+ * bericht. Vier keer dezelfde twee regels is vier kansen om er één te vergeten. */
+void MonitorSensors::noteDownSent(bool& down_sent, unsigned long& down_since) {
+  if (!down_sent) {
+    down_sent  = true;
+    down_since = millis();
+  }
+}
+
+/* De teller van de rustperiode. Voor één ingang, en dezelfde regel voor de
+ * monitors als voor de vaste kanalen -- vandaar losse verwijzingen in plaats van
+ * een struct: de twee soorten bewaren hun velden op een andere plek maar volgen
+ * hetzelfde recept. */
+void MonitorSensors::trackRecovery(bool up_now, bool& down_sent,
+                                   unsigned long& down_since,
+                                   unsigned long& up_since,
+                                   unsigned long& rec_until) {
+  unsigned long now = millis();
+
+  if (!up_now) {
+    /* Weer neer. De klok van de rustperiode begint straks opnieuw, en een
+     * herstelmelding die nog niet de deur uit was gaat NIET meer: die zou
+     * beweren dat het opgelost is terwijl het dat niet is. Dit is de rem tegen
+     * flappen -- een dienst die elke minuut op en neer gaat, haalt de
+     * rustperiode nooit en stuurt dus ook nooit een herstelmelding. */
+    up_since  = 0;
+    rec_until = 0;
+    return;
+  }
+
+  if (up_since == 0) up_since = now;      /* begin van aaneengesloten 'op' */
+
+  if (!down_sent) return;                 /* niets gemeld, niets te herstellen */
+  if (rec_until != 0) return;             /* venster loopt al of is al geweest */
+
+  /* rhold_s == 0 betekent "meteen melden", en dan is deze vergelijking meteen
+   * waar. Geen aparte tak nodig. */
+  if ((unsigned long)(now - up_since) < (unsigned long)_cfg.rhold_s * 1000UL) return;
+
+  rec_until = now + RECOVER_HOLD_MS;
+  MESH_DEBUG_PRINTLN("MonitorSensors: herstel gemeld na %lus storing",
+                     (unsigned long)((now - down_since) / 1000));
+}
+
+void MonitorSensors::loopRecovery() {
+  /* De monitors. monitorIsUp() en niet _mon[].up: een forcering hoort ook hier
+   * mee te doen, want anders zou "forceer op" een lopende storingsmelding wel
+   * opruimen maar geen herstelmelding geven -- en dan is de helft van de keten
+   * nog steeds niet te testen. */
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorUsed(i)) {
+      /* Vakje verdwenen: de boekhouding mee opruimen, anders erft een nieuwe
+       * monitor op dit vakje de storing van zijn voorganger. */
+      _mon[i].down_sent = false;
+      _mon[i].rec_until = 0;
+      _mon[i].up_since  = 0;
+      continue;
+    }
+    /* Tijdens de pauze wordt er niet geteld: zonder wifi weten wij niet of de
+     * dienst op is, en een rustperiode die doortikt terwijl wij blind zijn zou
+     * een herstel melden dat wij niet hebben vastgesteld. */
+    const bool sim_on = _sim[SIM_MON_FIRST + i].mode != SIM_OFF;
+    if (monitorsPaused() && !sim_on) continue;
+
+    trackRecovery(monitorIsUp(i), _mon[i].down_sent, _mon[i].down_since,
+                  _mon[i].up_since, _mon[i].rec_until);
+  }
+
+  /* De twee vaste kanalen. isMains()/isWifiOnline() en dus mét forcering, om
+   * dezelfde reden. */
+  trackRecovery(isMains(), _fixed_down_sent[FIXED_POWER],
+                _fixed_down_since[FIXED_POWER], _fixed_up_since[FIXED_POWER],
+                _fixed_rec_until[FIXED_POWER]);
+  trackRecovery(isWifiOnline(), _fixed_down_sent[FIXED_WIFI],
+                _fixed_down_since[FIXED_WIFI], _fixed_up_since[FIXED_WIFI],
+                _fixed_rec_until[FIXED_WIFI]);
+}
+
+/* De voorwaarde die main.cpp aan de TWEEDE Trigger per vakje hangt.
+ *
+ * Waar voor een kort venster en daarna onwaar: een herstelmelding is een
+ * gebeurtenis en geen toestand. Bleef zij waar zolang de dienst op is, dan hield
+ * elke gezonde monitor een plaats in de wachtrij bezet -- en die zijn er vier. */
+bool MonitorSensors::recoverAlert(int slot) {
+  if (slot < 0 || slot >= MAX_MONITORS) return false;
+  MonState& m = _mon[slot];
+
+  if (!_cfg.recover_alerts || !monitorUsed(slot) || m.rec_until == 0) {
+    m.rec_alerting = false;
+    return false;
+  }
+
+  if ((long)(millis() - m.rec_until) >= 0) {
+    /* Venster voorbij. down_sent gaat NU op onwaar en niet eerder: zolang het
+     * venster open staat, is het de reden dat er een herstelmelding loopt. Zonder
+     * dit wissen zou de volgende keer dat de dienst even wegvalt meteen weer een
+     * herstelmelding opleveren zonder dat er een storing gemeld is. */
+    m.rec_alerting = false;
+    m.down_sent    = false;
+    m.was_sim      = false;
+    m.rec_until    = 0;
+    return false;
+  }
+
+  if (m.rec_alerting) return true;
+  if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+
+  m.rec_alerting = true;
+  return true;
+}
+
+bool MonitorSensors::fixedRecoverAlert(int which) {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
+
+  if (!_cfg.recover_alerts || _fixed_rec_until[which] == 0) {
+    _fixed_rec_alerting[which] = false;
+    return false;
+  }
+  if ((long)(millis() - _fixed_rec_until[which]) >= 0) {
+    _fixed_rec_alerting[which] = false;
+    _fixed_down_sent[which]    = false;
+    _fixed_rec_until[which]    = 0;
+    return false;
+  }
+  if (_fixed_rec_alerting[which]) return true;
+  if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+
+  _fixed_rec_alerting[which] = true;
+  return true;
+}
+
+/* De DUUR in woorden. Onder een minuut in seconden, daarboven in minuten: "na
+ * 247s" laat de lezer rekenen en "na 4 min" niet, en boven het uur is "na 3u12"
+ * het enige dat nog leesbaar is. Die duur is het enige wat een herstelmelding
+ * boven een geruststelling uittilt. */
+static const char* durText(unsigned long secs) {
+  static char buf[16];
+  if (secs < 60)   snprintf(buf, sizeof(buf), "%lus", secs);
+  else if (secs < 3600) snprintf(buf, sizeof(buf), "%lu min", secs / 60);
+  else snprintf(buf, sizeof(buf), "%luu%02lu", secs / 3600, (secs % 3600) / 60);
+  return buf;
+}
+
+const char* MonitorSensors::recoverAlertText(int slot) const {
+  if (!monitorUsed(slot)) { s_alert_buf[0] = 0; return s_alert_buf; }
+
+  const MonState& m = _mon[slot];
+  const unsigned long secs = (millis() - m.down_since) / 1000;
+
+  /* Gemarkeerd als test wanneer de STORING een simulatie was, of wanneer er nu
+   * een forcering op staat. Beide, want beide gevallen bestaan: een forcering die
+   * vervalt terwijl het herstelvenster open staat, en een forcering op 'op' die
+   * juist de herstelmelding uitlokt. */
+  const bool sim = m.was_sim || _sim[SIM_MON_FIRST + slot].mode != SIM_OFF;
+  const char* mark = sim ? SIM_MARK : "";
+  const char* tail = sim ? SIM_TAIL : "";
+
+  if (monitorIsPush(slot) && m.was_stale) {
+    /* De MELDER was stil, niet de dienst. Dan is "weer bereikbaar" het verkeerde
+     * bericht: wij wisten niets, en nu weten we weer wel iets. Wie de
+     * stilte-waarschuwing gekregen heeft, hoort te horen dat de meldingen terug
+     * zijn -- niet dat een dienst hersteld is die misschien nooit plat lag. */
+    snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s meldt weer (was %s stil)%s",
+             mark, _cfg.mons[slot].name, durText(secs), tail);
+    return s_alert_buf;
+  }
+
+  snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s weer %s na %s%s",
+           mark, _cfg.mons[slot].name,
+           monitorIsPush(slot) ? "op gemeld" : "bereikbaar",
+           durText(secs), tail);
+  return s_alert_buf;
+}
+
+const char* MonitorSensors::fixedRecoverAlertText(int which) const {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) { s_alert_buf[0] = 0; return s_alert_buf; }
+
+  const unsigned long secs = (millis() - _fixed_down_since[which]) / 1000;
+  /* De storing op een vast kanaal kan bij deze opzet alleen een simulatie zijn
+   * (zie fixedAlert), dus het merkteken staat er altijd. Zou fixedAlert() ooit
+   * ook op de gemeten toestand gaan vuren, dan hoort hier dezelfde was_sim-vlag
+   * te komen als bij de monitors. */
+  snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s terug na %s%s",
+           SIM_MARK, which == FIXED_POWER ? "netvoeding" : "wifi",
+           durText(secs), SIM_TAIL);
+  return s_alert_buf;
+}
+
+/* ===================== simuleren en testen =====================
+ *
+ * De uitleg over WAAROM en over de nummering staat in de header, bij SIMULEREN.
+ * Hier staat alleen het uitvoerende deel.
+ */
+
+const char* MonitorSensors::simResultText(SimResult r) {
+  switch (r) {
+    case SIM_OK:        return "ok";
+    case SIM_ERR_INDEX: return "geen bestaande sensor (of een leeg monitorvakje)";
+    case SIM_ERR_SECS:  return "vervaltijd: 30-3600 s";
+    case SIM_ERR_FULL:  return "er staan al 2 forceringen; hef er eerst een op";
+    case SIM_ERR_GAP:   return "te snel achter elkaar; wacht een paar seconden";
+    case SIM_ERR_BUSY:  return "er loopt al een testbericht";
+  }
+  return "onbekende fout";
+}
+
+/* Bestaat deze sensor, en valt er iets over te zeggen? Een leeg monitorvakje
+ * mag niet geforceerd worden: er is geen kanaal, dus er is niets om over te
+ * melden en de waarschuwing zou een naam van niets dragen. */
+static bool simIdxUsable(const MonitorSensors* self, uint8_t idx) {
+  if (idx >= MonitorSensors::SIM_COUNT) return false;
+  if (idx < MonitorSensors::SIM_MON_FIRST) return true;   /* voeding en wifi bestaan altijd */
+  return self->monitorUsed((int)(idx - MonitorSensors::SIM_MON_FIRST));
+}
+
+MonitorSensors::SimMode MonitorSensors::simMode(uint8_t idx) const {
+  if (idx >= SIM_COUNT) return SIM_OFF;
+  return (SimMode)_sim[idx].mode;
+}
+
+uint32_t MonitorSensors::simSecsLeft(uint8_t idx) const {
+  if (idx >= SIM_COUNT || _sim[idx].mode == SIM_OFF) return 0;
+  long left = (long)(_sim[idx].until - millis());
+  return left > 0 ? (uint32_t)(left / 1000) + 1 : 0;
+}
+
+uint8_t MonitorSensors::simActiveCount() const {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < SIM_COUNT; i++) if (_sim[i].mode != SIM_OFF) n++;
+  return n;
+}
+
+/* EEN teller voor de hele wachtrij. Zie de uitleg bij alertsActive() in de
+ * header: drie losse tellers van twee zouden zes plaatsen vragen waar er vier
+ * zijn, en dan valt er stil een ECHTE batterijwaarschuwing weg. */
+uint8_t MonitorSensors::alertsActive() const {
+  uint8_t n = 0;
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (_mon[i].alerting) n++;
+    /* De HERSTELMELDING telt mee, en dat is geen detail: bij een internetstoring
+     * komen alle monitors ongeveer gelijktijdig terug. Zonder deze regel zou die
+     * golf naast de storingsmeldingen langs de rem glippen en de wachtrij
+     * volzetten -- precies waar de rem voor is. */
+    if (_mon[i].rec_alerting) n++;
+  }
+  for (int k = 0; k < FIXED_ALERT_COUNT; k++) {
+    if (_fixed_alerting[k]) n++;
+    if (_fixed_rec_alerting[k]) n++;
+  }
+  if (_test_state == TEST_SENDING) n++;
+  return n;
+}
+
+MonitorSensors::SimResult MonitorSensors::simSet(uint8_t idx, SimMode mode,
+                                                 uint16_t secs) {
+  if (!simIdxUsable(this, idx)) return SIM_ERR_INDEX;
+
+  unsigned long now = millis();
+
+  /* Opheffen mag altijd en meteen. Een rem op TERUG naar de waarheid zou de
+   * verkeerde kant beveiligen: dat is de handeling die je nooit wil vertragen. */
+  if (mode == SIM_OFF) {
+    if (_sim[idx].mode != SIM_OFF) {
+      _sim[idx].mode = SIM_OFF;
+      _sim[idx].until = 0;
+      _sim_last_change = now;
+      MESH_DEBUG_PRINTLN("MonitorSensors: simulatie %d opgeheven", (int)idx);
+    }
+    return SIM_OK;
+  }
+
+  if (secs == 0) secs = SIM_SECS_DEFAULT;
+  if (secs < SIM_SECS_MIN || secs > SIM_SECS_MAX) return SIM_ERR_SECS;
+
+  /* De rem tegen flapperen. Alleen op het AANZETTEN en op het OMZETTEN, want
+   * elke overgang is een DM-keten naar alle ontvangers. Een lopende forcering
+   * VERLENGEN met dezelfde stand is geen overgang en mag dus wel. */
+  const bool same = (_sim[idx].mode == (uint8_t)mode);
+  if (!same && _sim_last_change != 0
+      && (unsigned long)(now - _sim_last_change) < SIM_GAP_MS) {
+    return SIM_ERR_GAP;
+  }
+
+  /* De rem op het AANTAL. Een vakje dat al geforceerd staat kost geen nieuwe
+   * plaats, dus omzetten en verlengen kan altijd. */
+  if (_sim[idx].mode == SIM_OFF && simActiveCount() >= MAX_SIM_ACTIVE) {
+    return SIM_ERR_FULL;
+  }
+
+  _sim[idx].mode  = (uint8_t)mode;
+  _sim[idx].until = now + (unsigned long)secs * 1000UL;
+  if (!same) _sim_last_change = now;
+
+  MESH_DEBUG_PRINTLN("MonitorSensors: simulatie %d -> %s, %us",
+                     (int)idx, mode == SIM_UP ? "op" : "neer", (unsigned)secs);
+  return SIM_OK;
+}
+
+void MonitorSensors::simClearAll() {
+  bool any = false;
+  for (uint8_t i = 0; i < SIM_COUNT; i++) {
+    if (_sim[i].mode != SIM_OFF) { any = true; }
+    _sim[i].mode = SIM_OFF;
+    _sim[i].until = 0;
+  }
+  if (any) {
+    _sim_last_change = millis();
+    MESH_DEBUG_PRINTLN("MonitorSensors: alle simulaties opgeheven");
+  }
+}
+
+/* HET AFLOPEN. Dit is de belangrijkste lus van dit onderdeel.
+ *
+ * Een forcering die blijft staan zet een monitor stil uit, en dat is erger dan
+ * geen testknop hebben: de node meldt dan niet meer wat er echt gebeurt en
+ * niemand ziet dat. Daarom loopt elke forcering af, en daarom staat er hieronder
+ * een regel in de debug-uitvoer -- zodat het aflopen ook terug te vinden is.
+ *
+ * Het TERUGVALLEN kost hier geen enkele regel, en dat is precies de winst van de
+ * opzet: de meting is nooit overschreven, dus mode op SIM_OFF zetten IS het
+ * terugvallen op de waarde die er ondertussen gemeten is.
+ */
+void MonitorSensors::loopSim() {
+  unsigned long now = millis();
+  for (uint8_t i = 0; i < SIM_COUNT; i++) {
+    if (_sim[i].mode == SIM_OFF) continue;
+    if ((long)(now - _sim[i].until) < 0) continue;
+
+    _sim[i].mode  = SIM_OFF;
+    _sim[i].until = 0;
+    MESH_DEBUG_PRINTLN("MonitorSensors: simulatie %d verlopen, terug naar de meting", (int)i);
+  }
+}
+
+/* ---------------- de waarschuwing van de vaste kanalen ----------------
+ *
+ * WAAR ZOLANG ER EEN FORCERING OP STAAT. Zie de uitleg in de header: een echte
+ * alarmering op netvoeding en wifi is niet gevraagd en er is geen plaats voor in
+ * MAX_CONCURRENT_ALERTS. Wie dat wél wil, verandert hieronder de ene regel die
+ * op de forcering kijkt in de gemeten toestand -- bijvoorbeeld
+ *
+ *     const bool want = (which == FIXED_POWER) ? !isMains() : !isWifiOnline();
+ *
+ * en moet dan MAX_MONITOR_ALERTS verhogen EN nagaan of de batterij nog twee
+ * plaatsen overhoudt. Dat laatste is de reden dat het hier niet zo staat.
+ */
+bool MonitorSensors::fixedAlert(int which) {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
+
+  const uint8_t idx  = (which == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
+  const bool    want = (_sim[idx].mode == SIM_DOWN);
+
+  if (!want) { _fixed_alerting[which] = false; return false; }
+  if (_fixed_alerting[which]) return true;
+  if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+
+  _fixed_alerting[which] = true;
+  /* Ook hier: pas als de melding UITGAAT mag er straks een herstelmelding op
+   * volgen. Zie de uitleg bij noteDownSent(). */
+  noteDownSent(_fixed_down_sent[which], _fixed_down_since[which]);
+  return true;
+}
+
+const char* MonitorSensors::fixedAlertText(int which) const {
+  if (which == FIXED_POWER) {
+    snprintf(s_alert_buf, sizeof(s_alert_buf),
+             "%snetvoeding weg, node op batterij (%.3fV)%s",
+             SIM_MARK, _last_volts, SIM_TAIL);
+  } else if (which == FIXED_WIFI) {
+    /* Erbij dat de monitors bevriezen: dat is het GEVOLG dat de ontvanger moet
+     * kennen. Zonder onze wifi meten wij niets over de diensten, en dan is het
+     * uitblijven van verdere waarschuwingen geen goed nieuws. */
+    snprintf(s_alert_buf, sizeof(s_alert_buf),
+             "%swifi weg, monitors bevroren%s", SIM_MARK, SIM_TAIL);
+  } else {
+    s_alert_buf[0] = 0;
+  }
+  return s_alert_buf;
+}
+
+/* ---------------- het testbericht ----------------
+ *
+ * Het bericht zelf. Kort, want het hoeft maar één ding te doen: aankomen en
+ * herkenbaar zijn. Het loopnummer staat erin zodat twee tests naast elkaar te
+ * leggen zijn -- zonder dat nummer is "ik kreeg een testbericht" niet te
+ * koppelen aan "ik heb er om 14:03 een gestuurd".
+ */
+const char* MonitorSensors::testAlertText() const {
+  snprintf(s_alert_buf, sizeof(s_alert_buf),
+           "%sTESTBERICHT #%u van MeshUptime -- alleen om te zien of "
+           "waarschuwingen aankomen; er is niets stuk",
+           SIM_MARK, (unsigned)_test_seq);
+  return s_alert_buf;
+}
+
+MonitorSensors::SimResult MonitorSensors::testRequest(uint8_t recipients) {
+  unsigned long now = millis();
+
+  /* Loopt er nog een? Dan niet nog een keer. Twee testberichten door elkaar
+   * maken de ACK-telling onleesbaar -- en dat getal is de hele opbrengst. */
+  if (_test_state == TEST_PENDING || _test_state == TEST_SENDING) return SIM_ERR_BUSY;
+
+  /* De rem: hoogstens één per minuut. Zendtijd is gedeeld, en een knop die je
+   * vijf keer achter elkaar kunt indrukken is vijf DM-ketens naar iedereen. */
+  if (_test_asked_at != 0 && (unsigned long)(now - _test_asked_at) < TEST_GAP_MS) {
+    return SIM_ERR_GAP;
+  }
+
+  /* Plaats in de wachtrij van alertIf()? Zo niet, dan hier weigeren met de
+   * reden, en niet stil aannemen: een aanvraag die nooit verstuurd wordt is
+   * precies het soort stilte dat dit hele onderdeel moet wegnemen. */
+  if (alertsActive() >= MAX_MONITOR_ALERTS) return SIM_ERR_FULL;
+
+  _test_state      = TEST_PENDING;
+  _test_recipients = recipients;
+  _test_acks       = 0;
+  _test_last_ack   = 0;
+  _test_asked_at   = now;
+  _test_sent_at    = 0;
+  _test_hold_until = 0;
+  _test_seq++;
+
+  MESH_DEBUG_PRINTLN("MonitorSensors: testbericht #%u aangevraagd, %u ontvanger(s)",
+                     (unsigned)_test_seq, (unsigned)recipients);
+  return SIM_OK;
+}
+
+/* De voorwaarde voor alertIf(). Waar vanaf het moment dat main.cpp hem in een
+ * leesronde oppikt, tot het rondje langs de contacten klaar hoort te zijn.
+ *
+ * WAAROM ER EEN VENSTER IS EN NIET EEN ENKELE 'true': alertIf() vuurt op de
+ * OVERGANG en heeft daarna tijd nodig -- 8 s per ontvanger die het alarmrecht
+ * heeft. Zou de voorwaarde meteen weer false worden, dan haalt alertIf() de
+ * Trigger halverwege uit de wachtrij en krijgt alleen de eerste ontvanger iets.
+ * Zou hij voor altijd waar blijven, dan blijft er een plaats bezet die een echte
+ * waarschuwing nodig kan hebben. */
+bool MonitorSensors::testAlert() {
+  if (_test_state == TEST_PENDING) {
+    /* Plaats vrij? Dan is dit de leesronde waarin hij de deur uit gaat. */
+    if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+
+    unsigned long hold = TEST_HOLD_BASE_MS
+                       + (unsigned long)_test_recipients * TEST_HOLD_PER_MS;
+    if (hold > TEST_HOLD_MAX_MS) hold = TEST_HOLD_MAX_MS;
+
+    _test_state      = TEST_SENDING;
+    _test_sent_at    = millis();
+    _test_hold_until = _test_sent_at + hold;
+    MESH_DEBUG_PRINTLN("MonitorSensors: testbericht #%u gaat de deur uit",
+                       (unsigned)_test_seq);
+    return true;
+  }
+  return _test_state == TEST_SENDING;
+}
+
+/* Een ACK. main.cpp ziet ze langskomen en geeft ons de expected_acks[] van de
+ * Trigger mee; de vergelijking en de telling staan hier.
+ *
+ * ALLEEN TELLEN ZOLANG DE TEST LOOPT, en niet dezelfde ACK twee keer: een ACK
+ * kan over meerdere paden aankomen, en dan zou "3 van 2 bevestigd" op de pagina
+ * staan. Een getal dat hoger is dan het maximum maakt het hele overzicht
+ * verdacht, ook de delen die wel kloppen.
+ *
+ * Wat deze telling NIET kan zien: SensorMesh hergebruikt expected_acks[3] voor
+ * elke volgende ontvanger, dus een ACK die pas aankomt nadat er al naar de
+ * volgende ontvanger gestuurd is, is niet meer te herkennen. De pagina zegt
+ * daarom "minstens zoveel bevestigd" en niet "precies zoveel". */
+bool MonitorSensors::noteAlertAck(uint32_t ack_crc, const uint32_t* expected,
+                                 uint8_t n) {
+  if (_test_state != TEST_SENDING || expected == NULL) return false;
+  if (ack_crc == 0) return false;
+  if (ack_crc == _test_last_ack) return true;   /* al geteld */
+
+  if (n > 4) n = 4;
+  for (uint8_t i = 0; i < n; i++) {
+    if (expected[i] != ack_crc) continue;
+    _test_last_ack = ack_crc;
+    if (_test_acks < 255) _test_acks++;
+    MESH_DEBUG_PRINTLN("MonitorSensors: testbericht #%u bevestigd (%u van %u)",
+                       (unsigned)_test_seq, (unsigned)_test_acks,
+                       (unsigned)_test_recipients);
+    return true;
+  }
+  return false;
+}
+
+void MonitorSensors::loopTest() {
+  if (_test_state == TEST_PENDING) {
+    /* Nooit opgepakt (geen plaats vrijgekomen)? Dan vervalt de aanvraag met een
+     * reden in de uitvoer. Een aanvraag die eeuwig blijft wachten is een knop
+     * die niets deed. */
+    if ((unsigned long)(millis() - _test_asked_at) >= TEST_PENDING_MAX_MS) {
+      _test_state = TEST_DONE;
+      MESH_DEBUG_PRINTLN("MonitorSensors: testbericht #%u vervallen, nooit een vrije plaats",
+                         (unsigned)_test_seq);
+    }
+    return;
+  }
+
+  if (_test_state == TEST_SENDING && (long)(millis() - _test_hold_until) >= 0) {
+    _test_state = TEST_DONE;
+    MESH_DEBUG_PRINTLN("MonitorSensors: testbericht #%u klaar, %u van %u bevestigd",
+                       (unsigned)_test_seq, (unsigned)_test_acks,
+                       (unsigned)_test_recipients);
+  }
+}
+
+MonitorSensors::TestState MonitorSensors::testState() const {
+  return (TestState)_test_state;
+}
+
+uint32_t MonitorSensors::testAgeSecs() const {
+  if (_test_asked_at == 0) return 0;
+  return (uint32_t)((millis() - _test_asked_at) / 1000);
+}
+
+uint32_t MonitorSensors::testWaitSecs() const {
+  if (_test_asked_at == 0) return 0;
+  long left = (long)(_test_asked_at + TEST_GAP_MS - millis());
+  return left > 0 ? (uint32_t)(left / 1000) + 1 : 0;
+}
+
 /* ===================== telemetrie ===================== */
 
 bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   /* EERST de basisklasse: batterij (kanaal 1, door SensorMesh), GPS en de
    * omgevingssensoren blijven werken zoals upstream. */
   EnvironmentSensorManager::querySensors(requester_permissions, telemetry);
+
+  /* HET VASTE DEEL METEN, hier en niet schatten.
+   *
+   * Op dit punt staat er in het pakket wat SensorMesh en de basisklasse erin
+   * gezet hebben: de batterijspanning (4 byte), de GPS als die aanstaat (11 byte)
+   * en eventuele omgevingssensoren. Dat getal is het enige eerlijke "vast
+   * gebruik" voor het budget op de pagina -- een vast getal in de code zou stil
+   * verkeerd worden op de dag dat iemand GPS aanzet, en dan belooft de pagina
+   * ruimte die er niet is.
+   *
+   * Dit is bovendien de enige plek waar het te meten valt: querySensors() loopt
+   * in BEIDE paden (de periodieke ronde en het antwoord op een verzoek), en de
+   * basisklasse vertelt niet hoeveel zij gaat gebruiken. */
+  {
+    const int base = (int)telemetry.getSize();
+    if (base >= 0 && base <= TELEM_BUDGET) {
+      _telem_base = (uint8_t)base;
+      _telem_measured = true;
+    }
+  }
 
   /* Voeding en wifi vallen onder de basispermissie: dit is de toestand van de
    * node zelf, niet die van een omgevingssensor. Een vraagsteller die bit 0
@@ -759,8 +1545,19 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
    * aparte sensoren zijn die elk hun eigen waarschuwing kunnen krijgen, en
    * omdat een LPP_SWITCH 3 byte kost. */
   if (requester_permissions & TELEM_PERM_BASE) {
-    telemetry.addSwitch(CH_MAINS,   _mains ? 1 : 0);
-    telemetry.addSwitch(CH_BATTERY, _mains ? 0 : 1);
+    /* Het masker van afgekapte vakjes hoort bij DEZE uitlezing en niet bij de
+     * vorige: wie een pingtijd uitzet en daarmee ruimte maakt, moet de melding
+     * zien verdwijnen. */
+    _telem_dropped = 0;
+
+    /* isMains() en niet _mains: een forcering hoort OOK in de telemetrie te
+     * staan. Een dashboard aan de andere kant moet hetzelfde zien als deze node,
+     * anders is de simulatie een test van de pagina in plaats van van het
+     * systeem -- en dan blijft juist de vraag onbeantwoord of dat dashboard er
+     * iets van meekrijgt. */
+    const bool mains_now = isMains();
+    telemetry.addSwitch(CH_MAINS,   mains_now ? 1 : 0);
+    telemetry.addSwitch(CH_BATTERY, mains_now ? 0 : 1);
     /* Zonder aangehangen WifiTask is er geen wifi, en dan is "niet online" het
      * eerlijke antwoord. Het kanaal blijft altijd aanwezig, zodat een
      * dashboard geen veld ziet komen en gaan. */
@@ -794,16 +1591,40 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
     for (int i = 0; i < MAX_MONITORS; i++) {
       if (!monitorUsed(i)) continue;
 
-      const bool up = _mon[i].seeded && _mon[i].up;
-      const uint8_t need = TELEM_BYTES_SWITCH + (up ? TELEM_BYTES_GENERIC : 0);
+      /* monitorIsUp()/monitorSeeded() en niet _mon[i] rechtstreeks: dat is het
+       * ENIGE punt waar de forcering in de telemetrie komt, en het moet er zijn.
+       * Een simulatie die de pagina wel en het mesh niet bereikt, test de helft
+       * van de keten -- en juist de andere helft is waar het misgaat. */
+      const bool up = monitorSeeded(i) && monitorIsUp(i);
+      /* De pingtijd gaat alleen mee als de monitor OP is en als deze monitor hem
+       * mag meesturen (send_ms). Dat tweede is de knop waarmee 9 byte 3 byte
+       * wordt, en daarmee het verschil tussen zeventien en ruim vijftig monitors
+       * in hetzelfde pakket. */
+      const bool with_ms = up && _cfg.mons[i].send_ms;
+      const uint8_t need = TELEM_BYTES_SWITCH + (with_ms ? TELEM_BYTES_GENERIC : 0);
 
       if ((int)telemetry.getSize() + need > TELEM_BUDGET) {
-        MESH_DEBUG_PRINTLN("MonitorSensors: telemetrie vol bij kanaal %d, rest afgekapt", (int)_cfg.mons[i].channel);
-        break;
+        /* AFKAPPEN MAG, STIL AFKAPPEN NIET.
+         *
+         * Per monitor alles of niets -- een halve monitor (schakelaar erin,
+         * pingtijd eruit) zou een dashboard een tijd van nul laten tekenen. En
+         * geen 'break': de rest van de lus wordt doorlopen om te MARKEREN welke
+         * vakjes buiten het pakket vielen, zodat /status.json en de pagina kunnen
+         * zeggen WELKE dat waren. Een monitor die stil uit de telemetrie
+         * verdwijnt is de fout die dit project al twee keer gekost heeft.
+         *
+         * Doorlopen kan bovendien nog iets opleveren: een monitor die verderop
+         * staat en zijn pingtijd niet meestuurt, past soms nog wel in de 3 byte
+         * die er over zijn. Dat is geen truc maar de bedoeling van het budget. */
+        _telem_dropped |= ((uint32_t)1 << i);
+        MESH_DEBUG_PRINTLN("MonitorSensors: kanaal %d past niet in de telemetrie (%d/%d byte gebruikt)",
+                           (int)_cfg.mons[i].channel, (int)telemetry.getSize(),
+                           (int)TELEM_BUDGET);
+        continue;
       }
 
       telemetry.addSwitch(_cfg.mons[i].channel, up ? 1 : 0);
-      if (up) {
+      if (with_ms) {
         /* multiplier van LPP_GENERIC_SENSOR is 1, dus dit zijn exacte hele
          * milliseconden en geen afgeronde schaalwaarde. */
         telemetry.addGenericSensor(_cfg.mons[i].channel, (float)_mon[i].last_ms);
@@ -844,36 +1665,45 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
  * zou de node na een herstart weer bij 5 beginnen uitdelen en was de hele
  * afspraak een afspraak voor de duur van één stroomvoorziening.
  *
- * Zijn alle acht nummers een keer gebruikt en is er niets meer nieuw uit te
+ * Zijn alle nummers een keer gebruikt en is er niets meer nieuw uit te
  * delen, dan pas wordt een vrijgekomen nummer hergebruikt -- de laagste. Op dat
- * moment is hergebruik onvermijdelijk; wie zijn monitors acht keer opnieuw
+ * moment is hergebruik onvermijdelijk; wie zijn monitors ruim dertig keer opnieuw
  * indeelt, moet zijn dashboards nalopen. Dat staat in de melding hieronder.
  */
 uint8_t MonitorSensors::allocChannel() {
-  uint8_t in_use = 0;
+  /* uint32_t EN NIET uint8_t, en dat is de reden dat deze functie bij het
+   * verhogen van MAX_MONITORS moest worden nagelopen: met 32 kanalen past het
+   * masker niet in een byte. Een 1 << 31 op een uint8_t compileert zonder
+   * klacht en levert stil nul op -- en dan wordt kanaal 36 opnieuw uitgedeeld
+   * alsof hij nooit vergeven was. Dat is precies de stille fout waar deze hele
+   * toewijzer tegen bedoeld is. De static_assert hieronder houdt het vast. */
+  static_assert(MAX_MONITORS <= 32,
+                "ch_ever_used is een uint32_t; meer dan 32 kanalen past niet in dat masker");
+
+  uint32_t in_use = 0;
   for (int i = 0; i < MAX_MONITORS; i++) {
     if (_cfg.mons[i].channel != 0) {
-      in_use |= (uint8_t)(1 << (_cfg.mons[i].channel - CH_MONITOR_FIRST));
+      in_use |= ((uint32_t)1 << (_cfg.mons[i].channel - CH_MONITOR_FIRST));
     }
   }
 
   /* 1. een nummer dat nog nooit is uitgedeeld */
   for (uint8_t b = 0; b < MAX_MONITORS; b++) {
-    if (!(_cfg.ch_ever_used & (1 << b))) {
-      _cfg.ch_ever_used |= (uint8_t)(1 << b);
+    if (!(_cfg.ch_ever_used & ((uint32_t)1 << b))) {
+      _cfg.ch_ever_used |= ((uint32_t)1 << b);
       return (uint8_t)(CH_MONITOR_FIRST + b);
     }
   }
 
   /* 2. alles is een keer gebruikt: nu pas hergebruiken */
   for (uint8_t b = 0; b < MAX_MONITORS; b++) {
-    if (!(in_use & (1 << b))) {
+    if (!(in_use & ((uint32_t)1 << b))) {
       MESH_DEBUG_PRINTLN("MonitorSensors: kanaal %d wordt HERGEBRUIKT; dashboards die dit kanaal bewaard hebben, tonen nu een andere dienst", (int)(CH_MONITOR_FIRST + b));
       return (uint8_t)(CH_MONITOR_FIRST + b);
     }
   }
 
-  return 0;   /* alle acht bezet */
+  return 0;   /* alle vakjes bezet */
 }
 
 /* ===================== monitors beheren ===================== */
@@ -941,7 +1771,23 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
   for (int i = 0; i < MAX_MONITORS; i++) {
     if (_cfg.mons[i].channel == 0) { slot = i; break; }
   }
-  if (slot < 0) return MON_ERR_FULL;           /* alle acht vakjes bezet */
+  if (slot < 0) return MON_ERR_FULL;           /* alle vakjes bezet */
+
+  /* DE ECHTE GRENS: PAST HIJ NOG IN HET PAKKET?
+   *
+   * Deze keuring staat HIER en niet alleen in de browser, en dat is het verschil
+   * tussen gemak en een slot. De pagina rekent hetzelfde uit om het meteen te
+   * kunnen zeggen, maar /hook, de CLI en een script komen daar niet langs. Zonder
+   * deze regel zou een achttiende monitor stil worden aangemaakt en dan bij elke
+   * uitlezing buiten het pakket vallen -- geen foutmelding, maar wel verkeerde
+   * gegevens op een dashboard.
+   *
+   * Er wordt gerekend met de DUURSTE stand (9 byte, mét pingtijd), want zo wordt
+   * een nieuwe monitor aangemaakt. Wie meer monitors wil, zet bij een paar de
+   * pingtijd uit; dat staat in de foutmelding en op de pagina. */
+  if (!telemFits(TELEM_BYTES_SWITCH_PUB + TELEM_BYTES_GENERIC_PUB)) {
+    return MON_ERR_BYTES;
+  }
 
   uint8_t ch = allocChannel();
   if (ch == 0) return MON_ERR_FULL;
@@ -951,6 +1797,9 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
   StrHelper::strncpy(e.host, host, sizeof(e.host));
   e.interval_s = interval_s;
   e.channel    = ch;
+  /* Pingtijd standaard AAN: dat is wat iemand verwacht die een monitor aanmaakt,
+   * en het is wat elke eerdere versie deed. */
+  e.send_ms    = 1;
 
   memset(&_mon[slot], 0, sizeof(_mon[slot]));
   _mon[slot].up = true;               /* nog niet 'seeded'; zie applyResult() */
@@ -1141,8 +1990,9 @@ bool MonitorSensors::delMonitor(const char* name) {
  * MonitorStore.h.
  */
 
-#define MON_FIELDS_PER_MONITOR  4     /* name, host, int, state */
-#define MON_NUM_GLOBAL_SETTINGS 6     /* mains.hi/lo/state + mon.count/add/del */
+#define MON_FIELDS_PER_MONITOR  5     /* name, host, int, state, ms */
+#define MON_NUM_GLOBAL_SETTINGS 8     /* mains.hi/lo/state + mon.count/add/del
+                                       + alert.recover/alert.rhold */
 
 /* Vaste buffers, één per instelling: getSettingValue() is const en mag niets
  * alloceren, en met een buffer per instelling kan een aanroeper meerdere
@@ -1154,7 +2004,7 @@ static char s_setting_buf[4][12];
  * getSettingValue(i)) en die twee aanroepen staan dus tegelijk uit
  * (CommonCLI.cpp:302). Twee monitorwaarden naast elkaar vasthouden kan hier
  * niet, en dat hoeft ook niemand: elke aanroeper in de boom leest er één. */
-static char s_mon_name_buf[20];       /* "mon.12.state" + afsluiter */
+static char s_mon_name_buf[20];       /* "mon.36.state" + afsluiter */
 static char s_mon_val_buf[MON_HOST_LEN];
 
 int MonitorSensors::getNumSettings() const {
@@ -1175,6 +2025,12 @@ const char* MonitorSensors::getSettingName(int i) const {
     case 3: return "mon.count";     // alleen lezen: aantal monitors
     case 4: return "mon.add";       // knop: naam,adres[,interval]
     case 5: return "mon.del";       // knop: naam
+    /* De herstelmelding hangt hier en niet aan een eigen webroute, met opzet: zo
+     * loopt hij door dezelfde keuring en dezelfde opslag als elke andere
+     * instelling, en is hij ook over serieel en over een DM te zetten. Een node
+     * zonder wifi hoort zijn alarmgedrag ook te kunnen wijzigen. */
+    case 6: return "alert.recover"; // 0/1: melden als iets weer werkt
+    case 7: return "alert.rhold";   // s: hoe lang op voordat het herstel gemeld wordt
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -1183,7 +2039,10 @@ const char* MonitorSensors::getSettingName(int i) const {
   const int slot  = slotOfNth(nth);
   if (slot < 0) return NULL;
 
-  static const char* names[MON_FIELDS_PER_MONITOR] = { "name", "host", "int", "state" };
+  /* "ms" is de knop uit het bytebudget: 1 = de pingtijd gaat mee over het mesh
+   * (9 byte), 0 = alleen de schakelaar (3 byte). De METING loopt in beide gevallen
+   * door en blijft in "state" te zien. */
+  static const char* names[MON_FIELDS_PER_MONITOR] = { "name", "host", "int", "state", "ms" };
   snprintf(s_mon_name_buf, sizeof(s_mon_name_buf), "mon.%u.%s",
            (unsigned)_cfg.mons[slot].channel, names[field]);
   return s_mon_name_buf;
@@ -1209,6 +2068,14 @@ const char* MonitorSensors::getSettingValue(int i) const {
       return "<naam,adres[,interval]>";   /* knop: de vorm, niet een waarde */
     case 5:
       return "<naam>";
+    case 6:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%d",
+               _cfg.recover_alerts ? 1 : 0);
+      return s_setting_buf[2];
+    case 7:
+      snprintf(s_setting_buf[3], sizeof(s_setting_buf[3]), "%u",
+               (unsigned)_cfg.rhold_s);
+      return s_setting_buf[3];
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -1226,6 +2093,13 @@ const char* MonitorSensors::getSettingValue(int i) const {
       break;
     case 2:
       snprintf(s_mon_val_buf, sizeof(s_mon_val_buf), "%u", (unsigned)_cfg.mons[slot].interval_s);
+      break;
+    case 4:
+      /* Met het BYTEGETAL erbij, want dat is waar deze knop over gaat. Wie
+       * 'sensor list' leest, ziet dan meteen wat hij per monitor kost. */
+      snprintf(s_mon_val_buf, sizeof(s_mon_val_buf), "%u (%ub)",
+               (unsigned)(_cfg.mons[slot].send_ms ? 1 : 0),
+               (unsigned)monitorTelemBytes(slot));
       break;
     default:
       /* "pauze" is geen toestand van de dienst maar van ons: zie loopMonitors().
@@ -1280,6 +2154,24 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
   if (strcmp(name, "mains.state") == 0) return false;
   if (strcmp(name, "mon.count") == 0) return false;
 
+  if (strcmp(name, "alert.recover") == 0) {
+    /* Alleen 0 en 1, en niet "alles wat niet nul is": wie "aan" intypt zou
+     * anders stil 0 krijgen (atoi geeft 0) en denken dat het aanstaat. */
+    if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) return false;
+    _cfg.recover_alerts = (value[0] == '1') ? 1 : 0;
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "alert.rhold") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_RHOLD_MIN || v > MON_RHOLD_MAX) return false;
+    _cfg.rhold_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+
   if (strcmp(name, "mon.add") == 0) return addMonitor(value);
   if (strcmp(name, "mon.del") == 0) return delMonitor(value);
 
@@ -1294,6 +2186,20 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     if (ch < CH_MONITOR_FIRST || ch > CH_MONITOR_LAST) return false;
     int slot = findByChannel((uint8_t)ch);
     if (slot < 0) return false;
+
+    if (strcmp(field, "ms") == 0) {
+      /* AANZETTEN kost 6 byte extra en kan dus niet altijd; UITZETTEN maakt juist
+       * ruimte en mag altijd. Dat is geen willekeur maar dezelfde regel als bij
+       * het opheffen van een simulatie: de handeling die naar een veiliger stand
+       * gaat, hoort nooit geweigerd te worden. */
+      if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) return false;
+      const bool want = (value[0] == '1');
+      if (want && !_cfg.mons[slot].send_ms
+          && !telemFits(TELEM_BYTES_GENERIC_PUB)) return false;
+      _cfg.mons[slot].send_ms = want ? 1 : 0;
+      markDirty();
+      return true;
+    }
 
     if (strcmp(field, "name") == 0) {
       /* Hernoemen mag; het KANAAL verandert daarbij niet. Een naam is voor de

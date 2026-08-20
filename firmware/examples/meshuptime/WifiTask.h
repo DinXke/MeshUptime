@@ -40,6 +40,30 @@ public:
    * iemand een avond zoeken. */
   uint8_t lastDisconnectReason() const { return _last_reason; }
 
+  /* Klok van internet. De ESP32 heeft geen batterijgevoede klok, dus na elke
+   * herstart staat hij op 15 mei 2024 -- de vaste terugvalwaarde in
+   * CommonCLI.cpp:188. Dat is niet cosmetisch: MeshCore gebruikt tijdstempels
+   * voor herhaalbeveiliging, en telemetrie, waarschuwingsleeftijden en de
+   * verouderingsregel voor gemelde diensten hangen er allemaal aan. Een node
+   * die zijn eigen tijd niet weet, liegt over wanneer iets gebeurde.
+   *
+   * Alleen VOORUIT zetten, nooit achteruit: dezelfde regel die 'time <epoch>'
+   * en 'clock sync' aanhouden, en om dezelfde reden -- een klok die terugloopt
+   * maakt van geldige pakketten opeens herhalingen. */
+  bool timeSynced() const { return _time_synced; }
+
+  /* Beheer van de tijdsynchronisatie, voor de webinterface.
+   *
+   * De server is instelbaar omdat een node zonder internet maar met een eigen
+   * router vaak wel een tijdbron op het LAN heeft, en pool.ntp.org dan nooit
+   * antwoordt. syncNow() is er omdat wachten tot de volgende herverbinding geen
+   * antwoord is als je nu wil weten of het werkt. */
+  void        syncNow();
+  void        setNtpServer(const char* host);
+  const char* ntpServer() const { return _ntp[0] ? _ntp : "pool.ntp.org"; }
+  const char* lastSyncMsg() const { return _sync_msg; }
+  uint32_t    secsSinceSync() const { return _synced_at ? (millis() - _synced_at) / 1000 : 0; }
+
   uint32_t reconnectCount() const { return _reconnects; }
   uint32_t hardResetCount()  const { return _hard_resets; }
 
@@ -51,6 +75,13 @@ private:
   uint8_t  _fails = 0;         // mislukte pogingen achter elkaar
   uint32_t _reconnects = 0;
   uint32_t _hard_resets = 0;
+  bool     _time_synced = false;
+  unsigned long _sntp_deadline = 0;
+  char     _ntp[48] = {0};
+  char     _sync_msg[64] = {0};
+  unsigned long _synced_at = 0;
+  void startTimeSync();
+  void checkTimeSync();
 
   /* Vaste buffers: dit apparaat alloceert niets op de heap voor configuratie.
    * 33 en 65 zijn de maxima uit de 802.11-norm plus afsluiter. */

@@ -24,9 +24,25 @@
  *     hi 4.120
  *     lo 4.090
  *     ever 3
- *     m 5 60 google 8.8.8.8
- *     m 6 30 hoas hoas.scheepers.one
+ *     rec 1
+ *     rhold 120
+ *     m 5 60 google 8.8.8.8 1
+ *     m 6 30 hoas hoas.scheepers.one 0
  *     .
+ *
+ * De velden van een "m"-regel zijn: kanaal, interval, naam, adres en of de
+ * PINGTIJD meegaat over het mesh (zie MonitorCfgEntry::send_ms). Dat laatste veld
+ * is bij het LEZEN optioneel en krijgt dan de waarde 1 -- een bestand van een
+ * eerdere versie komt van firmware die de pingtijd altijd meestuurde, dus zo
+ * verandert er na een update niets aan wat er de ether in gaat. Bij het SCHRIJVEN
+ * staat hij er altijd.
+ *
+ * De kenregel blijft #MU1 nadat er "rec", "rhold" en dat zesde veld bij zijn
+ * gekomen, en dat is met opzet: onbekende sleutels worden overgeslagen en een
+ * ontbrekend veld heeft een verdedigbare standaard. Een bestand MET die regels is
+ * dus nog leesbaar door firmware die ze niet kent, en een bestand ZONDER is
+ * leesbaar door deze firmware. Het nummer verhogen zou beide kanten stukmaken
+ * voor een uitbreiding die niets breekt.
  *
  * Tekst en niet een binaire struct, om drie redenen: het is met "cat" te lezen
  * over de seriële console, een veld erbij maakt oude bestanden niet onleesbaar
@@ -52,7 +68,27 @@
  * en het ontleden gebeurt op zijn plaats in die buffer.
  */
 
-#define MON_MAX_MONITORS   8      /* net zoveel als er kanalen zijn: 5..12 */
+/* HET AANTAL VAKJES -- 32, en de kanalen zijn dus 5..36.
+ *
+ * WAAROM NIET 8 MEER, EN WAAROM DIT GETAL GEEN GRENS IS
+ *
+ * Een vast maximum op het AANTAL monitors is altijd of te krap of onwaar, want de
+ * echte grens zijn BYTES: de CayenneLPP van SensorMesh is MAX_PACKET_PAYLOAD - 4
+ * = 180 byte, en daar moet alles in. Met een pingtijd erbij kost een monitor
+ * 9 byte, zonder 3 byte, dus er passen er 17 of ruim vijftig -- afhankelijk van
+ * hoe ze ingesteld staan. Een teller van 8 kon dat verschil niet uitdrukken.
+ *
+ * 32 is daarom geen grens maar ruimte: genoeg dat het BUDGET de rem wordt en niet
+ * de teller, en dat budget staat live op de pagina. Wat het kost is nagerekend en
+ * niet aangenomen -- zie het rapport bij deze wijziging: ~1,7 kB aan MonState,
+ * ~2,0 kB aan MonitorCfgEntry en de Trigger-rijen in main.cpp. Op een bord met
+ * ~250 kB vrij RAM is dat te overzien; op 8 monitors stond er al net zoveel
+ * ongebruikt.
+ *
+ * DE KANAALNUMMERS BLIJVEN VASTLIGGEN. 5..12 betekende hetzelfde vóór deze
+ * wijziging als erna, dus een dashboard dat "kanaal 6 = google" bewaard heeft,
+ * blijft kloppen. Er komen alleen nummers bij aan de bovenkant. */
+#define MON_MAX_MONITORS  32      /* net zoveel als er kanalen zijn: 5..36 */
 #define MON_NAME_LEN      17      /* 16 tekens + afsluiter */
 #define MON_HOST_LEN      41      /* 40 tekens + afsluiter */
 
@@ -80,19 +116,69 @@ struct MonitorCfgEntry {
   char     name[MON_NAME_LEN];
   char     host[MON_HOST_LEN];
   uint16_t interval_s;
-  uint8_t  channel;        /* 5..12; 0 betekent: dit vakje is leeg */
+  uint8_t  channel;        /* 5..36; 0 betekent: dit vakje is leeg */
+
+  /* GAAT DE PINGTIJD MEE OVER HET MESH? Standaard ja, want dat is wat iemand
+   * verwacht die een monitor aanmaakt.
+   *
+   * Staat hij uit, dan publiceert querySensors() alleen de SCHAKELAAR (3 byte) en
+   * niet de LPP_GENERIC_SENSOR met de tijd (6 byte). Dat is het verschil tussen
+   * 9 en 3 byte per monitor, en daarmee tussen zeventien monitors en ruim vijftig
+   * in hetzelfde pakket.
+   *
+   * LET OP HET VERSCHIL, want het is niet hetzelfde en de pagina zegt het er ook
+   * bij: de pingtijd wordt nog steeds GEMETEN en is nog steeds te zien op de
+   * pagina, in 'sensor list' en in de DM-lijst. Hij gaat alleen niet meer de
+   * ether in. "De meting is er niet" en "de meting gaat niet mee" zijn twee heel
+   * verschillende dingen -- wie ze verwart, gaat een sensor repareren die werkt. */
+  uint8_t  send_ms;        /* 0 = alleen de schakelaar, 1 = ook de pingtijd */
 };
+
+/* Grenzen van de rustperiode voor een HERSTELMELDING. Hier en niet in
+ * MonitorSensors.cpp, om dezelfde reden als bij het interval: het inleesfilter en
+ * het instellingenfilter moeten dezelfde grenzen aanhouden.
+ *
+ * 0 is toegestaan en betekent "meteen melden". 120 s is de standaard: dat is
+ * langer dan twee ping-rondes op het standaardinterval, dus een dienst die
+ * flappert haalt hem niet. 3600 s is de bovengrens; wie langer wil wachten, wil
+ * eigenlijk geen herstelmelding. */
+#define MON_RHOLD_MIN         0
+#define MON_RHOLD_MAX      3600
+#define MON_RHOLD_DEFAULT   120
 
 struct MonitorCfg {
   float   mains_hi;
   float   mains_lo;
 
+  /* HERSTELMELDINGEN -- gaat er ook een bericht uit als iets weer WERKT?
+   *
+   * Standaard aan, want zonder herstelmelding krijg je "router onbereikbaar" en
+   * daarna nooit meer iets. Dan is er geen verschil te zien tussen "het is
+   * opgelost" en "de node is zelf gestopt met melden", en dat tweede is precies
+   * het geval dat je wil onderscheiden.
+   *
+   * Uit te zetten, want het verdubbelt het aantal berichten per storing en op een
+   * node met een krap zendbudget is dat een verdedigbare keuze.
+   *
+   * rhold_s is de rem tegen flappen: zo lang moet een dienst aaneengesloten weer
+   * op zijn voordat het herstel gemeld wordt. Zonder die rem stuurt een dienst
+   * die elke minuut op en neer gaat elke minuut twee berichten, en dat is de
+   * ergste vorm van een alarmsysteem -- het leert mensen meldingen negeren. */
+  uint8_t  recover_alerts;   /* 0 = uit, 1 = aan */
+  uint16_t rhold_s;          /* MON_RHOLD_MIN..MAX */
+
   /* Bitmasker van kanalen die OOIT zijn uitgedeeld, bit 0 = kanaal 5.
-   * Dit hoort bij de blijvende gegevens en niet bij het geheugen: zonder deze
-   * byte zou de node na een herstart weer bij kanaal 5 beginnen uitdelen, en
+   * Dit hoort bij de blijvende gegevens en niet bij het geheugen: zonder dit
+   * masker zou de node na een herstart weer bij kanaal 5 beginnen uitdelen, en
    * dan wijst een bewaarde koppeling bij een vraagsteller opnieuw naar de
-   * verkeerde dienst. Zie de uitleg bij allocChannel() in MonitorSensors.cpp. */
-  uint8_t ch_ever_used;
+   * verkeerde dienst. Zie de uitleg bij allocChannel() in MonitorSensors.cpp.
+   *
+   * uint32_t EN NIET uint8_t: met 32 kanalen past het masker niet meer in een
+   * byte. Dat is precies het soort verandering dat stil fout gaat -- de code
+   * compileert, en dan worden de kanalen boven 12 gewoon opnieuw uitgedeeld
+   * zonder dat er iets van te zien is. Het bestandsformaat draagt het getal als
+   * tekst, dus oude bestanden (waarden 0..255) blijven leesbaar. */
+  uint32_t ch_ever_used;
 
   MonitorCfgEntry mons[MON_MAX_MONITORS];
 };

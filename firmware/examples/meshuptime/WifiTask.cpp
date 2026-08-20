@@ -1,5 +1,8 @@
 #include "WifiTask.h"
 #include <WiFi.h>
+#include <time.h>
+#include "esp_sntp.h"
+#include "target.h"
 
 /* Logging. Een waakhond die bestaat om een moeilijk te betrappen storing te
  * repareren, moet kunnen vertellen dat hij iets gedaan heeft -- anders weet je
@@ -35,6 +38,10 @@ static const char* stateName(int s) {
  * wachtwoord op een terugvalnetwerk is precies wat je niet wil op het moment
  * dat je het nodig hebt. De webinterface erachter heeft WEL inloggegevens. */
 #define AP_SSID_PREFIX      "MeshUptime-"
+
+/* Ruim: de klok is nergens dringend voor, en een SNTP-poging die de radio in de
+ * weg zit is erger dan een klok die een minuut later goed staat. */
+#define SNTP_WAIT_MS         45000
 
 static volatile uint8_t g_last_reason = 0;
 static volatile bool    g_got_ip = false;
@@ -104,8 +111,76 @@ void WifiTask::startAP() {
   _next_action = 0;
 }
 
+/* De ondergrens waaronder een tijd niet echt kan zijn.
+ *
+ * NIET 1.7e9, en dat was mijn eerste fout: de vaste terugvalwaarde van deze
+ * firmware is 1715770351 (15 mei 2024, CommonCLI.cpp:188) en die ligt DAARBOVEN.
+ * Een drempel die de standaardwaarde doorlaat, keurt precies het geval goed dat
+ * hij moest tegenhouden. 1 januari 2025 ligt na elke terugvalwaarde in deze
+ * broncode en ver voor elke echte tijd die we ooit zullen zien. */
+#define TIME_FLOOR   1735689600UL
+
+void WifiTask::setNtpServer(const char* host) {
+  strncpy(_ntp, host ? host : "", sizeof(_ntp) - 1);
+  _ntp[sizeof(_ntp) - 1] = 0;
+}
+
+void WifiTask::syncNow() {
+  if (_state != ONLINE) {
+    strncpy(_sync_msg, "geen wifi", sizeof(_sync_msg) - 1);
+    return;
+  }
+  startTimeSync();
+}
+
+void WifiTask::startTimeSync() {
+  _time_synced = false;
+  /* De vlag WISSEN voordat we vragen. Anders leest checkTimeSync() straks de
+   * status van de VORIGE poging als bewijs voor deze. */
+  /* Consequent de esp_sntp_*-familie: de oudere lwip-namen (sntp_setoperatingmode)
+   * nemen een int en de nieuwe een eigen enum, en die twee door elkaar gebruiken
+   * gaf 'invalid conversion from int to esp_sntp_operatingmode_t'. */
+  esp_sntp_stop();
+  esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, ntpServer());
+  esp_sntp_init();
+  strncpy(_sync_msg, "bezig", sizeof(_sync_msg) - 1);
+  _sntp_deadline = millis() + SNTP_WAIT_MS;
+}
+
+void WifiTask::checkTimeSync() {
+  if (_sntp_deadline == 0) return;
+
+  /* Vragen of SNTP ANTWOORD HEEFT GEHAD, en niet of time() een getal teruggeeft.
+   * time() geeft altijd iets -- de eigen verkeerde klok als er niets binnenkwam,
+   * en precies dat maakte mijn eerste poging waardeloos. */
+  bool done = (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED);
+  time_t t = time(NULL);
+
+  if (done && (uint32_t) t >= TIME_FLOOR) {
+    uint32_t curr = rtc_clock.getCurrentTime();
+    if ((uint32_t) t > curr) {
+      rtc_clock.setCurrentTime((uint32_t) t);
+      snprintf(_sync_msg, sizeof(_sync_msg), "gezet via %s", ntpServer());
+      WIFI_LOG("klok van %s gezet op %lu (was %lu)\n",
+               ntpServer(), (unsigned long) t, (unsigned long) curr);
+    } else {
+      snprintf(_sync_msg, sizeof(_sync_msg), "eigen klok liep al goed");
+    }
+    _time_synced = true;
+    _synced_at = millis();
+    _sntp_deadline = 0;
+  } else if ((long)(millis() - _sntp_deadline) >= 0) {
+    snprintf(_sync_msg, sizeof(_sync_msg), "geen antwoord van %s", ntpServer());
+    WIFI_LOG("geen antwoord van de tijdserver %s; klok blijft zoals hij was\n",
+             ntpServer());
+    _sntp_deadline = 0;
+  }
+}
+
 void WifiTask::loop() {
   unsigned long now = millis();
+  checkTimeSync();
 
   /* Wegvallen opvangen, ongeacht in welke toestand we dachten te zitten. */
   if (g_dropped) {
@@ -127,6 +202,7 @@ void WifiTask::loop() {
       if (g_got_ip || WiFi.status() == WL_CONNECTED) {
         _fails = 0; _reconnects++;
         setState(ONLINE);
+        startTimeSync();
         WIFI_LOG("verbonden, rssi %d, ip %s\n",
                  WiFi.RSSI(), WiFi.localIP().toString().c_str());
       } else if ((long)(now - _next_action) >= 0) {
