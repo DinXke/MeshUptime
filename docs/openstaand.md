@@ -294,3 +294,32 @@ want die verstuurt aantoonbaar correct.
 **De IP-weg werkt wel en is nu de hoofdweg**: MeshManager leest de node over
 /status.json, met kanaalnamen. De mesh-weg is de redundante weg voor als WiFi weg
 is, en blijft open.
+
+---
+
+## Mesh-uitlezing: scope en filter definitief uitgesloten (20 aug, later)
+
+Twee verdenkingen uit de vorige notitie zijn nu weerlegd met een causale test in
+plaats van een vermoeden:
+
+- **Scope.** Alle zeven antwoord-floods van de node (login-reply, path-return,
+  ack, cli-reply) zijn gescoopt naar de regio via een nieuwe `floodScoped()`, met
+  de transportcode uit `default_scope` (regio `be`). Geflasht. Resultaat: nog
+  steeds `NOANSWER`. Scopen was op zich juist gedrag (de companion doet het ook),
+  maar het was niet de oorzaak.
+- **Packetfilter.** De filter op de repeater is met `filter off` volledig
+  ontwapend en daarna is gepolst: nóg steeds `NOANSWER`. De filter dropt onze
+  antwoorden dus niet. (De RESPONSE- en PATH-droptellers bewogen ook niet mee met
+  de pollpogingen.)
+
+**Conclusie: het is geen softwarefilter en geen scope, maar het retourpad zelf.**
+DinX-Home's login BEREIKT de node (seriële bewijs: ANON_REQ ontvangen), en de node
+ANTWOORDT (reply_len=13, flood verstuurd), maar het antwoord bereikt DinX-Home niet
+over de radio. Asymmetrisch: heen wel, terug niet. Dat wijst op RF/topologie — de
+node hoort DinX' flood (mogelijk via een relay), maar DinX hoort de teruggefloode
+reply niet, of een relay geeft de retour niet door. Vijf codeverdenkingen zijn nu
+uitgesloten (klok, acl.strict, gedeeld geheim, advert-type, scope) plus de filter.
+
+Volgende stap is niet in code maar ter plekke: afstand/antenne tussen node en
+DinX-Home, of de node dichter bij een repeater die wél een symmetrisch pad heeft.
+De IP-weg blijft de werkende hoofdweg; de mesh-weg is de redundante.
