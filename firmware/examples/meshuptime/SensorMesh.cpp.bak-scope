@@ -294,7 +294,7 @@ uint8_t SensorMesh::handleRequest(uint8_t perms, uint32_t sender_timestamp, uint
 
 mesh::Packet* SensorMesh::createSelfAdvert() {
   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
-  uint8_t app_data_len = _cli.buildAdvertData(self_adv_type, app_data);
+  uint8_t app_data_len = _cli.buildAdvertData(ADV_TYPE_SENSOR, app_data);
 
   return createAdvert(self_id, app_data, app_data_len);
 }
@@ -512,20 +512,6 @@ void SensorMesh::handleCommand(uint32_t sender_timestamp, char* command, char* r
     } else {
       strcpy(reply, "Err - 0 of 1");
     }
-  } else if (strcmp(command, "get adv.type") == 0) {
-    sprintf(reply, "%d", (int)self_adv_type);
-  } else if (memcmp(command, "set adv.type ", 13) == 0) {
-    const char* v = &command[13];
-    while (*v == ' ') v++;
-    /* 1 = chat, 4 = sensor. De andere types (repeater/room) horen bij een node
-     * die dat werkelijk is en zou verwarrend zijn hier, dus alleen deze twee. */
-    if (*v == '1' || *v == '4') {
-      setSelfAdvType((uint8_t)(*v - '0'));
-      sprintf(reply, "OK - adv.type=%d (%s)", (int)self_adv_type,
-              self_adv_type == 1 ? "chat" : "sensor");
-    } else {
-      strcpy(reply, "Err - 1 (chat) of 4 (sensor)");
-    }
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
     Serial.println("ACL:");
     for (int i = 0; i < acl.getNumClients(); i++) {
@@ -582,10 +568,10 @@ void SensorMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, con
       // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
       mesh::Packet* path = createPathReturn(sender, secret, packet->path, packet->path_len,
                                             PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
-      if (path) floodScoped(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+      if (path) sendFlood(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
     } else {
       mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, secret, reply_data, reply_len);
-      if (reply) floodScoped(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+      if (reply) sendFlood(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
     }
   }
 }
@@ -672,38 +658,6 @@ void SensorMesh::setAclStrict(bool on) {
   saveAclStrict();
 }
 
-#define ADV_TYPE_PATH   "/adv_type"
-void SensorMesh::loadAdvType() {
-  self_adv_type = 1;   // chat als standaard
-  if (_fs == NULL || !_fs->exists(ADV_TYPE_PATH)) return;
-#if defined(RP2040_PLATFORM)
-  File f = _fs->open(ADV_TYPE_PATH, "r");
-#else
-  File f = _fs->open(ADV_TYPE_PATH);
-#endif
-  if (!f) return;
-  char c = 0;
-  if (f.read((uint8_t *) &c, 1) == 1 && (c == '1' || c == '4')) self_adv_type = c - '0';
-  f.close();
-}
-void SensorMesh::saveAdvType() {
-  if (_fs == NULL) return;
-  File f = _fs->open(ADV_TYPE_PATH, "w");
-  if (!f) return;
-  uint8_t c = '0' + self_adv_type;
-  f.write(&c, 1);
-  f.close();
-}
-void SensorMesh::setSelfAdvType(uint8_t t) {
-  if (t != 1 && t != 4) return;
-  if (t == self_adv_type) return;
-  self_adv_type = t;
-  saveAdvType();
-  /* Meteen een advert, anders blijft de oude soort in andermans lijst staan tot
-   * het volgende geplande advert. */
-  sendSelfAdvertisement(2000, false);
-}
-
 bool SensorMesh::aclSetPerms(const uint8_t* pubkey, uint8_t perms) {
   if (perms == 0) return aclRemove(pubkey, PUB_KEY_SIZE);
 
@@ -773,7 +727,7 @@ void SensorMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
 void SensorMesh::sendAckTo(const ClientInfo& dest, uint32_t ack_hash, uint8_t path_hash_size) {
   if (dest.out_path_len == OUT_PATH_UNKNOWN) {
     mesh::Packet* ack = createAck(ack_hash);
-    if (ack) floodScoped(ack, TXT_ACK_DELAY, path_hash_size);
+    if (ack) sendFlood(ack, TXT_ACK_DELAY, path_hash_size);
   } else {
     uint32_t d = TXT_ACK_DELAY;
     if (getExtraAckTransmitCount() > 0) {
@@ -811,14 +765,14 @@ void SensorMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_i
         // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the response
         mesh::Packet* path = createPathReturn(from->id, secret, packet->path, packet->path_len,
                                               PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
-        if (path) floodScoped(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+        if (path) sendFlood(path, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
       } else {
         mesh::Packet* reply = createDatagram(PAYLOAD_TYPE_RESPONSE, from->id, secret, reply_data, reply_len);
         if (reply) {
           if (from->out_path_len != OUT_PATH_UNKNOWN) {  // we have an out_path, so send DIRECT
             sendDirect(reply, from->out_path, from->out_path_len, SERVER_RESPONSE_DELAY);
           } else {
-            floodScoped(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+            sendFlood(reply, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
           }
         }
       }
@@ -841,7 +795,7 @@ void SensorMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_i
             // let this sender know path TO here, so they can use sendDirect(), and ALSO encode the ACK
             mesh::Packet* path = createPathReturn(from->id, secret, packet->path, packet->path_len,
                                                   PAYLOAD_TYPE_ACK, (uint8_t *) &ack_hash, 4);
-            if (path) floodScoped(path, TXT_ACK_DELAY, packet->getPathHashSize());
+            if (path) sendFlood(path, TXT_ACK_DELAY, packet->getPathHashSize());
           } else {
             sendAckTo(*from, ack_hash, packet->getPathHashSize());
           }
@@ -877,7 +831,7 @@ void SensorMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_i
           auto reply = createDatagram(PAYLOAD_TYPE_TXT_MSG, from->id, secret, temp, 5 + text_len);
           if (reply) {
             if (from->out_path_len == OUT_PATH_UNKNOWN) {
-              floodScoped(reply, CLI_REPLY_DELAY_MILLIS, packet->getPathHashSize());
+              sendFlood(reply, CLI_REPLY_DELAY_MILLIS, packet->getPathHashSize());
             } else {
               sendDirect(reply, from->out_path, from->out_path_len, CLI_REPLY_DELAY_MILLIS);
             }
@@ -1024,7 +978,6 @@ void SensorMesh::begin(FILESYSTEM* fs) {
 
   acl.load(_fs, self_id);
   loadAclStrict();
-  loadAdvType();
   region_map.load(_fs);
 
   // establish default-scope

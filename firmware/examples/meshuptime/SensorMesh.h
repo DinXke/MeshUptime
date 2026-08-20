@@ -271,6 +271,44 @@ private:
   TransportKeyStore key_store;
   RegionMap region_map;
   TransportKey default_scope;
+
+  /* Het advert-type dat deze node uitzendt. Standaard ADV_TYPE_CHAT (1), niet
+   * SENSOR (4): een sensornode is technisch juist als SENSOR, maar de
+   * MeshCore-app geeft alleen bij een CHAT-contact een tekstvenster, en dat is
+   * de enige weg waarlangs de DM-opdrachten (list/get/status) te gebruiken zijn.
+   * Instelbaar en bewaard, zodat wisselen geen flash kost. Andere nodes onthouden
+   * het oude type tot er een nieuw advert met hogere tijdstempel langskomt --
+   * setSelfAdvType() stuurt daarom meteen een advert. */
+  uint8_t self_adv_type = 1;   // ADV_TYPE_CHAT
+  void loadAdvType();
+  void saveAdvType();
+public:
+  uint8_t selfAdvType() const { return self_adv_type; }
+  void setSelfAdvType(uint8_t t);
+protected:
+
+  /* Een antwoord-flood MET de regio-transportcode erop.
+   *
+   * Dit repareert waarom een repeater in een regio (bij ons 'be') onze
+   * login-antwoorden niet ontving: SensorMesh erft van mesh::Mesh en niet van
+   * BaseChatMesh, en miste dus sendFloodScoped. De antwoorden gingen met de kale
+   * sendFlood de lucht in, zonder transportcode -- en de packetfilter van de
+   * repeater gooit ongescopede floods weg (drop.hash). Bewezen met een seriele
+   * trace: de node stuurde reply_len=13, maar het kwam nooit aan.
+   *
+   * calcTransportCode() werkt op het UITGAANDE pakket, dus deze helper heeft het
+   * binnenkomende pakket niet nodig -- alleen default_scope, die begin() en
+   * onDefaultRegionChanged() uit de regiokaart zetten. Is er geen regio
+   * ingesteld (isNull), dan valt hij terug op de ongescopede flood, precies zoals
+   * de companion (BaseChatMesh::sendFloodScoped) het ook doet. */
+  void floodScoped(mesh::Packet* pkt, uint32_t delay_millis, uint8_t path_hash_size) {
+    if (default_scope.isNull()) {
+      sendFlood(pkt, delay_millis, path_hash_size);
+    } else {
+      uint16_t codes[2] = { default_scope.calcTransportCode(pkt), 0 };
+      sendFlood(pkt, codes, delay_millis, path_hash_size);
+    }
+  }
   uint32_t last_read_time;
   int matching_peer_indexes[MAX_SEARCH_RESULTS];
   int num_alert_tasks;
