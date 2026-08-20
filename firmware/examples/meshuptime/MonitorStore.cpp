@@ -2,10 +2,11 @@
 
 #include <Mesh.h>   /* alleen voor MESH_DEBUG_PRINTLN */
 
-/* Ruim genomen: de langste regel is "m 36 3600 zestien-tekens. " plus een adres
- * van 40 tekens plus de ping-vlag = 70 tekens. 96 laat plek voor nog een veld
- * zonder dat een oud bestand ineens afgekapt lijkt. */
-#define MON_LINE_MAX  96
+/* Ruim genomen: de langste regel was "m 36 3600 zestien-tekens. " plus een
+ * adres van 40 tekens plus de ping-vlag = 70 tekens; sinds de push-instellingen
+ * is het "purl " plus een URL van 100 tekens = 105. 132 laat plek voor nog een
+ * veld zonder dat een oud bestand ineens afgekapt lijkt. */
+#define MON_LINE_MAX  132
 
 /* De drempels uit docs/meting-voeding-2026-08-19.log; dezelfde getallen als in
  * MonitorSensors.h, maar hier is de plek waar ze na een wis terugkomen. */
@@ -27,6 +28,11 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
    * gevraagde standaard en dus een gedragsverandering bij het bijwerken; op 0
    * zetten geeft het oude "één melding en klaar". */
   cfg.repeat_s = MON_AREPEAT_DEFAULT;
+  /* Push standaard UIT (lege url): een node hoort niet ongevraagd naar buiten
+   * te praten. De memset heeft url en token al leeg gemaakt; alleen het
+   * heartbeat-interval krijgt zijn standaard, zodat "sensor get push.hb" iets
+   * zinnigs zegt nog voordat er ooit een url gezet is. */
+  cfg.push_hb_s = MON_PUSH_HB_DEFAULT;
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
 }
@@ -137,6 +143,26 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       int v = atoi(parts[1]);
       staged.repeat_s = (v == 0 || (v >= MON_AREPEAT_MIN && v <= MON_AREPEAT_MAX))
                       ? (uint16_t)v : MON_AREPEAT_DEFAULT;
+    } else if (strcmp(parts[0], "purl") == 0) {
+      /* Geen keuring op de inhoud hier: die zit in setSettingValue(), en wat in
+       * dit bestand staat is door diezelfde zeef geschreven. Alleen de lengte
+       * wordt bewaakt, want een afgekapte regel (zie readLine) mag geen half
+       * adres opleveren -- liever geen push dan een push naar het verkeerde
+       * adres. */
+      if (strlen(parts[1]) < MON_PUSH_URL_LEN) {
+        strncpy(staged.push_url, parts[1], MON_PUSH_URL_LEN - 1);
+        staged.push_url[MON_PUSH_URL_LEN - 1] = 0;
+      }
+    } else if (strcmp(parts[0], "ptok") == 0) {
+      if (strlen(parts[1]) < MON_PUSH_TOKEN_LEN) {
+        strncpy(staged.push_token, parts[1], MON_PUSH_TOKEN_LEN - 1);
+        staged.push_token[MON_PUSH_TOKEN_LEN - 1] = 0;
+      }
+    } else if (strcmp(parts[0], "phb") == 0) {
+      /* Buiten de grenzen: de standaard, om dezelfde reden als bij rhold. */
+      int v = atoi(parts[1]);
+      staged.push_hb_s = (v >= MON_PUSH_HB_MIN && v <= MON_PUSH_HB_MAX)
+                       ? (uint16_t)v : MON_PUSH_HB_DEFAULT;
     } else if (strcmp(parts[0], "m") == 0) {
       /* m <kanaal> <interval> <naam> <adres> [<pingtijd 0|1>]
        *
@@ -232,6 +258,20 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "rec %u\nrhold %u\narepeat %u\n",
                  (unsigned)(cfg.recover_alerts ? 1 : 0), (unsigned)cfg.rhold_s,
                  (unsigned)cfg.repeat_s);
+  f.write((const uint8_t*)line, len);
+
+  /* De push-instellingen. url en token alleen als ze er ZIJN: een lege regel
+   * "purl " zou bij het lezen op n < 2 stranden en is dus alleen ruis. phb gaat
+   * altijd mee, zodat een bijgesteld interval ook zonder url bewaard blijft. */
+  if (cfg.push_url[0]) {
+    len = snprintf(line, sizeof(line), "purl %s\n", cfg.push_url);
+    f.write((const uint8_t*)line, len);
+  }
+  if (cfg.push_token[0]) {
+    len = snprintf(line, sizeof(line), "ptok %s\n", cfg.push_token);
+    f.write((const uint8_t*)line, len);
+  }
+  len = snprintf(line, sizeof(line), "phb %u\n", (unsigned)cfg.push_hb_s);
   f.write((const uint8_t*)line, len);
 
   for (int i = 0; i < MON_MAX_MONITORS; i++) {

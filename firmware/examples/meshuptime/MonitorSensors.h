@@ -13,6 +13,36 @@
 
 class WifiTask;   // alleen als pointer nodig; de definitie staat in de .cpp
 
+/* ==================== GEBEURTENISSEN NAAR BUITEN (push) ====================
+ *
+ * PushTask moet DEZELFDE gebeurtenissen zien die alertIf() de mesh op stuurt:
+ * storing, herstel en gelabelde simulatie, met dezelfde tekst en dezelfde
+ * ernst. Geen dubbele waarheid: de gebeurtenis wordt aangemaakt op precies het
+ * moment dat de melding voor de mesh GEARMD wordt (de eerste keer, niet bij
+ * elke herhaling -- een herhaling is dezelfde storing nog eens, en de server
+ * heeft zijn eigen herinnering).
+ *
+ * Een abstracte afnemer en geen #include van PushTask.h, om dezelfde reden als
+ * bij setWifiTask(): main.cpp is de enige plek die beide objecten kent, en deze
+ * klasse blijft te bouwen zonder de push-laag. */
+
+/* Ruim boven de langste alerttekst (nagerekend 123 tekens bij een gesimuleerde
+ * ping-monitor; zie s_alert_buf in de .cpp). */
+#define MON_EVENT_TEXT_LEN 128
+
+struct MonitorEvent {
+  uint8_t ch;                        /* kanaal 2..36 */
+  uint8_t up;                        /* 0 = storing ("neer"), 1 = herstel ("op") */
+  uint8_t sim;                       /* 1 = gelabelde simulatie */
+  uint8_t sev_high;                  /* 1 = hoog; onze meldingen zijn LOW_PRI, dus 0 */
+  char    text[MON_EVENT_TEXT_LEN];  /* exact de tekst die de DM-weg kreeg */
+};
+
+class MonitorEventSink {
+public:
+  virtual void onMonitorEvent(const MonitorEvent& ev) = 0;
+};
+
 /* MonitorSensors -- de sensorlaag van MeshUptime.
  *
  * WAAROM DIT IN querySensors() ZIT EN NIET IN onSensorDataRead()
@@ -486,6 +516,32 @@ public:
    * Een "ok" van iemand zonder alarmrecht hoort main.cpp dus niet door te geven. */
   uint8_t confirmAlerts();
 
+  /* Hetzelfde als confirmAlerts(), maar voor EEN kanaal: het antwoord van de
+   * push-server bevestigt per kanaal, de ok-DM bevestigt alles. Kanaal 2/3 is
+   * de voeding (een meting met twee namen), 4 wifi, 5..36 een monitor. Geeft 1
+   * als er een openstaande melding gestopt is, anders 0.
+   *
+   * Een server-bevestiging gaat NIET in de "acked" van de volgende push mee:
+   * die lijst is voor wat er op de NODE bevestigd is, en de server weet zijn
+   * eigen bevestigingen al. */
+  uint8_t confirmAlertChannel(uint8_t ch);
+
+  /* De kanalen die sinds de vorige afname op de NODE bevestigd zijn (de ok-DM),
+   * als bitmasker (bit n = kanaal n). Afnemen WIST het masker hier; PushTask
+   * houdt het zelf vast tot de POST gelukt is, zodat een mislukte push geen
+   * bevestiging verliest. */
+  uint64_t takePushAcked() { uint64_t v = _push_acked; _push_acked = 0; return v; }
+
+  /* ==================== gebeurtenis-haak voor PushTask ====================
+   * Zie de uitleg bij MonitorEventSink bovenaan dit bestand. Zelfde patroon als
+   * setWifiTask(): main.cpp legt de koppeling, deze klasse kent PushTask niet. */
+  void setEventSink(MonitorEventSink* sink) { _events = sink; }
+
+  /* De push-instellingen, voor PushTask. Een lege url betekent: push uit. */
+  const char* pushUrl() const     { return _cfg.push_url; }
+  const char* pushToken() const   { return _cfg.push_token; }
+  uint16_t    pushHbSecs() const  { return _cfg.push_hb_s; }
+
   /* Voor de pagina: de herhaalperiode, hoeveel meldingen nu actief herhaald
    * worden, en hoeveel er de bovengrens raakten. */
   uint16_t alertRepeatSecs() const { return _cfg.repeat_s; }
@@ -892,6 +948,20 @@ private:
   static const uint8_t TELEM_BYTES_GENERIC = 6;   /* 2 kop + 4 gegeven */
 
   WifiTask* _wifi = NULL;
+
+  /* De afnemer van gebeurtenissen (PushTask). NULL = niemand luistert, en dan
+   * kost emitEvent() niets. */
+  MonitorEventSink* _events = NULL;
+
+  /* Bitmasker van kanalen die op de node bevestigd zijn (ok-DM) en nog niet in
+   * een gelukte push gemeld. bit n = kanaal n; met kanalen tot 36 moet dit een
+   * uint64_t zijn. RAM en niet SPIFFS: na een herstart is er niets meer te
+   * melden, want dan is er ook geen openstaande melding meer. */
+  uint64_t _push_acked = 0;
+
+  /* Een gebeurtenis aan de afnemer geven. De tekst wordt GEKOPIEERD (de bron is
+   * s_alert_buf en die is zo weer overschreven). */
+  void emitEvent(uint8_t ch, bool up, bool sim, const char* text);
 
   /* Instellingen die een herstart moeten overleven, in één blok zodat
    * MonitorStore ze in één keer kan lezen en schrijven. De drempels waren hier

@@ -1,0 +1,83 @@
+# Firmware-CI: bouwt examples/meshuptime tegen MeshCore op de gepinde tag.
+#
+# WAAROM: de drie soorten buildbreuk die een nacht gekost hebben -- ontbrekende
+# symbolen, kapotte literalen en main.cpp-drift -- zijn alle drie compilefouten.
+# Deze workflow herhaalt wat een mens lokaal doet (kloon op de tag, patch erop,
+# toepassing erin, pio run), zodat zo'n breuk bij de push opvalt en niet bij het
+# flashen.
+#
+# De opzet spiegelt de lokale bouwkopie:
+#   1. MeshCore ondiep klonen op companion-v1.17.0 (dezelfde tag als lokaal);
+#   2. de ENE variants-patch aanbrengen (firmware/patches/0001-...): zonder die
+#      patch kent variants/heltec_v3 SENSOR_MANAGER_CLASS niet;
+#   3. examples/meshuptime erin kopieren;
+#   4. firmware/platformio.ci.ini (zonder wifi-gegevens) neerleggen als
+#      platformio.local.ini -- MeshCore's platformio.ini leest die via
+#      extra_configs, net als lokaal;
+#   5. pio run -e meshuptime.
+name: firmware
+
+on:
+  push:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: MeshUptime uitchecken
+        uses: actions/checkout@v4
+
+      - name: MeshCore klonen op de gepinde tag
+        run: |
+          git clone --depth 1 --branch companion-v1.17.0 \
+            https://github.com/meshcore-dev/MeshCore.git meshcore
+
+      - name: Variants-patch aanbrengen
+        # De enige patch op de kern; zie firmware/patches/LEESMIJ.md. git apply
+        # faalt hard als de tag ooit niet meer past -- en dat is de bedoeling:
+        # dan is er echt iets te herzien en mag geen CI groen liegen.
+        run: |
+          cd meshcore
+          git apply ../firmware/patches/0001-sensor-manager-class-heltec-v3.patch
+
+      - name: Toepassing en CI-env inleggen
+        run: |
+          mkdir -p meshcore/examples/meshuptime
+          cp firmware/examples/meshuptime/* meshcore/examples/meshuptime/
+          cp firmware/platformio.ci.ini meshcore/platformio.local.ini
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # De toolchain- en frameworkpakketten zijn ~1 GB download; zonder cache
+      # duurt elke bouw een kwartier en met cache een paar minuten.
+      - name: PlatformIO-pakketten uit de cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-companion-v1.17.0-${{ hashFiles('firmware/platformio.ci.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-companion-v1.17.0-
+
+      - name: PlatformIO installeren
+        # Dezelfde versie als de lokale bouwkopie, zodat "werkt in CI" en
+        # "werkt op de werkbank" over hetzelfde gereedschap gaan.
+        run: pip install platformio==6.1.19
+
+      - name: Bouwen
+        run: |
+          cd meshcore
+          pio run -e meshuptime

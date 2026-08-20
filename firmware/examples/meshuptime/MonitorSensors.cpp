@@ -934,6 +934,33 @@ bool MonitorSensors::stepStoringAlert(bool want, bool& alerting, bool& down_sent
   return true;
 }
 
+/* ---------------- gebeurtenissen naar de push-laag ----------------
+ *
+ * Eén functie, aangeroepen op precies de vier plekken waar een melding voor de
+ * mesh GEARMD wordt: monitorstoring, monitorherstel en de twee vaste-kanaal-
+ * varianten. Zo krijgt de server letterlijk dezelfde tekst en dezelfde ernst
+ * als de DM-ontvangers -- geen dubbele waarheid. Herhalingen worden NIET nog
+ * eens gemeld: een herhaling is dezelfde storing nog eens de ether op, en de
+ * server heeft zijn eigen herinnering (zijn alert staat open tot iemand hem
+ * daar bevestigt).
+ *
+ * De tekst wordt gekopieerd, want de bron is s_alert_buf en die is bij de
+ * volgende aanroep alweer overschreven. Loopt hier in de hoofdtaak (alertIf
+ * wordt uit onSensorDataRead aangeroepen), dus geen volatile-gedoe nodig. */
+void MonitorSensors::emitEvent(uint8_t ch, bool up, bool sim, const char* text) {
+  if (_events == NULL) return;
+  MonitorEvent ev;
+  ev.ch       = ch;
+  ev.up       = up ? 1 : 0;
+  ev.sim      = sim ? 1 : 0;
+  /* Alles wat deze klasse meldt gaat als LOW_PRI de mesh op (zie main.cpp en
+   * de uitleg bij MAX_MONITOR_ALERTS); "hoog" is voor de batterij van
+   * SensorMesh zelf en die loopt niet door deze haak. */
+  ev.sev_high = 0;
+  StrHelper::strncpy(ev.text, text ? text : "", sizeof(ev.text));
+  _events->onMonitorEvent(ev);
+}
+
 bool MonitorSensors::monitorAlert(int slot) {
   if (!monitorUsed(slot)) {
     /* Vakje is leeg (of net verwijderd): voorwaarde uit, zodat main.cpp met
@@ -953,6 +980,9 @@ bool MonitorSensors::monitorAlert(int slot) {
      * weten of dit een simulatie of een stille melder was. */
     m.was_stale = m.stale;
     m.was_sim   = (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF);
+    /* NA het zetten van was_stale/was_sim, want monitorAlertText() kijkt naar
+     * de huidige toestand en de vlag moet dezelfde zijn als in de tekst. */
+    emitEvent(_cfg.mons[slot].channel, false, m.was_sim, monitorAlertText(slot));
   }
   return res;
 }
@@ -1217,6 +1247,10 @@ bool MonitorSensors::recoverAlert(int slot) {
   if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
 
   m.rec_alerting = true;
+  /* Dezelfde sim-vlag als recoverAlertText() in zijn merkteken zet. */
+  emitEvent(_cfg.mons[slot].channel, true,
+            m.was_sim || _sim[SIM_MON_FIRST + slot].mode != SIM_OFF,
+            recoverAlertText(slot));
   return true;
 }
 
@@ -1237,6 +1271,10 @@ bool MonitorSensors::fixedRecoverAlert(int which) {
   if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
 
   _fixed_rec_alerting[which] = true;
+  /* sim staat vast op waar: een vast kanaal alarmeert bij deze opzet alleen
+   * via een forcering (zie fixedAlert), en de tekst draagt SIM_MARK ook vast. */
+  emitEvent(which == FIXED_POWER ? CH_MAINS : CH_WIFI, true, true,
+            fixedRecoverAlertText(which));
   return true;
 }
 
@@ -1465,9 +1503,16 @@ bool MonitorSensors::fixedAlert(int which) {
    * bovengrens en de rem -- alleen zonder de was_stale/was_sim-vlaggen, want een
    * vast kanaal alarmeert bij deze opzet uitsluitend via een simulatie en dat is
    * altijd een test (fixedAlertText en de herstelvariant zetten SIM_MARK vast). */
-  return stepStoringAlert(want, _fixed_alerting[which], _fixed_down_sent[which],
-                          _fixed_down_since[which], _fixed_rep[which],
-                          which == FIXED_POWER ? 2 : 4, NULL);
+  bool first = false;
+  const bool res = stepStoringAlert(want, _fixed_alerting[which],
+                                    _fixed_down_sent[which],
+                                    _fixed_down_since[which], _fixed_rep[which],
+                                    which == FIXED_POWER ? 2 : 4, &first);
+  if (first) {
+    emitEvent(which == FIXED_POWER ? CH_MAINS : CH_WIFI, false, true,
+              fixedAlertText(which));
+  }
+  return res;
 }
 
 const char* MonitorSensors::fixedAlertText(int which) const {
@@ -1524,6 +1569,9 @@ uint8_t MonitorSensors::confirmAlerts() {
     if (!monitorUsed(i)) continue;
     if (monitorWantAlert(i) && _mon[i].down_sent && !_mon[i].rep.human_ack) {
       _mon[i].rep.human_ack = true;
+      /* Voor de push: op de NODE bevestigd, dus de server hoort het bij de
+       * volgende POST in "acked" -- dan sluit de site hem daar ook. */
+      _push_acked |= (uint64_t)1 << _cfg.mons[i].channel;
       n++;
     }
   }
@@ -1533,12 +1581,40 @@ uint8_t MonitorSensors::confirmAlerts() {
     const bool want = (_sim[idx].mode == SIM_DOWN);
     if (want && _fixed_down_sent[k] && !_fixed_rep[k].human_ack) {
       _fixed_rep[k].human_ack = true;
+      _push_acked |= (uint64_t)1 << (k == FIXED_POWER ? CH_MAINS : CH_WIFI);
       n++;
     }
   }
 
   if (n) MESH_DEBUG_PRINTLN("MonitorSensors: %u melding(en) door een mens bevestigd, herhalen gestopt", (unsigned)n);
   return n;
+}
+
+/* De bevestiging uit het push-antwoord: EEN kanaal, en zonder doorgifte naar
+ * _push_acked -- de server weet zijn eigen bevestigingen al, terugmelden zou
+ * alleen ruis zijn. Kanaal 3 (batterijvoeding) telt als kanaal 2: het is een
+ * meting met twee namen (zie querySensors) en de melding hangt aan de voeding. */
+uint8_t MonitorSensors::confirmAlertChannel(uint8_t ch) {
+  if (ch == CH_MAINS || ch == CH_BATTERY || ch == CH_WIFI) {
+    const int     k    = (ch == CH_WIFI) ? FIXED_WIFI : FIXED_POWER;
+    const uint8_t idx  = (k == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
+    const bool    want = (_sim[idx].mode == SIM_DOWN);
+    if (want && _fixed_down_sent[k] && !_fixed_rep[k].human_ack) {
+      _fixed_rep[k].human_ack = true;
+      MESH_DEBUG_PRINTLN("MonitorSensors: kanaal %u via de server bevestigd, herhalen gestopt", (unsigned)ch);
+      return 1;
+    }
+    return 0;
+  }
+
+  const int slot = findByChannel(ch);
+  if (slot < 0) return 0;
+  if (monitorWantAlert(slot) && _mon[slot].down_sent && !_mon[slot].rep.human_ack) {
+    _mon[slot].rep.human_ack = true;
+    MESH_DEBUG_PRINTLN("MonitorSensors: kanaal %u via de server bevestigd, herhalen gestopt", (unsigned)ch);
+    return 1;
+  }
+  return 0;
 }
 
 void MonitorSensors::repeatStatus(uint8_t& nagging, uint8_t& capped) const {
@@ -2565,8 +2641,9 @@ bool MonitorSensors::delMonitor(const char* name) {
  */
 
 #define MON_FIELDS_PER_MONITOR  5     /* name, host, int, state, ms */
-#define MON_NUM_GLOBAL_SETTINGS 9     /* mains.hi/lo/state + mon.count/add/del
-                                       + alert.recover/alert.rhold/alert.repeat */
+#define MON_NUM_GLOBAL_SETTINGS 12    /* mains.hi/lo/state + mon.count/add/del
+                                       + alert.recover/alert.rhold/alert.repeat
+                                       + push.url/push.token/push.hb */
 
 /* Vaste buffers, één per instelling: getSettingValue() is const en mag niets
  * alloceren, en met een buffer per instelling kan een aanroeper meerdere
@@ -2580,6 +2657,11 @@ static char s_setting_buf[4][12];
  * niet, en dat hoeft ook niemand: elke aanroeper in de boom leest er één. */
 static char s_mon_name_buf[20];       /* "mon.36.state" + afsluiter */
 static char s_mon_val_buf[MON_HOST_LEN];
+
+/* Eigen buffer voor de push-waarden: een URL van 100 tekens past niet in
+ * s_mon_val_buf (41), en die twee tegelijk uitgelezen (CommonCLI's
+ * naam=waarde-sprintf) mogen elkaar niet overschrijven. */
+static char s_push_val_buf[MON_PUSH_URL_LEN];
 
 int MonitorSensors::getNumSettings() const {
   return EnvironmentSensorManager::getNumSettings()
@@ -2606,6 +2688,12 @@ const char* MonitorSensors::getSettingName(int i) const {
     case 6: return "alert.recover"; // 0/1: melden als iets weer werkt
     case 7: return "alert.rhold";   // s: hoe lang op voordat het herstel gemeld wordt
     case 8: return "alert.repeat";  // s: herhaal tot een mens "ok" stuurt (0 = uit)
+    /* De gebeurtenis-push. Zelfde weg als elke andere instelling (CLI, DM en
+     * web door één zeef), zelfde opslag. Leegmaken gaat met "-": CommonCLI
+     * geeft "null" door als de waarde ontbreekt, dus die telt ook als leeg. */
+    case 9:  return "push.url";     // leeg = push uit; alleen http://
+    case 10: return "push.token";   // Bearer-token voor de server
+    case 11: return "push.hb";      // s: beloofd heartbeat-interval
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -2657,6 +2745,21 @@ const char* MonitorSensors::getSettingValue(int i) const {
       snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
                (unsigned)_cfg.repeat_s);
       return s_setting_buf[2];
+    case 9:
+      /* "-" voor leeg en niet een lege tekst: "push.url=" in 'sensor list'
+       * leest als een vergissing, "push.url=-" als een stand. */
+      StrHelper::strncpy(s_push_val_buf, _cfg.push_url[0] ? _cfg.push_url : "-",
+                         sizeof(s_push_val_buf));
+      return s_push_val_buf;
+    case 10:
+      StrHelper::strncpy(s_push_val_buf,
+                         _cfg.push_token[0] ? _cfg.push_token : "-",
+                         sizeof(s_push_val_buf));
+      return s_push_val_buf;
+    case 11:
+      snprintf(s_setting_buf[3], sizeof(s_setting_buf[3]), "%u",
+               (unsigned)_cfg.push_hb_s);
+      return s_setting_buf[3];
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -2760,6 +2863,57 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     if (end == value || *end != 0) return false;
     if (v != 0 && (v < MON_AREPEAT_MIN || v > MON_AREPEAT_MAX)) return false;
     _cfg.repeat_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+
+  if (strcmp(name, "push.url") == 0) {
+    /* Leegmaken: "-" of "null" (dat laatste geeft CommonCLI door als de waarde
+     * ontbreekt). Leeg = push uit. */
+    if (strcmp(value, "-") == 0 || strcmp(value, "null") == 0) {
+      _cfg.push_url[0] = 0;
+      markDirty();
+      return true;
+    }
+    /* Alleen http:// (zie MonitorCfg voor waarom geen TLS), geen spaties of
+     * stuurcodes, en er moet iets van een host achter het schema staan. TE LANG
+     * WORDT GEWEIGERD EN NIET AFGEKAPT: een half adres is een verkeerd adres.
+     * 100 tekens past door de CLI-weg (CommonCLI's tmp is 132; "push.url " plus
+     * 100 is 109 -- nagerekend, zie MON_PUSH_URL_LEN in MonitorStore.h). */
+    const size_t n = strlen(value);
+    if (n < 8 || n >= MON_PUSH_URL_LEN) return false;
+    if (memcmp(value, "http://", 7) != 0 || value[7] == 0 || value[7] == '/') return false;
+    for (const char* p = value; *p; p++) {
+      if (*p <= ' ' || *p > '~' || *p == '"' || *p == '\\') return false;
+    }
+    StrHelper::strncpy(_cfg.push_url, value, sizeof(_cfg.push_url));
+    /* Een enkele slash aan het einde eraf: PushTask plakt er "/api/sensorpush"
+     * achter, en "//api/..." is een ander pad dan bedoeld. */
+    if (n > 8 && _cfg.push_url[n - 1] == '/') _cfg.push_url[n - 1] = 0;
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "push.token") == 0) {
+    if (strcmp(value, "-") == 0 || strcmp(value, "null") == 0) {
+      _cfg.push_token[0] = 0;
+      markDirty();
+      return true;
+    }
+    const size_t n = strlen(value);
+    if (n == 0 || n >= MON_PUSH_TOKEN_LEN) return false;
+    for (const char* p = value; *p; p++) {
+      if (*p <= ' ' || *p > '~' || *p == '"' || *p == '\\') return false;
+    }
+    StrHelper::strncpy(_cfg.push_token, value, sizeof(_cfg.push_token));
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "push.hb") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_PUSH_HB_MIN || v > MON_PUSH_HB_MAX) return false;
+    _cfg.push_hb_s = (uint16_t)v;
     markDirty();
     return true;
   }

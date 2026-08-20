@@ -157,6 +157,23 @@ struct MonitorCfgEntry {
 #define MON_AREPEAT_MAX     3600
 #define MON_AREPEAT_DEFAULT  300
 
+/* Grenzen van de gebeurtenis-push (PushTask). Hier om dezelfde reden als de
+ * andere grenzen: het inleesfilter en het instellingenfilter moeten dezelfde
+ * aanhouden.
+ *
+ * De URL-lengte is nagerekend tegen de CLI-weg: "sensor set push.url <url>"
+ * loopt door CommonCLI's tmp-buffer (gemeten 132 byte, dus sleutel + waarde tot
+ * ~119 tekens). "push.url " is 9 tekens, dus een waarde van 100 past met marge
+ * -- langer wordt GEWEIGERD en niet afgekapt, want een half adres is een
+ * verkeerd adres. De heartbeat-grenzen: 10 s ondergrens (sneller belooft niets
+ * dat de gebeurtenis-push niet al doet), 3600 s bovengrens (een stiltesignaal
+ * van meer dan een uur bewaakt niets meer), 30 s standaard. */
+#define MON_PUSH_URL_LEN     101      /* 100 tekens + afsluiter */
+#define MON_PUSH_TOKEN_LEN    41      /* 40 tekens + afsluiter */
+#define MON_PUSH_HB_MIN       10
+#define MON_PUSH_HB_MAX     3600
+#define MON_PUSH_HB_DEFAULT   30
+
 struct MonitorCfg {
   float   mains_hi;
   float   mains_lo;
@@ -207,6 +224,20 @@ struct MonitorCfg {
    * zonder dat er iets van te zien is. Het bestandsformaat draagt het getal als
    * tekst, dus oude bestanden (waarden 0..255) blijven leesbaar. */
   uint32_t ch_ever_used;
+
+  /* DE GEBEURTENIS-PUSH -- naar de statsserver, zodat een storing hem in ~1 s
+   * bereikt in plaats van bij de volgende poll, en elke stilte een betekenis
+   * krijgt (heartbeat).
+   *
+   * push_url leeg = push uit; dat is de standaard, want een node hoort niet
+   * ongevraagd naar buiten te praten. Alleen http:// -- een TLS-stapel kost
+   * tientallen kB RAM op een bord dat die niet over heeft, en de server staat
+   * op het eigen LAN. Het token staat hier in klare tekst, net als het
+   * wifi-wachtwoord in de gebakken vlaggen: SPIFFS van dit bord is niet
+   * versleuteld en dat is een aanvaarde eigenschap van het hele apparaat. */
+  char     push_url[MON_PUSH_URL_LEN];
+  char     push_token[MON_PUSH_TOKEN_LEN];
+  uint16_t push_hb_s;      /* beloofd heartbeat-interval, MON_PUSH_HB_MIN..MAX */
 
   MonitorCfgEntry mons[MON_MAX_MONITORS];
 };

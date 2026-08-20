@@ -4,8 +4,10 @@
 #ifdef WIFI_SSID
   #include "WifiTask.h"
   #include "WebTask.h"
+  #include "PushTask.h"
   static WifiTask wifi_task;
   static WebTask  web_task;
+  static PushTask push_task;
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -272,6 +274,11 @@ void setup() {
      * NA the_mesh.begin(), en dat is geen stijl maar noodzaak: begin() leest de
      * toegangslijst en de stand van het slot uit SPIFFS. */
     web_task.setAcl(&the_mesh);
+    /* Gebeurtenis-push naar de server: draagt een storing binnen ~1 s en maakt
+     * van stilte een heartbeat. Na the_mesh.begin(fs), want self_id komt daar
+     * vandaan. */
+    push_task.begin(&wifi_task, &sensors, the_mesh.self_id.pub_key);
+    sensors.setEventSink(&push_task);
   }
   #ifdef HAS_MONITOR_SENSORS
     /* main.cpp is de enige plek die zowel de wifi-taak als de sensoren kent;
@@ -336,6 +343,7 @@ void loop() {
 #ifdef WIFI_SSID
   wifi_task.loop();
   web_task.loop();
+  push_task.loop();
 #endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();
