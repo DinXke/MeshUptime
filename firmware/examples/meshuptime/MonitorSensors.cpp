@@ -145,6 +145,10 @@ bool MonitorSensors::begin() {
   memset(_fixed_up_since, 0, sizeof(_fixed_up_since));
   memset(_fixed_rec_until, 0, sizeof(_fixed_rec_until));
   memset(_fixed_rec_alerting, 0, sizeof(_fixed_rec_alerting));
+  memset(_fixed_rep, 0, sizeof(_fixed_rep));
+
+  /* Geen ad-hoc ping na een start. Vluchtig, dus alleen RAM. */
+  memset(&_adhoc, 0, sizeof(_adhoc));
 
   unsigned long now = millis();
   for (int i = 0; i < MAX_MONITORS; i++) {
@@ -340,6 +344,11 @@ void MonitorSensors::loopMonitors() {
     } else {
       /* Lopende meting weggooien. abortPing() rekent hem NIET als mislukking. */
       if (_phase != PING_IDLE) abortPing();
+      /* Liep er een ad-hoc ping? Die krijgt een eerlijke uitslag in plaats van
+       * stil te verdwijnen: de vrager wacht erop. */
+      if (_adhoc.state == ADHOC_PENDING || _adhoc.state == ADHOC_BUSY) {
+        finishAdhoc(_adhoc.done ? "wifi viel weg tijdens de meting" : "geen wifi, niet gepingd");
+      }
       MESH_DEBUG_PRINTLN("MonitorSensors: wifi weg, bewaking bevroren (toestanden blijven staan)");
     }
   }
@@ -355,6 +364,19 @@ void MonitorSensors::loopMonitors() {
   switch (_phase) {
     case PING_RESOLVING: {
       uint8_t st = s_ping.dns_state;
+      /* AD-HOC: de naamsopzoeking van de vrij opgegeven ping. Aparte tak, want
+       * hierachter wordt _mon[_busy_slot] gebruikt en een ad-hoc heeft geen
+       * vakje. */
+      if (_busy_slot == ADHOC_SLOT) {
+        if (st == 1) {
+          _adhoc.addr_v4 = s_ping.dns_addr;
+          startAdhocOnePing();
+        } else if (st == 2 || (long)(now - _phase_deadline) >= 0) {
+          MESH_DEBUG_PRINTLN("MonitorSensors: ad-hoc naam '%s' niet op te lossen", s_ping.host);
+          finishAdhoc("kon het adres niet opzoeken");
+        }
+        break;
+      }
       if (st == 1) {
         if (_busy_slot >= 0) {
           _mon[_busy_slot].addr_v4    = s_ping.dns_addr;
@@ -378,6 +400,28 @@ void MonitorSensors::loopMonitors() {
 
     case PING_RUNNING: {
       uint8_t st = s_ping.state;
+      /* AD-HOC: één van de n pings is klaar (of de noodrem sloeg toe). Uitslag
+       * bijschrijven en via REAPING naar de volgende ping of naar het einde --
+       * _busy_slot blijft ADHOC_SLOT zodat REAPING weet dat dit ad-hoc is. */
+      if (_busy_slot == ADHOC_SLOT) {
+        if (st != 0) {
+          recordAdhocResult(st == 1, s_ping.ms);
+          _phase = PING_REAPING;
+          _phase_deadline = now + 100;
+        } else if ((long)(now - _phase_deadline) >= 0) {
+          /* Geen enkele callback: de sessie hangt. Zelf opruimen en als timeout
+           * tellen; REAPING ziet dan een lege handle en gaat door. */
+          if (s_ping.handle != NULL) {
+            esp_ping_stop(s_ping.handle);
+            esp_ping_delete_session(s_ping.handle);
+            s_ping.handle = NULL;
+          }
+          recordAdhocResult(false, 0);
+          _phase = PING_REAPING;
+          _phase_deadline = now + 100;
+        }
+        break;
+      }
       if (st != 0) {
         int slot = _busy_slot;
         uint32_t ms = s_ping.ms;
@@ -412,8 +456,19 @@ void MonitorSensors::loopMonitors() {
           esp_ping_delete_session(s_ping.handle);
           s_ping.handle = NULL;
         }
-        _phase = PING_IDLE;
-        _next_ping_at = now + PING_GAP_MS;
+        /* AD-HOC: nog een ping te gaan? Dan de volgende; anders de uitslag
+         * afronden. _busy_slot bleef ADHOC_SLOT (de monitorpaden zetten hem op
+         * -1 vóór REAPING), dus dat is het onderscheid. */
+        if (_busy_slot == ADHOC_SLOT) {
+          if (_adhoc.done < _adhoc.want) {
+            startAdhocOnePing();
+          } else {
+            finishAdhoc(NULL);
+          }
+        } else {
+          _phase = PING_IDLE;
+          _next_ping_at = now + PING_GAP_MS;
+        }
       }
       break;
 
@@ -486,6 +541,15 @@ void MonitorSensors::loopPushStale() {
  * hier wordt gekozen en niet gestapeld. Het meest achterlopende vakje eerst
  * houdt de intervallen eerlijk als er meer monitors zijn dan er tijd is. */
 void MonitorSensors::startNextPing() {
+  /* AD-HOC KRIJGT VOORRANG. Een mens wacht op zijn uitslag, een monitor niet:
+   * een wachtende ad-hoc gaat vóór de monitorronde. De lopende monitorping was
+   * al afgebroken toen de ad-hoc werd aangevraagd (zie startAdhocPing), dus hier
+   * hoeft alleen de start gekozen te worden. */
+  if (_adhoc.state == ADHOC_PENDING) {
+    startAdhocResolve();
+    return;
+  }
+
   unsigned long now = millis();
   int  best = -1;
   long best_overdue = -1;
@@ -772,11 +836,104 @@ int MonitorSensors::slotOfNth(int nth) const {
 
 /* ===================== waarschuwingen =====================
  *
- * Geen eigen lus, geen eigen herhalingen: alles gaat via alertIf() van
- * SensorMesh, dat één keer per overgang vuurt, vier pogingen doet, vier
- * expected_acks bijhoudt en de waarschuwing opruimt zodra de storing over is.
- * Hier staat alleen de VOORWAARDE, en de begrenzing op MAX_MONITOR_ALERTS.
+ * Geen eigen lus en geen eigen verzendweg: alles gaat via alertIf() van
+ * SensorMesh. De HERHALING tot bevestiging zit ook hier -- niet als een tweede
+ * pad, maar als een voorwaarde die per periode even op onwaar valt en weer op
+ * waar komt, zodat alertIf zijn eigen lus opnieuw langs de ontvangers stuurt.
+ * Zie de header bij HERHALEN TOT EEN MENS BEVESTIGT en stepStoringAlert().
  */
+
+/* De ruwe storingsvoorwaarde, zonder herhaal-/ack-/remlogica. Gedeeld met
+ * confirmAlerts(), zodat "is er een storing" op één plek beslist wordt.
+ *
+ * Een FORCERING komt hier het echte pad binnen: sim DOWN telt als storing, sim UP
+ * onderdrukt hem. De pauzeregel geldt alleen voor de GEMETEN toestand -- een
+ * forcering is een bewering en geen meting, en die blijft geldig terwijl onze
+ * wifi weg is (LoRa staat daar los van). */
+bool MonitorSensors::monitorWantAlert(int slot) const {
+  if (!monitorUsed(slot)) return false;
+  const uint8_t sim = _sim[SIM_MON_FIRST + slot].mode;
+  if (sim == SIM_UP)   return false;
+  if (sim == SIM_DOWN) return true;
+  /* Verouderd EN neer kan niet tegelijk: verouderen zet seeded op false. */
+  return !monitorsPaused() && ((_mon[slot].seeded && !_mon[slot].up) || _mon[slot].stale);
+}
+
+/* De gedeelde kern. Zie de header voor het waarom; hier het recept.
+ *
+ * Retourneert wat main.cpp aan alertIf() voert. Beheert vier dingen:
+ *  - eerste melding (armt, zet down_sent, meldt armed_first);
+ *  - herhalen: als er een melding staat en de periode verstreken is, valt de
+ *    voorwaarde deze ronde op onwaar (de "puls laag") zodat alertIf de Trigger
+ *    opruimt; de ronde erna komt hij op waar en her-armt alertIf -> nieuwe zending;
+ *  - stoppen bij menselijke bevestiging (human_ack);
+ *  - de harde bovengrens MAX_ALERT_REPEATS.
+ */
+bool MonitorSensors::stepStoringAlert(bool want, bool& alerting, bool& down_sent,
+                                      unsigned long& down_since, AlertRepeat& r,
+                                      int idx_for_log, bool* armed_first) {
+  if (armed_first) *armed_first = false;
+  const unsigned long now = millis();
+
+  /* Storing voorbij: alles van de herhaling terug naar nul. down_sent NIET --
+   * dat blijft staan voor de herstelmelding, die het na de storing opruimt. */
+  if (!want) {
+    alerting = false;
+    r.human_ack = false; r.pulse = false; r.max_logged = false;
+    r.repeats = 0; r.next_repeat = 0;
+    return false;
+  }
+
+  /* Een mens heeft bevestigd: de pieper zwijgt, ook al is de storing er nog.
+   * down_sent blijft staan, dus de herstelmelding komt straks gewoon. */
+  if (r.human_ack) { alerting = false; return false; }
+
+  const bool rep_on = (_cfg.repeat_s > 0);
+
+  /* Bovengrens bereikt: stoppen met herhalen. De monitor blijft down op de pagina
+   * en in de telemetrie; alleen de DM's houden op. Eén regel in de log. */
+  if (rep_on && r.repeats >= MAX_ALERT_REPEATS) {
+    if (!r.max_logged) {
+      MESH_DEBUG_PRINTLN("MonitorSensors: alarm %d bovengrens van %d herhalingen bereikt, stopt met herhalen",
+                         idx_for_log, (int)MAX_ALERT_REPEATS);
+      r.max_logged = true;
+    }
+    alerting = false;
+    return false;
+  }
+
+  if (r.pulse) {
+    /* Dit is de her-arm-ronde na een puls laag: door naar het armen hieronder. */
+    r.pulse = false;
+  } else if (alerting) {
+    /* Er staat een melding. Tijd voor een herhaling? Dan één ronde onwaar geven
+     * zodat alertIf de Trigger opruimt; volgende ronde her-armen we. */
+    if (rep_on && (long)(now - r.next_repeat) >= 0) {
+      r.pulse = true;
+      alerting = false;
+      return false;
+    }
+    return true;   /* melding staat, niets te doen */
+  }
+
+  /* Armen -- eerste melding of een herhaling. Door dezelfde rem als elke andere
+   * waarschuwing: een herhaling moet een plaats in de wachtrij heroveren, dus een
+   * golf herhalingen verdringt zichzelf netjes in plaats van de band vol te
+   * zetten. Lukt het armen nu niet, dan volgende ronde opnieuw -- geen verlies. */
+  if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
+
+  const bool first = !down_sent;
+  alerting = true;
+  if (first) {
+    noteDownSent(down_sent, down_since);
+    if (armed_first) *armed_first = true;
+  } else if (r.repeats < 255) {
+    r.repeats++;
+  }
+  if (rep_on) r.next_repeat = now + (unsigned long)_cfg.repeat_s * 1000UL;
+  return true;
+}
+
 bool MonitorSensors::monitorAlert(int slot) {
   if (!monitorUsed(slot)) {
     /* Vakje is leeg (of net verwijderd): voorwaarde uit, zodat main.cpp met
@@ -786,69 +943,18 @@ bool MonitorSensors::monitorAlert(int slot) {
   }
 
   MonState& m = _mon[slot];
+  const bool want = monitorWantAlert(slot);
 
-  /* ---- EEN FORCERING KOMT HIER HET ECHTE PAD BINNEN ----
-   *
-   * En dat is de hele truc: de voorwaarde is de GEFORCEERDE stand, en de rest --
-   * het versturen, de contactkeuze op PERM_RECV_ALERTS_*, de pogingen, de ACK's,
-   * het opruimen bij "herstel" -- doet alertIf() in main.cpp precies zoals bij
-   * een echte storing. Er is geen tak hieronder die weet dat dit een test is.
-   *
-   * DE PAUZEREGEL GELDT HIER NIET, en dat is met opzet. monitorsPaused() zegt
-   * "wij hebben niet kunnen meten", en dat is een uitspraak over een meting. Een
-   * forcering is geen meting maar een bewering, en die blijft geldig terwijl onze
-   * wifi weg is -- LoRa staat daar los van, dus de waarschuwing kan gewoon de
-   * deur uit. Zou de pauze hier wel gelden, dan zou een test op een node met
-   * wifi-problemen stil niets doen, precies wanneer je hem nodig hebt. */
-  const uint8_t sim = _sim[SIM_MON_FIRST + slot].mode;
-  if (sim != SIM_OFF) {
-    if (sim == SIM_UP) { m.alerting = false; return false; }
-    if (m.alerting) return true;
-    if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
-    m.alerting = true;
-    noteDownSent(m.down_sent, m.down_since);
-    m.was_stale = false;
-    m.was_sim   = true;
-    return true;
+  bool first = false;
+  const bool res = stepStoringAlert(want, m.alerting, m.down_sent, m.down_since,
+                                    m.rep, (int)_cfg.mons[slot].channel, &first);
+  if (first) {
+    /* Alleen op de EERSTE melding vastgelegd, zodat de herstel- en herhaaltekst
+     * weten of dit een simulatie of een stille melder was. */
+    m.was_stale = m.stale;
+    m.was_sim   = (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF);
   }
-
-  /* Bevestigd down, en we waren op dat moment niet blind. monitorsPaused()
-   * dekt zowel "geen wifi" als de insteltijd erna.
-   *
-   * Voor een GEMELDE dienst komt daar één geval bij: de melder is stil
-   * gevallen. Dat gaat langs DEZELFDE weg naar buiten -- monitorAlert() en
-   * monitorAlertText(), die main.cpp al aan alertIf() hangt -- en niet langs een
-   * tweede waarschuwingspad. Eén weg betekent ook dat de rem op
-   * MAX_MONITOR_ALERTS hier vanzelf voor beide gevallen geldt en dat een storing
-   * die overgaat door hetzelfde alertIf() wordt opgeruimd.
-   *
-   * Verouderd EN neer kan niet tegelijk: verouderen zet seeded op false. Van de
-   * twee is "geen melding meer" dan het nieuwste feit, en dat is ook het feit
-   * dat de ontvanger nodig heeft. */
-  const bool want = !monitorsPaused() && ((m.seeded && !m.up) || m.stale);
-
-  if (!want) {
-    m.alerting = false;
-    return false;
-  }
-  if (m.alerting) return true;    /* loopt al; niet nog eens gaan tellen */
-
-  if (alertsActive() >= MAX_MONITOR_ALERTS) {
-    /* Rem, geen verlies: zodra er een plaats vrijkomt komt deze monitor bij
-     * een volgende leesronde aan de beurt, want de voorwaarde blijft waar
-     * zolang hij down is. */
-    return false;
-  }
-
-  m.alerting = true;
-  /* HIER wordt vastgelegd dat wij deze storing GEMELD hebben, en niet alleen dat
-   * hij bestond. Dat is voorwaarde 1 van de herstelmelding (zie de header): een
-   * dienst die wegviel zonder dat er ooit iemand iets van hoorde, hoort geen
-   * "weer bereikbaar" op te leveren. */
-  noteDownSent(m.down_sent, m.down_since);
-  m.was_stale = m.stale;
-  m.was_sim   = false;
-  return true;
+  return res;
 }
 
 /* Vaste buffer. alertIf() kopieert de tekst meteen in de Trigger, dus hij hoeft
@@ -881,19 +987,35 @@ static char s_alert_buf[160];
 static const char SIM_MARK[] = "TEST ";
 static const char SIM_TAIL[] = " -- dit is een SIMULATIE, geen echte storing";
 
+/* Het herhaalachtervoegsel: " (herhaling N)" zodra dit een tweede of latere
+ * zending is. Dat getal is voor de ontvanger het teken dat de melding nog
+ * openstaat -- de pieper piept nog, niemand heeft "ok" gestuurd. Op de eerste
+ * melding (repeats == 0) staat er niets. Vaste buffer, want alertText gebruikt
+ * geen String in dit pad. */
+static const char* repeatSuffix(uint8_t repeats) {
+  static char rp[20];
+  if (repeats == 0) { rp[0] = 0; return rp; }
+  snprintf(rp, sizeof(rp), " (herhaling %u)", (unsigned)repeats);
+  return rp;
+}
+
 const char* MonitorSensors::monitorAlertText(int slot) const {
   if (!monitorUsed(slot)) { s_alert_buf[0] = 0; return s_alert_buf; }
 
+  const char* rp = repeatSuffix(_mon[slot].rep.repeats);
+
   /* Gesimuleerd? Dan gaat de gewone tekst tussen het merkteken en de uitleg. Het
    * middenstuk is hetzelfde als bij een echte storing, en dat is de bedoeling:
-   * de ontvanger leest dezelfde melding en ziet erbij dat hij niet echt is. */
+   * de ontvanger leest dezelfde melding en ziet erbij dat hij niet echt is. Het
+   * herhaalachtervoegsel staat vóór de uitleg, zodat "(herhaling 3)" bij de
+   * melding hoort en niet achter de disclaimer bengelt. */
   const bool sim = _sim[SIM_MON_FIRST + slot].mode != SIM_OFF;
   if (sim) {
-    snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s %s (%s)%s",
+    snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s %s (%s)%s%s",
              SIM_MARK, _cfg.mons[slot].name,
              monitorIsPush(slot) ? "gemeld als neer" : "onbereikbaar",
              monitorIsPush(slot) ? "gemeld" : _cfg.mons[slot].host,
-             SIM_TAIL);
+             rp, SIM_TAIL);
     return s_alert_buf;
   }
 
@@ -904,17 +1026,17 @@ const char* MonitorSensors::monitorAlertText(int slot) const {
      * verkeerde kant op zoeken. Het adres staat er niet bij -- dat is "-" en zegt
      * niets. */
     if (_mon[slot].stale) {
-      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s: geen melding meer (>%lus)",
-               _cfg.mons[slot].name, (unsigned long)monitorStaleSecs(slot));
+      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s: geen melding meer (>%lus)%s",
+               _cfg.mons[slot].name, (unsigned long)monitorStaleSecs(slot), rp);
     } else {
-      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s gemeld als neer",
-               _cfg.mons[slot].name);
+      snprintf(s_alert_buf, sizeof(s_alert_buf), "%s gemeld als neer%s",
+               _cfg.mons[slot].name, rp);
     }
     return s_alert_buf;
   }
 
-  snprintf(s_alert_buf, sizeof(s_alert_buf), "%s onbereikbaar (%s)",
-           _cfg.mons[slot].name, _cfg.mons[slot].host);
+  snprintf(s_alert_buf, sizeof(s_alert_buf), "%s onbereikbaar (%s)%s",
+           _cfg.mons[slot].name, _cfg.mons[slot].host, rp);
   return s_alert_buf;
 }
 
@@ -1339,32 +1461,478 @@ bool MonitorSensors::fixedAlert(int which) {
   const uint8_t idx  = (which == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
   const bool    want = (_sim[idx].mode == SIM_DOWN);
 
-  if (!want) { _fixed_alerting[which] = false; return false; }
-  if (_fixed_alerting[which]) return true;
-  if (alertsActive() >= MAX_MONITOR_ALERTS) return false;
-
-  _fixed_alerting[which] = true;
-  /* Ook hier: pas als de melding UITGAAT mag er straks een herstelmelding op
-   * volgen. Zie de uitleg bij noteDownSent(). */
-  noteDownSent(_fixed_down_sent[which], _fixed_down_since[which]);
-  return true;
+  /* Zelfde recept als de monitors: eerste melding, herhalen tot bevestiging, de
+   * bovengrens en de rem -- alleen zonder de was_stale/was_sim-vlaggen, want een
+   * vast kanaal alarmeert bij deze opzet uitsluitend via een simulatie en dat is
+   * altijd een test (fixedAlertText en de herstelvariant zetten SIM_MARK vast). */
+  return stepStoringAlert(want, _fixed_alerting[which], _fixed_down_sent[which],
+                          _fixed_down_since[which], _fixed_rep[which],
+                          which == FIXED_POWER ? 2 : 4, NULL);
 }
 
 const char* MonitorSensors::fixedAlertText(int which) const {
+  const char* rp = (which >= 0 && which < FIXED_ALERT_COUNT)
+                 ? repeatSuffix(_fixed_rep[which].repeats) : "";
   if (which == FIXED_POWER) {
     snprintf(s_alert_buf, sizeof(s_alert_buf),
-             "%snetvoeding weg, node op batterij (%.3fV)%s",
-             SIM_MARK, _last_volts, SIM_TAIL);
+             "%snetvoeding weg, node op batterij (%.3fV)%s%s",
+             SIM_MARK, _last_volts, rp, SIM_TAIL);
   } else if (which == FIXED_WIFI) {
     /* Erbij dat de monitors bevriezen: dat is het GEVOLG dat de ontvanger moet
      * kennen. Zonder onze wifi meten wij niets over de diensten, en dan is het
      * uitblijven van verdere waarschuwingen geen goed nieuws. */
     snprintf(s_alert_buf, sizeof(s_alert_buf),
-             "%swifi weg, monitors bevroren%s", SIM_MARK, SIM_TAIL);
+             "%swifi weg, monitors bevroren%s%s", SIM_MARK, rp, SIM_TAIL);
   } else {
     s_alert_buf[0] = 0;
   }
   return s_alert_buf;
+}
+
+/* ---------------- de menselijke bevestiging ---------------- */
+
+bool MonitorSensors::isAckText(const uint8_t* data, size_t len) {
+  if (data == NULL) return false;
+  /* Spaties vooraan en achteraan wegknippen. De DM-payload is niet noodzakelijk
+   * met een nul afgesloten, dus we werken op lengte. */
+  size_t a = 0, b = len;
+  while (a < b && (data[a] == ' ' || data[a] == '\t' || data[a] == '\r'
+                   || data[a] == '\n')) a++;
+  while (b > a && (data[b-1] == ' ' || data[b-1] == '\t' || data[b-1] == '\r'
+                   || data[b-1] == '\n')) b--;
+  const size_t n = b - a;
+
+  /* Hoofdletterongevoelig, exact "ok" of "ack" -- niet "ok, komt goed", want dan
+   * zou elke zin die met ok begint stil alle meldingen doven. Kort en streng. */
+  if (n == 2) {
+    return (data[a]|0x20) == 'o' && (data[a+1]|0x20) == 'k';
+  }
+  if (n == 3) {
+    return (data[a]|0x20) == 'a' && (data[a+1]|0x20) == 'c' && (data[a+2]|0x20) == 'k';
+  }
+  return false;
+}
+
+uint8_t MonitorSensors::confirmAlerts() {
+  uint8_t n = 0;
+
+  /* Een melding is "open" als wij hem GEMELD hebben (down_sent) en de storing nog
+   * loopt (monitorWantAlert). down_sent alleen zou ook een net herstelde dienst
+   * meetellen waarvan het herstelvenster nog open staat, en die valt niets te
+   * bevestigen. */
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorUsed(i)) continue;
+    if (monitorWantAlert(i) && _mon[i].down_sent && !_mon[i].rep.human_ack) {
+      _mon[i].rep.human_ack = true;
+      n++;
+    }
+  }
+
+  for (int k = 0; k < FIXED_ALERT_COUNT; k++) {
+    const uint8_t idx = (k == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
+    const bool want = (_sim[idx].mode == SIM_DOWN);
+    if (want && _fixed_down_sent[k] && !_fixed_rep[k].human_ack) {
+      _fixed_rep[k].human_ack = true;
+      n++;
+    }
+  }
+
+  if (n) MESH_DEBUG_PRINTLN("MonitorSensors: %u melding(en) door een mens bevestigd, herhalen gestopt", (unsigned)n);
+  return n;
+}
+
+void MonitorSensors::repeatStatus(uint8_t& nagging, uint8_t& capped) const {
+  nagging = 0; capped = 0;
+  const bool rep_on = (_cfg.repeat_s > 0);
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorUsed(i)) continue;
+    if (!monitorWantAlert(i) || !_mon[i].down_sent || _mon[i].rep.human_ack) continue;
+    if (rep_on && _mon[i].rep.repeats >= MAX_ALERT_REPEATS) capped++;
+    else nagging++;
+  }
+  for (int k = 0; k < FIXED_ALERT_COUNT; k++) {
+    const uint8_t idx = (k == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
+    if (_sim[idx].mode != SIM_DOWN || !_fixed_down_sent[k] || _fixed_rep[k].human_ack) continue;
+    if (rep_on && _fixed_rep[k].repeats >= MAX_ALERT_REPEATS) capped++;
+    else nagging++;
+  }
+}
+
+/* ===================== sensorbeheer per DM =====================
+ *
+ * Zie de header bij SENSORBEHEER PER DM voor het waarom en de syntax. Alles hier
+ * routeert door createMonitor()/deleteMonitor()/setSettingValue() -- dezelfde
+ * keuring en schrijfweg als de web-GUI en de CLI.
+ */
+
+static bool isAllDigits(const char* s) {
+  if (s == NULL || *s == 0) return false;
+  for (const char* p = s; *p; p++) if (*p < '0' || *p > '9') return false;
+  return true;
+}
+
+/* Een naam-of-kanaal-argument naar een vakjenummer. Alles wat alleen cijfers is,
+ * is een KANAAL (de afspraak uit de header); anders een naam. Exact, nooit een
+ * prefix. -1 als er niets op past. */
+int MonitorSensors::resolveTarget(const char* tok) const {
+  if (tok == NULL || tok[0] == 0) return -1;
+  if (isAllDigits(tok)) {
+    int ch = atoi(tok);
+    if (ch < CH_MONITOR_FIRST || ch > CH_MONITOR_LAST) return -1;
+    return findByChannel((uint8_t)ch);
+  }
+  return findByName(tok);
+}
+
+const char* MonitorSensors::handleDmMonCommand(const char* line) {
+  static char s_dm_buf[200];
+  if (line == NULL) return NULL;
+
+  /* Een muteerbare kopie om op de spaties te splitsen; de DM-tekst is hooguit
+   * 160 byte (zie DmCommands), dus dit past ruim. Geen String, geen allocatie. */
+  char buf[164];
+  StrHelper::strncpy(buf, line, sizeof(buf));
+
+  char* argv[8];
+  int argc = 0;
+  char* p = buf;
+  while (*p && argc < 8) {
+    while (*p == ' ' || *p == '\t') p++;
+    if (!*p) break;
+    argv[argc++] = p;
+    while (*p && *p != ' ' && *p != '\t') p++;
+    if (*p) *p++ = 0;
+  }
+  if (argc == 0) return NULL;
+
+  /* ---- add <naam> <adres> [interval] ---- */
+  if (strcmp(argv[0], "add") == 0) {
+    if (argc < 3) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "add <naam> <adres> [interval]");
+      return s_dm_buf;
+    }
+    unsigned long ivl = MON_INTERVAL_DEFAULT;
+    if (argc >= 4) {
+      /* Geen eigen grenzencontrole: createMonitor keurt het interval zelf. Hier
+       * alleen tekst -> getal, en rommel wordt 0 en dus door createMonitor
+       * afgekeurd met MON_ERR_INTERVAL. */
+      ivl = strtoul(argv[3], NULL, 10);
+    }
+    uint8_t ch = 0;
+    MonResult r = createMonitor(argv[1], argv[2], (uint16_t)ivl, &ch);
+    if (r != MON_OK) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "add geweigerd: %s", monResultText(r));
+      return s_dm_buf;
+    }
+    snprintf(s_dm_buf, sizeof(s_dm_buf), "ok, '%s' op kanaal %u (elke %lus)",
+             argv[1], (unsigned)ch, ivl);
+    return s_dm_buf;
+  }
+
+  /* ---- del <naam|kanaal> ---- */
+  if (strcmp(argv[0], "del") == 0) {
+    if (argc < 2) { snprintf(s_dm_buf, sizeof(s_dm_buf), "del <naam|kanaal>"); return s_dm_buf; }
+    int slot = resolveTarget(argv[1]);
+    if (slot < 0) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "del: geen monitor '%s'", argv[1]);
+      return s_dm_buf;
+    }
+    const uint8_t ch = _cfg.mons[slot].channel;
+    /* deleteMonitor werkt op naam; wij hebben de naam van het gevonden vakje. Zo
+     * loopt del op kanaalnummer door exact dezelfde weg als del op naam. */
+    char nm[MON_NAME_LEN];
+    StrHelper::strncpy(nm, _cfg.mons[slot].name, sizeof(nm));
+    MonResult r = deleteMonitor(nm);
+    if (r != MON_OK) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "del geweigerd: %s", monResultText(r));
+      return s_dm_buf;
+    }
+    /* Eerlijk over de prijs, en geen bevestigingsdialoog: een DM-ronde over LoRa
+     * is traag en kost zendtijd. */
+    snprintf(s_dm_buf, sizeof(s_dm_buf),
+             "verwijderd; kanaal %u blijft vergeven (komt niet terug zolang er "
+             "verse nummers zijn)", (unsigned)ch);
+    return s_dm_buf;
+  }
+
+  /* ---- edit <naam|kanaal> [host=..] [int=..] [naam=..] [ms=0|1] ---- */
+  if (strcmp(argv[0], "edit") == 0) {
+    if (argc < 3) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf),
+               "edit <naam|kanaal> [host=<adres>] [int=<s>] [naam=<nieuw>] [ms=0|1]");
+      return s_dm_buf;
+    }
+    int slot = resolveTarget(argv[1]);
+    if (slot < 0) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "edit: geen monitor '%s'", argv[1]);
+      return s_dm_buf;
+    }
+    const uint8_t ch = _cfg.mons[slot].channel;
+
+    int done = 0, failed = 0;
+    bool host_changed = false;
+    char last_bad[16]; last_bad[0] = 0;
+
+    for (int i = 2; i < argc; i++) {
+      char* eq = strchr(argv[i], '=');
+      if (eq == NULL) { failed++; StrHelper::strncpy(last_bad, argv[i], sizeof(last_bad)); continue; }
+      *eq = 0;
+      const char* key = argv[i];
+      const char* val = eq + 1;
+
+      /* De sleutelnaam naar de settings-zeef. "naam" (Nederlands, in de DM) wordt
+       * "name" (de interne sleutel); de andere vallen samen. */
+      const char* field = NULL;
+      if      (strcmp(key, "host") == 0) field = "host";
+      else if (strcmp(key, "int")  == 0) field = "int";
+      else if (strcmp(key, "naam") == 0) field = "name";
+      else if (strcmp(key, "ms")   == 0) field = "ms";
+      if (field == NULL) { failed++; StrHelper::strncpy(last_bad, key, sizeof(last_bad)); continue; }
+
+      char setting[24];
+      snprintf(setting, sizeof(setting), "mon.%u.%s", (unsigned)ch, field);
+      if (setSettingValue(setting, val)) {
+        done++;
+        if (strcmp(field, "host") == 0) host_changed = true;
+      } else {
+        failed++;
+        StrHelper::strncpy(last_bad, key, sizeof(last_bad));
+      }
+    }
+
+    /* De adreswaarschuwing kort, net als de web-GUI: hetzelfde kanaalnummer wijst
+     * daarna naar een andere dienst. */
+    int n = snprintf(s_dm_buf, sizeof(s_dm_buf),
+                     "kanaal %u: %d gewijzigd%s", (unsigned)ch, done,
+                     failed ? "" : "");
+    if (failed) n += snprintf(s_dm_buf + n, sizeof(s_dm_buf) - n,
+                              ", %d geweigerd (%s?)", failed, last_bad);
+    if (host_changed) snprintf(s_dm_buf + n, sizeof(s_dm_buf) - n,
+                               ". LET OP: kanaal %u wijst nu een andere dienst aan; "
+                               "pas de naam en je dashboard aan", (unsigned)ch);
+    return s_dm_buf;
+  }
+
+  /* ---- ping <adres> [n] ---- (ad-hoc; uitslag komt LATER, apart)
+   *
+   * Deze regel geeft alleen de ONMIDDELLIJKE reactie terug ("gestart" / "bezig"
+   * / een weigering). De echte uitslag komt via adhocReady()/adhocResultText(),
+   * die DmCommands na een paar seconden ophaalt en als eigen DM stuurt. Zo blokt
+   * niets: het commando keurt en start, meer niet. */
+  if (strcmp(argv[0], "ping") == 0) {
+    if (argc < 2) { snprintf(s_dm_buf, sizeof(s_dm_buf), "ping <adres> [n]"); return s_dm_buf; }
+    /* Zonder wifi meteen een eerlijk antwoord en niets starten -- pingen zou
+     * onze eigen verbinding meten, niet het adres. */
+    if (!wifiReallyOnline()) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "geen wifi, niet gepingd");
+      return s_dm_buf;
+    }
+    unsigned long n = ADHOC_DEFAULT_PINGS;
+    if (argc >= 3) n = strtoul(argv[2], NULL, 10);
+    SimResult r = startAdhocPing(argv[1], (uint8_t)n);
+    if (r == SIM_ERR_BUSY) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "bezig met %s, probeer zo opnieuw", adhocHost());
+      return s_dm_buf;
+    }
+    if (r != SIM_OK) {
+      snprintf(s_dm_buf, sizeof(s_dm_buf),
+               "adres: 1-40 tekens uit a-z A-Z 0-9 . - _ (geen IPv6)");
+      return s_dm_buf;
+    }
+    uint8_t got = (n == 0 || n > ADHOC_MAX_PINGS) ? (n == 0 ? ADHOC_DEFAULT_PINGS : ADHOC_MAX_PINGS) : (uint8_t)n;
+    snprintf(s_dm_buf, sizeof(s_dm_buf),
+             "ping naar %s gestart (%ux); de uitslag volgt zo als aparte DM%s",
+             argv[1], (unsigned)got, _adhoc.delayed ? " (even wachten, pingmachine was bezig)" : "");
+    return s_dm_buf;
+  }
+
+  return NULL;   /* niet van ons: DmCommands valt door naar list/get/status/help */
+}
+
+const char* MonitorSensors::dmCommandHelp() {
+  /* Eén regel per commando, kort want het gaat over LoRa. De admin-eis staat
+   * erbij zodat een leescontact begrijpt waarom er niets gebeurt. */
+  return "add <naam> <adres> [int] | edit <naam|kanaal> [host= int= naam= ms=] | "
+         "del <naam|kanaal> | ping <adres> [n] -- alleen voor admins; "
+         "naam-of-kanaal: alleen cijfers = kanaal";
+}
+
+/* ===================== ad-hoc ping =====================
+ *
+ * Zie de header bij AD-HOC PING. Deelt de ene esp_ping-sessie en de fasemachine
+ * met de monitorbewaking; elke tak hierboven in loopMonitors is met
+ * (_busy_slot == ADHOC_SLOT) bewaakt.
+ */
+MonitorSensors::SimResult MonitorSensors::startAdhocPing(const char* host, uint8_t n) {
+  if (!validHost(host)) return SIM_ERR_INDEX;
+  /* PUSH_HOST ("-") is een geldig adres voor de zeef maar niets om te pingen. */
+  if (strcmp(host, PUSH_HOST) == 0) return SIM_ERR_INDEX;
+
+  if (_adhoc.state == ADHOC_PENDING || _adhoc.state == ADHOC_BUSY) return SIM_ERR_BUSY;
+
+  if (n == 0) n = ADHOC_DEFAULT_PINGS;
+  if (n > ADHOC_MAX_PINGS) n = ADHOC_MAX_PINGS;
+
+  memset(&_adhoc, 0, sizeof(_adhoc));
+  StrHelper::strncpy(_adhoc.host, host, sizeof(_adhoc.host));
+  _adhoc.want   = n;
+  _adhoc.min_ms = 0xFFFFFFFFUL;
+  _adhoc.state  = ADHOC_PENDING;
+
+  /* VOORRANG: draait er nu een monitorping, dan afbreken (telt niet als
+   * mislukking) zodat de ad-hoc als eerste gaat. _next_ping_at op nu, zodat de
+   * IDLE-tak van loopMonitors de ad-hoc meteen oppakt en niet eerst PING_GAP_MS
+   * wacht. */
+  _adhoc.delayed = (_phase != PING_IDLE);
+  if (_phase != PING_IDLE) abortPing();
+  _next_ping_at = millis();
+  return SIM_OK;
+}
+
+void MonitorSensors::startAdhocResolve() {
+  _adhoc.state = ADHOC_BUSY;
+  StrHelper::strncpy(s_ping.host, _adhoc.host, sizeof(s_ping.host));
+
+  /* Al een IP? Dan geen DNS. Zelfde snelweg als startResolve(). */
+  ip4_addr_t lit;
+  if (ip4addr_aton(s_ping.host, &lit)) {
+    _adhoc.addr_v4 = ip4_addr_get_u32(&lit);
+    startAdhocOnePing();
+    return;
+  }
+
+  s_ping.dns_state = 0;
+  s_ping.dns_addr  = 0;
+  _busy_slot = ADHOC_SLOT;
+  _phase = PING_RESOLVING;
+  _phase_deadline = millis() + DNS_DEADLINE_MS;
+
+  if (tcpip_try_callback(mon_do_resolve, this) != ERR_OK) {
+    /* lwIP-rij vol: even wachten en opnieuw, net als bij een monitor. */
+    _busy_slot = -1;
+    _phase = PING_IDLE;
+    _adhoc.state = ADHOC_PENDING;
+    _next_ping_at = millis() + PING_GAP_MS;
+  }
+}
+
+void MonitorSensors::startAdhocOnePing() {
+  esp_ping_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.count           = 1;
+  cfg.interval_ms     = 1000;
+  cfg.timeout_ms      = ADHOC_TIMEOUT_MS;   /* ruimer dan de monitor: een mens
+                                               wil weten of het TRAAG is, niet
+                                               alleen of het er is */
+  cfg.data_size       = 32;
+  cfg.tos             = 0;
+  cfg.ttl             = 64;
+  cfg.task_stack_size = 3072;
+  cfg.task_prio       = 2;
+  cfg.interface       = 0;
+  ip_addr_set_ip4_u32(&cfg.target_addr, _adhoc.addr_v4);
+
+  esp_ping_callbacks_t cbs;
+  memset(&cbs, 0, sizeof(cbs));
+  cbs.cb_args         = NULL;
+  cbs.on_ping_success = mon_ping_success;
+  cbs.on_ping_timeout = mon_ping_timeout;
+  cbs.on_ping_end     = NULL;
+
+  s_ping.state = 0;
+  s_ping.ms    = 0;
+
+  if (s_ping.handle != NULL) {
+    esp_ping_delete_session(s_ping.handle);
+    s_ping.handle = NULL;
+  }
+
+  if (esp_ping_new_session(&cfg, &cbs, &s_ping.handle) != ESP_OK) {
+    s_ping.handle = NULL;
+    finishAdhoc("kon geen ping-sessie maken");
+    return;
+  }
+  if (esp_ping_start(s_ping.handle) != ESP_OK) {
+    esp_ping_delete_session(s_ping.handle);
+    s_ping.handle = NULL;
+    finishAdhoc("kon de ping niet starten");
+    return;
+  }
+
+  _adhoc.state = ADHOC_BUSY;
+  _busy_slot = ADHOC_SLOT;
+  _phase = PING_RUNNING;
+  _phase_deadline = millis() + PING_DEADLINE_MS;   /* noodrem boven de timeout */
+}
+
+void MonitorSensors::recordAdhocResult(bool ok, uint32_t ms) {
+  if (_adhoc.done < ADHOC_MAX_PINGS) {
+    _adhoc.results[_adhoc.done] = ok ? ms : 0xFFFFFFFFUL;
+  }
+  _adhoc.done++;
+  if (ok) {
+    _adhoc.ok++;
+    _adhoc.sum_ms += ms;
+    if (ms < _adhoc.min_ms) _adhoc.min_ms = ms;
+    if (ms > _adhoc.max_ms) _adhoc.max_ms = ms;
+  }
+}
+
+void MonitorSensors::finishAdhoc(const char* note) {
+  _adhoc.note        = note;
+  _adhoc.finished_at = millis();
+  _adhoc.state       = ADHOC_DONE;
+  /* De sessie kan nog open staan als we vroegtijdig eindigen (DNS-fout); opruimen
+   * zodat de monitorbewaking een schone machine terugkrijgt. */
+  if (s_ping.handle != NULL) {
+    esp_ping_stop(s_ping.handle);
+    esp_ping_delete_session(s_ping.handle);
+    s_ping.handle = NULL;
+  }
+  _busy_slot = -1;
+  _phase = PING_IDLE;
+  _next_ping_at = millis() + PING_GAP_MS;   /* monitors weer aan de beurt */
+  MESH_DEBUG_PRINTLN("MonitorSensors: ad-hoc ping naar %s klaar (%u/%u ok)",
+                     _adhoc.host, (unsigned)_adhoc.ok, (unsigned)_adhoc.done);
+}
+
+const char* MonitorSensors::adhocResultText() const {
+  static char buf[220];
+  int n = snprintf(buf, sizeof(buf), "ping %s:", _adhoc.host);
+
+  if (_adhoc.note) {
+    n += snprintf(buf + n, sizeof(buf) - n, " %s", _adhoc.note);
+  }
+  for (uint8_t i = 0; i < _adhoc.done && i < ADHOC_MAX_PINGS; i++) {
+    if (_adhoc.results[i] == 0xFFFFFFFFUL) {
+      n += snprintf(buf + n, sizeof(buf) - n, " timeout");
+    } else {
+      n += snprintf(buf + n, sizeof(buf) - n, " %lums", (unsigned long)_adhoc.results[i]);
+    }
+  }
+  if (_adhoc.done > 0) {
+    n += snprintf(buf + n, sizeof(buf) - n, " | %u/%u ok",
+                  (unsigned)_adhoc.ok, (unsigned)_adhoc.done);
+    if (_adhoc.ok > 0) {
+      uint32_t avg = _adhoc.sum_ms / _adhoc.ok;
+      n += snprintf(buf + n, sizeof(buf) - n, ", min/gem/max %lu/%lu/%lu ms",
+                    (unsigned long)_adhoc.min_ms, (unsigned long)avg,
+                    (unsigned long)_adhoc.max_ms);
+    }
+  }
+  /* De ouderdom van de uitslag, zoals de alerts hun duur meegeven: als de
+   * bezorging traag was, hoort de vrager te zien hoe oud het antwoord is. */
+  const unsigned long age = _adhoc.finished_at ? (millis() - _adhoc.finished_at) / 1000 : 0;
+  snprintf(buf + n, sizeof(buf) - n, " (%lus geleden%s)",
+           age, _adhoc.delayed ? ", start was uitgesteld" : "");
+  return buf;
+}
+
+void MonitorSensors::adhocClear() {
+  /* Alleen de vlag: de velden worden bij de volgende startAdhocPing gewist. Zo
+   * blijft de laatste uitslag leesbaar tot hij echt overschreven wordt. DONE ->
+   * NONE betekent bovendien dat een nieuwe ping niet meer op BUSY afketst. */
+  _adhoc.state = ADHOC_NONE;
 }
 
 /* ---------------- het testbericht ----------------
@@ -1991,8 +2559,8 @@ bool MonitorSensors::delMonitor(const char* name) {
  */
 
 #define MON_FIELDS_PER_MONITOR  5     /* name, host, int, state, ms */
-#define MON_NUM_GLOBAL_SETTINGS 8     /* mains.hi/lo/state + mon.count/add/del
-                                       + alert.recover/alert.rhold */
+#define MON_NUM_GLOBAL_SETTINGS 9     /* mains.hi/lo/state + mon.count/add/del
+                                       + alert.recover/alert.rhold/alert.repeat */
 
 /* Vaste buffers, één per instelling: getSettingValue() is const en mag niets
  * alloceren, en met een buffer per instelling kan een aanroeper meerdere
@@ -2031,6 +2599,7 @@ const char* MonitorSensors::getSettingName(int i) const {
      * zonder wifi hoort zijn alarmgedrag ook te kunnen wijzigen. */
     case 6: return "alert.recover"; // 0/1: melden als iets weer werkt
     case 7: return "alert.rhold";   // s: hoe lang op voordat het herstel gemeld wordt
+    case 8: return "alert.repeat";  // s: herhaal tot een mens "ok" stuurt (0 = uit)
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -2076,6 +2645,12 @@ const char* MonitorSensors::getSettingValue(int i) const {
       snprintf(s_setting_buf[3], sizeof(s_setting_buf[3]), "%u",
                (unsigned)_cfg.rhold_s);
       return s_setting_buf[3];
+    case 8:
+      /* Hergebruik van buffer [2]: elke aanroeper leest er één (zie de noot bij
+       * s_mon_val_buf), dus twee waarden hoeven hier niet naast elkaar te staan. */
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.repeat_s);
+      return s_setting_buf[2];
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -2168,6 +2743,17 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     if (end == value || *end != 0) return false;
     if (v < MON_RHOLD_MIN || v > MON_RHOLD_MAX) return false;
     _cfg.rhold_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "alert.repeat") == 0) {
+    /* 0 = uit (geen herhaling), anders binnen de grenzen. 0 apart toegestaan,
+     * want die valt buiten [MIN..MAX] en zou anders geweigerd worden. */
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v != 0 && (v < MON_AREPEAT_MIN || v > MON_AREPEAT_MAX)) return false;
+    _cfg.repeat_s = (uint16_t)v;
     markDirty();
     return true;
   }

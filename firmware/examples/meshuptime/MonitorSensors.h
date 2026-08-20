@@ -423,6 +423,174 @@ public:
   bool     recoverEnabled() const { return _cfg.recover_alerts != 0; }
   uint16_t recoverHoldSecs() const { return _cfg.rhold_s; }
 
+  /* ==================== HERHALEN TOT EEN MENS BEVESTIGT ====================
+   *
+   * WAAROM, EN WAT HET NIET IS
+   *
+   * alertIf() vuurt eenmaal per storingsovergang, doet zijn vier
+   * TRANSPORT-pogingen en gaat dan stil -- de Trigger blijft staan maar er gaat
+   * niets meer uit tot de storing over is. Een transport-ACK bewijst alleen dat
+   * een PAKKET aankwam, niet dat een MENS keek. Bjorn wil het tweede: de melding
+   * herhaalt tot een companion een DM met "ok" terugstuurt. Als een pieper die
+   * blijft piepen tot iemand hem indrukt.
+   *
+   * HOE HET DOOR HET BESTAANDE alertIf LOOPT, ZONDER TWEEDE VERZENDWEG
+   *
+   * main.cpp roept elke leesronde alertIf(monitorAlert(i), monitor_down[i], ...)
+   * aan. alertIf her-verstuurt alleen op een OVERGANG van de voorwaarde (onwaar
+   * -> waar). Om te herhalen laat monitorAlert() de voorwaarde daarom één ronde
+   * op onwaar vallen en de ronde erna weer op waar -- een "puls laag". alertIf
+   * ruimt bij de onwaar de Trigger op en herbouwt hem bij de waar, en zijn eigen
+   * lus loopt dan opnieuw langs alle ontvangers. Er is dus geen tweede pad en
+   * geen tweede boekhouding: de herhaling spreekt exact de taal die alertIf al
+   * kent. Gevolg: een herhaling is een echte her-arm en gaat door DEZELFDE
+   * MAX_MONITOR_ALERTS-rem als een eerste melding -- een golf storingen die
+   * tegelijk herhaalt, verdringt elkaar netjes in de wachtrij in plaats van de
+   * band vol te zetten. De puls-laag freeft bovendien de plaats even, zodat een
+   * wachtende storing ertussen kan.
+   *
+   * Omdat alertIf alleen uit onSensorDataRead() loopt (elke leesronde), is de
+   * herhaalperiode grofweg op de leesronde afgerond -- en dat is precies waarom
+   * de ondergrens 60 s is. De klik die de herhaling STOPT ("ok") werkt wel
+   * meteen: human_ack laat monitorAlert() de eerstvolgende keer onwaar geven.
+   *
+   * DRIE STOPVOORWAARDEN: de storing is voorbij (dienst weer op), OF een companion
+   * bevestigde met "ok", OF de harde bovengrens MAX_ALERT_REPEATS is bereikt.
+   *
+   * SAMENHANG MET DE HERSTELMELDING: down_sent blijft staan zolang de storing
+   * loopt, dus als hij oplost -- of iemand nu "ok" stuurde of niet -- gaat de
+   * herstelmelding gewoon uit. "ok" bevestigt de MELDING, niet de storing. */
+
+  /* De harde bovengrens op het aantal HERHALINGEN (de eerste melding telt niet
+   * mee). Zonder grens vult een node die niemand bevestigt eeuwig de band.
+   *
+   * 12 is verdedigbaar: bij de standaardperiode van 300 s is dat een uur lang
+   * herhalen, en een storing die na een uur nog door niemand is bevestigd, heeft
+   * een groter probleem dan een gemiste melding -- doorgaan kost dan alleen
+   * zendtijd. Bij de ondergrens van 60 s is het ~12 minuten; ook dan is "niemand
+   * reageert" op zichzelf al het signaal. Bij het bereiken ervan stopt het
+   * herhalen (de monitor blijft op de pagina en in de telemetrie gewoon down) en
+   * komt er een regel in de debug-uitvoer en op de pagina. */
+  static const uint8_t MAX_ALERT_REPEATS = 12;
+
+  /* Herkent een DM-tekst als bevestiging: "ok" of "ack", hoofdletterongevoelig,
+   * na het wegknippen van spaties. STATISCH en publiek zodat main.cpp hem in
+   * handleIncomingMsg kan aanroepen -- de herkenning hoort op één plek en niet
+   * half in main.cpp. Werkt op de ruwe (mogelijk niet-afgesloten) DM-payload. */
+  static bool isAckText(const uint8_t* data, size_t len);
+
+  /* Een menselijke bevestiging verwerken. Zet human_ack op ALLE op dit moment
+   * openstaande storingsmeldingen (monitors én de vaste kanalen) en geeft terug
+   * hoeveel er zo gestopt zijn. De PERMISSIECONTROLE zit NIET hier maar in
+   * main.cpp: die kent de ClientInfo en dus het alarmrecht, deze klasse niet.
+   * Een "ok" van iemand zonder alarmrecht hoort main.cpp dus niet door te geven. */
+  uint8_t confirmAlerts();
+
+  /* Voor de pagina: de herhaalperiode, hoeveel meldingen nu actief herhaald
+   * worden, en hoeveel er de bovengrens raakten. */
+  uint16_t alertRepeatSecs() const { return _cfg.repeat_s; }
+  void     repeatStatus(uint8_t& nagging, uint8_t& capped) const;
+
+  /* Uitkomst van simSet(), testRequest() en startAdhocPing(). Zelfde gedachte als
+   * MonResult: wie aan de andere kant staat moet WETEN waarom het niet ging, en
+   * de keuring hoort op één plek te zitten en niet half in WebTask of DmCommands.
+   * Staat hier (en niet bij de SIMULEREN-sectie) omdat de ad-hoc ping hierboven
+   * hem al gebruikt; een enum moet vóór zijn eerste gebruik gedefinieerd zijn. */
+  enum SimResult : uint8_t {
+    SIM_OK = 0,
+    SIM_ERR_INDEX,      /* geen bestaande sensor/vakje, of een ongeldig adres */
+    SIM_ERR_SECS,       /* vervaltijd buiten SIM_SECS_MIN..MAX */
+    SIM_ERR_FULL,       /* MAX_SIM_ACTIVE bereikt */
+    SIM_ERR_GAP,        /* te snel achter elkaar (SIM_GAP_MS / TEST_GAP_MS) */
+    SIM_ERR_BUSY        /* er loopt al een testbericht of een ad-hoc ping */
+  };
+
+  /* ==================== SENSORBEHEER PER DM ====================
+   *
+   * add/edit/del over een DM, met exact DEZELFDE keuring en DEZELFDE schrijfweg
+   * als de web-GUI en de CLI: createMonitor(), deleteMonitor() en de
+   * settings-zeef (setSettingValue op "mon.<kanaal>.*"). Geen tweede schrijfpad,
+   * geen tweede keuring -- die zouden ooit uiteenlopen.
+   *
+   * Deze ENE methode neemt de al-uit-de-DM-geknipte regel en geeft de
+   * antwoordtekst terug (of NULL als de regel niet met add/edit/del begint, zodat
+   * de DM-afhandeling naar zijn eigen list/get/status/help kan doorvallen). De
+   * DM-plumbing -- het herkennen van de regel, de knipper, de ACK-opvolging en de
+   * admin-check (onPeerDataRecv laat DM-tekst alleen door voor from->isAdmin())
+   * -- blijft in DmCommands; dat is met opzet, want DmCommands kent deze klasse
+   * niet en praat alleen met zijn DmDataSource.
+   *
+   * SYNTAX (argumenten door spaties gescheiden):
+   *   add <naam> <adres> [interval]
+   *   edit <naam|kanaal> [host=<adres>] [int=<secs>] [naam=<nieuw>] [ms=0|1]
+   *   del <naam|kanaal>
+   *
+   * NAAM vs KANAAL: een argument dat ALLEEN uit cijfers bestaat is een
+   * kanaalnummer, al het andere is een naam. del accepteert alleen een EXACTE
+   * naam of een exact kanaal -- nooit een prefix, want stil de verkeerde monitor
+   * wissen kost een kanaal dat niet terugkomt.
+   *
+   * Het antwoord past in de bestaande knipper (kan meerdere stukken worden). */
+  const char* handleDmMonCommand(const char* line);
+
+  /* De helpregels voor de DM-commando's van deze klasse (add/edit/del en ping),
+   * zodat DmCommands ze bij zijn eigen `help` kan zetten zonder ze over te typen
+   * -- één plek voor de syntax. */
+  static const char* dmCommandHelp();
+
+  /* ==================== AD-HOC PING ====================
+   *
+   * `ping <adres> [n]` -- n keer pingen naar een vrij op te geven adres, uitslag
+   * per DM terug. De kern is TIMING: de DM-afhandeling draait in de mesh-loop, en
+   * n pings duren seconden, dus dit mag NIET blokkeren. Daarom: startAdhocPing()
+   * keurt en start, en het antwoord komt LATER -- DmCommands vraagt elke ronde
+   * adhocReady() en stuurt zodra de uitslag klaar is één antwoord-DM met alles
+   * erin (niet één per ping -- dat is zendtijd).
+   *
+   * EEN PING TEGELIJK BLIJFT DE WET. Er is precies één esp_ping-sessie in dit
+   * bestand (s_ping). De ad-hoc ping deelt die, en krijgt VOORRANG: loopt er een
+   * monitorronde, dan wordt die afgebroken (niet als mislukking geteld -- zie
+   * abortPing) en schuift op. De keuze is bewust: een mens wacht op zijn uitslag,
+   * een monitor niet. Was de start vertraagd, dan staat dat in het antwoord.
+   *
+   * EEN AD-HOC TEGELIJK. Eén pending-slot, geen wachtrij: een tweede `ping`
+   * terwijl er één loopt, wordt geweigerd met "bezig met <adres>".
+   *
+   * DE KOPPELING AAN DE VRAGER zit NIET hier. Deze klasse weet niet wie het
+   * vroeg; ze levert alleen de uitslag en een "klaar"-vlag. DmCommands onthoudt de
+   * vrager -- op PUBLIEKE SLEUTEL en niet op contact-index, want indexen
+   * verschuiven als de ACL verandert -- en zoekt het contact opnieuw op wanneer de
+   * uitslag klaar is. Is die sleutel dan uit de ACL verdwenen, dan vervalt het
+   * antwoord (de uitslag wordt geconsumeerd en weggegooid). */
+  static const uint8_t ADHOC_DEFAULT_PINGS = 3;
+  static const uint8_t ADHOC_MAX_PINGS     = 5;
+  static const uint32_t ADHOC_TIMEOUT_MS   = 2000;   /* per ping */
+
+  enum AdhocState : uint8_t {
+    ADHOC_NONE = 0,   /* niets gevraagd, of de uitslag is opgehaald */
+    ADHOC_PENDING,    /* gevraagd, wacht tot de pingmachine vrij is */
+    ADHOC_BUSY,       /* bezig met opzoeken of pingen */
+    ADHOC_DONE        /* klaar; adhocResultText() staat klaar tot adhocClear() */
+  };
+
+  /* Start een ad-hoc ping. n == 0 -> ADHOC_DEFAULT_PINGS; boven ADHOC_MAX_PINGS
+   * wordt afgekapt. Zelfde adreszeef als overal (validHost). Zonder wifi zet dit
+   * meteen een klare uitslag "geen wifi, niet gepingd" -- eerlijk en zonder te
+   * pingen. */
+  SimResult startAdhocPing(const char* host, uint8_t n);
+
+  AdhocState  adhocState() const { return (AdhocState)_adhoc.state; }
+  bool        adhocReady() const { return _adhoc.state == ADHOC_DONE; }
+  /* De uitslagtekst: per ping de tijd of "timeout", plus een slotregel
+   * "x/y ok, min/gem/max ms" en hoe oud de uitslag is. Zinvol zodra adhocReady().
+   * Geen String; vaste buffer. */
+  const char* adhocResultText() const;
+  /* De uitslag is verstuurd (of de vrager is weg): slot vrijgeven. */
+  void        adhocClear();
+  /* Het adres waar we nu mee bezig zijn -- voor de "bezig met <adres>"-weigering
+   * en voor het help/statusantwoord. */
+  const char* adhocHost() const { return _adhoc.host; }
+
   /* ==================== SIMULEREN EN TESTEN ====================
    *
    * WAAROM DIT ER IS
@@ -515,17 +683,6 @@ public:
   static const uint8_t  MAX_SIM_ACTIVE = MAX_MONITOR_ALERTS;   /* = 2 */
   static const uint32_t SIM_GAP_MS     = 10000;
 
-  /* Uitkomst van simSet() en testRequest(). Zelfde gedachte als MonResult: wie
-   * aan de andere kant staat moet WETEN waarom het niet ging, en de keuring hoort
-   * op één plek te zitten en niet half in WebTask. */
-  enum SimResult : uint8_t {
-    SIM_OK = 0,
-    SIM_ERR_INDEX,      /* geen bestaande sensor, of een leeg monitorvakje */
-    SIM_ERR_SECS,       /* vervaltijd buiten SIM_SECS_MIN..MAX */
-    SIM_ERR_FULL,       /* MAX_SIM_ACTIVE bereikt */
-    SIM_ERR_GAP,        /* te snel achter elkaar (SIM_GAP_MS / TEST_GAP_MS) */
-    SIM_ERR_BUSY        /* er loopt al een testbericht */
-  };
   static const char* simResultText(SimResult r);
 
   /* Een forcering zetten of opheffen. mode == SIM_OFF heft op en heeft geen
@@ -753,6 +910,20 @@ private:
 
   /* Gemeten toestand per vakje. Staat NIET in MonitorCfg: na een herstart is
    * hij ongeldig en moet er opnieuw gemeten worden. */
+  /* De staat van "herhalen tot een mens bevestigt", voor één alarm-ingang.
+   * Zowel een monitorvakje als een vast kanaal heeft er één; de logica in
+   * stepStoringAlert() werkt op referenties zodat beide soorten hetzelfde recept
+   * volgen. Geen SPIFFS: dit is meetwerk, geen instelling, en na een herstart is
+   * er per definitie niets te herhalen. */
+  struct AlertRepeat {
+    bool          human_ack;     /* een companion bevestigde met "ok" */
+    bool          pulse;         /* wij lieten de voorwaarde deze ronde vallen om
+                                    hem volgende ronde te her-armen (de "puls laag") */
+    bool          max_logged;    /* de bovengrens is al in de log gemeld */
+    uint8_t       repeats;       /* aantal HERHALINGEN (de eerste melding telt niet) */
+    unsigned long next_repeat;   /* millis waarop de volgende herhaling mag */
+  };
+
   struct MonState {
     unsigned long next_check;    /* millis van de volgende ronde */
     uint32_t      last_ms;       /* laatst gemeten rondetijd */
@@ -789,6 +960,8 @@ private:
     unsigned long rec_until;     /* venster waarin de herstelmelding waar is */
     bool          rec_alerting;  /* wij vragen nu om een herstelmelding */
 
+    AlertRepeat   rep;           /* herhalen tot bevestiging */
+
     /* Alleen voor GEMELDE diensten. Ook deze twee horen niet in MonitorCfg: ze
      * gaan over metingen en niet over instellingen, en na een herstart weten wij
      * per definitie niets over een gemelde dienst. */
@@ -811,9 +984,40 @@ private:
   };
 
   PingPhase     _phase = PING_IDLE;
+  /* _busy_slot: 0..MAX_MONITORS-1 = een monitorvakje, -1 = niets, ADHOC_SLOT =
+   * de ad-hoc ping. Die sentinel laat de fasemachine één sessie delen zonder dat
+   * de monitorpaden veranderen: elke ad-hoc-tak is met (_busy_slot == ADHOC_SLOT)
+   * bewaakt, de rest blijft byte-voor-byte het bestaande pad. */
+  static const int8_t ADHOC_SLOT = -2;
   int8_t        _busy_slot = -1;        /* vakje dat nu aan de beurt is */
   unsigned long _phase_deadline = 0;
   unsigned long _next_ping_at = 0;      /* rusttijd tussen twee pings */
+
+  /* ---------------- de ad-hoc ping ----------------
+   *
+   * Eén slot, geen wachtrij. De uitslag staat hier tot DmCommands hem opgehaald
+   * heeft (adhocClear). Geen SPIFFS: dit is vluchtig meetwerk. */
+  struct AdhocPing {
+    uint8_t       state;         /* AdhocState */
+    char          host[MON_HOST_LEN];
+    uint32_t      addr_v4;       /* opgelost adres; 0 = nog niet */
+    uint8_t       want;          /* aantal gevraagde pings */
+    uint8_t       done;          /* aantal afgeronde pings */
+    uint8_t       ok;            /* daarvan gelukt */
+    uint32_t      results[ADHOC_MAX_PINGS];  /* per ping: ms, of 0xFFFFFFFF = timeout */
+    uint32_t      min_ms;
+    uint32_t      max_ms;
+    uint32_t      sum_ms;
+    bool          delayed;       /* de start moest wachten op de pingmachine */
+    unsigned long finished_at;   /* millis waarop de uitslag klaar kwam */
+    const char*   note;          /* korte reden bij een vroeg einde (wifi weg e.d.) */
+  };
+  AdhocPing _adhoc = { ADHOC_NONE, {0}, 0, 0, 0, 0, {0}, 0, 0, 0, false, 0, NULL };
+
+  void startAdhocResolve();
+  void startAdhocOnePing();
+  void recordAdhocResult(bool ok, uint32_t ms);
+  void finishAdhoc(const char* note);
 
   /* De uitslag van de lopende ping en van de lopende naamsopzoeking staat NIET
    * hier maar in bestandsbereik in MonitorSensors.cpp (s_ping). Reden: die
@@ -870,6 +1074,20 @@ private:
   unsigned long _fixed_up_since[FIXED_ALERT_COUNT];
   unsigned long _fixed_rec_until[FIXED_ALERT_COUNT];
   bool          _fixed_rec_alerting[FIXED_ALERT_COUNT];
+  AlertRepeat   _fixed_rep[FIXED_ALERT_COUNT];    /* herhalen tot bevestiging */
+
+  /* De kern van "herhalen tot bevestiging", gedeeld door de monitors en de vaste
+   * kanalen. Geeft terug wat er aan alertIf() gevoerd moet worden en beheert de
+   * eerste melding, het her-armen per periode (de puls-laag), de menselijke
+   * bevestiging en de bovengrens. armed_first (mag NULL) wordt true op de ronde
+   * waarin de EERSTE melding wordt gearmd, zodat de monitorkant zijn was_stale/
+   * was_sim daar kan zetten. */
+  bool stepStoringAlert(bool want, bool& alerting, bool& down_sent,
+                        unsigned long& down_since, AlertRepeat& r,
+                        int idx_for_log, bool* armed_first);
+  /* De ruwe storingsvoorwaarde van een monitorvakje (sim of gemeten), zonder de
+   * herhaal-, ack- of remlogica. Gedeeld door monitorAlert() en confirmAlerts(). */
+  bool monitorWantAlert(int slot) const;
 
   /* De boekhouding van de herstelmelding bijwerken. Aparte lus en niet in
    * applyResult(): de vaste kanalen hebben geen applyResult, en de klok van de
@@ -947,6 +1165,9 @@ private:
   uint8_t allocChannel();
   int     findByName(const char* name) const;
   int     findByChannel(uint8_t ch) const;
+  /* Een "naam of kanaal"-argument (uit een DM-commando) naar een vakjenummer.
+   * Alleen cijfers = kanaal; anders een naam. Exact, nooit een prefix. */
+  int     resolveTarget(const char* tok) const;
   int     slotOfNth(int nth) const;     /* nde bezette vakje -> vakjenummer */
   bool    addMonitor(const char* spec);
   bool    delMonitor(const char* name);

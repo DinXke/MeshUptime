@@ -159,6 +159,26 @@ public:
 
   const NeighbourList& getNeighbours() const { return neighbours; }
 
+  /* Trek de VOLGENDE sensorleesronde naar voren.
+   *
+   * loop() leest de sensoren en roept onSensorDataRead() -- en dus alertIf() --
+   * pas aan als curr >= last_read_time + SENSOR_READ_INTERVAL_SECS (60 s). Een
+   * forcering via de webinterface werkt meteen op monitorAlert(), maar het
+   * BERICHT wacht tot die ronde: gemiddeld 30, hoogstens 60 seconden. Voor een
+   * testknop is dat funest -- wie op 'neer' klikt en niets ziet, denkt dat het
+   * stuk is.
+   *
+   * Deze methode zet last_read_time op 0, zodat de eerstvolgende loop() de ronde
+   * meteen draait. Dat is het ENIGE wat ze doet: ze trekt het MOMENT naar voren
+   * en verandert niets aan het alertpad. Het echte pad blijft het echte pad --
+   * dezelfde querySensors(), dezelfde onSensorDataRead(), dezelfde alertIf(). Er
+   * gaat hooguit één leesronde eerder dan gepland, en die kost een ADC-meting;
+   * niets blokkerends, geen extra zendverkeer uit zichzelf.
+   *
+   * WebTask roept dit aan via de SensorMesh-pointer die main.cpp met setAcl()
+   * al zet -- geen nieuwe koppeling nodig. */
+  void requestSensorReadNow() { last_read_time = 0; }
+
 protected:
   // current telemetry data queries
   float getVoltage(uint8_t channel) { return getTelemValue(channel, LPP_VOLTAGE); }

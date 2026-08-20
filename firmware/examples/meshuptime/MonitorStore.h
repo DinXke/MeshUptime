@@ -26,6 +26,7 @@
  *     ever 3
  *     rec 1
  *     rhold 120
+ *     arepeat 300
  *     m 5 60 google 8.8.8.8 1
  *     m 6 30 hoas hoas.scheepers.one 0
  *     .
@@ -146,6 +147,16 @@ struct MonitorCfgEntry {
 #define MON_RHOLD_MAX      3600
 #define MON_RHOLD_DEFAULT   120
 
+/* Grenzen van de herhaalperiode (repeat_s). 0 is toegestaan en betekent uit.
+ * De ondergrens is 60 s en niet lager: elke herhaling is een DM-keten naar alle
+ * ontvangers, dus zendtijd op een band die met anderen gedeeld wordt, en de
+ * waarschuwingen worden toch maar eens per leesronde (60 s) beoordeeld -- korter
+ * instellen zou niets versnellen en alleen de band belasten. 3600 s bovengrens:
+ * wie langer wil wachten kan net zo goed uitzetten. */
+#define MON_AREPEAT_MIN       60
+#define MON_AREPEAT_MAX     3600
+#define MON_AREPEAT_DEFAULT  300
+
 struct MonitorCfg {
   float   mains_hi;
   float   mains_lo;
@@ -166,6 +177,23 @@ struct MonitorCfg {
    * ergste vorm van een alarmsysteem -- het leert mensen meldingen negeren. */
   uint8_t  recover_alerts;   /* 0 = uit, 1 = aan */
   uint16_t rhold_s;          /* MON_RHOLD_MIN..MAX */
+
+  /* HERHALEN TOT EEN MENS BEVESTIGT -- als een pieper die blijft piepen.
+   *
+   * Zolang een storing actief is EN nog geen companion "ok" terugstuurde, wordt
+   * de melding elke repeat_s seconden opnieuw naar de ontvangers gestuurd. Dit is
+   * NIET de transport-ACK (die bewijst alleen dat een pakket aankwam); dit wacht
+   * op een MENS. Een aankomstbewijs zegt niet dat iemand keek.
+   *
+   * 0 = uit: één melding en klaar, het gedrag van vóór deze functie. Anders
+   * minimaal MON_AREPEAT_MIN, want elke herhaling is zendtijd op een gedeelde
+   * band. Standaard MON_AREPEAT_DEFAULT.
+   *
+   * LET OP -- dit is een gedragsverandering bij het bijwerken: een node die dit
+   * bestand nog zonder "arepeat"-regel heeft, krijgt de standaard (300 s) en gaat
+   * dus herhalen waar hij dat eerst niet deed. Dat is met opzet de gevraagde
+   * standaard; wie het oude gedrag wil, zet alert.repeat op 0. */
+  uint16_t repeat_s;         /* 0 = uit, anders MON_AREPEAT_MIN..MAX */
 
   /* Bitmasker van kanalen die OOIT zijn uitgedeeld, bit 0 = kanaal 5.
    * Dit hoort bij de blijvende gegevens en niet bij het geheugen: zonder dit

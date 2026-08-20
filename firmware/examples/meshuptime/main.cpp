@@ -77,6 +77,18 @@ public:
              sensors.isMains() ? "net" : "batterij", sensors.lastVolts(),
              sensors.isWifiOnline() ? "online" : "weg");
   }
+
+  /* Doorschakelingen naar MonitorSensors: bevestiging, sensorbeheer en ad-hoc
+   * ping over DM. DmCommands blijft zo los van MonitorSensors -- het praat
+   * alleen met deze bron. */
+  bool        dmIsAck(const uint8_t* d, size_t n) override { return MonitorSensors::isAckText(d, n); }
+  uint8_t     dmConfirmAlerts() override { return sensors.confirmAlerts(); }
+  const char* dmMonCommand(const char* line) override { return sensors.handleDmMonCommand(line); }
+  int         dmAdhocState() override { return (int) sensors.adhocState(); }
+  bool        dmAdhocReady() override { return sensors.adhocReady(); }
+  const char* dmAdhocResult() override { return sensors.adhocResultText(); }
+  void        dmAdhocClear() override { sensors.adhocClear(); }
+  const char* dmHelpExtra() override { return MonitorSensors::dmCommandHelp(); }
 };
 static MonitorDmSource dm_source;
 

@@ -100,16 +100,20 @@ bool DmCommands::isAllowed(const ClientInfo& from) const {
 }
 
 void DmCommands::startReply(const ClientInfo& to) {
-  reset();
-
   /* De ontvanger wordt GEKOPIEERD. Het antwoord loopt over meerdere
    * loop()-rondes, en in die tijd kan acl.putClient() of acl.load() de
    * ClientInfo achter deze referentie overschrijven. */
-  _to_id = to.id;
-  memcpy(_to_secret, to.shared_secret, PUB_KEY_SIZE);
-  if (to.out_path_len != OUT_PATH_UNKNOWN && to.out_path_len <= MAX_PATH_SIZE) {
-    memcpy(_to_path, to.out_path, to.out_path_len);
-    _to_path_len = to.out_path_len;
+  startReplyStored(to.id, to.shared_secret, to.out_path, to.out_path_len);
+}
+
+void DmCommands::startReplyStored(const mesh::Identity& id, const uint8_t* secret,
+                                  const uint8_t* path, uint8_t path_len) {
+  reset();
+  _to_id = id;
+  memcpy(_to_secret, secret, PUB_KEY_SIZE);
+  if (path_len != OUT_PATH_UNKNOWN && path_len <= MAX_PATH_SIZE) {
+    memcpy(_to_path, path, path_len);
+    _to_path_len = path_len;
   } else {
     _to_path_len = OUT_PATH_UNKNOWN;
   }
@@ -435,6 +439,23 @@ bool DmCommands::onAck(uint32_t ack_crc) {
  * inschuiven zou de radio voor seconden bezet zetten voor iets wat niemand
  * gevraagd heeft behalve een enkele afzender; de radio gaat voor. */
 void DmCommands::loop() {
+  /* Uitgesteld ping-antwoord. Zodra de uitslag klaar is EN er geen ander
+   * antwoord onderweg is: het naar de bewaarde vrager sturen. Is de vrager
+   * ondertussen uit de ACL verdwenen, dan is _ping_secret/_pad nog geldig van
+   * toen -- we sturen alsnog; kan hij niet meer ontsleutelen, dan is dat zijn
+   * verlies en geen fout hier. */
+  if (_ping_wait && _data != nullptr && _data->dmAdhocReady() && _num_chunks == 0) {
+    startReplyStored(_ping_id, _ping_secret, _ping_path, _ping_path_len);
+    appendText(_data->dmAdhocResult());
+    _data->dmAdhocClear();
+    _ping_wait = false;
+    splitReply();
+    if (_num_chunks == 0) { reset(); }
+    else { _next_action = millis() + DM_FIRST_SEND_MS; }
+    /* val door: hieronder verstuurt loop() het eerste stuk niet -- _next_action
+     * is net gezet, dus de gewone weg pakt het op. */
+  }
+
   if (_num_chunks == 0) return;
   if ((long)(millis() - _next_action) < 0) return;
 
@@ -522,6 +543,52 @@ bool DmCommands::handleDm(const ClientInfo& from, uint32_t timestamp, const uint
   }
   // van dezelfde afzender: de nieuwe vraag vervangt de vorige (hij vroeg opnieuw)
 
+  /* Bevestiging: een companion met alarmrecht stuurt "ok"/"ack" en stopt daarmee
+   * het herhalen van alle openstaande storingen. Vóór de gewone dispatch, want
+   * "ok" is geen opdracht met argumenten. Alleen wie waarschuwingen krijgt mag
+   * bevestigen -- een leescontact heeft niets te bevestigen. */
+  if (_data->dmIsAck(text, len)) {
+    if (from.permissions & (PERM_RECV_ALERTS_LO | PERM_RECV_ALERTS_HI)) {
+      uint8_t k = _data->dmConfirmAlerts();
+      startReply(from);
+      char msg[48];
+      snprintf(msg, sizeof(msg), "bevestigd, %u melding%s gestopt",
+               (unsigned)k, k == 1 ? "" : "en");
+      appendText(msg);
+      splitReply();
+      _next_action = millis() + DM_FIRST_SEND_MS;
+    }
+    return true;   // ACK naar de afzender hoe dan ook; geen tekst als hij geen recht had
+  }
+
+  /* Sensorbeheer en ad-hoc ping: add/edit/del/ping. De MonitorSensors-kant kent
+   * de keuring en de schrijfweg; hier alleen de tekst terugsturen. Een ad-hoc
+   * ping antwoordt "gestart..." en de UITSLAG komt later -- zie loop(). */
+  {
+    const char* r = _data->dmMonCommand(p);
+    if (r != nullptr) {
+      startReply(from);
+      appendText(r);
+      /* Ping gestart en loopt nog? Onthoud de vrager voor het uitgestelde
+       * antwoord. Gekopieerd, want de ClientInfo kan tegen die tijd weg zijn. */
+      if (_data->dmAdhocState() != 0 && !_data->dmAdhocReady()) {
+        _ping_wait = true;
+        _ping_id = from.id;
+        memcpy(_ping_secret, from.shared_secret, PUB_KEY_SIZE);
+        if (from.out_path_len != OUT_PATH_UNKNOWN && from.out_path_len <= MAX_PATH_SIZE) {
+          memcpy(_ping_path, from.out_path, from.out_path_len);
+          _ping_path_len = from.out_path_len;
+        } else {
+          _ping_path_len = OUT_PATH_UNKNOWN;
+        }
+      }
+      splitReply();
+      if (_num_chunks == 0) { reset(); return true; }
+      _next_action = millis() + DM_FIRST_SEND_MS;
+      return true;
+    }
+  }
+
   startReply(from);
 
   if (strcasecmp(p, "list") == 0) {
@@ -530,6 +597,8 @@ bool DmCommands::handleDm(const ClientInfo& from, uint32_t timestamp, const uint
     buildStatus();
   } else if (strcasecmp(p, "help") == 0 || strcmp(p, "?") == 0) {
     buildHelp();
+    const char* extra = _data->dmHelpExtra();
+    if (extra != nullptr && *extra) appendText(extra);
   } else if (strncasecmp(p, "get", 3) == 0 && (p[3] == ' ' || p[3] == 0)) {
     char* arg = p + 3;
     while (*arg == ' ') arg++;

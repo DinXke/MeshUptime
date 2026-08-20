@@ -23,6 +23,10 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
    * standaard hoort de stand te zijn die het minste stilte oplevert. */
   cfg.recover_alerts = 1;
   cfg.rhold_s = MON_RHOLD_DEFAULT;
+  /* Herhalen tot bevestiging standaard aan (300 s). Zie MonitorCfg: dit is de
+   * gevraagde standaard en dus een gedragsverandering bij het bijwerken; op 0
+   * zetten geeft het oude "één melding en klaar". */
+  cfg.repeat_s = MON_AREPEAT_DEFAULT;
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
 }
@@ -127,6 +131,12 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       int v = atoi(parts[1]);
       staged.rhold_s = (v >= MON_RHOLD_MIN && v <= MON_RHOLD_MAX)
                      ? (uint16_t)v : MON_RHOLD_DEFAULT;
+    } else if (strcmp(parts[0], "arepeat") == 0) {
+      /* 0 (uit) is geldig; anders binnen de grenzen, en buiten de grenzen valt
+       * hij op de standaard terug in plaats van op de rommel uit het bestand. */
+      int v = atoi(parts[1]);
+      staged.repeat_s = (v == 0 || (v >= MON_AREPEAT_MIN && v <= MON_AREPEAT_MAX))
+                      ? (uint16_t)v : MON_AREPEAT_DEFAULT;
     } else if (strcmp(parts[0], "m") == 0) {
       /* m <kanaal> <interval> <naam> <adres> [<pingtijd 0|1>]
        *
@@ -212,6 +222,16 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
 
   len = snprintf(line, sizeof(line), "hi %.3f\nlo %.3f\never %lu\n",
                  cfg.mains_hi, cfg.mains_lo, (unsigned long)cfg.ch_ever_used);
+  f.write((const uint8_t*)line, len);
+
+  /* De alarminstellingen: herstelmelding aan/uit, de rustperiode daarvan, en de
+   * herhaalperiode. Deze regel ontbrak eerder -- rec/rhold werden wel gelezen maar
+   * nooit geschreven, dus een gewijzigde herstelmelding overleefde geen herstart.
+   * Alle drie staan er nu, elk op een eigen sleutel zodat een oud bestand zonder
+   * een ervan gewoon de standaard houdt. */
+  len = snprintf(line, sizeof(line), "rec %u\nrhold %u\narepeat %u\n",
+                 (unsigned)(cfg.recover_alerts ? 1 : 0), (unsigned)cfg.rhold_s,
+                 (unsigned)cfg.repeat_s);
   f.write((const uint8_t*)line, len);
 
   for (int i = 0; i < MON_MAX_MONITORS; i++) {

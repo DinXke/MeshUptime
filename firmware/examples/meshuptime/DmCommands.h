@@ -60,6 +60,19 @@ public:
    * woorden van de toepassing. Uptime en vrije heap zet DmCommands er zelf
    * bij -- die kent het bord, niet de toepassing. */
   virtual void dmStatusLine(char* dest, size_t max_len) = 0;
+
+  /* Uitbreidingen voor sensorbeheer, bevestiging en ad-hoc ping over DM.
+   * Standaard leeg (default-implementatie), zodat een DmDataSource die ze niet
+   * kent gewoon list/get/status/help houdt. main.cpp's MonitorDmSource schakelt
+   * ze door naar MonitorSensors. */
+  virtual bool        dmIsAck(const uint8_t* data, size_t len) { (void)data; (void)len; return false; }
+  virtual uint8_t     dmConfirmAlerts() { return 0; }
+  virtual const char* dmMonCommand(const char* line) { (void)line; return nullptr; }
+  virtual int         dmAdhocState() { return 0; }   /* 0 = ADHOC_NONE */
+  virtual bool        dmAdhocReady() { return false; }
+  virtual const char* dmAdhocResult() { return ""; }
+  virtual void        dmAdhocClear() {}
+  virtual const char* dmHelpExtra() { return nullptr; }
 };
 
 /* ================== DE MAAT VAN EEN BERICHT ==================
@@ -175,6 +188,14 @@ private:
    * antwoord loopt over meerdere loop()-rondes, en in die tijd kan de ACL
    * herschreven worden (putClient/applyPermissions/acl.load). */
   mesh::Identity _to_id;
+  /* De vrager van een ad-hoc ping, gekopieerd zoals _to_* -- het antwoord komt
+   * pas rondes later en de ClientInfo achter de referentie kan dan overschreven
+   * zijn. _ping_wait zegt of er een uitslag verwacht wordt. */
+  bool          _ping_wait = false;
+  mesh::Identity _ping_id;
+  uint8_t       _ping_secret[PUB_KEY_SIZE];
+  uint8_t       _ping_path[MAX_PATH_SIZE];
+  uint8_t       _ping_path_len = 0;
   uint8_t        _to_secret[PUB_KEY_SIZE];
   uint8_t        _to_path[MAX_PATH_SIZE];
   uint8_t        _to_path_len;
@@ -204,6 +225,10 @@ private:
   void reset();
   bool isAllowed(const ClientInfo& from) const;
   void startReply(const ClientInfo& to);
+  /* Zoals startReply maar vanuit los bewaarde velden -- voor het uitgestelde
+   * ping-antwoord, waar geen ClientInfo meer voorhanden is. */
+  void startReplyStored(const mesh::Identity& id, const uint8_t* secret,
+                        const uint8_t* path, uint8_t path_len);
 
   bool appendText(const char* s);
   void buildList();

@@ -102,7 +102,9 @@ static char g_json[10240];
  * stil afgekapte antwoord op een node in het veld -- net als de static_assert bij
  * g_acl. MON_MAX_MONITORS is met een bouwvlag te verhogen; dan moet deze buffer
  * mee. */
-static_assert(300 + 370 + 4 * 210 + MON_MAX_MONITORS * 235 + 130 + JSON_TAIL
+/* 820 voor de kopblokken: vaste velden ~300 + budget ~200 + ad-hoc ~300 (de
+ * ping-uitslagtekst) + sim/rec/rep/test ~320 -- ruim afgerond. */
+static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 235 + 130 + JSON_TAIL
               <= sizeof(g_json),
               "g_json te klein voor MON_MAX_MONITORS -- zie de rekensom hierboven");
 
@@ -673,6 +675,7 @@ letter-spacing:.13em;color:var(--muted)}
 
 <div id="simban"></div>
 <div class="tilegrid" id="t"></div>
+<div id="pingres"></div>
 
 <h2>Monitoroverzicht &mdash; de kanaalkaart</h2>
 <p class="why"><b>Waarom een MeshCore-app hier <i>switch</i> en <i>genericsensor</i>
@@ -751,9 +754,11 @@ een echte storing: een echt DM-pakket, dezelfde keuze van ontvangers op het
 verzendweg en géén nepbericht &mdash; dan zou deze pagina zichzelf testen in
 plaats van het systeem. De forcering staat om dezelfde reden óók in de
 <b>telemetrie</b>: een dashboard aan de andere kant hoort hetzelfde te zien.<br>
-<b>Reken op maximaal een minuut.</b> Waarschuwingen worden alleen bij de
-periodieke leesronde beoordeeld (elke 60&nbsp;s), en die ronde is precies het
-pad dat we willen testen. Een knop die sneller was, was een andere weg.</p>
+<b>Reken op enkele seconden tot de eerste zendpoging</b>, daarna de gewone
+bezorgtijd over het mesh. Waarschuwingen worden bij de periodieke leesronde
+beoordeeld (elke 60&nbsp;s), maar een klik op deze knoppen <i>trekt die ronde
+meteen naar voren</i> &mdash; alleen het moment, niet het pad. Het blijft dus
+precies de weg die een echte waarschuwing ook loopt.</p>
 
 <div class="card">
 <div class="row">
@@ -762,19 +767,38 @@ min="30" max="3600" value="600"><span class="cur">30 t/m 3600; een forcering
 kan niet blijven staan</span></label>
 <label>Rust voor een herstelmelding (s)<input id="rhold" type="number"
 min="0" max="3600" value="120"><span class="cur" id="rholdcur">nu: –</span></label>
+<label>Herhalen tot bevestiging (s)<input id="arep" type="number"
+min="0" max="3600" value="300"><span class="cur" id="arepcur">nu: –</span></label>
 </div>
 <div class="row" style="margin-top:.6rem">
 <label class="cb"><input type="checkbox" id="recon"> ook melden als iets weer
 <b>werkt</b></label>
 </div>
 <div class="quick">
-<button id="rgo">herstelmelding opslaan</button>
+<button id="rgo">alarminstellingen opslaan</button>
 <button id="tgo">testbericht sturen</button>
 <button id="sclr">alles vrijgeven</button>
 </div>
+<div id="nagban"></div>
 <div id="smsg"></div>
 <div class="deliv" id="deliv"></div>
-<p class="note"><b>Herstelmeldingen &mdash; waarom die er horen te zijn.</b>
+<p class="note"><b>Herhalen tot bevestiging &mdash; als een pieper.</b> Standaard
+herhaalt een storingsmelding elke <b>herhaalperiode</b> tot een companion een DM
+met <code>ok</code> (of <code>ack</code>) terugstuurt. Dat is met opzet <i>niet</i>
+de transport-ACK: die bewijst alleen dat een pakket aankwam, niet dat een
+<b>mens</b> keek. Alleen een contact met het <b>alarm</b>-recht kan bevestigen;
+één &quot;ok&quot; stopt alle op dat moment openstaande meldingen tegelijk. Zet
+de periode op <b>0</b> voor het oude gedrag (één melding en klaar). De ondergrens
+is 60&nbsp;s, want elke herhaling is zendtijd op een gedeelde band en de
+meldingen worden toch maar eens per leesronde beoordeeld.<br>
+<b>Er zit een harde bovengrens op</b> van een handvol herhalingen: een node die
+niemand binnen die tijd bevestigt, heeft een groter probleem dan een gemiste
+melding, en doorgaan vult alleen de band. Bij het bereiken ervan stopt het
+herhalen (de monitor blijft gewoon down in beeld) en zie je dat hieronder.
+Herhalingen tellen mee in dezelfde grens van twee gelijktijdige meldingen, dus
+een golf storingen verdringt elkaar netjes in plaats van de band vol te
+zetten.<br>
+<b>Herstelmeldingen &mdash; waarom die er horen te zijn.</b>
 <code>alertIf()</code> stuurt een bericht bij het BEGIN van een storing en doet
 bij het einde alleen zijn Trigger opruimen. Zonder herstelmelding krijg je dus
 &quot;router onbereikbaar&quot; en daarna nooit meer iets &mdash; en dan is
@@ -952,8 +976,16 @@ regel. Wat er niet in een formulier staat, typ je hier.<br>
 <code>mains.hi</code> <code>mains.lo</code> <code>mains.state</code>
 <code>mon.count</code> <code>mon.add</code> <code>mon.del</code> en per kanaal
 <code>mon.&lt;kan&gt;.name</code> <code>mon.&lt;kan&gt;.host</code>
-<code>mon.&lt;kan&gt;.int</code> <code>mon.&lt;kan&gt;.state</code>. En
+<code>mon.&lt;kan&gt;.int</code> <code>mon.&lt;kan&gt;.state</code>
+<code>mon.&lt;kan&gt;.ms</code>
+<code>alert.recover</code> <code>alert.rhold</code> <code>alert.repeat</code>. En
 <code>sensor list</code> voor de hele lijst.<br>
+<b>Ad-hoc ping:</b> <code>ping &lt;adres&gt; [n]</code> pingt een vrij op te
+geven adres (n keer, standaard 3, hoogstens 5). Niet-blokkerend: de console
+antwoordt &quot;gestart&quot; en de uitslag verschijnt onder de tegels op het
+tabblad <b>bewaking</b>. Over een DM werkt hetzelfde commando, met de uitslag als
+DM terug. De monitor-pingmachine wordt gedeeld; de ad-hoc krijgt voorrang en de
+monitorronde schuift een tel op.<br>
 <b>Drie dingen weigert deze pagina</b>, met de reden in het antwoord:
 alles met <code>prv.key</code> (de privésleutel over HTTP zonder TLS is de
 identiteit van de node weggeven), <code>start ota</code> (dat opent een eigen
@@ -1227,6 +1259,19 @@ cls(tot?(up==tot?"ok":"warn"):"unk")],
 var h="";t.forEach(function(x){h+='<div class="tile"><div class="k">'+x[0]+
 '</div><div class="v c-'+x[3]+'">'+x[1]+'</div><div class="s">'+x[2]+"</div></div>"});
 document.getElementById("t").innerHTML=h}
+
+/* DE AD-HOC PING-UITSLAG. Verschijnt onder de tegels zodra een `ping <adres>` uit
+   de CLI-console klaar is (of terwijl hij loopt: "bezig"). Cyaan zoals de andere
+   'waarom'-kaders, want dit is informatie en geen alarm. De uitslag komt uit
+   /status.json -- dezelfde die de DM-variant vult -- dus de console hoefde er niet
+   op te wachten. */
+function pingres(d){
+var e=document.getElementById("pingres");var a=d.adhoc;
+if(!a||a.st=="niets"){e.className="";e.innerHTML="";return}
+e.className="why";
+if(a.st=="klaar"){e.innerHTML="<b>ping-uitslag:</b> "+a.txt}
+else{e.innerHTML="<b>ping bezig</b> naar "+(a.host||"?")+
+" &mdash; de uitslag verschijnt hier zodra alle pings klaar zijn"}}
 
 var KH=[["kan","num"],["naam",""],["adres",""],["interval","num"],
 ["toestand",""],["ms","num"],["mislukt","num"],["byte","num"],["simulatie",""],
@@ -1794,7 +1839,7 @@ if(!r.ok){return r.text().then(function(t){say2(t.trim(),0)})}
 return r.json().then(function(d){lock(d);acltab(d);nbtab(d)})})}
 
 function u2(){return fetch("status.json").then(function(r){return r.json()})
-.then(function(d){tiles(d);simban(d);table(d);tbud(d);deliv(d);recui(d);
+.then(function(d){tiles(d);simban(d);pingres(d);table(d);tbud(d);deliv(d);recui(d);
 var s=document.getElementById("ssid");if(!s.value){s.value=d.ssid}
 document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})
 /* EEN MISLUKTE VERVERSING MOET ZICH MELDEN. Zonder deze tak bleef de pagina
@@ -2163,33 +2208,57 @@ document.getElementById("sclr").onclick=function(){psim("sim/clear","")}
 
    ALLEEN WAT VERANDERD IS, want elke gelukte 'sensor set' zet een
    flashschrijving in de wacht. WASREC houdt de laatst ontvangen stand bij. */
-var WASREC={on:null,hold:null};
+var WASREC={on:null,hold:null,rep:null};
 document.getElementById("rgo").onclick=function(){
 var on=document.getElementById("recon").checked?1:0;
 var h=parseInt(document.getElementById("rhold").value,10);
+var rp=parseInt(document.getElementById("arep").value,10);
 if(!(h>=0&&h<=3600)){ssay("rust: 0 t/m 3600 s",0);return}
+if(!(rp===0||(rp>=60&&rp<=3600))){ssay("herhalen: 0 (uit) of 60 t/m 3600 s",0);return}
 var cmds=[];
 if(WASREC.on===null||on!=WASREC.on){cmds.push("sensor set alert.recover "+on)}
 if(WASREC.hold===null||h!=WASREC.hold){cmds.push("sensor set alert.rhold "+h)}
+if(WASREC.rep===null||rp!=WASREC.rep){cmds.push("sensor set alert.repeat "+rp)}
 if(!cmds.length){ssay("niets veranderd",1);return}
 ssay("bezig...",1);
 cliSeq(cmds,function(good,bad,last){
 if(bad){ssay(bad+" van de "+(good+bad)+" geweigerd: "+last.trim(),0)}
-else{ssay("herstelmelding "+(on?"aan":"uit")+", rust "+h+" s",1)}
+else{ssay("opgeslagen: herstel "+(on?"aan":"uit")+", rust "+h+" s, herhalen "+
+(rp?rp+" s":"uit"),1)}
 u2()})}
 
-/* De twee velden bijwerken uit status.json -- maar NIET terwijl iemand erin
-   bezig is. Daarom alleen als de waarde nog overeenkomt met wat er het laatst
-   uit de node kwam; wie iets getypt heeft, houdt zijn tekst. Dezelfde regel als
-   bij het bewerken van een tabelregel, en om dezelfde reden. */
+/* De velden bijwerken uit status.json -- maar NIET terwijl iemand erin bezig is.
+   Daarom alleen als de waarde nog overeenkomt met wat er het laatst uit de node
+   kwam; wie iets getypt heeft, houdt zijn tekst. Dezelfde regel als bij het
+   bewerken van een tabelregel, en om dezelfde reden. */
 function recui(d){
-var r=d.rec;if(!r){return}
+var r=d.rec,rep=d.rep;if(!r){return}
 var cb=document.getElementById("recon"),hf=document.getElementById("rhold");
 if(WASREC.on===null||cb.checked==(WASREC.on==1)){cb.checked=r.on==1}
 if(WASREC.hold===null||hf.value==""+WASREC.hold){hf.value=r.hold}
 WASREC.on=r.on;WASREC.hold=r.hold;
 document.getElementById("rholdcur").textContent=
-"nu: "+(r.on?"aan":"uit")+", rust "+r.hold+" s"+(r.hold?"":" (meteen melden)")}
+"nu: "+(r.on?"aan":"uit")+", rust "+r.hold+" s"+(r.hold?"":" (meteen melden)");
+if(rep){
+var af=document.getElementById("arep");
+if(WASREC.rep===null||af.value==""+WASREC.rep){af.value=rep.secs}
+WASREC.rep=rep.secs;
+document.getElementById("arepcur").textContent=
+"nu: "+(rep.secs?"elke "+rep.secs+" s (tot 'ok'), max "+rep.cap+"x":"uit");
+/* DE PIEP-BANNER: hoeveel meldingen nu ONBEVESTIGD herhaald worden, en hoeveel er
+   de bovengrens raakten. Amber zolang er iets nagt, want dat is een openstaande
+   storing die op een mens wacht; dit is precies wat je in één oogopslag wil zien. */
+var nb=document.getElementById("nagban");
+if(rep.nag||rep.maxed){
+nb.className="sb";
+nb.innerHTML='<div class="t"><b>'+
+(rep.nag?rep.nag+" melding(en) herhalen tot bevestiging":"")+
+(rep.nag&&rep.maxed?" &middot; ":"")+
+(rep.maxed?rep.maxed+" op de bovengrens gestopt":"")+"</b>"+
+"Een companion met alarmrecht stopt ze door <code>ok</code> per DM te sturen. "+
+(rep.maxed?"De gestopte meldingen blijven op de pagina als storing zichtbaar; "+
+"alleen het herhalen hield op.":"")+"</div>"}
+else{nb.className="";nb.innerHTML=""}}}
 
 document.getElementById("ka").onsubmit=function(ev){ev.preventDefault();
 var f=ev.target.elements;
@@ -2400,6 +2469,15 @@ static const char* testStateName(MonitorSensors::TestState s) {
   }
 }
 
+static const char* adhocStateName(MonitorSensors::AdhocState s) {
+  switch (s) {
+    case MonitorSensors::ADHOC_PENDING: return "wacht";
+    case MonitorSensors::ADHOC_BUSY:    return "bezig";
+    case MonitorSensors::ADHOC_DONE:    return "klaar";
+    default:                            return "niets";
+  }
+}
+
 void WebTask::handleStatus() {
   if (!requireAuth()) return;
 
@@ -2437,12 +2515,29 @@ void WebTask::handleStatus() {
         (unsigned)MonitorSensors::TELEM_BYTES_GENERIC_PUB);
   }
 
-  char simblk[260];
+  /* De ad-hoc ping apart, want de uitslagtekst is lang en hoort niet in de marge
+   * van simblk te hoeven passen. Alleen de tekst als hij klaar is; anders leeg.
+   * host en tekst bevatten alleen tekens uit validHost en onze eigen woorden, dus
+   * niets om te ontsnappen. */
+  char adhocblk[300];
+  adhocblk[0] = 0;
+  if (_mon != nullptr) {
+    const MonitorSensors::AdhocState as = _mon->adhocState();
+    snprintf(adhocblk, sizeof(adhocblk),
+        "\"adhoc\":{\"st\":\"%s\",\"host\":\"%s\",\"txt\":\"%s\"},",
+        adhocStateName(as), _mon->adhocHost(),
+        as == MonitorSensors::ADHOC_DONE ? _mon->adhocResultText() : "");
+  }
+
+  char simblk[320];
   simblk[0] = 0;
   if (_mon != nullptr) {
+    uint8_t nag = 0, capped = 0;
+    _mon->repeatStatus(nag, capped);
     snprintf(simblk, sizeof(simblk),
         "\"sim\":{\"n\":%u,\"max\":%u,\"secs\":%u,\"min\":%u,\"lim\":%u},"
         "\"rec\":{\"on\":%d,\"hold\":%u},"
+        "\"rep\":{\"secs\":%u,\"min\":%u,\"lim\":%u,\"cap\":%u,\"nag\":%u,\"maxed\":%u},"
         "\"test\":{\"st\":\"%s\",\"seq\":%u,\"rc\":%u,\"ack\":%u,\"age\":%lu,"
         "\"wait\":%lu,\"rcnow\":%u},",
         (unsigned)_mon->simActiveCount(),
@@ -2452,6 +2547,11 @@ void WebTask::handleStatus() {
         (unsigned)MonitorSensors::SIM_SECS_MAX,
         _mon->recoverEnabled() ? 1 : 0,
         (unsigned)_mon->recoverHoldSecs(),
+        (unsigned)_mon->alertRepeatSecs(),
+        (unsigned)MON_AREPEAT_MIN,
+        (unsigned)MON_AREPEAT_MAX,
+        (unsigned)MonitorSensors::MAX_ALERT_REPEATS,
+        (unsigned)nag, (unsigned)capped,
         testStateName(_mon->testState()),
         (unsigned)_mon->testSeq(),
         (unsigned)_mon->testRecipients(),
@@ -2465,7 +2565,7 @@ void WebTask::handleStatus() {
       "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"rssi\":%d,"
       "\"reason\":%u,\"reconnects\":%lu,\"resets\":%lu,\"uptime\":%lu,"
       "\"heap\":%lu,\"largest\":%lu,\"ssid\":\"%s\","
-      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s\"mon\":[",
+      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s%s\"mon\":[",
       _fw, wifiStateName(_wifi),
       ip[0], ip[1], ip[2], ip[3],
       (int)WiFi.RSSI(),
@@ -2483,7 +2583,7 @@ void WebTask::handleStatus() {
       _mon != nullptr ? (_mon->isMains() ? 1 : 0) : -1,
       _mon != nullptr ? _mon->lastVolts() : 0.0f,
       _mon != nullptr && _mon->monitorsPaused() ? 1 : 0,
-      budblk, simblk);
+      budblk, adhocblk, simblk);
 
   if (n < 0 || (size_t)n >= sizeof(g_json)) {   /* kan niet; vangnet */
     _server->send(500, "text/plain", "antwoord te groot");
@@ -2932,6 +3032,13 @@ void WebTask::handleSim() {
     return;
   }
 
+  /* De klik belooft een onmiddellijk gevolg, dus trek de leesronde naar voren.
+   * Zonder dit werkt de forcering wel meteen op monitorAlert(), maar wacht het
+   * BERICHT tot de gewone ronde -- gemiddeld 30, hoogstens 60 s -- en dan denkt
+   * wie op 'neer' klikt dat de knop stuk is. Ook bij OPHEFFEN (SIM_OFF): een
+   * vroegtijdig herstel hoort net zo goed meteen zichtbaar te zijn. */
+  if (_acl != nullptr) _acl->requestSensorReadNow();
+
   char msg[160];
   if (m == MonitorSensors::SIM_OFF) {
     snprintf(msg, sizeof(msg), "sensor %lu terug op de meting\n", idx);
@@ -2940,8 +3047,7 @@ void WebTask::handleSim() {
      * met een script doet moet ook weten wanneer het van zichzelf ophoudt. */
     snprintf(msg, sizeof(msg),
              "sensor %lu geforceerd op '%s' voor %lus; daarna vanzelf terug naar "
-             "de meting. De waarschuwing gaat bij de volgende leesronde uit "
-             "(hoogstens 60s).\n",
+             "de meting. De eerste zendpoging volgt binnen enkele seconden.\n",
              idx, m == MonitorSensors::SIM_UP ? "op" : "neer", secs);
   }
   _server->send(200, "text/plain", msg);
@@ -2963,6 +3069,10 @@ void WebTask::handleSimClear() {
 
   const uint8_t was = _mon->simActiveCount();
   _mon->simClearAll();
+
+  /* Ook hier de ronde naar voren: alles terug op de meting hoort meteen te
+   * kloppen, niet pas na een leesinterval. */
+  if (_acl != nullptr) _acl->requestSensorReadNow();
 
   char msg[96];
   snprintf(msg, sizeof(msg), "%u forcering(en) opgeheven; alles staat weer op de "
@@ -3015,12 +3125,19 @@ void WebTask::handleAlertTest() {
     return;
   }
 
+  /* De leesronde naar voren: het testbericht gaat langs het echte alertpad
+   * (onSensorDataRead -> alertIf), en dat pad draait normaal pas bij de volgende
+   * ronde. Met deze duw is de eerste zendpoging er binnen enkele seconden in
+   * plaats van na maximaal een minuut -- zonder aan het pad zelf iets te
+   * veranderen. */
+  if (_acl != nullptr) _acl->requestSensorReadNow();
+
   char msg[200];
   snprintf(msg, sizeof(msg),
-           "testbericht #%u aangevraagd voor %u ontvanger(s). Hij gaat de deur "
-           "uit bij de volgende leesronde (hoogstens 60s) -- dat is geen "
-           "vertraging maar hetzelfde pad als een echte waarschuwing. Bevestigde "
-           "aflevering komt hieronder te staan.\n",
+           "testbericht #%u aangevraagd voor %u ontvanger(s). De eerste "
+           "zendpoging volgt binnen enkele seconden langs hetzelfde pad als een "
+           "echte waarschuwing; daarna de gewone bezorgtijd over het mesh. "
+           "Bevestigde aflevering komt hieronder te staan.\n",
            (unsigned)_mon->testSeq(), (unsigned)rc);
   _server->send(200, "text/plain", msg);
 }
@@ -3611,6 +3728,55 @@ void WebTask::handleCli() {
 
   char cf[12];
   if (!getArg(*_server, "confirm", cf, sizeof(cf))) cf[0] = 0;
+
+  /* ------------------------------ ad-hoc ping ----------------------------- */
+  /* 'ping <adres> [n]' is GEEN mesh-CLI-opdracht (die zou "Unknown command"
+   * geven), dus hier onderscheppen we hem en sturen hem naar de ad-hoc
+   * pingmachine van de sensorlaag -- dezelfde die de DM-variant gebruikt, dus
+   * geen tweede weg. De webconsole is synchroon en mag niet blokkeren: we
+   * antwoorden "gestart" en de uitslag verschijnt daarna in /status.json, precies
+   * zoals de pagina hem toont. Wie geen sensorlaag heeft, valt door naar de
+   * gewone afhandeling (die dan "Unknown command" geeft). */
+  if ((cmdIs(cmd, "ping ") || strcmp(cmd, "ping") == 0) && _mon != nullptr) {
+    const char* arg = cmd + 4;
+    while (*arg == ' ') arg++;
+    char host[MON_HOST_LEN + 4]; host[0] = 0;
+    unsigned long n = 0;
+    /* "<adres> [n]" met sscanf-vrije, eenvoudige splitsing: geen String, geen
+     * allocatie. */
+    {
+      int hi = 0;
+      while (arg[hi] && arg[hi] != ' ' && hi < (int)sizeof(host) - 1) { host[hi] = arg[hi]; hi++; }
+      host[hi] = 0;
+      const char* np = arg + hi;
+      while (*np == ' ') np++;
+      if (*np) n = strtoul(np, nullptr, 10);
+    }
+    if (host[0] == 0) {
+      _server->send(400, "text/plain", "ping <adres> [n]\n");
+      return;
+    }
+    if (!_mon->isWifiOnline()) {
+      _server->send(200, "text/plain", "geen wifi, niet gepingd\n");
+      return;
+    }
+    MonitorSensors::SimResult r = _mon->startAdhocPing(host, (uint8_t)n);
+    char msg[160];
+    if (r == MonitorSensors::SIM_ERR_BUSY) {
+      snprintf(msg, sizeof(msg), "bezig met %s, probeer zo opnieuw\n", _mon->adhocHost());
+      _server->send(200, "text/plain", msg);
+    } else if (r != MonitorSensors::SIM_OK) {
+      _server->send(200, "text/plain",
+          "adres: 1-40 tekens uit a-z A-Z 0-9 . - _ (geen IPv6)\n");
+    } else {
+      snprintf(msg, sizeof(msg),
+          "ping naar %s gestart; de uitslag verschijnt zo bij 'bewaking' "
+          "(onder de tegels). Niet-blokkerend, dus deze console wacht er niet "
+          "op.\n", host);
+      _server->send(200, "text/plain", msg);
+    }
+    return;
+  }
 
   /* ------------------------------ de weigeringen -------------------------- */
 
