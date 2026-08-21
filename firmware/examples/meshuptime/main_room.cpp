@@ -105,12 +105,12 @@ public:
   const char* dmAdhocResult() override { return sensors.adhocResultText(); }
   void        dmAdhocClear() override { sensors.adhocClear(); }
   const char* dmHelpExtra() override {
-    static char h[440];
+    static char h[480];
     snprintf(h, sizeof(h),
       "%s || diagnose(read): dns <host>, ping <host> [n], port <host> <poort>, "
       "http <url>, scan, traceroute <host>, neighbors/nb, wifi, sys, history <s> | "
       "bedien(readwrite): checknow <s>, mute <s> [sec], unmute <s>, snooze [sec], "
-      "test | beheer(admin): reboot, ntp",
+      "test | beheer(admin): sendto <pubkey> <msg>, reboot, ntp",
       MonitorSensors::dmCommandHelp());
     return h;
   }
@@ -369,6 +369,22 @@ int MonitorDmSource::dmNodeCommand(const char* line, uint8_t role, char* out, si
   }
 
   /* ---------- BEHEER (admin) ---------- */
+  if (!strcasecmp(verb, "sendto")) {
+    ND_NEED(3);
+    /* sendto <pubkey64> <bericht> -- schone DM vanaf de bot naar één contact. */
+    char* sp = (char*)strchr(arg, ' ');
+    if (!sp) { snprintf(out, out_len, "gebruik: sendto <pubkey64> <bericht>"); return (int)strlen(out); }
+    char hex[PUB_KEY_SIZE * 2 + 1];
+    int hl = (int)(sp - arg);
+    if (hl != PUB_KEY_SIZE * 2) { snprintf(out, out_len, "sendto: volledige pubkey (64 hex) nodig"); return (int)strlen(out); }
+    memcpy(hex, arg, hl); hex[hl] = 0;
+    const char* msg = sp + 1;
+    while (*msg == ' ') msg++;
+    if (!*msg) { snprintf(out, out_len, "sendto: leeg bericht"); return (int)strlen(out); }
+    int r = the_mesh.webBotSendTo(hex, msg);
+    snprintf(out, out_len, r == 0 ? "DM verstuurd vanaf de bot" : "sendto mislukt (pubkey/bot?)");
+    return (int)strlen(out);
+  }
   if (!strcasecmp(verb, "reboot")) {
     ND_NEED(3);
     g_reboot_at = millis() + 1500;

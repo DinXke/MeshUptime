@@ -43,6 +43,14 @@
 #define ROOM_CFG_PATH   "/room_cfg"
 /* Sensor-node-config (namen/actief/stealth) en identiteiten (/snode_id_N). */
 #define SNODE_CFG_PATH  "/snode_cfg"
+/* Bot: identiteit via IdentityStore ("/bot_id"); de DM-ontvangerslijst als tekst. */
+#define BOT_ID_NAME      "/bot_id"
+#define BOT_RECIPS_PATH  "/bot_recips"
+/* Eigenaar-seed: de lijst begint met deze pubkey op een verse node. */
+#define BOT_OWNER_SEED_HEX  "2cb0c5eb473757805eab00f9dd0594c229d6e50b2acec6b57403b6259c9e126f"
+
+/* Vooruit-declaratie: de join-URI-encoder staat lager in dit bestand. */
+static void roomUrlEncode(const char* in, char* out, size_t out_len);
 
 struct ServerStats {
   uint16_t batt_milli_volts;
@@ -87,6 +95,10 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   num_alert_tasks = 0;
   _post_cb = NULL;
   _post_cb_ctx = NULL;
+  _bot_active = false;
+  _bot_name[0] = 0;
+  _bot_next_local_advert = _bot_next_flood_advert = 0;
+  memset(_bot_recips, 0, sizeof(_bot_recips));
 
   memset(rooms, 0, sizeof(rooms));
   for (int i = 0; i < MAX_ROOMS; i++) {
@@ -196,6 +208,21 @@ void RoomMesh::begin(FILESYSTEM* fs) {
    * NA het activeren van rooms + sensor-nodes gebeuren, want applyPermissions
    * gebruikt de slot-identiteit voor het gedeelde geheim. */
   loadAclGrants();
+
+  /* ---- BOT: CHAT/notifier-identiteit ----
+   * Eigen persistent sleutelpaar (/bot_id) + DM-ontvangerslijst (/bot_recips). Op
+   * een verse node wordt de lijst met de eigenaar-pubkey geseed, zodat dm/both-
+   * alerts meteen ergens aankomen. De bot is altijd actief (niet-stealth). */
+  bool had_bot_recips = (_fs != NULL) && _fs->exists(BOT_RECIPS_PATH);
+  loadOrCreateBotIdentity();
+  _bot_active = true;
+  if (_bot_name[0] == 0) StrHelper::strncpy(_bot_name, BOT_NAME_DEFAULT, sizeof(_bot_name));
+  loadBotRecips();
+  if (!had_bot_recips) {
+    uint8_t seed[PUB_KEY_SIZE];
+    if (mesh::Utils::fromHex(seed, PUB_KEY_SIZE, BOT_OWNER_SEED_HEX)) botRecipAdd(seed);
+    saveBotRecips();
+  }
 
   /* Alleen room 0's ACL wordt bewaard (in het bestaande contacts-bestand); de
    * ACL's van de extra rooms en de sensor-nodes leven in RAM en worden opnieuw
@@ -1154,6 +1181,8 @@ void RoomMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
     if (!snodes[i].active || snodes[i].stealth) continue;
     sendSensorNodeAdvertisement(snodes[i], delay_millis + (uint32_t)(MAX_ROOMS + i) * 1000, flood);
   }
+  if (_bot_active)
+    sendBotAdvertisement(delay_millis + (uint32_t)(MAX_ROOMS + MAX_SENSOR_NODES) * 1000, flood);
 }
 
 void RoomMesh::updateAdvertTimer() {
@@ -1171,6 +1200,9 @@ void RoomMesh::updateAdvertTimer() {
       snodes[i].next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
     }
   }
+  /* Bot erachteraan (verschoven zodat hij niet met de rooms/snodes samenvalt). */
+  if (!_bot_active || _prefs.advert_interval == 0) _bot_next_local_advert = 0;
+  else _bot_next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)(MAX_ROOMS + MAX_SENSOR_NODES) * 15000);
 }
 
 void RoomMesh::updateFloodAdvertTimer() {
@@ -1188,6 +1220,8 @@ void RoomMesh::updateFloodAdvertTimer() {
       snodes[i].next_flood_advert = futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
     }
   }
+  if (!_bot_active || _prefs.flood_advert_interval == 0) _bot_next_flood_advert = 0;
+  else _bot_next_flood_advert = futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000 + (uint32_t)(MAX_ROOMS + MAX_SENSOR_NODES) * 15000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1327,6 +1361,19 @@ void RoomMesh::loop() {
     }
   }
 
+  /* Bot-advert (CHAT). Zelfde timer-discipline; verschoven na de snodes. */
+  if (_bot_active) {
+    const uint32_t bstag = (uint32_t)(MAX_ROOMS + MAX_SENSOR_NODES) * 15000;
+    if (_bot_next_flood_advert && millisHasNowPassed(_bot_next_flood_advert)) {
+      sendBotAdvertisement(0, true);
+      _bot_next_flood_advert = futureMillis(FLOOD_ADVERT_INTERVAL_MS + bstag);
+      _bot_next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + bstag);
+    } else if (_bot_next_local_advert && millisHasNowPassed(_bot_next_local_advert)) {
+      sendBotAdvertisement(0, false);
+      _bot_next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + bstag);
+    }
+  }
+
   if (set_radio_at && millisHasNowPassed(set_radio_at)) {
     set_radio_at = 0;
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
@@ -1350,12 +1397,23 @@ void RoomMesh::loop() {
   if (num_alert_tasks > 0) {
     AlertTask* t = &alert_tasks[0];
     if (millisHasNowPassed(t->send_expiry)) {
+      /* from_bot: itereer de bot-ontvangerslijst (schone DM vanaf de bot). Anders:
+       * de klassieke weg over room-0-contacten met alarm-recht. Beide delen de
+       * attempt/ACK-boekhouding en het onAckRecv-pad. */
+      int contact_count = t->from_bot ? botRecipCount() : rooms[0].acl.getNumClients();
       if (t->attempt >= 4) {
         t->curr_contact_idx++;
-        if (t->curr_contact_idx >= rooms[0].acl.getNumClients()) {
+        if (t->curr_contact_idx >= contact_count) {
           t->text[0] = 0;
           num_alert_tasks--;
           for (int i = 0; i < num_alert_tasks; i++) alert_tasks[i] = alert_tasks[i + 1];
+        } else if (t->from_bot) {
+          uint8_t pub[PUB_KEY_SIZE];
+          if (botRecipGetByIdx(t->curr_contact_idx, pub)) {
+            t->attempt = t->high_pri ? 0 : 3;
+            t->timestamp = getRTCClock()->getCurrentTimeUnique();
+            sendBotAlertDM(pub, t);
+          }
         } else {
           auto c = rooms[0].acl.getClientByIdx(t->curr_contact_idx);
           uint16_t pri_mask = t->high_pri ? PERM_RECV_ALERTS_HI : PERM_RECV_ALERTS_LO;
@@ -1365,9 +1423,15 @@ void RoomMesh::loop() {
             sendAlertDM(c, t);
           }
         }
-      } else if (t->curr_contact_idx < rooms[0].acl.getNumClients()) {
-        auto c = rooms[0].acl.getClientByIdx(t->curr_contact_idx);
-        sendAlertDM(c, t);
+      } else if (t->curr_contact_idx < contact_count) {
+        if (t->from_bot) {
+          uint8_t pub[PUB_KEY_SIZE];
+          if (botRecipGetByIdx(t->curr_contact_idx, pub)) sendBotAlertDM(pub, t);
+          else t->attempt = 4;
+        } else {
+          auto c = rooms[0].acl.getClientByIdx(t->curr_contact_idx);
+          sendAlertDM(c, t);
+        }
       } else {
         t->attempt = 4;
       }
@@ -1411,16 +1475,288 @@ void RoomMesh::dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, co
     }
   }
 
-  // DM-deel: via het AlertTask-pad (herhaal-tot-ACK naar room-0-contacten met recht)
-  if ((mode & ALERT_MODE_DM) && num_alert_tasks < ROOM_MAX_ALERTS) {
+  // DM-deel: SCHONE DM vanaf de bot naar ELKE ontvanger in de bot-lijst
+  // (herhaal-tot-ACK per ontvanger). Vervangt de oude room-identiteit-DM zodat
+  // dm/both nu als een gewoon chatcontact in de app tonen.
+  if ((mode & ALERT_MODE_DM) && _bot_active && botRecipCount() > 0 &&
+      num_alert_tasks < ROOM_MAX_ALERTS) {
     AlertTask* t = &alert_tasks[num_alert_tasks];
     StrHelper::strncpy(t->text, text, sizeof(t->text));
     t->high_pri = high_pri;
+    t->from_bot = true;
     t->send_expiry = 0;
     t->attempt = 4;
     t->curr_contact_idx = -1;
     num_alert_tasks++;
   }
+}
+
+/* ================================================================== */
+/*  BOT: CHAT/notifier-identiteit + DM-ontvangerslijst                 */
+/* ================================================================== */
+
+void RoomMesh::loadOrCreateBotIdentity() {
+  if (_fs == NULL) return;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*_fs, "");
+#else
+  IdentityStore store(*_fs, "/identity");
+#endif
+  if (!store.load(BOT_ID_NAME, _bot_id)) {
+    _bot_id = radio_new_identity();
+    int count = 0;
+    while (count < 10 && (_bot_id.pub_key[0] == 0x00 || _bot_id.pub_key[0] == 0xFF)) {
+      _bot_id = radio_new_identity(); count++;
+    }
+    store.save(BOT_ID_NAME, _bot_id);
+  }
+}
+
+int RoomMesh::botRecipFindFree() const {
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) if (_bot_recips[i].level == 0) return i;
+  return -1;
+}
+
+int RoomMesh::botRecipCount() const {
+  int n = 0;
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) if (_bot_recips[i].level != 0) n++;
+  return n;
+}
+
+bool RoomMesh::botRecipGetByIdx(int idx, uint8_t* pub_out) const {
+  int n = 0;
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) {
+    if (_bot_recips[i].level == 0) continue;
+    if (n == idx) { memcpy(pub_out, _bot_recips[i].pub_key, PUB_KEY_SIZE); return true; }
+    n++;
+  }
+  return false;
+}
+
+/* Toevoegen: VOLLEDIGE pubkey. 0 ok, -2 al aanwezig (geen fout), -3 vol. */
+int RoomMesh::botRecipAdd(const uint8_t* pubkey) {
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) {
+    if (_bot_recips[i].level != 0 && memcmp(_bot_recips[i].pub_key, pubkey, PUB_KEY_SIZE) == 0)
+      return -2;   // al in de lijst
+  }
+  int f = botRecipFindFree();
+  if (f < 0) return -3;
+  memcpy(_bot_recips[f].pub_key, pubkey, PUB_KEY_SIZE);
+  _bot_recips[f].level = 1;
+  return 0;
+}
+
+/* Verwijderen op prefix (>= 6 byte). 1 ok, -2 niet gevonden, -3 dubbelzinnig. */
+int RoomMesh::botRecipDelPrefix(const uint8_t* prefix, int key_len) {
+  if (key_len < 6 || key_len > PUB_KEY_SIZE) return -2;
+  int hit = -1, hits = 0;
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) {
+    if (_bot_recips[i].level == 0) continue;
+    if (memcmp(_bot_recips[i].pub_key, prefix, key_len) == 0) { hit = i; hits++; }
+  }
+  if (hits == 0) return -2;
+  if (hits > 1) return -3;
+  _bot_recips[hit].level = 0;
+  memset(_bot_recips[hit].pub_key, 0, PUB_KEY_SIZE);
+  return 1;
+}
+
+/* Ontvangerslijst als tekst: één regel per ontvanger  ->  b <level> <pubkeyhex> */
+void RoomMesh::saveBotRecips() {
+  if (_fs == NULL) return;
+  File f = _fs->open(BOT_RECIPS_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUBOT1\n");
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < MAX_BOT_RECIPS; i++) {
+    if (_bot_recips[i].level == 0) continue;
+    mesh::Utils::toHex(hex, _bot_recips[i].pub_key, PUB_KEY_SIZE);
+    f.printf("b %d %s\n", (int)_bot_recips[i].level, hex);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadBotRecips() {
+  if (_fs == NULL || !_fs->exists(BOT_RECIPS_PATH)) return;
+  File f = _fs->open(BOT_RECIPS_PATH, "r");
+  if (!f) return;
+  char line[96];
+  bool first = true;
+  int bi = 0;
+  memset(_bot_recips, 0, sizeof(_bot_recips));
+  while (f.available() && bi < MAX_BOT_RECIPS) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int c = f.read();
+      if (c < 0 || c == '\n') break;
+      if (c == '\r') continue;
+      line[len++] = (char)c;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'b') continue;
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    int level = atoi(p);  while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    char* hex = p;
+    if (level <= 0) continue;
+    if (strlen(hex) < PUB_KEY_SIZE * 2) continue;
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) continue;
+    memcpy(_bot_recips[bi].pub_key, pubkey, PUB_KEY_SIZE);
+    _bot_recips[bi].level = (uint8_t)level;
+    bi++;
+  }
+  f.close();
+}
+
+/* Advert als CHAT-contact (type=1), zodat de MeshCore-app de bot als gewoon
+ * chatcontact toont. Standaard MeshCore-formaat via AdvertDataBuilder. */
+mesh::Packet* RoomMesh::createBotAdvert() {
+  uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+  AdvertDataBuilder builder(ADV_TYPE_CHAT, _bot_name);
+  uint8_t app_data_len = builder.encodeTo(app_data);
+  self_id = _bot_id;
+  return createAdvert(_bot_id, app_data, app_data_len);
+}
+
+void RoomMesh::sendBotAdvertisement(int delay_millis, bool flood) {
+  mesh::Packet* pkt = createBotAdvert();
+  if (!pkt) return;
+  if (flood) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+  else sendZeroHop(pkt, delay_millis);
+  self_id = rooms[0].id;   // standaard-identiteit herstellen
+}
+
+/* Schone DM vanaf de bot naar een losse pubkey (niet in een ACL). Berekent het
+ * gedeelde geheim zelf uit de volledige pubkey; verder identiek aan sendAlertDM
+ * zodat ACK-herhaling en onAckRecv gedeeld blijven. */
+void RoomMesh::sendBotAlertDM(const uint8_t* pubkey, AlertTask* t) {
+  int text_len = strlen(t->text);
+  uint8_t data[MAX_PACKET_PAYLOAD];
+  memcpy(data, &t->timestamp, 4);
+  data[4] = (TXT_TYPE_PLAIN << 2) | t->attempt;
+  memcpy(&data[5], t->text, text_len);
+
+  uint8_t secret[PUB_KEY_SIZE];
+  _bot_id.calcSharedSecret(secret, pubkey);
+  mesh::Identity dest(pubkey);
+
+  self_id = _bot_id;   // de DM komt van de bot
+  mesh::Utils::sha256((uint8_t*)&t->expected_acks[t->attempt], 4, data, 5 + text_len, _bot_id.pub_key, PUB_KEY_SIZE);
+  t->attempt++;
+
+  auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, dest, secret, data, 5 + text_len);
+  if (pkt) sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  t->send_expiry = futureMillis(ALERT_ACK_EXPIRY_MILLIS);
+  self_id = rooms[0].id;
+}
+
+/* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Enqueue als een
+ * gerichte AlertTask met een 1-ontvanger-lijst? Nee: hergebruik het AlertTask-pad
+ * niet (dat itereert de HELE lijst). We sturen hier direct, best-effort met de
+ * standaard flood-herhaling van de mesh. Lange tekst wordt geknipt. */
+int RoomMesh::botSendTo(const uint8_t* pubkey, const char* text) {
+  if (!_bot_active || !text || text[0] == 0) return -1;
+  uint8_t secret[PUB_KEY_SIZE];
+  _bot_id.calcSharedSecret(secret, pubkey);
+  mesh::Identity dest(pubkey);
+
+  size_t total = strlen(text);
+  size_t chunk = MAX_PACKET_PAYLOAD - 6;   // 4 ts + 1 flags + marge
+  if (chunk > MAX_POST_TEXT_LEN) chunk = MAX_POST_TEXT_LEN;
+  size_t off = 0;
+  int sent = 0;
+  while (off < total) {
+    size_t n = total - off;
+    if (n > chunk) n = chunk;
+    uint8_t data[MAX_PACKET_PAYLOAD];
+    uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+    memcpy(data, &ts, 4);
+    data[4] = (TXT_TYPE_PLAIN << 2);
+    memcpy(&data[5], text + off, n);
+    self_id = _bot_id;
+    auto pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, dest, secret, data, 5 + n);
+    if (pkt) { sendFloodScoped(default_scope, pkt, (uint32_t)sent * 300, _prefs.path_hash_mode + 1); sent++; }
+    off += n;
+  }
+  self_id = rooms[0].id;
+  return sent > 0 ? 0 : -1;
+}
+
+/* DM de HELE ontvangerslijst (admin). Via het AlertTask-pad -> herhaal-tot-ACK
+ * per ontvanger. Retour = aantal ontvangers, of <0 fout. */
+int RoomMesh::botPost(const char* text) {
+  if (!_bot_active || !text || text[0] == 0) return -1;
+  int rc = botRecipCount();
+  if (rc == 0) return 0;
+  if (num_alert_tasks >= ROOM_MAX_ALERTS) return -3;   // wachtrij vol
+  AlertTask* t = &alert_tasks[num_alert_tasks];
+  StrHelper::strncpy(t->text, text, sizeof(t->text));
+  t->high_pri = false;
+  t->from_bot = true;
+  t->send_expiry = 0;
+  t->attempt = 4;
+  t->curr_contact_idx = -1;
+  num_alert_tasks++;
+  return rc;
+}
+
+/* ---- IWebNode: bot ---- */
+bool RoomMesh::webBotPubHex(char* out, size_t out_len) {
+  if (!_bot_active || out_len < (size_t)(PUB_KEY_SIZE * 2 + 1)) return false;
+  mesh::Utils::toHex(out, _bot_id.pub_key, PUB_KEY_SIZE);
+  return true;
+}
+
+bool RoomMesh::webBotJoinUri(char* out, size_t out_len) {
+  if (!_bot_active) return false;
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, _bot_id.pub_key, PUB_KEY_SIZE);
+  char enc[sizeof(_bot_name) * 3 + 1];
+  roomUrlEncode(_bot_name, enc, sizeof(enc));
+  /* type=1 = ADV_TYPE_CHAT (Companion). Formaat uit MeshCore docs/qr_codes.md. */
+  int n = snprintf(out, out_len,
+                   "meshcore://contact/add?name=%s&public_key=%s&type=1", enc, hex);
+  return n > 0 && (size_t)n < out_len;
+}
+
+bool RoomMesh::webBotRecipGet(int idx, char* pub64, size_t out_len, int* level) {
+  if (out_len < (size_t)(PUB_KEY_SIZE * 2 + 1)) return false;
+  uint8_t pub[PUB_KEY_SIZE];
+  if (!botRecipGetByIdx(idx, pub)) return false;
+  mesh::Utils::toHex(pub64, pub, PUB_KEY_SIZE);
+  if (level) *level = 1;
+  return true;
+}
+
+int RoomMesh::webBotRecipSet(const char* pub_hex, int level) {
+  (void)level;
+  if (!pub_hex || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -2;
+  uint8_t pubkey[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, pub_hex)) return -2;
+  int r = botRecipAdd(pubkey);
+  if (r == 0 || r == -2) { saveBotRecips(); return 0; }   // -2 = al aanwezig: idempotent ok
+  return r;
+}
+
+int RoomMesh::webBotRecipDel(const char* prefix_hex) {
+  if (!prefix_hex) return -2;
+  int hexlen = (int)strlen(prefix_hex);
+  if (hexlen < 12 || (hexlen & 1) || hexlen > PUB_KEY_SIZE * 2) return -2;
+  uint8_t prefix[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(prefix, hexlen / 2, prefix_hex)) return -2;
+  int r = botRecipDelPrefix(prefix, hexlen / 2);
+  if (r == 1) saveBotRecips();
+  return r;
+}
+
+int RoomMesh::webBotSendTo(const char* pub_hex, const char* text) {
+  if (!pub_hex || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -2;
+  uint8_t pubkey[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, pub_hex)) return -2;
+  return botSendTo(pubkey, text);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1456,6 +1792,8 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     else { addServerPost(0, msg); strcpy(reply, "OK"); }
   } else if (memcmp(command, "sensornode ", 11) == 0) {
     handleSensorNodeCommand(command + 11, reply);
+  } else if (memcmp(command, "bot ", 4) == 0) {
+    handleBotCommand(command + 4, reply);
   } else if (memcmp(command, "room ", 5) == 0) {
     handleRoomCommand(command + 5, reply);
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
@@ -1679,6 +2017,96 @@ void RoomMesh::handleSensorNodeCommand(char* args, char* reply) {
     return;
   }
   strcpy(reply, "sensornode list|add|del|stealth|set name");
+}
+
+/* bot list | add <pubkey64> | del <prefix>=>12hex | post <msg> | sendto <pubkey64>
+ * <msg> | advert [flood] | uri
+ * De ontvangerslijst draagt VOLLEDIGE pubkeys (het gedeelde geheim wordt eruit
+ * berekend); verwijderen mag op een prefix (>=12 hex). */
+void RoomMesh::handleBotCommand(char* args, char* reply) {
+  while (*args == ' ') args++;
+
+  if (strncmp(args, "list", 4) == 0) {
+    char* p = reply;
+    int n = 0;
+    p += sprintf(p, "bot-ontvangers:");
+    for (int i = 0; i < MAX_BOT_RECIPS; i++) {
+      if (_bot_recips[i].level == 0) continue;
+      n++;
+      if ((p - reply) > 170) continue;   // reply-buffer niet overschrijden
+      char hex[PUB_KEY_SIZE * 2 + 1];
+      mesh::Utils::toHex(hex, _bot_recips[i].pub_key, PUB_KEY_SIZE);
+      hex[12] = 0;   // korte weergave: prefix
+      p += sprintf(p, " %s", hex);
+    }
+    if (n == 0) strcpy(reply, "bot-ontvangers: (leeg)");
+    return;
+  }
+  if (memcmp(args, "add ", 4) == 0) {
+    char* hex = args + 4;
+    while (*hex == ' ') hex++;
+    if (strlen(hex) < PUB_KEY_SIZE * 2) { strcpy(reply, "Err - volledige pubkey (64 hex) nodig"); return; }
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) { strcpy(reply, "Err - bad pubkey"); return; }
+    int r = botRecipAdd(pubkey);
+    if (r == 0)      { saveBotRecips(); strcpy(reply, "OK ontvanger toegevoegd"); }
+    else if (r == -2) strcpy(reply, "OK (stond al in de lijst)");
+    else              strcpy(reply, "Err - lijst vol");
+    return;
+  }
+  if (memcmp(args, "del ", 4) == 0) {
+    char* hex = args + 4;
+    while (*hex == ' ') hex++;
+    int hexlen = (int)strlen(hex);
+    if (hexlen < 12 || (hexlen & 1) || hexlen > PUB_KEY_SIZE * 2) { strcpy(reply, "Err - prefix >=12 hex"); return; }
+    uint8_t prefix[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(prefix, hexlen / 2, hex)) { strcpy(reply, "Err - bad prefix"); return; }
+    int r = botRecipDelPrefix(prefix, hexlen / 2);
+    if (r == 1)      { saveBotRecips(); strcpy(reply, "OK ontvanger verwijderd"); }
+    else if (r == -3) strcpy(reply, "Err - prefix past op meerdere; maak hem langer");
+    else              strcpy(reply, "Err - niet gevonden");
+    return;
+  }
+  if (memcmp(args, "post ", 5) == 0) {
+    char* msg = args + 5;
+    while (*msg == ' ') msg++;
+    if (*msg == 0) { strcpy(reply, "Err - lege tekst"); return; }
+    int r = botPost(msg);
+    if (r > 0)       sprintf(reply, "OK gepost naar %d ontvanger(s)", r);
+    else if (r == 0) strcpy(reply, "geen ontvangers");
+    else             strcpy(reply, "Err - wachtrij vol");
+    return;
+  }
+  if (memcmp(args, "sendto ", 7) == 0) {
+    char* hex = args + 7;
+    while (*hex == ' ') hex++;
+    char* sp = strchr(hex, ' ');
+    if (sp == NULL) { strcpy(reply, "gebruik: bot sendto <pubkey64> <bericht>"); return; }
+    *sp++ = 0;
+    while (*sp == ' ') sp++;
+    if (strlen(hex) != PUB_KEY_SIZE * 2) { strcpy(reply, "Err - volledige pubkey (64 hex) nodig"); return; }
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) { strcpy(reply, "Err - bad pubkey"); return; }
+    if (*sp == 0) { strcpy(reply, "Err - lege tekst"); return; }
+    int r = botSendTo(pubkey, sp);
+    strcpy(reply, r == 0 ? "OK verstuurd" : "Err - versturen mislukt");
+    return;
+  }
+  if (memcmp(args, "advert", 6) == 0) {
+    char* q = args + 6;
+    while (*q == ' ') q++;
+    bool flood = (memcmp(q, "flood", 5) == 0);
+    sendBotAdvertisement(0, flood);
+    sprintf(reply, "OK bot-advert (%s)", flood ? "flood" : "zero-hop");
+    return;
+  }
+  if (strncmp(args, "uri", 3) == 0 || strncmp(args, "info", 4) == 0) {
+    char uri[160];
+    if (webBotJoinUri(uri, sizeof(uri))) snprintf(reply, 200, "%s : %s", _bot_name, uri);
+    else strcpy(reply, "bot niet actief");
+    return;
+  }
+  strcpy(reply, "bot list|add <pubkey>|del <prefix>|post <msg>|sendto <pubkey> <msg>|advert [flood]|uri");
 }
 
 /* read/readwrite/admin (+ aliassen) -> PERM_ACL_* ; 0 = onbekend. */

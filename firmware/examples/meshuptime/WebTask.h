@@ -244,6 +244,7 @@ private:
   /* Gemeenschappelijke poort voor de room-routes: meshlaag gekoppeld EN deze node
    * kent rooms. Verstuurt zelf het 503/501-antwoord en geeft dan false. */
   bool roomsAvailable();
+  bool botAvailable();
 
   /* VIRTUELE SENSOR-NODES. Symmetrisch met /room/add|edit|del; de lijst zit in
    * /rooms.json (aparte "snodes"-array), backup/restore loopt mee met /rooms/*. */
@@ -264,6 +265,24 @@ private:
   /* SNMP-monitor aanmaken (POST /monitor/snmp): name, host/ip, int, community, oid,
    * interp, snmparg. Maakt de monitor + zet de SNMP-velden via de bestaande weg. */
   void handleMonSnmp();
+
+  /* Ontdekte contacten (buurtlijst): /contacts.json geeft naam + VOLLEDIGE pubkey
+   * + snr/hops/laatst-gehoord. Alleen publieke sleutels; de kiezer voor de
+   * bot-ontvangers en de ACL-grants leest deze lijst. */
+  void handleContactsJson();
+
+  /* Bot (CHAT/notifier-identiteit + DM-ontvangerslijst).
+   *  /bot.json (GET)      : status + pubkey + join-uri + ontvangerslijst (pubkeys).
+   *  /bot/recipient (POST): key (64hex) toevoegen, of del=<prefix>=>12hex.
+   *  /bot/advert (POST)   : flood=0/1.
+   *  /bot/sendto (POST)   : key (64hex) + msg -- ad-hoc schone DM (flash-melding).
+   *  /bot/post (POST)     : msg -- DM de hele ontvangerslijst.
+   * De v2c-community en gedeelde geheimen komen NOOIT in deze endpoints voor. */
+  void handleBotJson();
+  void handleBotRecip();
+  void handleBotAdvert();
+  void handleBotSendto();
+  void handleBotPost();
 
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
@@ -311,6 +330,12 @@ private:
   friend void web_route_roomadvert();
   friend void web_route_snodeadvert();
   friend void web_route_monsnmp();
+  friend void web_route_contactsjson();
+  friend void web_route_botjson();
+  friend void web_route_botrecip();
+  friend void web_route_botadvert();
+  friend void web_route_botsendto();
+  friend void web_route_botpost();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

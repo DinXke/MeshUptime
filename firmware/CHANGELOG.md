@@ -21,6 +21,18 @@ tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalwe
   (BER/ASN.1 over UDP:161, v2c). De gepollde waarde stroomt door de bestaande
   telemetrie/alert-pijplijn (CayenneLPP → sensor-nodes → mesh → MeshManager; alerts
   → rooms/DM). Geen nieuw verzendpad; alleen een nieuwe bron.
+- **Bot: virtuele CHAT/notifier-identiteit** (`BE-HSS-DinX-Bot`): een eigen
+  persistent chat-contact (ADV_TYPE_CHAT/type=1, join-URI type=1) dat SCHONE DM's
+  stuurt — voor flash-meldingen én voor de per-sensor `dm`/`both`-alerts (herbedraad
+  van de room-identiteit naar de bot, herhaal-tot-ACK per ontvanger). Persistente
+  DM-ontvangerslijst (`/bot_recips`, 16 ingangen, geseed met de eigenaar). CLI
+  `bot list|add|del|post|sendto|advert`, room/DM-commando `sendto`, en web-GUI
+  (bot-tab: join/QR, ontvangerbeheer, sendto/post). Endpoints `/bot.json`,
+  `/bot/recipient`, `/bot/advert`, `/bot/sendto`, `/bot/post`.
+- **Ontdekte contacten**: `/contacts.json` (buurtlijst met VOLLEDIGE pubkey + naam +
+  snr/hops/laatst-gehoord) voedt een kiezer in de web-GUI voor zowel de
+  bot-ontvangers als de per-slot ACL-grants (kiezen uit gehoorde nodes i.p.v. alleen
+  handmatig plakken). Alleen publieke sleutels.
 
 ## v2.1.0 — room-beheer, sensor-nodes, ACL, bediening
 

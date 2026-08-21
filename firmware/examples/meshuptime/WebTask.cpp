@@ -446,6 +446,12 @@ void web_route_snodeacl()     { if (g_self) g_self->handleSNodeAcl(); }
 void web_route_roomadvert()   { if (g_self) g_self->handleRoomAdvert(); }
 void web_route_snodeadvert()  { if (g_self) g_self->handleSNodeAdvert(); }
 void web_route_monsnmp()      { if (g_self) g_self->handleMonSnmp(); }
+void web_route_contactsjson() { if (g_self) g_self->handleContactsJson(); }
+void web_route_botjson()      { if (g_self) g_self->handleBotJson(); }
+void web_route_botrecip()     { if (g_self) g_self->handleBotRecip(); }
+void web_route_botadvert()    { if (g_self) g_self->handleBotAdvert(); }
+void web_route_botsendto()    { if (g_self) g_self->handleBotSendto(); }
+void web_route_botpost()      { if (g_self) g_self->handleBotPost(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -925,6 +931,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button data-p="2">toegang</button>
 <button id="tabrooms" data-p="4" hidden>rooms</button>
 <button id="tabsnodes" data-p="5" hidden>sensor-nodes</button>
+<button id="tabbot" data-p="6" hidden>bot</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -1564,8 +1571,9 @@ leeg. Vul alleen in wat je wilt veranderen; vink <b>gastwachtwoord wissen</b> aa
 het weg te halen. Een nieuwe naam gaat direct het advert in.</p>
 <h3 style="margin:.6rem 0 .3rem">Toegang &mdash; wachtwoordloos per sleutel</h3>
 <div class="card pad0"><table id="racl"></table></div>
-<div class="frow"><input id="racl-pub" placeholder="volledige pubkey (64 hex)"
-maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<div class="frow"><select id="racl-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
+<input id="racl-pub" placeholder="of plak volledige pubkey (64 hex)"
+maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
 <select id="racl-lvl" style="width:auto"><option value="read">read</option>
 <option value="readwrite">readwrite</option><option value="admin">admin</option></select>
 <button type="button" id="racl-add">grant</button></div>
@@ -1649,8 +1657,9 @@ stealth (niet adverteren)</label>
 <button type="button" onclick="nodeAdvert(1,SNEI,0)">zero-hop</button></div>
 <h3 style="margin:.6rem 0 .3rem">Toegang &mdash; wachtwoordloos per sleutel</h3>
 <div class="card pad0"><table id="sacl"></table></div>
-<div class="frow"><input id="sacl-pub" placeholder="volledige pubkey (64 hex)"
-maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<div class="frow"><select id="sacl-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
+<input id="sacl-pub" placeholder="of plak volledige pubkey (64 hex)"
+maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
 <select id="sacl-lvl" style="width:auto"><option value="read">read</option>
 <option value="readwrite">readwrite</option><option value="admin">admin</option></select>
 <button type="button" id="sacl-add">grant</button></div>
@@ -1668,6 +1677,54 @@ verwijderen mag op prefix.</p>
 <p class="note">Vinkje = deze sensor verschijnt als telemetrie op deze sensor-node (de
 <b>sn</b>-bit). Uitvinken <b>ontkoppelt</b> alleen; de monitor blijft bestaan.
 Globaal verwijderen: tabblad bewaking.</p></div>
+</section>
+
+<section id="p6" hidden>
+<h2>Bot &mdash; meldingen als een gewoon chatcontact</h2>
+<p class="why"><b>Waarom een aparte bot:</b> een DM vanaf een <i>room</i>-identiteit
+toont rommelig in de MeshCore-app. De bot is een eigen <b>chat</b>-contact
+(type&nbsp;1) dat <b>schone DM's</b> stuurt: voor flash-meldingen en voor de
+per-sensor <i>dm</i>/<i>both</i>-alerts. Voeg de bot als contact toe (QR/join-link)
+en zet jezelf op de ontvangerslijst.</p>
+
+<div class="card" id="botcard">
+<div class="row"><b id="bot-name">&hellip;</b>
+<span class="key" id="bot-pub" title="volledige pubkey (klik om te kopiëren)"></span></div>
+<div class="frow" style="margin-top:.4rem">
+<input id="bot-uri" readonly spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="bot-copy">kopieer</button></div>
+<canvas id="bqr" style="margin-top:.5rem;max-width:100%;image-rendering:pixelated"></canvas>
+<div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Advert nu:</span>
+<button type="button" onclick="botAdvert(1)">flood</button>
+<button type="button" onclick="botAdvert(0)">zero-hop</button></div>
+<div id="botmsg"></div></div>
+
+<h2>Ontvangers &mdash; wie de DM's krijgt</h2>
+<div class="card pad0"><table id="botrl"></table></div>
+<div class="frow" style="margin-top:.4rem">
+<select id="bot-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; uit gehoorde contacten &mdash;</option></select>
+<input id="bot-pub-in" placeholder="of plak volledige pubkey (64 hex)" maxlength="64"
+spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="bot-add">toevoegen</button></div>
+<div id="botaddmsg"></div>
+<p class="note">Toevoegen vraagt de <b>volledige</b> pubkey (het gedeelde geheim
+wordt eruit berekend); kies uit de <b>gehoorde contacten</b> of plak hem. Verwijderen
+mag op een prefix (&ge;12 hex).</p>
+
+<h2>Handmatig een DM sturen</h2>
+<div class="card">
+<div class="frow">
+<select id="bot-sto-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
+<input id="bot-sto-key" placeholder="pubkey (64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:10rem"></div>
+<div class="frow" style="margin-top:.35rem">
+<input id="bot-sto-msg" placeholder="bericht" maxlength="150" spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="bot-sto-go">stuur DM</button></div>
+<div class="quick" style="margin-top:.35rem">
+<input id="bot-post-msg" placeholder="bericht naar de HELE lijst" maxlength="150" spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="bot-post-go">post naar allen</button></div>
+<div id="botsendmsg"></div>
+<p class="note">Eén DM (<b>stuur DM</b>) of naar iedereen op de lijst
+(<b>post naar allen</b>). Beide zijn beheer-acties.</p></div>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -2395,10 +2452,11 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=5;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+for(var k=1;k<=6;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
 if(p=="3"){cfg()}
-if(p=="4"){roomsLoad()}
-if(p=="5"){snodesLoad()}}}
+if(p=="4"){roomsLoad();refreshPickers()}
+if(p=="5"){snodesLoad();refreshPickers()}
+if(p=="6"){botLoad()}}}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -2908,7 +2966,8 @@ if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
 /* Bij het laden: is dit een room-node? Zo ja, toon de tab. */
 function roomsProbe(){roomsGet().then(function(d){
 var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0);
-var ts=document.getElementById("tabsnodes");if(ts)ts.hidden=!(d&&d.snode_max>0)})
+var ts=document.getElementById("tabsnodes");if(ts)ts.hidden=!(d&&d.snode_max>0);
+var tb=document.getElementById("tabbot");if(tb)tb.hidden=!(d&&d.max>0)})
 .catch(function(){})}
 
 function roomsLoad(){roomsGet().then(function(d){
@@ -3137,6 +3196,101 @@ document.getElementById("sacl-add").onclick=function(){
 var pub=document.getElementById("sacl-pub").value.trim(),lvl=document.getElementById("sacl-lvl").value;
 if(SNEI<0||!pub)return;
 aclSet(1,SNEI,pub,lvl,"saclmsg",function(){document.getElementById("sacl-pub").value="";aclRefresh(1)})};
+
+/* ============ gehoorde contacten: kiezer (bot-ontvangers + ACL-grants) =========
+   /contacts.json draagt de buurtlijst met VOLLEDIGE pubkey (nodig voor het gedeelde
+   geheim). De kiezer vult een pubkey-invoerveld; handmatig plakken kan ook. */
+var CONTACTS=[];
+function contactsGet(){return fetch("contacts.json",{credentials:"include"})
+.then(function(r){if(!r.ok)throw 0;return r.json()})
+.then(function(d){CONTACTS=(d&&d.contacts)||[];return CONTACTS}).catch(function(){return[]})}
+function fillPicker(id){var sel=document.getElementById(id);if(!sel)return;
+while(sel.options.length>1)sel.remove(1);
+CONTACTS.forEach(function(c){var o=document.createElement("option");o.value=c.k;
+var nm=c.n&&c.n.length?c.n:(c.k.slice(0,8)+"…");
+o.textContent=nm+" · "+c.k.slice(0,6)+"… ("+c.t+","+c.h+"h)";sel.appendChild(o)})}
+function bindPicker(pickId,inId){var sel=document.getElementById(pickId);if(!sel)return;
+sel.onchange=function(){var v=sel.value;if(v){var i=document.getElementById(inId);if(i)i.value=v}}}
+function refreshPickers(){contactsGet().then(function(){
+["racl-pick","sacl-pick","bot-pick","bot-sto-pick"].forEach(fillPicker)})}
+bindPicker("racl-pick","racl-pub");bindPicker("sacl-pick","sacl-pub");
+bindPicker("bot-pick","bot-pub-in");bindPicker("bot-sto-pick","bot-sto-key");
+
+/* ============================== bot (chat/notifier) =========================
+   Alles praat met /bot.json en de /bot/* endpoints. Zichtbaar op room-nodes. */
+function bmsg(id,t,ok){rmsg(id,t,ok)}
+function drawQRon(cvId,uri){var qr=qrcode(0,"M");qr.addData(uri);qr.make();
+var n=qr.getModuleCount(),s=4,q=4,cv=document.getElementById(cvId);if(!cv)return;
+cv.width=cv.height=(n+q*2)*s;var g=cv.getContext("2d");
+g.fillStyle="#fff";g.fillRect(0,0,cv.width,cv.height);g.fillStyle="#000";
+for(var y=0;y<n;y+=1)for(var x=0;x<n;x+=1)if(qr.isDark(y,x))g.fillRect((x+q)*s,(y+q)*s,s,s)}
+var BOT=null;
+function botGet(){return fetch("bot.json",{credentials:"include"})
+.then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
+function botLoad(){refreshPickers();botGet().then(function(d){
+if(!d){document.getElementById("bot-name").textContent="geen bot op deze node";return}
+BOT=d;
+document.getElementById("bot-name").textContent=d.name;
+var kp=document.getElementById("bot-pub");kp.textContent=d.pub.slice(0,8)+"…"+d.pub.slice(-4);
+kp.title=d.pub+"  (klik om te kopiëren)";kp.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(d.pub)};
+document.getElementById("bot-uri").value=d.uri||"";
+try{drawQRon("bqr",d.uri)}catch(e){}
+botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)})}
+function botRender(list,max){var e=document.getElementById("botrl");e.innerHTML="";
+var h=e.insertRow();["ontvanger","",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+list.forEach(function(g){var r=e.insertRow();
+var c=r.insertCell();c.className="key";c.textContent=g.k.slice(0,8)+"…"+g.k.slice(-4);
+c.title=g.k+"  (klik om te kopiëren)";
+c.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(g.k)};
+r.insertCell().textContent="";
+c=r.insertCell();c.className="acts";var b=document.createElement("button");b.textContent="wis";
+b.onclick=function(){botDel(g.k)};c.appendChild(b)});
+if(!list.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=3;
+c.textContent="(nog geen ontvangers — voeg jezelf toe)";c.style.color="var(--muted)"}}
+function botAdd(){var pub=document.getElementById("bot-pub-in").value.trim();
+if(!pub)return;
+fetch("bot/recipient",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"key="+encodeURIComponent(pub)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){document.getElementById("bot-pub-in").value="";
+var pk=document.getElementById("bot-pick");if(pk)pk.value="";
+bmsg("botaddmsg","ontvanger toegevoegd",1);botLoad()}
+else bmsg("botaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botaddmsg","mislukt",0)})}
+function botDel(pub){if(!confirm("Ontvanger "+pub.slice(0,8)+"… verwijderen?"))return;
+fetch("bot/recipient",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"del="+encodeURIComponent(pub)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){bmsg("botaddmsg","ontvanger weg",1);botLoad()}
+else bmsg("botaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botaddmsg","mislukt",0)})}
+function botAdvert(flood){fetch("bot/advert",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"flood="+(flood?1:0)})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("botmsg",j.ok?("bot-advert verstuurd ("+(flood?"flood":"zero-hop")+")"):"mislukt",j.ok?1:0)})
+.catch(function(){bmsg("botmsg","mislukt",0)})}
+document.getElementById("bot-add").onclick=botAdd;
+document.getElementById("bot-copy").onclick=function(){
+var i=document.getElementById("bot-uri");i.focus();i.select();
+if(navigator.clipboard&&navigator.clipboard.writeText)
+navigator.clipboard.writeText(i.value).then(function(){bmsg("botmsg","join-link gekopieerd",1)},function(){});
+else try{document.execCommand("copy");bmsg("botmsg","join-link gekopieerd",1)}catch(e){}};
+document.getElementById("bot-sto-go").onclick=function(){
+var k=document.getElementById("bot-sto-key").value.trim(),m=document.getElementById("bot-sto-msg").value;
+if(!k||!m){bmsg("botsendmsg","pubkey en bericht nodig",0);return}
+fetch("bot/sendto",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"key="+encodeURIComponent(k)+"&msg="+encodeURIComponent(m)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){document.getElementById("bot-sto-msg").value="";bmsg("botsendmsg","DM verstuurd",1)}
+else bmsg("botsendmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botsendmsg","mislukt",0)})};
+document.getElementById("bot-post-go").onclick=function(){
+var m=document.getElementById("bot-post-msg").value;
+if(!m){bmsg("botsendmsg","bericht nodig",0);return}
+fetch("bot/post",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"msg="+encodeURIComponent(m)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){document.getElementById("bot-post-msg").value="";bmsg("botsendmsg","gepost naar "+j.sent+" ontvanger(s)",1)}
+else bmsg("botsendmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botsendmsg","mislukt",0)})};
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
    Dezelfde rm/sn-maskers als per-sensor, maar PER room/sensor-node getoond.
@@ -3388,6 +3542,15 @@ void WebTask::routes() {
   _server->on("/snode/advert", HTTP_POST, web_route_snodeadvert);
   /* SNMP-monitor aanmaken. POST-only, net als /monitor. */
   _server->on("/monitor/snmp", HTTP_POST, web_route_monsnmp);
+  /* Ontdekte contacten (buurtlijst met VOLLEDIGE pubkey) -- de kiezer voor de
+   * bot-ontvangers en de ACL-grants leest deze lijst. GET, alleen publieke sleutels. */
+  _server->on("/contacts.json", HTTP_GET, web_route_contactsjson);
+  /* Bot (CHAT/notifier): leeskant /bot.json (GET), mutaties POST. */
+  _server->on("/bot.json", HTTP_GET, web_route_botjson);
+  _server->on("/bot/recipient", HTTP_POST, web_route_botrecip);
+  _server->on("/bot/advert", HTTP_POST, web_route_botadvert);
+  _server->on("/bot/sendto", HTTP_POST, web_route_botsendto);
+  _server->on("/bot/post", HTTP_POST, web_route_botpost);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -4911,6 +5074,153 @@ void WebTask::handleSNodeAdvert() {
   }
   char msg[64]; snprintf(msg, sizeof(msg), "{\"ok\":true,\"flood\":%d}", flood ? 1 : 0);
   _server->send(200, "application/json", msg);
+}
+
+/* ================================================================== */
+/*  Ontdekte contacten + bot (CHAT/notifier)                           */
+/* ================================================================== */
+
+/* GET /contacts.json -- de buurtlijst met VOLLEDIGE pubkey, voor de kiezers (bot-
+ * ontvangers + ACL-grants). Alleen publieke gegevens. */
+void WebTask::handleContactsJson() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return; }
+
+  const NeighbourList& nb = _acl->getNeighbours();
+  const uint32_t now = _acl->nowSecs();
+  char key[PUB_KEY_SIZE * 2 + 1];
+  char esc[NB_JSON_NAME];
+
+  int n = snprintf(g_json, sizeof(g_json), "{\"max\":%d,\"contacts\":[", MAX_NEIGHBOURS);
+  bool first = true;
+  for (int i = 0; i < nb.getNumEntries(); i++) {
+    const NeighbourEntry* e = nb.getEntryByIdx(i);
+    if ((size_t)n > sizeof(g_json) - 160) break;
+    mesh::Utils::toHex(key, e->pub_key, PUB_KEY_SIZE);
+    jsonEscape(e->name, esc, sizeof(esc));
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+        "%s{\"k\":\"%s\",\"n\":\"%s\",\"t\":%u,\"h\":%u,\"s\":\"%.1f\",\"a\":%ld,\"c\":%lu}",
+        first ? "" : ",", key, esc, (unsigned)e->adv_type, (unsigned)e->hops,
+        ((float)e->snr4) / 4.0f, ageOf(e->heard_at, now), (unsigned long)e->count);
+    first = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* Kleine guard: bestaat er een bot op deze node? (SensorMesh: nee.) */
+bool WebTask::botAvailable() {
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return false; }
+  if (!_acl->webBotActive()) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"deze node kent geen bot (sensor-variant)\"}");
+    return false;
+  }
+  return true;
+}
+
+/* GET /bot.json -- botstatus + join-uri + ontvangerslijst. NOOIT geheimen. */
+void WebTask::handleBotJson() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+
+  char name[24]; jsonEscape(_acl->webBotName(), name, sizeof(name));
+  char pub[PUB_KEY_SIZE * 2 + 1] = {0}; _acl->webBotPubHex(pub, sizeof(pub));
+  char uri[200] = {0}; _acl->webBotJoinUri(uri, sizeof(uri));
+  char euri[300]; jsonEscape(uri, euri, sizeof(euri));
+
+  int n = snprintf(g_json, sizeof(g_json),
+      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,\"recips\":[",
+      name, pub, euri, _acl->webBotRecipMax());
+  int cnt = _acl->webBotRecipCount();
+  char rk[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < cnt; i++) {
+    if ((size_t)n > sizeof(g_json) - 90) break;
+    int lvl = 1;
+    if (!_acl->webBotRecipGet(i, rk, sizeof(rk), &lvl)) continue;
+    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"k\":\"%s\",\"l\":%d}",
+                  i == 0 ? "" : ",", rk, lvl);
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /bot/recipient -- toevoegen (key=64hex) of verwijderen (del=prefix>=12hex). */
+void WebTask::handleBotRecip() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+
+  char del[PUB_KEY_SIZE * 2 + 1];
+  if (getArg(*_server, "del", del, sizeof(del)) && del[0]) {
+    int r = _acl->webBotRecipDel(del);
+    if (r == 1) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+    _server->send(400, "application/json",
+        r == -3 ? "{\"ok\":false,\"error\":\"prefix past op meerdere\"}"
+                : "{\"ok\":false,\"error\":\"niet gevonden of ongeldige prefix\"}");
+    return;
+  }
+  char key[PUB_KEY_SIZE * 2 + 1];
+  if (!getArg(*_server, "key", key, sizeof(key)) || key[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"key ontbreekt\"}");
+    return;
+  }
+  int r = _acl->webBotRecipSet(key, 1);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  _server->send(400, "application/json",
+      r == -3 ? "{\"ok\":false,\"error\":\"ontvangerslijst vol\"}"
+              : "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
+}
+
+/* POST /bot/advert  (flood=0/1). */
+void WebTask::handleBotAdvert() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+  char fl[4]; bool flood = getArg(*_server, "flood", fl, sizeof(fl)) && fl[0] == '1';
+  if (!_acl->webBotAdvert(flood)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bot niet actief\"}");
+    return;
+  }
+  char msg[64]; snprintf(msg, sizeof(msg), "{\"ok\":true,\"flood\":%d}", flood ? 1 : 0);
+  _server->send(200, "application/json", msg);
+}
+
+/* POST /bot/sendto  (key=64hex, msg) -- ad-hoc schone DM (flash-melding). */
+void WebTask::handleBotSendto() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+  char key[PUB_KEY_SIZE * 2 + 1];
+  if (!getArg(*_server, "key", key, sizeof(key)) || strlen(key) != PUB_KEY_SIZE * 2) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
+    return;
+  }
+  char msg[200];
+  if (!getArg(*_server, "msg", msg, sizeof(msg)) || msg[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bericht ontbreekt\"}");
+    return;
+  }
+  int r = _acl->webBotSendTo(key, msg);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  _server->send(400, "application/json", "{\"ok\":false,\"error\":\"versturen mislukt\"}");
+}
+
+/* POST /bot/post  (msg) -- DM de hele ontvangerslijst. */
+void WebTask::handleBotPost() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+  char msg[200];
+  if (!getArg(*_server, "msg", msg, sizeof(msg)) || msg[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bericht ontbreekt\"}");
+    return;
+  }
+  int r = _acl->webBotPost(msg);
+  if (r >= 0) {
+    char out[64]; snprintf(out, sizeof(out), "{\"ok\":true,\"sent\":%d}", r);
+    _server->send(200, "application/json", out);
+    return;
+  }
+  _server->send(400, "application/json", "{\"ok\":false,\"error\":\"wachtrij vol of geen ontvangers\"}");
 }
 
 /* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.

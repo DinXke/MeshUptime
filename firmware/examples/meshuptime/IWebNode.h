@@ -130,4 +130,30 @@ public:
    * (multi-hop) i.p.v. zero-hop lokaal. */
   virtual bool webRoomAdvert(int idx, bool flood)  { (void)idx; (void)flood; return false; }
   virtual bool webSNodeAdvert(int idx, bool flood) { (void)idx; (void)flood; return false; }
+
+  /* ---- BOT: virtuele CHAT/notifier-identiteit + DM-ontvangerslijst ----------
+   * Eén CHAT-contact (ADV_TYPE_CHAT / type=1) dat SCHONE DM's stuurt: voor
+   * flash-meldingen en voor de per-sensor dm/both-alerts. Zo tonen die DM's als
+   * een gewoon chatcontact in de MeshCore-app i.p.v. rommelig vanaf een room.
+   * Alleen de room-server (RoomMesh) implementeert dit; SensorMesh laat de
+   * standaarden staan (webBotActive()==false). De pubkey is publiek; de
+   * ontvangerslijst bevat ALLEEN publieke sleutels (nooit een geheim). */
+  virtual bool webBotActive()               { return false; }
+  virtual const char* webBotName()          { return ""; }
+  virtual bool webBotPubHex(char* out, size_t out_len)  { (void)out; (void)out_len; return false; }
+  virtual bool webBotJoinUri(char* out, size_t out_len) { (void)out; (void)out_len; return false; }
+  virtual int  webBotRecipMax()             { return 0; }
+  virtual int  webBotRecipCount()           { return 0; }
+  virtual bool webBotRecipGet(int i, char* pub64, size_t out_len, int* level)
+                                            { (void)i; (void)pub64; (void)out_len; (void)level; return false; }
+  /* Toevoegen/wijzigen: VOLLEDIGE pubkey (64 hex) vereist -- het gedeelde geheim
+   * wordt eruit berekend. Retour 0 ok, <0 fout. */
+  virtual int  webBotRecipSet(const char* pub_hex, int level) { (void)pub_hex; (void)level; return -1; }
+  /* Verwijderen: prefix >= 12 hex. Retour 1 ok, <0 fout. */
+  virtual int  webBotRecipDel(const char* prefix_hex)  { (void)prefix_hex; return -1; }
+  virtual bool webBotAdvert(bool flood)     { (void)flood; return false; }
+  /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Retour 0 ok. */
+  virtual int  webBotSendTo(const char* pub_hex, const char* text) { (void)pub_hex; (void)text; return -1; }
+  /* DM de HELE ontvangerslijst. Retour = aantal ontvangers aangeschreven, <0 fout. */
+  virtual int  webBotPost(const char* text) { (void)text; return -1; }
 };

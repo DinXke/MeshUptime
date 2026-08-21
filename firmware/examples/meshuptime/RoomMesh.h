@@ -135,6 +135,16 @@
   #define MAX_ACL_GRANTS  16
 #endif
 
+/* DM-ONTVANGERS VAN DE BOT (zie de bot-uitleg in RoomMesh.cpp). Een persistente
+ * set volledige pubkeys; de bot DM't hen bij flash-meldingen en bij de per-sensor
+ * dm/both-alerts. 16 ingangen, elk 33 byte. */
+#ifndef MAX_BOT_RECIPS
+  #define MAX_BOT_RECIPS  16
+#endif
+#ifndef BOT_NAME_DEFAULT
+  #define BOT_NAME_DEFAULT   "BE-HSS-DinX-Bot"
+#endif
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -227,14 +237,23 @@ struct AclGrant {
 struct AlertTask {
   uint32_t timestamp;
   bool     high_pri;
+  bool     from_bot;           // true = DM vanaf de bot naar de ontvangerslijst
   uint32_t expected_acks[4];
   int8_t   curr_contact_idx;
   uint8_t  attempt;
   unsigned long send_expiry;
   char     text[MAX_PACKET_PAYLOAD];
 
-  AlertTask() { text[0] = 0; }
+  AlertTask() { text[0] = 0; from_bot = false; }
   bool isTriggered() const { return text[0] != 0; }
+};
+
+/* Eén DM-ontvanger van de bot: de VOLLEDIGE pubkey (nodig voor het ECDH-geheim).
+ * level is gereserveerd (nu altijd 1 = "krijgt alle meldingen"); apart gehouden
+ * zodat later filtering per ontvanger kan zonder het opslagformaat te breken. */
+struct BotRecip {
+  uint8_t pub_key[PUB_KEY_SIZE];
+  uint8_t level;               // 0 = vrije ingang; >=1 = actief
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
@@ -344,6 +363,32 @@ public:
     sendSensorNodeAdvertisement(snodes[idx], 0, flood); return true;
   }
 
+  /* ---- IWebNode: bot (CHAT/notifier-identiteit + DM-ontvangerslijst) ---- */
+  bool        webBotActive() override { return _bot_active; }
+  const char* webBotName() override   { return _bot_name; }
+  bool        webBotPubHex(char* out, size_t out_len) override;
+  bool        webBotJoinUri(char* out, size_t out_len) override;
+  int         webBotRecipMax() override   { return MAX_BOT_RECIPS; }
+  int         webBotRecipCount() override { return botRecipCount(); }
+  bool        webBotRecipGet(int i, char* pub64, size_t out_len, int* level) override;
+  int         webBotRecipSet(const char* pub_hex, int level) override;
+  int         webBotRecipDel(const char* prefix_hex) override;
+  bool        webBotAdvert(bool flood) override {
+    if (!_bot_active) return false;
+    sendBotAdvertisement(0, flood); return true;
+  }
+  int         webBotSendTo(const char* pub_hex, const char* text) override;
+  int         webBotPost(const char* text) override { return botPost(text); }
+
+  /* ---- Bot: publieke API (CLI + intern) ---- */
+  bool botActive() const { return _bot_active; }
+  int  botRecipCount() const;
+  bool botRecipGetByIdx(int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
+  int  botRecipAdd(const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
+  int  botRecipDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet gevonden, -3 dubbelzinnig
+  int  botSendTo(const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
+  int  botPost(const char* text);                              // aantal aangeschreven, <0 fout
+
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
    * informatief (alleen de `ver`-CLI leest dit); het protocol-versieveld is het
@@ -430,6 +475,16 @@ private:
   /* Persistente per-sleutel toegangsgrants (wachtwoordloos). Zie MAX_ACL_GRANTS. */
   AclGrant      _grants[MAX_ACL_GRANTS];
 
+  /* ---- BOT: virtuele CHAT/notifier-identiteit ----
+   * Eén CHAT-contact met eigen persistent sleutelpaar (/bot_id). Stuurt schone
+   * DM's naar de ontvangerslijst (_bot_recips). Adverteert als ADV_TYPE_CHAT op de
+   * gewone advert-timers, zichtbaar in de MeshCore-app als gewoon chatcontact. */
+  mesh::LocalIdentity _bot_id;
+  bool          _bot_active;
+  char          _bot_name[24];
+  unsigned long _bot_next_local_advert, _bot_next_flood_advert;
+  BotRecip      _bot_recips[MAX_BOT_RECIPS];
+
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
   RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
@@ -487,6 +542,18 @@ private:
 
   /* ---- DM-alarmpad ---- */
   void          sendAlertDM(const ClientInfo* c, AlertTask* t);
+  /* Schone DM vanaf de bot naar een losse pubkey (niet in een ACL): berekent het
+   * gedeelde geheim zelf. Deelt de AlertTask-ACK-boekhouding met sendAlertDM. */
+  void          sendBotAlertDM(const uint8_t* pubkey, AlertTask* t);
+
+  /* ---- bot: identiteit, advert, ontvangerslijst ---- */
+  void          loadOrCreateBotIdentity();
+  void          saveBotRecips();
+  void          loadBotRecips();
+  mesh::Packet* createBotAdvert();
+  void          sendBotAdvertisement(int delay_millis, bool flood);
+  int           botRecipFindFree() const;
+  void          handleBotCommand(char* args, char* reply);
 
   /* ---- adverts + telemetrie voor sensor-nodes ---- */
   mesh::Packet* createSensorNodeAdvert(RoomSlot& slot);
