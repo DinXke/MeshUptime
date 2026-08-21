@@ -5,6 +5,7 @@
 
 #include "TimeSeriesData.h"
 #include "NeighbourList.h"
+#include "IWebNode.h"
 
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
 #include <InternalFileSystem.h>
@@ -47,8 +48,16 @@
 #define MAX_SEARCH_RESULTS      8
 #define MAX_CONCURRENT_ALERTS   4
 
-class SensorMesh : public mesh::Mesh, public CommonCLICallbacks {
+class SensorMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
 public:
+  /* ---- IWebNode: de brug naar WebTask. De meeste methoden bestaan al hieronder
+   * (getNodePrefs, getAclStrict/..., getNeighbours, requestSensorReadNow); deze
+   * vier overbruggen namen die met de basisklasse zouden botsen. ---- */
+  void        handleCommandWeb(uint32_t ts, char* command, char* reply) override { handleCommand(ts, command, reply); }
+  const char* getRoleName() override { return getRole(); }
+  const uint8_t* getSelfPubKey() override { return self_id.pub_key; }
+  uint32_t    nowSecs() override { return getRTCClock()->getCurrentTime(); }
+
   SensorMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms, mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
   void begin(FILESYSTEM* fs);
   void loop();

@@ -3,6 +3,7 @@
 #include "MonitorSensors.h"
 #include "MonitorStore.h"
 #include "SensorMesh.h"
+#include "IWebNode.h"
 
 #include <WebServer.h>
 #include <WiFi.h>
@@ -3603,7 +3604,7 @@ void WebTask::handleAclJson() {
   const NeighbourList& nb = _acl->getNeighbours();
   /* De klok van de MESH en niet millis(): last_activity en heard_at staan in
    * RTC-seconden, en die twee mag je niet met elkaar verrekenen. */
-  const uint32_t now = _acl->getRTCClock()->getCurrentTime();
+  const uint32_t now = _acl->nowSecs();
 
   int n = snprintf(g_acl, sizeof(g_acl),
       "{\"strict\":%d,\"max\":%d,\"nbmax\":%d,\"acl\":[",
@@ -3982,7 +3983,7 @@ void WebTask::handleCfgJson() {
   fmtNum(bbw,   sizeof(bbw),   (double)LORA_BW,   3);
 
   char pubkey[PUB_KEY_SIZE*2 + 2];
-  mesh::Utils::toHex(pubkey, _acl->getSelfId().pub_key, PUB_KEY_SIZE);
+  mesh::Utils::toHex(pubkey, _acl->getSelfPubKey(), PUB_KEY_SIZE);
 
   /* HET KANAALBUDGET. g_ever_mask krijgt de kanalen die NU in gebruik zijn erbij:
    * die zijn per definitie vergeven, en zo valt het gat dicht tussen een net
@@ -4035,7 +4036,7 @@ void WebTask::handleCfgJson() {
       "\"mon_used\":%d,\"mon_max\":%u,\"ch_first\":%u,\"ch_last\":%u,"
       "\"ch_ever\":%d,\"ch_free\":%d,"
       "\"baked\":{\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u}}",
-      g_cfg_name, g_cfg_owner, pubkey, _acl->getRole(),
+      g_cfg_name, g_cfg_owner, pubkey, _acl->getRoleName(),
       freq, bw, (unsigned)p->sf, (unsigned)p->cr,
       (int)p->tx_power_dbm, af, (unsigned)p->agc_reset_interval * 4,
       p->rx_boosted_gain ? "on" : "off",
@@ -4357,7 +4358,7 @@ void WebTask::handleCli() {
    * betekenen dat het antwoord niet meer bij de opdracht hoort, en dat is op een
    * console erger dan een paar gemiste milliseconden. */
   g_reply[0] = 0;
-  _acl->handleCommand(0, cmd, g_reply);
+  _acl->handleCommandWeb(0, cmd, g_reply);
 
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "text/plain", g_reply);
@@ -4381,7 +4382,7 @@ void WebTask::runDeferred() {
   g_deferred[0] = 0;
 
   g_reply[0] = 0;
-  _acl->handleCommand(0, cmd, g_reply);
+  _acl->handleCommandWeb(0, cmd, g_reply);
 }
 
 /* POST /web/cred   user=<nieuw>&pass=<nieuw>   (form-urlencoded)

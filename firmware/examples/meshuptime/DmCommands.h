@@ -171,6 +171,15 @@ public:
   /* Uit de gewone loop(). Verstuurt HOOGSTENS EEN stuk per ronde. */
   void loop();
 
+  /* ROOM-VARIANT: bouw ALLEEN de antwoordtekst op voor een room-commando, zonder
+   * iets te versturen. Hergebruikt buildList/buildGet/buildStatus/buildHelp en de
+   * mon-commando's (add/edit/del/ping) via dezelfde DmDataSource. Geeft de lengte
+   * van de tekst in 'out' terug, of 0 als de regel geen herkend commando is (dan
+   * is het een gewone room-post en hoeft er niets terug). RoomMesh knipt 'out'
+   * daarna in room-posts. Verstuurt NIETS zelf -- de bezorging loopt via de
+   * room-post-synchronisatie, niet via het DM-ACK-pad. */
+  int  renderReply(const ClientInfo& from, const char* line, char* out, size_t out_len);
+
   bool isBusy() const { return _num_chunks > 0; }
 
   /* Optioneel: main.cpp kan getNodePrefs()->path_hash_mode + 1 doorgeven, zoals

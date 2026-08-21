@@ -62,7 +62,7 @@
  */
 class WifiTask;
 class MonitorSensors;
-class SensorMesh;
+class IWebNode;    // de node-interface (SensorMesh of RoomMesh); zie IWebNode.h
 class WebServer;   // vooruit verklaard: WebServer.h hoort niet in deze header
 
 class WebTask {
@@ -93,7 +93,7 @@ public:
    * deze setter is alleen ouder dan zijn taak. Hem omdopen zou main.cpp raken en
    * dat is de moeite van een naam niet waard -- vandaar deze noot in plaats van
    * een tweede setter die hetzelfde veld zet. */
-  void setAcl(SensorMesh* mesh) { _acl = mesh; }
+  void setAcl(IWebNode* mesh) { _acl = mesh; }
 
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
   void loop();
@@ -103,7 +103,7 @@ public:
 private:
   WifiTask*       _wifi = nullptr;
   MonitorSensors* _mon = nullptr;
-  SensorMesh*     _acl = nullptr;
+  IWebNode*       _acl = nullptr;
   WebServer*      _server = nullptr;
   const char*     _fw = "";
   bool            _serving = false;

@@ -476,6 +476,58 @@ void DmCommands::loop() {
   sendChunk();
 }
 
+/* ============================== ROOM-ANTWOORD ============================== */
+
+int DmCommands::renderReply(const ClientInfo& from, const char* line, char* out, size_t out_len) {
+  (void)from;
+  if (_data == NULL || line == NULL || out == NULL || out_len == 0) return 0;
+
+  char cmd[64];
+  const size_t n = (strlen(line) < sizeof(cmd) - 1) ? strlen(line) : sizeof(cmd) - 1;
+  memcpy(cmd, line, n);
+  cmd[n] = 0;
+
+  char* p = cmd;
+  while (*p == ' ' || *p == '\t') p++;
+  char* e = p + strlen(p);
+  while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
+  if (*p == 0) return 0;
+
+  /* Werkbuffer leegmaken; in de room-variant stuurt DmCommands niets, dus _text
+   * is hier vrij te gebruiken als opbouwbuffer. */
+  _text[0] = 0;
+  _tail[0] = 0;
+  _gen_omitted = 0;
+
+  if (strcasecmp(p, "list") == 0) {
+    buildList();
+  } else if (strcasecmp(p, "status") == 0) {
+    buildStatus();
+  } else if (strcasecmp(p, "help") == 0 || strcmp(p, "?") == 0) {
+    buildHelp();
+    const char* extra = _data->dmHelpExtra();
+    if (extra != nullptr && *extra) appendText(extra);
+  } else if (strncasecmp(p, "get", 3) == 0 && (p[3] == ' ' || p[3] == 0)) {
+    char* arg = p + 3;
+    while (*arg == ' ') arg++;
+    if (*arg == 0) appendText("gebruik: get <naam>");
+    else buildGet(arg);
+  } else {
+    /* Sensorbeheer (add/edit/del/ping): de MonitorSensors-kant keurt en schrijft;
+     * hier alleen de antwoordtekst. */
+    const char* r = _data->dmMonCommand(p);
+    if (r != nullptr) {
+      strlcpy(out, r, out_len);
+      return (int)strlen(out);
+    }
+    /* Geen herkend commando: dit is een gewone room-post, geen vraag. */
+    return 0;
+  }
+
+  strlcpy(out, _text, out_len);
+  return (int)strlen(out);
+}
+
 /* ============================== BINNENKOMEND ============================== */
 
 bool DmCommands::handleDm(const ClientInfo& from, uint32_t timestamp, const uint8_t* text, size_t len) {
