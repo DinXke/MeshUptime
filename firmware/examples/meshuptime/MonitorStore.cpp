@@ -131,9 +131,15 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
 
   /* Alles gaat eerst naar een SCHADUWKOPIE. Zo blijft cfg ongemoeid als het
    * bestand halverwege ophoudt: de aanroeper krijgt dan zijn standaardwaarden
-   * en niet een halve monitorlijst. Kost 8 * 60 byte stapel, en dat is de
-   * enige plek in deze klasse waar dat gebeurt (begin(), eenmalig). */
-  MonitorCfg staged;
+   * en niet een halve monitorlijst.
+   *
+   * STATIC EN NIET OP DE STAPEL: sinds de SNMP-velden (snmp_oid[80] +
+   * snmp_community[24] per ingang x MON_MAX_MONITORS) is een MonitorCfg ~6 kB.
+   * Op de stapel liet dat de 8 kB loopTask-stack overlopen tijdens de SPIFFS-lees
+   * hier (stack-canary panic bij boot). load() draait eenmalig/coöperatief; de
+   * setDefaults() hieronder herinitialiseert bij elke aanroep, dus static is
+   * veilig. Kost ~6 kB .bss i.p.v. ~6 kB stapel. */
+  static MonitorCfg staged;
   setDefaults(staged);
 
   char line[MON_LINE_MAX];

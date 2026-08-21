@@ -19,6 +19,16 @@
   #include <WiFi.h>
 #endif
 
+/* VEILIGHEIDSMARGE OP DE loopTask-STACK. De Arduino-standaard is 8 kB; setup()
+ * en loop() draaien daarop. Grote features (SNMP-opbouw, JSON-bouwers, crypto,
+ * SPIFFS-lees) kunnen tijdelijk veel stapel vragen. De root-fix haalt de dikke
+ * MonitorCfg (~6 kB) en de SNMP-buffers van de stapel; deze 16 kB is de gordel
+ * bovenop de bretels. SET_LOOP_TASK_STACK_SIZE is de door de ESP32-core
+ * ondersteunde weg (build-flag pakt de voorgecompileerde core niet). */
+#if defined(ESP32)
+  SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 /* Uitgestelde herstart (room/DM-commando 'reboot'): niet meteen, zodat het
  * antwoord nog verstuurd kan worden. loop() voert hem uit. */
 static unsigned long g_reboot_at = 0;
@@ -554,5 +564,19 @@ void loop() {
   rtc_clock.tick();
 #ifdef HAS_EXTERNAL_WATCHDOG
   external_watchdog.loop();
+#endif
+
+#if defined(ESP32)
+  /* Stapel-waakhond: het LAAGSTE vrije stapelniveau van de loopTask sinds boot,
+   * eens per ~30 s. Zo wordt een krappe of teruglopende marge VROEG zichtbaar in
+   * plaats van pas bij een canary-panic. Waarde in bytes; blijft dit onder ~1500,
+   * dan is er een dikke stapelgebruiker vanuit loop() bijgekomen. */
+  static unsigned long next_stack_log = 0;
+  if ((long)(millis() - next_stack_log) >= 0) {
+    next_stack_log = millis() + 30000;
+    UBaseType_t hw = uxTaskGetStackHighWaterMark(NULL);   // woorden vrij (minimum)
+    MESH_DEBUG_PRINTLN("loopTask vrije stapel (min sinds boot): %u byte",
+                       (unsigned)(hw * sizeof(StackType_t)));
+  }
 #endif
 }

@@ -3469,17 +3469,18 @@ void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
    * File-object alloceert intern, en dat mag bij het opstarten en niet per
    * verzoek.
    *
-   * De MonitorCfg staat op de stapel en niet statisch. Hij is ongeveer 500 byte
-   * en hij leeft één functieaanroep; begin() wordt uit setup() geroepen en daar
-   * is die ruimte er. Hem statisch maken zou 500 byte RAM kosten voor een waarde
-   * waar één byte van gebruikt wordt.
+   * De MonitorCfg staat STATIC en niet op de stapel. Sinds de SNMP-velden
+   * (snmp_oid[80] + snmp_community[24] per ingang x MON_MAX_MONITORS) is een
+   * MonitorCfg ~6 kB; op de stapel liet dat samen met MonitorStore::load de 8 kB
+   * loopTask-stack overlopen bij boot. begin() draait eenmalig uit setup();
+   * setDefaults() herinitialiseert, dus static is veilig. ~6 kB .bss.
    *
    * Mislukt het lezen, dan blijft het masker 0 en vult cfg.json zich met wat er
    * nu in gebruik is. Dat is een ONDERschatting van wat vergeven is, en dat is de
    * goede kant om fout te zitten: de pagina belooft dan niet meer ruimte dan er
    * is. Zij zegt er ook bij waar het getal op berust. */
   {
-    MonitorCfg cfg;
+    static MonitorCfg cfg;
     MonitorStore::setDefaults(cfg);
     if (MonitorStore::load(SPIFFS, cfg)) g_ever_mask = cfg.ch_ever_used;
   }

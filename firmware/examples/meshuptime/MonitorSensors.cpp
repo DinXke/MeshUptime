@@ -277,25 +277,31 @@ static int snmp_encode_oid(const char* oid, uint8_t* out, int cap) {
   return o;
 }
 
-/* Bouw een SNMPv2c GET. Retour: pakketlengte, of -1. */
+/* Bouw een SNMPv2c GET. Retour: pakketlengte, of -1.
+ *
+ * DE OPBOUW-BUFFERS ZIJN STATIC EN NIET OP DE STAPEL. Samen zijn ze ~1,4 kB; op
+ * de stapel bliezen ze het frame van loopSnmp (die vanuit loop() draait) tot
+ * ~2,2 kB op. Er is altijd hoogstens EEN SNMP-GET tegelijk (coöperatief vanuit
+ * loop(), niet-reentrant), dus gedeelde static-scratch is veilig en houdt de
+ * loopTask-stack laag. */
 static int snmp_build_get(uint8_t* buf, int cap, const char* community, const char* oid, uint32_t reqid) {
-  uint8_t oidb[128];
+  static uint8_t oidb[128];
   int oidlen = snmp_encode_oid(oid, oidb, sizeof(oidb));
   if (oidlen < 0 || oidlen > 120) return -1;
   int comlen = (int)strlen(community);
   if (comlen > 100) return -1;
 
-  uint8_t vb[160]; int v = 0;
+  static uint8_t vb[160]; int v = 0;
   vb[v++] = 0x06; vb[v++] = (uint8_t)oidlen; memcpy(vb + v, oidb, oidlen); v += oidlen;
   vb[v++] = 0x05; vb[v++] = 0x00;                       // NULL-waarde
 
-  uint8_t vbseq[170]; int vs = 0;
+  static uint8_t vbseq[170]; int vs = 0;
   vbseq[vs++] = 0x30; vbseq[vs++] = (uint8_t)v; memcpy(vbseq + vs, vb, v); vs += v;
 
-  uint8_t vlist[180]; int vl = 0;
+  static uint8_t vlist[180]; int vl = 0;
   vlist[vl++] = 0x30; vlist[vl++] = (uint8_t)vs; memcpy(vlist + vl, vbseq, vs); vl += vs;
 
-  uint8_t pdu[220]; int pd = 0;
+  static uint8_t pdu[220]; int pd = 0;
   pdu[pd++] = 0x02; pdu[pd++] = 0x04;
   pdu[pd++] = (uint8_t)(reqid >> 24); pdu[pd++] = (uint8_t)(reqid >> 16);
   pdu[pd++] = (uint8_t)(reqid >> 8);  pdu[pd++] = (uint8_t)(reqid);
@@ -303,10 +309,10 @@ static int snmp_build_get(uint8_t* buf, int cap, const char* community, const ch
   pdu[pd++] = 0x02; pdu[pd++] = 0x01; pdu[pd++] = 0x00;  // error-index
   memcpy(pdu + pd, vlist, vl); pd += vl;
 
-  uint8_t pduw[230]; int pw = 0;
+  static uint8_t pduw[230]; int pw = 0;
   pduw[pw++] = 0xA0; pduw[pw++] = (uint8_t)pd; memcpy(pduw + pw, pdu, pd); pw += pd;
 
-  uint8_t body[320]; int b = 0;
+  static uint8_t body[320]; int b = 0;
   body[b++] = 0x02; body[b++] = 0x01; body[b++] = 0x01;  // version = 1 (v2c)
   body[b++] = 0x04; body[b++] = (uint8_t)comlen; memcpy(body + b, community, comlen); b += comlen;
   memcpy(body + b, pduw, pw); b += pw;
@@ -2646,7 +2652,7 @@ void MonitorSensors::loopSnmp() {
     if (!ip.fromString(_cfg.mons[pick].host)) {
       if (!WiFi.hostByName(_cfg.mons[pick].host, ip)) { applyResult(pick, false, 0); return; }
     }
-    uint8_t pkt[340];
+    static uint8_t pkt[340];   // static: uit de loopTask-stack, één GET tegelijk
     _snmp_reqid = (uint32_t)esp_random();
     const char* comm = _cfg.mons[pick].snmp_community[0] ? _cfg.mons[pick].snmp_community : "public";
     int len = snmp_build_get(pkt, sizeof(pkt), comm, _cfg.mons[pick].snmp_oid, _snmp_reqid);
@@ -2663,7 +2669,7 @@ void MonitorSensors::loopSnmp() {
   /* phase 1: op het antwoord wachten. */
   int psz = s_snmp_udp.parsePacket();
   if (psz > 0) {
-    uint8_t rb[512];
+    static uint8_t rb[512];   // static: uit de loopTask-stack, één antwoord tegelijk
     int n = s_snmp_udp.read(rb, sizeof(rb));
     int slot = _snmp_slot;
     int32_t num = 0; bool isnum = false; char sbuf[48];

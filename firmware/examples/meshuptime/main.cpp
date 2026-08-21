@@ -1,6 +1,13 @@
 #include "SensorMesh.h"
 #include "DmCommands.h"
 
+/* Veiligheidsmarge op de loopTask-stack (zie main_room.cpp). De gedeelde
+ * MonitorStore::load/WebTask::begin dragen de dikke MonitorCfg nu static i.p.v.
+ * op de stapel; deze 16 kB is de extra marge, ook voor de sensor-variant. */
+#if defined(ESP32)
+  SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+#endif
+
 #ifdef WIFI_SSID
   #include "WifiTask.h"
   #include "WebTask.h"
