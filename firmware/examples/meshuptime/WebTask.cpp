@@ -97,8 +97,8 @@
  * volgende stap dezelfde: de monitorlijst uit status.json halen en apart en
  * langzamer ophalen, met alleen de METINGEN op 5 s.
  */
-static char g_json[11264];
-#define JSON_TAIL  320      /* ruimte die altijd vrij blijft voor één regel + "]}" */
+static char g_json[14336];
+#define JSON_TAIL  400      /* ruimte die altijd vrij blijft voor één regel + "]}" */
 
 /* Dwingt de rekensom hierboven af bij het compileren in plaats van bij het eerste
  * stil afgekapte antwoord op een node in het veld -- net als de static_assert bij
@@ -106,9 +106,9 @@ static char g_json[11264];
  * mee. */
 /* 820 voor de kopblokken: vaste velden ~300 + budget ~200 + ad-hoc ~300 (de
  * ping-uitslagtekst) + sim/rec/rep/test ~320 -- ruim afgerond. */
-/* 250 (was 235) per monitor: sinds de room-variant draagt elke regel ook "am",
- * "rm" en "sn" (de sensor-node-set), ~15 byte extra. */
-static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 250 + 130 + JSON_TAIL
+/* 360 per monitor: bovenop "am"/"rm"/"sn" draagt een SNMP-monitor nu ook "knd",
+ * "itp" en de OID (tot 80 tekens) -- ~110 byte extra in het duurste geval. */
+static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 360 + 130 + JSON_TAIL
               <= sizeof(g_json),
               "g_json te klein voor MON_MAX_MONITORS -- zie de rekensom hierboven");
 
@@ -445,6 +445,7 @@ void web_route_roomacl()      { if (g_self) g_self->handleRoomAcl(); }
 void web_route_snodeacl()     { if (g_self) g_self->handleSNodeAcl(); }
 void web_route_roomadvert()   { if (g_self) g_self->handleRoomAdvert(); }
 void web_route_snodeadvert()  { if (g_self) g_self->handleSNodeAdvert(); }
+void web_route_monsnmp()      { if (g_self) g_self->handleMonSnmp(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -1118,6 +1119,37 @@ uit (minimaal 90&nbsp;s), dan wordt de toestand onbekend en gaat er een
 waarschuwing over het mesh. Een onbekende naam op <code>/hook</code> maakt de
 dienst zelf aan en antwoordt met het kanaal dat hij kreeg.</p>
 </form></div>
+
+<details><summary>SNMP-monitor toevoegen</summary><div>
+<form id="asnmp">
+<div class="row">
+<label>Naam<input name="name" maxlength="16" required placeholder="dak-repeater-in"></label>
+<label>Doel-IP<input name="host" maxlength="40" required placeholder="10.10.30.1"></label>
+<label>Interval (s)<input name="int" type="number" min="10" max="3600" value="60" required></label>
+</div>
+<div class="row">
+<label>Community<input name="community" maxlength="23" type="password"
+autocomplete="new-password" placeholder="public"></label>
+<label>OID<input name="oid" maxlength="79" required spellcheck="false"
+placeholder="1.3.6.1.2.1.2.2.1.10.2"></label>
+</div>
+<div class="row">
+<label>Interpretatie<select name="interp">
+<option value="numeric">numeric (gauge/integer)</option>
+<option value="rate">rate (counter -&gt; per seconde)</option>
+<option value="status">status (down als != waarde)</option></select></label>
+<label>Status-waarde<input name="snmparg" type="number" value="1" title="voor interp=status: de 'up'-waarde, bv 1"></label>
+</div>
+<button>SNMP-monitor toevoegen</button>
+<div id="smsg"></div>
+<p class="note">De node doet zelf een niet-blokkerende <b>SNMP-GET</b> (v2c) op
+UDP:161. De waarde stroomt als telemetrie over het mesh (zelfde kanaal/rooms/sensor-
+nodes als een gewone monitor); geen antwoord = down (alert). <b>numeric</b>: de
+waarde zelf (gauge/integer/timeticks). <b>rate</b>: het tempo van een counter
+(bv. bytes/s -&gt; verkeer). <b>status</b>: down zodra de waarde ongelijk is aan de
+status-waarde (bv. ifOperStatus, 1 = up). Het community-wachtwoord wordt
+geobfuskeerd opgeslagen en nooit teruggegeven.</p>
+</form></div></details>
 
 </section>
 <section id="p2" hidden>
@@ -2751,6 +2783,24 @@ post("monitor","name="+encodeURIComponent(f["name"].value)+
 "&host="+encodeURIComponent(f["host"].value)+
 "&int="+encodeURIComponent(f["int"].value))};
 
+/* SNMP-monitor toevoegen: eigen endpoint /monitor/snmp. */
+document.getElementById("asnmp").onsubmit=function(ev){ev.preventDefault();
+var f=ev.target.elements;
+var sm=document.getElementById("smsg");
+fetch("monitor/snmp",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(f["name"].value)+
+"&host="+encodeURIComponent(f["host"].value)+
+"&int="+encodeURIComponent(f["int"].value)+
+"&community="+encodeURIComponent(f["community"].value)+
+"&oid="+encodeURIComponent(f["oid"].value)+
+"&interp="+encodeURIComponent(f["interp"].value)+
+"&snmparg="+encodeURIComponent(f["snmparg"].value)})
+.then(function(r){return r.text().then(function(t){
+sm.className=r.ok?"ok":"bad";sm.textContent=t.trim();
+if(r.ok){f["name"].value="";f["oid"].value="";f["community"].value="";u2();cfg()}})})
+.catch(function(){sm.className="bad";sm.textContent="verbindingsfout"})};
+
 /* ---- de twee knoppen van het simulatiedeel ----
  *
  * Het TESTBERICHT vraagt eerst. Niet omdat het gevaarlijk is, maar omdat het
@@ -3336,6 +3386,8 @@ void WebTask::routes() {
   /* Handmatig advert (flood/zero-hop) per room/snode. */
   _server->on("/room/advert", HTTP_POST, web_route_roomadvert);
   _server->on("/snode/advert", HTTP_POST, web_route_snodeadvert);
+  /* SNMP-monitor aanmaken. POST-only, net als /monitor. */
+  _server->on("/monitor/snmp", HTTP_POST, web_route_monsnmp);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -3708,7 +3760,7 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           ",{\"ch\":%u,\"n\":\"%s\",\"h\":\"%s\",\"i\":%u,\"st\":\"%s\","
           "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\","
           "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d,"
-          "\"am\":%u,\"rm\":%u,\"sn\":%u}",
+          "\"am\":%u,\"rm\":%u,\"sn\":%u,\"knd\":%u,\"itp\":%u,\"oid\":\"%s\"}",
           (unsigned)_mon->monitorChannel(i),
           _mon->monitorName(i),
           push ? "(gemeld)" : _mon->monitorHost(i),
@@ -3735,7 +3787,12 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
            * als telemetrie tonen). Alleen betekenisvol in de room-variant. */
           (unsigned)_mon->monitorAlertMode(i),
           (unsigned)_mon->monitorRoomsMask(i),
-          (unsigned)_mon->monitorSensorNodesMask(i));
+          (unsigned)_mon->monitorSensorNodesMask(i),
+          /* knd = soort (0 host, 1 snmp), itp = SNMP-interpretatie, oid = de OID
+           * (het community wordt NOOIT geexposeerd). */
+          (unsigned)_mon->monitorKind(i),
+          (unsigned)_mon->monitorSnmpInterp(i),
+          _mon->monitorSnmpOid(i));
     }
   }
 
@@ -3899,6 +3956,54 @@ void WebTask::handleMonAdd() {
 
   char msg[80];
   snprintf(msg, sizeof(msg), "ok %s -> kanaal %u\n", name, (unsigned)ch);
+  _server->send(200, "text/plain", msg);
+}
+
+/* POST /monitor/snmp  (name, host, int, community, oid, interp, snmparg)
+ * Maakt een SNMP-monitor: eerst een gewone monitor (naam/host/interval), daarna de
+ * SNMP-velden via de bestaande setSettingValue-weg. Host = doel-IP (of naam). */
+void WebTask::handleMonSnmp() {
+  if (!requireAuth()) return;
+  if (_mon == nullptr) { _server->send(503, "text/plain", "sensorlaag niet gekoppeld"); return; }
+
+  char name[MON_NAME_LEN + 4], host[MON_HOST_LEN + 4], comm[24], oid[80], interp[12], sarg[16];
+  getArg(*_server, "name", name, sizeof(name));
+  getArg(*_server, "host", host, sizeof(host));
+  getArg(*_server, "community", comm, sizeof(comm));
+  getArg(*_server, "oid", oid, sizeof(oid));
+  getArg(*_server, "interp", interp, sizeof(interp));
+  getArg(*_server, "snmparg", sarg, sizeof(sarg));
+  unsigned long ivl = 0;
+  if (!getUInt(*_server, "int", MON_INTERVAL_MIN, MON_INTERVAL_MAX, MON_INTERVAL_DEFAULT, &ivl)) {
+    _server->send(400, "text/plain", MonitorSensors::monResultText(MonitorSensors::MON_ERR_INTERVAL));
+    return;
+  }
+  if (!name[0] || !host[0] || !oid[0]) {
+    _server->send(400, "text/plain", "naam, host/ip en oid zijn verplicht\n");
+    return;
+  }
+
+  uint8_t ch = 0;
+  MonitorSensors::MonResult r = _mon->createMonitor(name, host, (uint16_t)ivl, &ch);
+  if (r != MonitorSensors::MON_OK) {
+    _server->send(httpCodeFor(r), "text/plain", MonitorSensors::monResultText(r));
+    return;
+  }
+  char key[24];
+  snprintf(key, sizeof(key), "mon.%u.type", (unsigned)ch); _mon->setSettingValue(key, "snmp");
+  snprintf(key, sizeof(key), "mon.%u.oid", (unsigned)ch);
+  if (!_mon->setSettingValue(key, oid)) {
+    /* Ongeldige OID -> de monitor is al gemaakt; laat 'm als host staan, meld het. */
+    snprintf(key, sizeof(key), "mon.%u.type", (unsigned)ch); _mon->setSettingValue(key, "host");
+    _server->send(400, "text/plain", "ongeldige OID (alleen cijfers en punten)\n");
+    return;
+  }
+  if (comm[0])   { snprintf(key, sizeof(key), "mon.%u.community", (unsigned)ch); _mon->setSettingValue(key, comm); }
+  if (interp[0]) { snprintf(key, sizeof(key), "mon.%u.interp", (unsigned)ch);    _mon->setSettingValue(key, interp); }
+  if (sarg[0])   { snprintf(key, sizeof(key), "mon.%u.snmparg", (unsigned)ch);   _mon->setSettingValue(key, sarg); }
+
+  char msg[80];
+  snprintf(msg, sizeof(msg), "ok snmp %s -> kanaal %u\n", name, (unsigned)ch);
   _server->send(200, "text/plain", msg);
 }
 

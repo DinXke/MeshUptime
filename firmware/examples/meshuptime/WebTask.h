@@ -261,6 +261,10 @@ private:
   void handleRoomAdvert();
   void handleSNodeAdvert();
 
+  /* SNMP-monitor aanmaken (POST /monitor/snmp): name, host/ip, int, community, oid,
+   * interp, snmparg. Maakt de monitor + zet de SNMP-velden via de bestaande weg. */
+  void handleMonSnmp();
+
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
    * Loopt via de bestaande CLI ('sensor set mon.<ch>.alert/rooms') zodat er geen
@@ -306,6 +310,7 @@ private:
   friend void web_route_snodeacl();
   friend void web_route_roomadvert();
   friend void web_route_snodeadvert();
+  friend void web_route_monsnmp();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

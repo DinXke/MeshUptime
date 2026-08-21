@@ -27,6 +27,7 @@
 #include "lwip/tcp.h"
 #if defined(ESP32)
   #include <WiFi.h>
+  #include <WiFiUdp.h>
 #endif
 
 /* Grenzen waarbinnen een drempel nog ergens op lijkt. Ruim genomen: dit is
@@ -213,6 +214,132 @@ static void net_do_abort(void* ctx) {
   if (s_net.pcb) { tcp_abort(s_net.pcb); s_net.pcb = NULL; }
 }
 
+/* ==================== SNMP-monitor: BER/ASN.1-codec over UDP:161 ====================
+ *
+ * Een compacte, zelfstandige SNMPv2c-GET (geen externe lib). Niet-blokkerend via
+ * WiFiUDP: het verzoek gaat weg met beginPacket/write/endPacket, het antwoord wordt
+ * in loopSnmp() met parsePacket() gepolld. Alle lengtes van ONZE inhoud passen in de
+ * korte BER-vorm (<128); we weigeren netjes als een OID te lang zou worden. */
+#if defined(ESP32)
+static WiFiUDP s_snmp_udp;
+static bool    s_snmp_udp_open = false;
+
+/* dotted OID -> BER-inhoud (zonder tag/len). Retour: lengte, of -1. */
+static int snmp_encode_oid(const char* oid, uint8_t* out, int cap) {
+  uint32_t arcs[48]; int na = 0;
+  const char* p = oid;
+  while (*p && na < 48) {
+    while (*p == '.') p++;
+    if (!*p) break;
+    uint32_t v = 0; bool any = false;
+    while (*p >= '0' && *p <= '9') { v = v * 10 + (uint32_t)(*p - '0'); p++; any = true; }
+    if (!any) return -1;
+    arcs[na++] = v;
+  }
+  if (na < 2) return -1;
+  int o = 0;
+  if (o >= cap) return -1;
+  out[o++] = (uint8_t)(arcs[0] * 40 + arcs[1]);
+  for (int i = 2; i < na; i++) {
+    uint32_t v = arcs[i];
+    uint8_t tmp[5]; int nt = 0;
+    do { tmp[nt++] = (uint8_t)(v & 0x7F); v >>= 7; } while (v);
+    for (int j = nt - 1; j >= 0; j--) {
+      if (o >= cap) return -1;
+      out[o++] = (uint8_t)(tmp[j] | (j ? 0x80 : 0x00));
+    }
+  }
+  return o;
+}
+
+/* Bouw een SNMPv2c GET. Retour: pakketlengte, of -1. */
+static int snmp_build_get(uint8_t* buf, int cap, const char* community, const char* oid, uint32_t reqid) {
+  uint8_t oidb[128];
+  int oidlen = snmp_encode_oid(oid, oidb, sizeof(oidb));
+  if (oidlen < 0 || oidlen > 120) return -1;
+  int comlen = (int)strlen(community);
+  if (comlen > 100) return -1;
+
+  uint8_t vb[160]; int v = 0;
+  vb[v++] = 0x06; vb[v++] = (uint8_t)oidlen; memcpy(vb + v, oidb, oidlen); v += oidlen;
+  vb[v++] = 0x05; vb[v++] = 0x00;                       // NULL-waarde
+
+  uint8_t vbseq[170]; int vs = 0;
+  vbseq[vs++] = 0x30; vbseq[vs++] = (uint8_t)v; memcpy(vbseq + vs, vb, v); vs += v;
+
+  uint8_t vlist[180]; int vl = 0;
+  vlist[vl++] = 0x30; vlist[vl++] = (uint8_t)vs; memcpy(vlist + vl, vbseq, vs); vl += vs;
+
+  uint8_t pdu[220]; int pd = 0;
+  pdu[pd++] = 0x02; pdu[pd++] = 0x04;
+  pdu[pd++] = (uint8_t)(reqid >> 24); pdu[pd++] = (uint8_t)(reqid >> 16);
+  pdu[pd++] = (uint8_t)(reqid >> 8);  pdu[pd++] = (uint8_t)(reqid);
+  pdu[pd++] = 0x02; pdu[pd++] = 0x01; pdu[pd++] = 0x00;  // error-status
+  pdu[pd++] = 0x02; pdu[pd++] = 0x01; pdu[pd++] = 0x00;  // error-index
+  memcpy(pdu + pd, vlist, vl); pd += vl;
+
+  uint8_t pduw[230]; int pw = 0;
+  pduw[pw++] = 0xA0; pduw[pw++] = (uint8_t)pd; memcpy(pduw + pw, pdu, pd); pw += pd;
+
+  uint8_t body[320]; int b = 0;
+  body[b++] = 0x02; body[b++] = 0x01; body[b++] = 0x01;  // version = 1 (v2c)
+  body[b++] = 0x04; body[b++] = (uint8_t)comlen; memcpy(body + b, community, comlen); b += comlen;
+  memcpy(body + b, pduw, pw); b += pw;
+
+  if (v > 127 || vs > 127 || vl > 127 || pd > 127 || pw > 127 || b > 127) return -1;
+  int total = 0;
+  if (2 + b > cap) return -1;
+  buf[total++] = 0x30; buf[total++] = (uint8_t)b; memcpy(buf + total, body, b); total += b;
+  return total;
+}
+
+/* Lees één BER-TLV. Retour: pointer naar de waarde, zet *tag/*vlen; NULL bij fout. */
+static const uint8_t* ber_tlv(const uint8_t* p, const uint8_t* end, uint8_t* tag, uint32_t* vlen) {
+  if (p + 2 > end) return NULL;
+  *tag = p[0];
+  uint32_t len = p[1]; const uint8_t* v = p + 2;
+  if (len & 0x80) {
+    int nb = len & 0x7F;
+    if (nb > 4 || v + nb > end) return NULL;
+    len = 0;
+    for (int i = 0; i < nb; i++) len = (len << 8) | v[i];
+    v += nb;
+  }
+  if (v + len > end) return NULL;
+  *vlen = len;
+  return v;
+}
+
+/* Haal de waarde van de (eerste) varbind uit een SNMP-antwoord. */
+static bool snmp_extract(const uint8_t* pkt, int plen, int32_t* out_num, bool* is_num, char* out_str, int str_cap) {
+  const uint8_t* end = pkt + plen;
+  uint8_t tag; uint32_t l;
+  const uint8_t* v = ber_tlv(pkt, end, &tag, &l);              // outer SEQUENCE
+  if (!v || tag != 0x30) return false;
+  const uint8_t* q = v; const uint8_t* qend = v + l;
+  v = ber_tlv(q, qend, &tag, &l); if (!v) return false; q = v + l;   // version
+  v = ber_tlv(q, qend, &tag, &l); if (!v) return false; q = v + l;   // community
+  v = ber_tlv(q, qend, &tag, &l); if (!v) return false;              // response-PDU
+  const uint8_t* pend = v + l; q = v;
+  for (int i = 0; i < 3; i++) { v = ber_tlv(q, pend, &tag, &l); if (!v) return false; q = v + l; }
+  v = ber_tlv(q, pend, &tag, &l); if (!v || tag != 0x30) return false;   // varbind-list
+  const uint8_t* lend = v + l; q = v;
+  v = ber_tlv(q, lend, &tag, &l); if (!v || tag != 0x30) return false;   // varbind
+  const uint8_t* vbend = v + l; q = v;
+  v = ber_tlv(q, vbend, &tag, &l); if (!v) return false; q = v + l;      // OID (skip)
+  v = ber_tlv(q, vbend, &tag, &l); if (!v) return false;                 // value
+  if (tag == 0x02 || tag == 0x41 || tag == 0x42 || tag == 0x43 || tag == 0x46) {
+    uint64_t val = 0; for (uint32_t i = 0; i < l && i < 8; i++) val = (val << 8) | v[i];
+    *out_num = (int32_t)val; *is_num = true; return true;
+  }
+  if (tag == 0x04) {
+    uint32_t c = l < (uint32_t)(str_cap - 1) ? l : (uint32_t)(str_cap - 1);
+    memcpy(out_str, v, c); out_str[c] = 0; *is_num = false; return true;
+  }
+  return false;   // NULL / noSuchObject / noSuchInstance / endOfMibView
+}
+#endif  // ESP32
+
 bool MonitorSensors::begin() {
   bool ok = EnvironmentSensorManager::begin();
 
@@ -283,6 +410,7 @@ void MonitorSensors::loop() {
 
   loopMonitors();
   loopNetDiag();   // async port/http/scan/traceroute; coöperatief, niet-blokkerend
+  loopSnmp();      // SNMP-monitors: niet-blokkerende GET (WiFiUDP), één tegelijk
 
   /* OP EEN TIK VAN 250 ms EN NIET ELKE RONDE.
    *
@@ -659,6 +787,8 @@ void MonitorSensors::startNextPing() {
      * mislukking geteld worden -- twee bronnen voor één toestand, en de
      * verkeerde zou winnen. */
     if (monitorIsPush(i)) continue;
+    /* SNMP-monitors worden NIET gepingd; die pollt loopSnmp() apart via UDP:161. */
+    if (_cfg.mons[i].kind == MON_KIND_SNMP) continue;
     long overdue = (long)(now - _mon[i].next_check);
     if (overdue >= 0 && overdue > best_overdue) {
       best = i;
@@ -851,6 +981,10 @@ uint16_t    MonitorSensors::monitorInterval(int slot) const  { return monitorUse
 uint8_t     MonitorSensors::monitorAlertMode(int slot) const { uint8_t m = monitorUsed(slot) ? _cfg.mons[slot].alert_mode : 0; return m ? m : MON_ALERT_DEFAULT; }
 uint16_t    MonitorSensors::monitorRoomsMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].rooms_mask : MON_ROOMS_DEFAULT; }
 uint16_t    MonitorSensors::monitorSensorNodesMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].sensornodes : MON_SNODES_DEFAULT; }
+uint8_t     MonitorSensors::monitorKind(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].kind : MON_KIND_HOST; }
+const char* MonitorSensors::monitorSnmpOid(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].snmp_oid : ""; }
+uint8_t     MonitorSensors::monitorSnmpInterp(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].snmp_interp : MON_SNMP_NUMERIC; }
+int32_t     MonitorSensors::monitorSnmpArg(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].snmp_arg : 0; }
 
 /* Alarm-bezorging van de vaste bronnen (MON_FA_*). */
 uint8_t     MonitorSensors::fixedAlertMode(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_ALERT_DEFAULT; uint8_t m = _cfg.fixed_alert_mode[idx]; return m ? m : MON_ALERT_DEFAULT; }
@@ -1901,6 +2035,11 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       if (strcmp(k, "rooms") == 0) field = "rooms";
       else if (strcmp(k, "snodes") == 0) field = "snodes";
       else if (strcmp(k, "alert") == 0 || strcmp(k, "mode") == 0) field = "alert";
+      else if (strcmp(k, "type") == 0) field = "type";
+      else if (strcmp(k, "community") == 0) field = "community";
+      else if (strcmp(k, "oid") == 0) field = "oid";
+      else if (strcmp(k, "interp") == 0) field = "interp";
+      else if (strcmp(k, "snmparg") == 0) field = "snmparg";
       if (field) {
         char setting[24];
         snprintf(setting, sizeof(setting), "mon.%u.%s", (unsigned)ch, field);
@@ -1974,6 +2113,11 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       else if (strcmp(key, "mode")  == 0) field = "alert";   // alias van 'alert'
       else if (strcmp(key, "rooms") == 0) field = "rooms";    // "0,1"
       else if (strcmp(key, "snodes") == 0) field = "snodes";  // "0,1" (sensor-nodes)
+      else if (strcmp(key, "type") == 0) field = "type";      // snmp | host
+      else if (strcmp(key, "community") == 0) field = "community";
+      else if (strcmp(key, "oid") == 0) field = "oid";
+      else if (strcmp(key, "interp") == 0) field = "interp";  // numeric|rate|status
+      else if (strcmp(key, "snmparg") == 0) field = "snmparg";
       if (field == NULL) { failed++; StrHelper::strncpy(last_bad, key, sizeof(last_bad)); continue; }
 
       char setting[24];
@@ -2385,6 +2529,90 @@ void MonitorSensors::loopNetDiag() {
       return;
     }
   }
+}
+
+/* ---- SNMP-poller: één GET tegelijk, round-robin over de due SNMP-monitors ---- */
+void MonitorSensors::loopSnmp() {
+#if defined(ESP32)
+  if (!wifiReallyOnline()) return;
+  unsigned long now = millis();
+
+  if (_snmp_phase == 0) {
+    int pick = -1;
+    for (int i = 0; i < MAX_MONITORS; i++) {
+      if (!monitorUsed(i) || _cfg.mons[i].kind != MON_KIND_SNMP) continue;
+      if ((long)(now - _mon[i].next_check) >= 0) { pick = i; break; }
+    }
+    if (pick < 0) return;
+
+    /* reschedule NU (of het lukt of niet: één poging per interval). */
+    _mon[pick].next_check = now + (unsigned long)_cfg.mons[pick].interval_s * 1000UL;
+
+    IPAddress ip;
+    if (!ip.fromString(_cfg.mons[pick].host)) {
+      if (!WiFi.hostByName(_cfg.mons[pick].host, ip)) { applyResult(pick, false, 0); return; }
+    }
+    uint8_t pkt[340];
+    _snmp_reqid = (uint32_t)esp_random();
+    const char* comm = _cfg.mons[pick].snmp_community[0] ? _cfg.mons[pick].snmp_community : "public";
+    int len = snmp_build_get(pkt, sizeof(pkt), comm, _cfg.mons[pick].snmp_oid, _snmp_reqid);
+    if (len < 0) { applyResult(pick, false, 0); return; }   // ongeldige/te lange OID
+
+    if (!s_snmp_udp_open) { s_snmp_udp.begin(0); s_snmp_udp_open = true; }
+    s_snmp_udp.beginPacket(ip, MON_SNMP_PORT);
+    s_snmp_udp.write(pkt, len);
+    s_snmp_udp.endPacket();
+    _snmp_slot = pick; _snmp_phase = 1; _snmp_deadline = now + 2500;
+    return;
+  }
+
+  /* phase 1: op het antwoord wachten. */
+  int psz = s_snmp_udp.parsePacket();
+  if (psz > 0) {
+    uint8_t rb[512];
+    int n = s_snmp_udp.read(rb, sizeof(rb));
+    int slot = _snmp_slot;
+    int32_t num = 0; bool isnum = false; char sbuf[48];
+    if (n > 0 && slot >= 0 && snmp_extract(rb, n, &num, &isnum, sbuf, sizeof(sbuf)))
+      applySnmpResult(slot, isnum, num);
+    else if (slot >= 0)
+      applyResult(slot, false, 0);
+    _snmp_phase = 0; _snmp_slot = -1;
+    return;
+  }
+  if ((long)(now - _snmp_deadline) >= 0) {
+    if (_snmp_slot >= 0) applyResult(_snmp_slot, false, 0);   // geen antwoord = down
+    _snmp_phase = 0; _snmp_slot = -1;
+  }
+#endif
+}
+
+void MonitorSensors::applySnmpResult(int slot, bool got_number, int32_t raw) {
+  if (slot < 0 || slot >= MAX_MONITORS) return;
+  MonitorCfgEntry& c = _cfg.mons[slot];
+  int32_t value = raw;
+
+  if (c.snmp_interp == MON_SNMP_RATE && got_number) {
+    /* Tempo = delta/seconde. Wrap-veilig via uint32-rekenkunde. */
+    unsigned long now = millis();
+    if (_mon[slot].snmp_prev_ms != 0) {
+      uint32_t dt = (uint32_t)((now - _mon[slot].snmp_prev_ms) / 1000UL); if (dt == 0) dt = 1;
+      uint32_t d = (uint32_t)raw - _mon[slot].snmp_prev;
+      value = (int32_t)(d / dt);
+    } else {
+      value = 0;   // eerste meting: nog geen tempo
+    }
+    _mon[slot].snmp_prev = (uint32_t)raw;
+    _mon[slot].snmp_prev_ms = now;
+  }
+
+  bool up;
+  if (c.snmp_interp == MON_SNMP_STATUS) up = got_number && (value == c.snmp_arg);
+  else                                  up = got_number;   // numeric/rate: bereikbaar = kreeg een getal
+
+  /* De waarde in last_ms -> die gaat als LPP_GENERIC over het mesh. up drijft de
+   * bestaande debounce + alert-pijplijn (applyResult). */
+  applyResult(slot, up, got_number ? (uint32_t)value : _mon[slot].last_ms);
 }
 
 /* ---------------- het testbericht ----------------
@@ -2806,6 +3034,13 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
   /* Nieuwe monitor verschijnt standaard op sensor-node 0 ("BE-HSS-DinX-Up").
    * Reconfigureerbaar via mon.<ch>.snodes. */
   e.sensornodes = MON_SNODES_DEFAULT;
+  /* Standaard een gewone host/ping-monitor; SNMP-velden leeg. Via mon.<ch>.type /
+   * .community / .oid / .interp om te zetten naar een SNMP-monitor. */
+  e.kind = MON_KIND_HOST;
+  e.snmp_interp = MON_SNMP_NUMERIC;
+  e.snmp_arg = 0;
+  e.snmp_community[0] = 0;
+  e.snmp_oid[0] = 0;
 
   memset(&_mon[slot], 0, sizeof(_mon[slot]));
   _mon[slot].up = true;               /* nog niet 'seeded'; zie applyResult() */
@@ -3380,6 +3615,43 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     }
     if (strcmp(field, "snodes") == 0) {  /* lijst van sensor-node-indexen, bv "0,1" */
       _cfg.mons[slot].sensornodes = parseRoomsMask(value);   // zelfde "0,1"/"none"-vorm
+      markDirty();
+      return true;
+    }
+    /* ---- SNMP-velden ---- */
+    if (strcmp(field, "type") == 0) {          /* snmp | host/ping */
+      if (!strcasecmp(value, "snmp")) _cfg.mons[slot].kind = MON_KIND_SNMP;
+      else if (!strcasecmp(value, "host") || !strcasecmp(value, "ping")) _cfg.mons[slot].kind = MON_KIND_HOST;
+      else return false;
+      markDirty();
+      return true;
+    }
+    if (strcmp(field, "community") == 0) {      /* SNMP-community; "-" = wissen */
+      if (strlen(value) >= sizeof(_cfg.mons[slot].snmp_community)) return false;
+      if (!strcmp(value, "-")) _cfg.mons[slot].snmp_community[0] = 0;
+      else StrHelper::strncpy(_cfg.mons[slot].snmp_community, value, sizeof(_cfg.mons[slot].snmp_community));
+      markDirty();
+      return true;
+    }
+    if (strcmp(field, "oid") == 0) {            /* dotted OID */
+      if (strlen(value) >= sizeof(_cfg.mons[slot].snmp_oid)) return false;
+      for (const char* q = value; *q; q++) if (*q != '.' && (*q < '0' || *q > '9')) return false;
+      StrHelper::strncpy(_cfg.mons[slot].snmp_oid, value, sizeof(_cfg.mons[slot].snmp_oid));
+      markDirty();
+      return true;
+    }
+    if (strcmp(field, "interp") == 0) {         /* numeric | rate | status */
+      uint8_t iv;
+      if      (!strcasecmp(value, "numeric") || !strcmp(value, "0")) iv = MON_SNMP_NUMERIC;
+      else if (!strcasecmp(value, "rate")    || !strcmp(value, "1")) iv = MON_SNMP_RATE;
+      else if (!strcasecmp(value, "status")  || !strcmp(value, "2")) iv = MON_SNMP_STATUS;
+      else return false;
+      _cfg.mons[slot].snmp_interp = iv;
+      markDirty();
+      return true;
+    }
+    if (strcmp(field, "snmparg") == 0) {        /* status: de "up"-waarde */
+      _cfg.mons[slot].snmp_arg = (int32_t)strtol(value, NULL, 10);
       markDirty();
       return true;
     }

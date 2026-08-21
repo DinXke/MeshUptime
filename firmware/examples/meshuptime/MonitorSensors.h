@@ -297,6 +297,11 @@ public:
   /* SENSOR-NODE-set per monitor: op welke virtuele sensor-nodes deze sensor als
    * telemetrie-kanaal verschijnt (bitmasker). */
   uint16_t    monitorSensorNodesMask(int slot) const;
+  /* SNMP-monitor: soort + config (NOOIT het community teruggeven). */
+  uint8_t     monitorKind(int slot) const;
+  const char* monitorSnmpOid(int slot) const;
+  uint8_t     monitorSnmpInterp(int slot) const;
+  int32_t     monitorSnmpArg(int slot) const;
   /* Idem voor de vaste bronnen (MON_FA_* uit MonitorStore.h). */
   uint8_t     fixedAlertMode(int idx) const;
   uint16_t    fixedRoomsMask(int idx) const;
@@ -1097,6 +1102,11 @@ private:
      * per definitie niets over een gemelde dienst. */
     unsigned long last_report;   /* millis van de laatste melding; 0 = nooit */
     bool          stale;         /* melding te oud; toestand onbekend */
+
+    /* Alleen voor SNMP-monitors met interp RATE: de vorige counter-uitlezing, om
+     * het tempo (delta/seconde) te berekenen. RAM-only. */
+    uint32_t      snmp_prev;
+    unsigned long snmp_prev_ms;
   };
   MonState _mon[MAX_MONITORS];
 
@@ -1161,6 +1171,19 @@ private:
     char          result[200];
   } _netdiag = { 0, NETS_NONE, {0}, 0, {0}, 0, {0} };
   void loopNetDiag();
+
+  /* SNMP-poller (één GET tegelijk, round-robin over de SNMP-monitors). Niet-
+   * blokkerend via WiFiUDP (send + parsePacket-poll). De WiFiUDP + de BER-codec
+   * staan file-scope in de .cpp. */
+  int           _snmp_slot = -1;      /* actieve monitor-slot; -1 = idle */
+  uint8_t       _snmp_phase = 0;      /* 0 idle, 1 verstuurd/wacht */
+  unsigned long _snmp_deadline = 0;
+  uint32_t      _snmp_reqid = 0;
+  void loopSnmp();
+  /* Past een SNMP-uitlezing toe: interp NUMERIC/RATE -> waarde in last_ms +
+   * up=bereikbaar; STATUS -> up = (waarde == snmp_arg). Loopt via applyResult, dus
+   * door dezelfde debounce + alert-pijplijn als een ping-monitor. */
+  void applySnmpResult(int slot, bool got_number, int32_t raw);
 
   void startAdhocResolve();
   void startAdhocOnePing();

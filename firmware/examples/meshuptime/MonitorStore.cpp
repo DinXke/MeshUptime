@@ -6,12 +6,50 @@
  * adres van 40 tekens plus de ping-vlag = 70 tekens; sinds de push-instellingen
  * is het "purl " plus een URL van 100 tekens = 105. 132 laat plek voor nog een
  * veld zonder dat een oud bestand ineens afgekapt lijkt. */
-#define MON_LINE_MAX  132
+/* 240: sinds de SNMP-monitor draagt een "m"-regel ook interp/arg, de OID (tot 80)
+ * en het geobfuskeerde community (tot ~46 hex). Ruim boven de langste combinatie. */
+#define MON_LINE_MAX  240
 
 /* De drempels uit docs/meting-voeding-2026-08-19.log; dezelfde getallen als in
  * MonitorSensors.h, maar hier is de plek waar ze na een wis terugkomen. */
 #define MON_DEFAULT_HI  4.12f
 #define MON_DEFAULT_LO  4.09f
+
+/* SNMP-community-OBFUSCATIE (geen versleuteling): XOR met een vaste sleutelstroom,
+ * dan hex. Doel: geen klaartekst-community in /monitors.cfg (met 'cat' te lezen).
+ * SPIFFS is toch onversleuteld, dus dit is bewust een drempel, geen beveiliging. */
+static const char MON_OBF_KEY[] = "MU-snmp-obf-2026";
+static void monObfToHex(const char* in, char* out, size_t out_len) {
+  static const char hx[] = "0123456789abcdef";
+  size_t o = 0, k = 0;
+  if (!in || !in[0]) { if (out_len >= 2) { out[0] = '-'; out[1] = 0; } return; }
+  for (size_t i = 0; in[i] && o + 3 < out_len; i++) {
+    uint8_t b = (uint8_t)in[i] ^ (uint8_t)MON_OBF_KEY[k];
+    k = (k + 1) % (sizeof(MON_OBF_KEY) - 1);
+    out[o++] = hx[b >> 4]; out[o++] = hx[b & 0x0f];
+  }
+  out[o] = 0;
+}
+static void monObfFromHex(const char* hex, char* out, size_t out_len) {
+  out[0] = 0;
+  if (!hex || !hex[0] || (hex[0] == '-' && hex[1] == 0)) return;
+  size_t n = strlen(hex); if (n & 1) return;
+  size_t o = 0, k = 0;
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (size_t i = 0; i + 1 < n && o + 1 < out_len; i += 2) {
+    int hi = nib(hex[i]), lo = nib(hex[i + 1]);
+    if (hi < 0 || lo < 0) break;
+    uint8_t b = (uint8_t)((hi << 4) | lo) ^ (uint8_t)MON_OBF_KEY[k];
+    k = (k + 1) % (sizeof(MON_OBF_KEY) - 1);
+    out[o++] = (char)b;
+  }
+  out[o] = 0;
+}
 
 void MonitorStore::setDefaults(MonitorCfg& cfg) {
   memset(&cfg, 0, sizeof(cfg));
@@ -122,10 +160,10 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       break;
     }
 
-    /* Ruim genoeg voor de langste regel: de m-regel telt nu tot 9 velden
-     * (m ch int naam adres send_ms alert rooms snodes). */
-    char* parts[10];
-    int n = splitTokens(line, parts, 10);
+    /* Ruim genoeg voor de langste regel: de m-regel telt nu tot 14 velden
+     * (m ch int naam adres send_ms alert rooms snodes kind interp snmparg comm oid). */
+    char* parts[16];
+    int n = splitTokens(line, parts, 16);
     if (n < 2) continue;               /* onvolledige regel: overslaan */
 
     if (strcmp(parts[0], "hi") == 0) {
@@ -220,6 +258,18 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
          * (sensor-node 0), zodat een monitor na een update op de standaard-node
          * blijft verschijnen. */
         e.sensornodes = (n >= 9) ? (uint16_t)strtoul(parts[8], NULL, 10) : MON_SNODES_DEFAULT;
+        /* Velden 10-14 (SNMP) optioneel: oude bestanden -> gewone host-monitor. */
+        e.kind        = (n >= 10) ? (uint8_t)atoi(parts[9])  : MON_KIND_HOST;
+        e.snmp_interp = (n >= 11) ? (uint8_t)atoi(parts[10]) : MON_SNMP_NUMERIC;
+        e.snmp_arg    = (n >= 12) ? (int32_t)strtol(parts[11], NULL, 10) : 0;
+        if (n >= 13) monObfFromHex(parts[12], e.snmp_community, sizeof(e.snmp_community));
+        if (n >= 14) {
+          strncpy(e.snmp_oid, parts[13], sizeof(e.snmp_oid) - 1);
+          e.snmp_oid[sizeof(e.snmp_oid) - 1] = 0;
+          if (e.snmp_oid[0] == '-' && e.snmp_oid[1] == 0) e.snmp_oid[0] = 0;
+        }
+        if (e.kind > MON_KIND_SNMP) e.kind = MON_KIND_HOST;
+        if (e.snmp_interp > MON_SNMP_STATUS) e.snmp_interp = MON_SNMP_NUMERIC;
       }
       num_mons++;
     }
@@ -325,11 +375,15 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
      * bij het LEZEN is hij optioneel (voor oudere bestanden). Zo staat er na één
      * schrijfronde een expliciete waarde in het bestand en hoeft niemand te
      * raden wat de standaard was toen dit weggeschreven werd. */
-    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u %u\n",
+    char comm_hex[52]; monObfToHex(e.snmp_community, comm_hex, sizeof(comm_hex));
+    const char* oid = (e.snmp_oid[0]) ? e.snmp_oid : "-";
+    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u %u %u %u %ld %s %s\n",
                    (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host,
                    (unsigned)(e.send_ms ? 1 : 0),
                    (unsigned)e.alert_mode, (unsigned)e.rooms_mask,
-                   (unsigned)e.sensornodes);
+                   (unsigned)e.sensornodes,
+                   (unsigned)e.kind, (unsigned)e.snmp_interp, (long)e.snmp_arg,
+                   comm_hex, oid);
     if (f.write((const uint8_t*)line, len) != (size_t)len) {
       /* Schijf vol of stuk: het kladbestand is nu onbetrouwbaar, dus laten we
        * de bestaande .cfg met rust. */

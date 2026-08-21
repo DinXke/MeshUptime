@@ -201,7 +201,29 @@ struct MonitorCfgEntry {
    * telemetrie-kanaal verschijnt. Bij het LEZEN optioneel (oude bestanden krijgen
    * MON_SNODES_DEFAULT); bij het SCHRIJVEN altijd. Los van rooms_mask. */
   uint16_t sensornodes;    /* bit i = sensor-node i */
+
+  /* ---- SNMP-MONITOR (nieuwe soort) ----
+   * kind == MON_KIND_HOST (0): een gewone ping/host-monitor (host = adres).
+   * kind == MON_KIND_SNMP (1): de node doet zelf een SNMP-GET op host:161. Het
+   *   community-wachtwoord staat GEOBFUSKEERD op schijf (XOR + hex) -- niet in de
+   *   klaartekst en niet in status.json/backup. De gepollde waarde stroomt door de
+   *   bestaande telemetrie (last_ms) en alert-pijplijn (up/down via applyResult).
+   * interp: hoe de OID-waarde te lezen -- numeriek, teller->tempo, of status/drempel. */
+  uint8_t  kind;                    /* MON_KIND_* */
+  uint8_t  snmp_interp;             /* MON_SNMP_* */
+  int32_t  snmp_arg;               /* status: de "up"-waarde (bv 1 = ifOperStatus up) */
+  char     snmp_community[24];     /* GEOBFUSKEERD op schijf */
+  char     snmp_oid[80];           /* dotted OID, bv 1.3.6.1.2.1.2.2.1.10.2 */
 };
+
+/* Monitor-soort. */
+#define MON_KIND_HOST   0
+#define MON_KIND_SNMP   1
+/* SNMP-interpretatie van de OID-waarde. */
+#define MON_SNMP_NUMERIC  0   /* gauge/integer/timeticks -> telemetriewaarde */
+#define MON_SNMP_RATE     1   /* counter -> tempo (delta/seconde), bv bytes/s */
+#define MON_SNMP_STATUS   2   /* down als waarde != snmp_arg (bv ifOperStatus) */
+#define MON_SNMP_PORT   161
 
 /* Grenzen van de rustperiode voor een HERSTELMELDING. Hier en niet in
  * MonitorSensors.cpp, om dezelfde reden als bij het interval: het inleesfilter en
