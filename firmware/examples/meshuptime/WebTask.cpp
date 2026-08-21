@@ -714,6 +714,19 @@ animation:pulse 2.5s infinite}
 rgba(76,201,240,.07),transparent 70%);padding:.7rem .9rem;border-radius:0 8px 8px 0;
 font-size:.87rem;margin:0 0 .8rem}
 .why b{color:var(--cyan)}
+/* Compacte "?"-help: elke uitleg (.why/.note) wordt bij het laden achter een
+   klein "?"-schijfje gevouwen (zie het declutter-script). Instellingen eerst,
+   kennis een klik weg -- niets gaat verloren. */
+details.help{display:block;margin:.3rem 0}
+details.help>summary{list-style:none;cursor:help;display:inline-flex;
+align-items:center;justify-content:center;width:1.15rem;height:1.15rem;
+border:1px solid var(--border);border-radius:50%;color:var(--muted);
+font-size:.72rem;font-weight:700;line-height:1;user-select:none}
+details.help>summary::-webkit-details-marker{display:none}
+details.help>summary::marker{content:""}
+details.help>summary:hover,details.help[open]>summary{color:var(--accent);border-color:var(--accent)}
+details.help[open]>summary{margin-bottom:.35rem}
+details.help>.why,details.help>.note{margin:.2rem 0 .2rem}
 code,kbd{font-family:var(--mono);font-size:.85em;background:var(--bg);
 border:1px solid var(--border);border-radius:4px;padding:.05em .35em}
 .row{display:flex;gap:.7rem;flex-wrap:wrap}.row>label{flex:1 1 9rem}
@@ -3367,6 +3380,20 @@ u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
 cfg();
 roomsProbe();
+
+/* ===================== declutter: uitleg achter een "?" =====================
+   CONSISTENT over ALLE panelen: elke .why/.note-uitleg wordt bij het laden in
+   een compacte, dichtgeklapte "?"-help gestopt. Instellingen staan zo vooraan en
+   compact; de tekst (de KENNIS) blijft, één klik weg. Eén keer bij het laden --
+   alle uitleg staat statisch in de HTML, dus dynamisch gegenereerde tabellen
+   raken dit niet. */
+(function(){var ps=document.querySelectorAll("p.why,p.note");
+for(var i=0;i<ps.length;i++){var p=ps[i];
+if(p.parentNode&&p.parentNode.classList&&p.parentNode.classList.contains("help"))continue;
+var d=document.createElement("details");d.className="help";
+var s=document.createElement("summary");s.textContent="?";
+s.title=p.classList.contains("why")?"waarom dit zo is":"toelichting";
+p.parentNode.insertBefore(d,p);d.appendChild(s);d.appendChild(p)}})();
 </script></body></html>)HTML";
 
 /* -------------------------------- opslag ---------------------------------- */
