@@ -33,6 +33,11 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
    * heartbeat-interval krijgt zijn standaard, zodat "sensor get push.hb" iets
    * zinnigs zegt nog voordat er ooit een url gezet is. */
   cfg.push_hb_s = MON_PUSH_HB_DEFAULT;
+  /* Alarm-bezorging vaste bronnen: standaard BOTH naar room 0 ("Storingen"). */
+  for (int i = 0; i < MON_FA_COUNT; i++) {
+    cfg.fixed_alert_mode[i] = MON_ALERT_DEFAULT;
+    cfg.fixed_rooms_mask[i] = MON_ROOMS_DEFAULT;
+  }
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
 }
@@ -116,8 +121,8 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       break;
     }
 
-    char* parts[6];
-    int n = splitTokens(line, parts, 6);
+    char* parts[8];
+    int n = splitTokens(line, parts, 8);
     if (n < 2) continue;               /* onvolledige regel: overslaan */
 
     if (strcmp(parts[0], "hi") == 0) {
@@ -163,6 +168,17 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       int v = atoi(parts[1]);
       staged.push_hb_s = (v >= MON_PUSH_HB_MIN && v <= MON_PUSH_HB_MAX)
                        ? (uint16_t)v : MON_PUSH_HB_DEFAULT;
+    } else if (strcmp(parts[0], "fa") == 0) {
+      /* fa <idx> <mode> <rooms> -- alarm-bezorging van een VASTE bron (MON_FA_*).
+       * Onbekende/lege waarden vallen op de standaard terug. */
+      if (n >= 4) {
+        int fi = atoi(parts[1]);
+        if (fi >= 0 && fi < MON_FA_COUNT) {
+          uint8_t m = (uint8_t)(atoi(parts[2]) & MON_ALERT_BOTH);
+          staged.fixed_alert_mode[fi] = m ? m : MON_ALERT_DEFAULT;
+          staged.fixed_rooms_mask[fi] = (uint16_t)strtoul(parts[3], NULL, 10);
+        }
+      }
     } else if (strcmp(parts[0], "m") == 0) {
       /* m <kanaal> <interval> <naam> <adres> [<pingtijd 0|1>]
        *
@@ -186,6 +202,14 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       strncpy(e.name, parts[3], MON_NAME_LEN - 1); e.name[MON_NAME_LEN - 1] = 0;
       strncpy(e.host, parts[4], MON_HOST_LEN - 1); e.host[MON_HOST_LEN - 1] = 0;
       e.send_ms    = (n >= 6) ? (atoi(parts[5]) ? 1 : 0) : 1;
+      /* Velden 7 en 8 (alarm-route + room-set) zijn optioneel: een bestand van
+       * vóór de room-variant heeft ze niet en krijgt de standaard (BOTH, room 0).
+       * De sensor-variant negeert ze. */
+      {
+        uint8_t am = (n >= 7) ? (uint8_t)(atoi(parts[6]) & MON_ALERT_BOTH) : MON_ALERT_DEFAULT;
+        e.alert_mode = am ? am : MON_ALERT_DEFAULT;
+        e.rooms_mask = (n >= 8) ? (uint16_t)strtoul(parts[7], NULL, 10) : MON_ROOMS_DEFAULT;
+      }
       num_mons++;
     }
     /* Onbekende sleutel: stil overslaan, zodat een nieuwer bestand op oude
@@ -274,6 +298,13 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "phb %u\n", (unsigned)cfg.push_hb_s);
   f.write((const uint8_t*)line, len);
 
+  /* Alarm-bezorging van de vaste bronnen (MON_FA_*): route + room-set. */
+  for (int i = 0; i < MON_FA_COUNT; i++) {
+    len = snprintf(line, sizeof(line), "fa %d %u %u\n", i,
+                   (unsigned)cfg.fixed_alert_mode[i], (unsigned)cfg.fixed_rooms_mask[i]);
+    f.write((const uint8_t*)line, len);
+  }
+
   for (int i = 0; i < MON_MAX_MONITORS; i++) {
     const MonitorCfgEntry& e = cfg.mons[i];
     if (e.channel == 0) continue;
@@ -282,9 +313,10 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
      * bij het LEZEN is hij optioneel (voor oudere bestanden). Zo staat er na één
      * schrijfronde een expliciete waarde in het bestand en hoeft niemand te
      * raden wat de standaard was toen dit weggeschreven werd. */
-    len = snprintf(line, sizeof(line), "m %u %u %s %s %u\n",
+    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u\n",
                    (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host,
-                   (unsigned)(e.send_ms ? 1 : 0));
+                   (unsigned)(e.send_ms ? 1 : 0),
+                   (unsigned)e.alert_mode, (unsigned)e.rooms_mask);
     if (f.write((const uint8_t*)line, len) != (size_t)len) {
       /* Schijf vol of stuk: het kladbestand is nu onbetrouwbaar, dus laten we
        * de bestaande .cfg met rust. */

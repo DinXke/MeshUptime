@@ -93,6 +93,31 @@
 #define MON_NAME_LEN      17      /* 16 tekens + afsluiter */
 #define MON_HOST_LEN      41      /* 40 tekens + afsluiter */
 
+/* ALARM-BEZORGROUTE, per sensor. Bitmasker; zelfde waarden als ALERT_MODE_* in
+ * RoomMesh/SensorMesh, hier los gedefinieerd zodat de opslaglaag niet van de
+ * meshlaag afhangt. DM = via het bestaande alertIf/sendAlert-pad (ACK-herhaling),
+ * ROOM = als servertekst in de toegewezen room(s), BOTH = allebei. */
+#define MON_ALERT_DM       1
+#define MON_ALERT_ROOM     2
+#define MON_ALERT_BOTH     3
+#define MON_ALERT_DEFAULT  MON_ALERT_BOTH
+
+/* ROOM-LIDMAATSCHAPSSET per sensor: een bitmasker van room-indexen (bit i = room
+ * i). Een sensor kan zo in MEERDERE rooms tegelijk posten. Standaard room 0
+ * ("Storingen"). uint16_t = tot 16 rooms; ruim boven MAX_ROOMS. */
+#define MON_ROOMS_DEFAULT  0x0001
+
+/* De VASTE alarmbronnen (geen ping-monitor). Elk heeft een eigen route+room-set
+ * in MonitorCfg. Volgorde vastgelegd zodat de opslag-indexen stabiel blijven. */
+enum {
+  MON_FA_BATT_CRIT = 0,   /* batterij kritisch */
+  MON_FA_BATT_LOW,        /* batterij laag */
+  MON_FA_MAINS,           /* netvoeding weg */
+  MON_FA_WIFI,            /* wifi weg */
+  MON_FA_TEST,            /* testbericht */
+  MON_FA_COUNT
+};
+
 #define MON_CFG_PATH   "/monitors.cfg"
 #define MON_TMP_PATH   "/monitors.tmp"
 
@@ -155,6 +180,13 @@ struct MonitorCfgEntry {
    * ether in. "De meting is er niet" en "de meting gaat niet mee" zijn twee heel
    * verschillende dingen -- wie ze verwart, gaat een sensor repareren die werkt. */
   uint8_t  send_ms;        /* 0 = alleen de schakelaar, 1 = ook de pingtijd */
+
+  /* ALARM-BEZORGING per monitor (room-variant). alert_mode = MON_ALERT_* ,
+   * rooms_mask = bitmasker van room-indexen. Bij het LEZEN optioneel (oude
+   * bestanden krijgen de standaard: BOTH, room 0); bij het SCHRIJVEN altijd. De
+   * sensor-variant negeert deze velden -- die alarmeert altijd via DM. */
+  uint8_t  alert_mode;     /* MON_ALERT_DM | MON_ALERT_ROOM */
+  uint16_t rooms_mask;     /* bit i = room i */
 };
 
 /* Grenzen van de rustperiode voor een HERSTELMELDING. Hier en niet in
@@ -260,6 +292,11 @@ struct MonitorCfg {
   char     push_url[MON_PUSH_URL_LEN];
   char     push_token[MON_PUSH_TOKEN_LEN];
   uint16_t push_hb_s;      /* beloofd heartbeat-interval, MON_PUSH_HB_MIN..MAX */
+
+  /* ALARM-BEZORGING voor de VASTE bronnen (MON_FA_*): route + room-set, zoals de
+   * per-monitor velden hierboven maar voor batterij/netvoeding/wifi/test. */
+  uint8_t  fixed_alert_mode[MON_FA_COUNT];
+  uint16_t fixed_rooms_mask[MON_FA_COUNT];
 
   MonitorCfgEntry mons[MON_MAX_MONITORS];
 };

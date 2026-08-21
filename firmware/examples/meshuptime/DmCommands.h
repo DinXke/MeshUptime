@@ -178,7 +178,7 @@ public:
    * is het een gewone room-post en hoeft er niets terug). RoomMesh knipt 'out'
    * daarna in room-posts. Verstuurt NIETS zelf -- de bezorging loopt via de
    * room-post-synchronisatie, niet via het DM-ACK-pad. */
-  int  renderReply(const ClientInfo& from, const char* line, char* out, size_t out_len);
+  int  renderReply(const ClientInfo& from, int room_idx, const char* line, char* out, size_t out_len);
 
   bool isBusy() const { return _num_chunks > 0; }
 
@@ -230,6 +230,10 @@ private:
    * dit is een rem tegen zendtijdverspilling, geen beveiliging. */
   uint8_t       _deny_key[4];
   unsigned long _deny_until;
+
+  /* Rem op ad-hoc ping vanuit een room (renderReply): niet vaker dan ~elke 20 s,
+   * want een ping is zendtijd op een gedeelde band. */
+  unsigned long _room_ping_until = 0;
 
   void reset();
   bool isAllowed(const ClientInfo& from) const;

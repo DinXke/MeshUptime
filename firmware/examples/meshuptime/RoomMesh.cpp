@@ -499,7 +499,7 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
              * of het een commando is en zo ja het antwoord terug in de room posten. */
             addPost(slot, client, (const char*)&data[5]);
             char out[512];
-            int rlen = roomCommandReply(client, (const char*)&data[5], out, sizeof(out));
+            int rlen = roomCommandReply(client, _active_slot, (const char*)&data[5], out, sizeof(out));
             if (rlen > 0) addServerPost(_active_slot, out);
           }
           temp[5] = 0;

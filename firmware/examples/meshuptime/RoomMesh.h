@@ -302,8 +302,8 @@ protected:
    * main_room.cpp overschrijft dit en gebruikt DmCommands + MonitorDmSource om
    * het antwoord op te bouwen. Geeft de lengte van de opgebouwde tekst terug (0 =
    * geen commando); RoomMesh post die tekst dan terug in de room (geknipt). */
-  virtual int roomCommandReply(ClientInfo* from, const char* line, char* out, size_t out_len) {
-    (void)from; (void)line; (void)out; (void)out_len; return 0;
+  virtual int roomCommandReply(ClientInfo* from, int room_idx, const char* line, char* out, size_t out_len) {
+    (void)from; (void)room_idx; (void)line; (void)out; (void)out_len; return 0;
   }
 
 #if ENV_INCLUDE_GPS == 1

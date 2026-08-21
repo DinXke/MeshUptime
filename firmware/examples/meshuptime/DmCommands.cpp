@@ -478,28 +478,66 @@ void DmCommands::loop() {
 
 /* ============================== ROOM-ANTWOORD ============================== */
 
-int DmCommands::renderReply(const ClientInfo& from, const char* line, char* out, size_t out_len) {
-  (void)from;
+/* De VOLLEDIGE commandoset als tweede front-end op dezelfde kern (DmDataSource ->
+ * MonitorSensors). Zie de rechtenmatrix onderaan deze functie.
+ *
+ * ROOM-BEWUSTZIJN: room_idx is de room waarin het commando gepost werd. Bij
+ * `add`/`edit` zonder eigen rooms= wordt die room de standaardtoewijzing -- typ je
+ * `add` in "Telemetrie", dan komt de nieuwe monitor in "Telemetrie".
+ *
+ * RECHTEN: muterend (add/edit/del) vereist ADMIN (room-hoofdwachtwoord); lezend
+ * (list/get/status/help) en ok/ping mag elk lid. ping heeft een simpele rem tegen
+ * zendtijdmisbruik. */
+int DmCommands::renderReply(const ClientInfo& from, int room_idx, const char* line, char* out, size_t out_len) {
   if (_data == NULL || line == NULL || out == NULL || out_len == 0) return 0;
 
-  char cmd[64];
-  const size_t n = (strlen(line) < sizeof(cmd) - 1) ? strlen(line) : sizeof(cmd) - 1;
-  memcpy(cmd, line, n);
-  cmd[n] = 0;
-
+  char cmd[164];
+  StrHelper::strncpy(cmd, line, sizeof(cmd));
   char* p = cmd;
   while (*p == ' ' || *p == '\t') p++;
   char* e = p + strlen(p);
   while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r' || e[-1] == '\n')) *--e = 0;
   if (*p == 0) return 0;
 
-  /* Werkbuffer leegmaken; in de room-variant stuurt DmCommands niets, dus _text
-   * is hier vrij te gebruiken als opbouwbuffer. */
+  const bool is_admin = from.isAdmin();
+
+  /* Eerste woord = het commando (voor de rechten- en room-defaultbeslissing). */
+  char verb[12];
+  {
+    int i = 0;
+    while (p[i] && p[i] != ' ' && i < (int)sizeof(verb) - 1) { verb[i] = p[i]; i++; }
+    verb[i] = 0;
+  }
+  const bool is_mut = (strcasecmp(verb, "add") == 0 || strcasecmp(verb, "edit") == 0 ||
+                       strcasecmp(verb, "del") == 0);
+
+  /* ---- ok / ack: alarm bevestigen (stopt herhalen op het DM-pad). ---- */
+  if (_data->dmIsAck((const uint8_t*)p, strlen(p))) {
+    uint8_t k = _data->dmConfirmAlerts();
+    snprintf(out, out_len, "bevestigd, %u melding%s gestopt", (unsigned)k, k == 1 ? "" : "en");
+    return (int)strlen(out);
+  }
+
+  /* ---- rechten: muteren mag alleen een beheerder ---- */
+  if (is_mut && !is_admin) {
+    strlcpy(out, "alleen de beheerder mag add/edit/del (room-hoofdwachtwoord)", out_len);
+    return (int)strlen(out);
+  }
+
+  /* ---- ping: rem tegen zendtijdmisbruik (elke ~20 s een ad-hoc ping) ---- */
+  if (strcasecmp(verb, "ping") == 0) {
+    if ((long)(millis() - _room_ping_until) < 0) {
+      strlcpy(out, "ping: even wachten (te snel achter elkaar)", out_len);
+      return (int)strlen(out);
+    }
+    _room_ping_until = millis() + 20000UL;
+  }
+
   _text[0] = 0;
   _tail[0] = 0;
   _gen_omitted = 0;
 
-  if (strcasecmp(p, "list") == 0) {
+  if (strcasecmp(p, "list") == 0 || strcasecmp(p, "ls") == 0) {
     buildList();
   } else if (strcasecmp(p, "status") == 0) {
     buildStatus();
@@ -513,14 +551,22 @@ int DmCommands::renderReply(const ClientInfo& from, const char* line, char* out,
     if (*arg == 0) appendText("gebruik: get <naam>");
     else buildGet(arg);
   } else {
-    /* Sensorbeheer (add/edit/del/ping): de MonitorSensors-kant keurt en schrijft;
-     * hier alleen de antwoordtekst. */
-    const char* r = _data->dmMonCommand(p);
+    /* Sensorbeheer/ad-hoc (add/edit/del/ping) -> de MonitorSensors-kant keurt en
+     * schrijft. ROOM-DEFAULT: mist een add/edit een eigen rooms=, dan koppelen we
+     * hem aan de room waarin dit gepost is. */
+    char line2[180];
+    if ((strcasecmp(verb, "add") == 0 || strcasecmp(verb, "edit") == 0) &&
+        strstr(p, "rooms=") == NULL && room_idx >= 0) {
+      snprintf(line2, sizeof(line2), "%s rooms=%d", p, room_idx);
+    } else {
+      StrHelper::strncpy(line2, p, sizeof(line2));
+    }
+    const char* r = _data->dmMonCommand(line2);
     if (r != nullptr) {
       strlcpy(out, r, out_len);
       return (int)strlen(out);
     }
-    /* Geen herkend commando: dit is een gewone room-post, geen vraag. */
+    /* Geen herkend commando: gewone room-post, geen vraag -> niets terug. */
     return 0;
   }
 

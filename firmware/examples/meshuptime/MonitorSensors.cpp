@@ -748,6 +748,33 @@ const char* MonitorSensors::monitorName(int slot) const     { return monitorUsed
 const char* MonitorSensors::monitorHost(int slot) const     { return monitorUsed(slot) ? _cfg.mons[slot].host : ""; }
 uint16_t    MonitorSensors::monitorInterval(int slot) const  { return monitorUsed(slot) ? _cfg.mons[slot].interval_s : 0; }
 
+/* Alarm-bezorging per monitor (room-variant). Lege waarde -> BOTH/room0, zodat
+ * een monitor uit een oud bestand nooit stil ongealarmeerd blijft. */
+uint8_t     MonitorSensors::monitorAlertMode(int slot) const { uint8_t m = monitorUsed(slot) ? _cfg.mons[slot].alert_mode : 0; return m ? m : MON_ALERT_DEFAULT; }
+uint16_t    MonitorSensors::monitorRoomsMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].rooms_mask : MON_ROOMS_DEFAULT; }
+
+/* Alarm-bezorging van de vaste bronnen (MON_FA_*). */
+uint8_t     MonitorSensors::fixedAlertMode(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_ALERT_DEFAULT; uint8_t m = _cfg.fixed_alert_mode[idx]; return m ? m : MON_ALERT_DEFAULT; }
+uint16_t    MonitorSensors::fixedRoomsMask(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_ROOMS_DEFAULT; return _cfg.fixed_rooms_mask[idx]; }
+
+/* Zetters voor de vaste-bron-config (via CLI/web). mode 0 = ongewijzigd laten
+ * (ongeldig); rooms_mask mag 0 zijn ("geen room", dan enkel DM als de mode DM
+ * bevat). Schrijft naar flash via markDirty(). */
+bool MonitorSensors::setFixedAlertMode(int idx, uint8_t mode) {
+  if (idx < 0 || idx >= MON_FA_COUNT) return false;
+  mode &= MON_ALERT_BOTH;
+  if (mode == 0) return false;
+  _cfg.fixed_alert_mode[idx] = mode;
+  markDirty();
+  return true;
+}
+bool MonitorSensors::setFixedRoomsMask(int idx, uint16_t mask) {
+  if (idx < 0 || idx >= MON_FA_COUNT) return false;
+  _cfg.fixed_rooms_mask[idx] = mask;
+  markDirty();
+  return true;
+}
+
 /* DEZE TWEE ZIJN HET HELE SIMULATIEPAD voor de monitors.
  *
  * Staat er een forcering op dit vakje, dan geven zij de geforceerde stand; de
@@ -1690,21 +1717,38 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
    * "udm-pro" zijn verschillende monitors. */
   if (strcasecmp(argv[0], "add") == 0) {
     if (argc < 3) {
-      snprintf(s_dm_buf, sizeof(s_dm_buf), "add <naam> <adres> [interval]");
+      snprintf(s_dm_buf, sizeof(s_dm_buf), "add <naam> <adres> [interval] [rooms=0,1] [mode=dm|room|both]");
       return s_dm_buf;
     }
+    /* Interval is positioneel (argv[3]) MAAR alleen als het geen sleutel=waarde is:
+     * "add naam host rooms=0" heeft geen interval. */
     unsigned long ivl = MON_INTERVAL_DEFAULT;
-    if (argc >= 4) {
-      /* Geen eigen grenzencontrole: createMonitor keurt het interval zelf. Hier
-       * alleen tekst -> getal, en rommel wordt 0 en dus door createMonitor
-       * afgekeurd met MON_ERR_INTERVAL. */
+    int kv_start = 3;
+    if (argc >= 4 && strchr(argv[3], '=') == NULL) {
       ivl = strtoul(argv[3], NULL, 10);
+      kv_start = 4;
     }
     uint8_t ch = 0;
     MonResult r = createMonitor(argv[1], argv[2], (uint16_t)ivl, &ch);
     if (r != MON_OK) {
       snprintf(s_dm_buf, sizeof(s_dm_buf), "add geweigerd: %s", monResultText(r));
       return s_dm_buf;
+    }
+    /* Optionele room-toewijzing/route meteen toepassen (room-variant). */
+    for (int i = kv_start; i < argc; i++) {
+      char* eq = strchr(argv[i], '=');
+      if (eq == NULL) continue;
+      *eq = 0;
+      const char* k = argv[i];
+      const char* v = eq + 1;
+      const char* field = NULL;
+      if (strcmp(k, "rooms") == 0) field = "rooms";
+      else if (strcmp(k, "alert") == 0 || strcmp(k, "mode") == 0) field = "alert";
+      if (field) {
+        char setting[24];
+        snprintf(setting, sizeof(setting), "mon.%u.%s", (unsigned)ch, field);
+        setSettingValue(setting, v);
+      }
     }
     snprintf(s_dm_buf, sizeof(s_dm_buf), "ok, '%s' op kanaal %u (elke %lus)",
              argv[1], (unsigned)ch, ivl);
@@ -1741,7 +1785,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
   if (strcasecmp(argv[0], "edit") == 0) {
     if (argc < 3) {
       snprintf(s_dm_buf, sizeof(s_dm_buf),
-               "edit <naam|kanaal> [host=<adres>] [int=<s>] [naam=<nieuw>] [ms=0|1]");
+               "edit <naam|kanaal> [host=..] [int=..] [naam=..] [ms=0|1] [alert=dm|room|both] [rooms=0,1]");
       return s_dm_buf;
     }
     int slot = resolveTarget(argv[1]);
@@ -1765,10 +1809,13 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       /* De sleutelnaam naar de settings-zeef. "naam" (Nederlands, in de DM) wordt
        * "name" (de interne sleutel); de andere vallen samen. */
       const char* field = NULL;
-      if      (strcmp(key, "host") == 0) field = "host";
-      else if (strcmp(key, "int")  == 0) field = "int";
-      else if (strcmp(key, "naam") == 0) field = "name";
-      else if (strcmp(key, "ms")   == 0) field = "ms";
+      if      (strcmp(key, "host")  == 0) field = "host";
+      else if (strcmp(key, "int")   == 0) field = "int";
+      else if (strcmp(key, "naam")  == 0) field = "name";
+      else if (strcmp(key, "ms")    == 0) field = "ms";
+      else if (strcmp(key, "alert") == 0) field = "alert";   // dm|room|both
+      else if (strcmp(key, "mode")  == 0) field = "alert";   // alias van 'alert'
+      else if (strcmp(key, "rooms") == 0) field = "rooms";   // "0,1"
       if (field == NULL) { failed++; StrHelper::strncpy(last_bad, key, sizeof(last_bad)); continue; }
 
       char setting[24];
@@ -2450,6 +2497,10 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
   /* Pingtijd standaard AAN: dat is wat iemand verwacht die een monitor aanmaakt,
    * en het is wat elke eerdere versie deed. */
   e.send_ms    = 1;
+  /* Alarm-bezorging (room-variant): standaard BOTH naar room 0 ("Storingen").
+   * Reconfigureerbaar via mon.<ch>.alert / mon.<ch>.rooms. */
+  e.alert_mode = MON_ALERT_DEFAULT;
+  e.rooms_mask = MON_ROOMS_DEFAULT;
 
   memset(&_mon[slot], 0, sizeof(_mon[slot]));
   _mon[slot].up = true;               /* nog niet 'seeded'; zie applyResult() */
@@ -2810,6 +2861,32 @@ const char* MonitorSensors::getSettingValue(int i) const {
   return s_mon_val_buf;
 }
 
+/* "dm"/"room"/"both" of numeriek 1/2/3 -> MON_ALERT_* ; 0 = ongeldig. */
+static uint8_t parseAlertMode(const char* v) {
+  while (*v == ' ') v++;
+  if (strcasecmp(v, "dm") == 0)   return MON_ALERT_DM;
+  if (strcasecmp(v, "room") == 0) return MON_ALERT_ROOM;
+  if (strcasecmp(v, "both") == 0) return MON_ALERT_BOTH;
+  int n = atoi(v);
+  if (n >= 1 && n <= 3) return (uint8_t)n;
+  return 0;
+}
+
+/* Een lijst van room-INDEXEN ("0", "0,1", "1 2") -> bitmasker. "" of "none" = 0. */
+static uint16_t parseRoomsMask(const char* v) {
+  while (*v == ' ') v++;
+  if (*v == 0 || strcasecmp(v, "none") == 0) return 0;
+  uint16_t mask = 0;
+  while (*v) {
+    while (*v == ' ' || *v == ',') v++;
+    if (*v == 0) break;
+    int idx = atoi(v);
+    if (idx >= 0 && idx < 16) mask |= (uint16_t)(1u << idx);
+    while (*v && *v != ' ' && *v != ',') v++;
+  }
+  return mask;
+}
+
 bool MonitorSensors::setSettingValue(const char* name, const char* value) {
   const bool is_hi = strcmp(name, "mains.hi") == 0;
   const bool is_lo = strcmp(name, "mains.lo") == 0;
@@ -2984,7 +3061,38 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
       return true;
     }
 
+    if (strcmp(field, "alert") == 0) {   /* dm|room|both */
+      uint8_t m = parseAlertMode(value);
+      if (m == 0) return false;
+      _cfg.mons[slot].alert_mode = m;
+      markDirty();
+      return true;
+    }
+    if (strcmp(field, "rooms") == 0) {   /* lijst van room-indexen, bv "0,1" */
+      _cfg.mons[slot].rooms_mask = parseRoomsMask(value);
+      markDirty();
+      return true;
+    }
+
     return false;   /* mon.N.state is een uitlezing; onbekend veld idem */
+  }
+
+  /* Vaste bronnen: fa.<idx>.mode = dm|room|both , fa.<idx>.rooms = "0,1".
+   * idx = MON_FA_* (0=batt-krit,1=batt-laag,2=netvoeding,3=wifi,4=test). */
+  if (memcmp(name, "fa.", 3) == 0) {
+    int fi = atoi(name + 3);
+    const char* dot = strchr(name + 3, '.');
+    if (dot == NULL || fi < 0 || fi >= MON_FA_COUNT) return false;
+    const char* field = dot + 1;
+    if (strcmp(field, "mode") == 0) {
+      uint8_t m = parseAlertMode(value);
+      if (m == 0) return false;
+      return setFixedAlertMode(fi, m);
+    }
+    if (strcmp(field, "rooms") == 0) {
+      return setFixedRoomsMask(fi, parseRoomsMask(value));
+    }
+    return false;
   }
 
   return EnvironmentSensorManager::setSettingValue(name, value);

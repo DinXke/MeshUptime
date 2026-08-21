@@ -290,6 +290,15 @@ public:
   const char* monitorName(int slot) const;
   const char* monitorHost(int slot) const;
   uint16_t    monitorInterval(int slot) const;
+  /* Alarm-bezorging per monitor (room-variant): route (MON_ALERT_*) en room-set
+   * (bitmasker van room-indexen). De sensor-variant negeert deze. */
+  uint8_t     monitorAlertMode(int slot) const;
+  uint16_t    monitorRoomsMask(int slot) const;
+  /* Idem voor de vaste bronnen (MON_FA_* uit MonitorStore.h). */
+  uint8_t     fixedAlertMode(int idx) const;
+  uint16_t    fixedRoomsMask(int idx) const;
+  bool        setFixedAlertMode(int idx, uint8_t mode);
+  bool        setFixedRoomsMask(int idx, uint16_t mask);
   bool        monitorIsUp(int slot) const;
   bool        monitorSeeded(int slot) const;             /* al ooit een uitslag? */
   uint32_t    monitorPingMs(int slot) const;

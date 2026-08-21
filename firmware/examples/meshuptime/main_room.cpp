@@ -116,21 +116,17 @@ protected:
   bool st_mon_down[MonitorSensors::MAX_MONITORS];
   bool st_mains_down = false, st_wifi_down = false;
 
-  /* Per-sensor route + room-set. STAP 1: vaste, zinvolle standaard (alle alarmen
-   * naar "Storingen", route both). STAP 2 (MonitorSensors-config) vervangt dit
-   * door sensors.monitorAlertMode(slot)/monitorRoomsMask(slot) en de vaste-sensor-
-   * config. */
-  uint8_t  alertMode(int /*slot or fixed*/) { return ALERT_MODE_BOTH; }
-  uint16_t alertRooms() { return (uint16_t)(1u << ROOM_STORINGEN); }
-
-  void edge(bool down_now, bool& was_down, bool high_pri,
+  /* Per-sensor route (dm/room/both) + room-set komen uit de MonitorSensors-config
+   * (mon.<ch>.alert/rooms en fa.<idx>.mode/rooms), instelbaar via web/serieel/room
+   * en bewaard. Op een OVERGANG verdeelt dispatchAlert() volgens die keuze. */
+  void edge(bool down_now, bool& was_down, bool high_pri, uint8_t mode, uint16_t rooms,
             const char* down_text, const char* up_text) {
     if (down_now && !was_down) {
       was_down = true;
-      dispatchAlert(alertMode(0), alertRooms(), high_pri, down_text);
+      dispatchAlert(mode, rooms, high_pri, down_text);
     } else if (!down_now && was_down) {
       was_down = false;
-      dispatchAlert(alertMode(0), alertRooms(), high_pri, up_text);
+      dispatchAlert(mode, rooms, high_pri, up_text);
     }
   }
 
@@ -139,31 +135,38 @@ protected:
 
     char t1[48];
     snprintf(t1, sizeof(t1), "Batterij kritisch (%.2fV)!", v);
-    edge(v < 3.4f, st_batt_crit, true, t1, "Batterij hersteld");
+    edge(v < 3.4f, st_batt_crit, true,
+         sensors.fixedAlertMode(MON_FA_BATT_CRIT), sensors.fixedRoomsMask(MON_FA_BATT_CRIT),
+         t1, "Batterij hersteld");
     char t2[48];
     snprintf(t2, sizeof(t2), "Batterij laag (%.2fV)", v);
-    edge(v < 3.6f, st_batt_low, false, t2, "Batterij weer op peil");
+    edge(v < 3.6f, st_batt_low, false,
+         sensors.fixedAlertMode(MON_FA_BATT_LOW), sensors.fixedRoomsMask(MON_FA_BATT_LOW),
+         t2, "Batterij weer op peil");
 
     for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
       bool down = sensors.monitorUsed(i) && sensors.monitorSeeded(i) &&
                   !sensors.monitorsPaused() && !sensors.monitorIsUp(i);
       edge(down, st_mon_down[i], false,
+           sensors.monitorAlertMode(i), sensors.monitorRoomsMask(i),
            sensors.monitorAlertText(i), sensors.recoverAlertText(i));
     }
 
     edge(!sensors.isMains(), st_mains_down, false,
+         sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS),
          sensors.fixedAlertText(MonitorSensors::FIXED_POWER),
          sensors.fixedRecoverAlertText(MonitorSensors::FIXED_POWER));
     edge(!sensors.isWifiOnline(), st_wifi_down, false,
+         sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI),
          sensors.fixedAlertText(MonitorSensors::FIXED_WIFI),
          sensors.fixedRecoverAlertText(MonitorSensors::FIXED_WIFI));
   }
 
   /* Een room-post herkennen als commando en de antwoordtekst opbouwen. RoomMesh
    * post die tekst dan terug in de room (geknipt). */
-  int roomCommandReply(ClientInfo* from, const char* line, char* out, size_t out_len) override {
+  int roomCommandReply(ClientInfo* from, int room_idx, const char* line, char* out, size_t out_len) override {
     if (from == nullptr) return 0;
-    return dm.renderReply(*from, line, out, out_len);
+    return dm.renderReply(*from, room_idx, line, out, out_len);
   }
 
 public:

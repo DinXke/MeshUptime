@@ -1774,6 +1774,16 @@ var iN=inp(cells[1],m.n,16,"n1");
 var iH=inp(cells[2],m.k=="gemeld"?"-":m.h,40,"n2");
 var iI=inp(cells[3],""+m.i,4,"n3");
 
+/* Alarm-route (dm/room/both) + room-set (bv "0,1"). Alleen zinvol op de
+   room-variant; op een sensor-node worden ze bewaard maar genegeerd. am/rm komen
+   uit status.json. */
+function m2l(mk){var a=[];for(var b=0;b<16;b++){if(mk&(1<<b))a.push(b)}return a.join(",")}
+var iA=document.createElement("select");iA.className="n3";
+[["1","dm"],["2","room"],["3","both"]].forEach(function(o){var op=document.createElement("option");op.value=o[0];op.textContent=o[1];if(o[0]===String(m.am||3))op.selected=true;iA.appendChild(op)});
+var iR=document.createElement("input");iR.className="n3";iR.maxLength=12;iR.value=m2l(m.rm||1);iR.title="rooms, bv 0,1";
+cells[3].appendChild(document.createTextNode(" "));cells[3].appendChild(iA);
+cells[3].appendChild(document.createTextNode(" "));cells[3].appendChild(iR);
+
 cells[CACTS].textContent="";
 var ok=document.createElement("button");ok.textContent="opslaan";ok.className="go";
 var no=document.createElement("button");no.textContent="annuleer";
@@ -3132,7 +3142,8 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
       n += snprintf(buf + n, len - n,
           ",{\"ch\":%u,\"n\":\"%s\",\"h\":\"%s\",\"i\":%u,\"st\":\"%s\","
           "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\","
-          "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d}",
+          "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d,"
+          "\"am\":%u,\"rm\":%u}",
           (unsigned)_mon->monitorChannel(i),
           _mon->monitorName(i),
           push ? "(gemeld)" : _mon->monitorHost(i),
@@ -3153,7 +3164,11 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
            * heeft. Nu staat hij in het antwoord en dus op de pagina. */
           _mon->monitorSendsMs(i) ? 1 : 0,
           (unsigned)_mon->monitorTelemBytes(i),
-          _mon->monitorDropped(i) ? 1 : 0);
+          _mon->monitorDropped(i) ? 1 : 0,
+          /* am = alarm-route (1=dm,2=room,3=both), rm = room-set bitmasker. Alleen
+           * betekenisvol in de room-variant; de sensor-node negeert ze. */
+          (unsigned)_mon->monitorAlertMode(i),
+          (unsigned)_mon->monitorRoomsMask(i));
     }
   }
 
