@@ -8,6 +8,7 @@
 #include <WiFi.h>
 #include <SPIFFS.h>
 #include <esp_heap_caps.h>
+#include <esp_random.h>   /* esp_random() voor de sessietokens; hardware-RNG */
 
 /* De GEBAKKEN radio-instellingen, om ze op de pagina NAAST de huidige te kunnen
  * zetten. Dat is de kern van de waarschuwing bij freq/bw/sf/cr: een getal alleen
@@ -163,6 +164,151 @@ static char g_web_user[WEB_USER_LEN];
 static char g_web_pass[WEB_PASS_LEN];
 static bool g_web_custom = false;
 
+/* ----------------------- de sessie-login voor mensen ---------------------- */
+
+/* WAAROM EEN STATISCHE SESSIETABEL EN NIET EEN ONDERTEKENDE STATELESS TOKEN.
+ *
+ * De opdracht liet de keuze en vroeg om een beargumentering. Het werd een kleine
+ * statische tabel in RAM met willekeurige tokens, en dat is hier de betere keuze:
+ *
+ *  - GEEN device-secret om te maken, te bewaren en te beschermen. Een HMAC-token
+ *    is maar zo geheim als de sleutel op SPIFFS, en SPIFFS is op dit bord niet
+ *    versleuteld. Een tabel heeft niets te lekken: het token IS de sessie.
+ *  - GEEN afhankelijkheid van een kloktijd. Een stateless token draagt zijn
+ *    vervaltijd als absolute tijd, en die moet je kunnen toetsen -- maar de RTC van
+ *    deze node kan ongezet zijn (geen GPS, geen NTP gegarandeerd). De tabel toetst
+ *    op millis(), een monotone teller die altijd klopt; overloop na ~49 dagen wordt
+ *    met een SIGNED verschil opgevangen.
+ *  - EEN HERSTART WIST DE SESSIES, en dat is voor een terugval-beheertoegang een
+ *    kenmerk en geen gebrek: na een reboot log je opnieuw in. Een gestolen cookie
+ *    overleeft de reboot niet.
+ *  - LEAN. Vier sessies kosten hieronder ~150 byte RAM, geen heap, geen crypto-
+ *    bibliotheek in flash. Dat past bij een node waarvan het echte beheer over
+ *    LoRa-DM's loopt en het web de terugval is.
+ *
+ * De prijs -- de tabel is er maar EEN (deze node) en de sessies leven niet over
+ * herstarts -- is precies wat je voor een terugval-login wil.
+ *
+ * VEILIGHEID, EERLIJK: het token gaat als cookie over ONVERSLEUTELD HTTP. Wie het
+ * LAN kan meelezen, leest de cookie en kan hem overnemen -- net als bij Basic-auth.
+ * Dit VERVANGT de popup, niet TLS. De cookie is HttpOnly (geen JS-diefstal via XSS)
+ * en SameSite=Strict (geen CSRF vanaf een andere site), maar er staat met opzet
+ * GEEN 'Secure' op, want dan zou de node over gewoon HTTP geen enkele cookie meer
+ * zetten. Zet deze node niet open naar buiten; gebruik een VPN of een TLS-proxy als
+ * het van buiten moet. */
+#define WEB_COOKIE_NAME  "mu_sess"
+#define WEB_SESS_MAX     4                          /* gelijktijdige sessies */
+#define WEB_SESS_HEX     32                         /* 16 willekeurige bytes -> 32 hex */
+#define WEB_SESS_TTL_MS  (12UL * 60UL * 60UL * 1000UL)   /* 12 uur */
+
+struct WebSession {
+  char          tok[WEB_SESS_HEX + 1];
+  unsigned long expires_ms;
+  bool          used;
+};
+static WebSession g_sess[WEB_SESS_MAX] = {};
+
+/* DE ANTI-BRUTE-FORCE-REM. Een groeiende WACHTTIJD tussen mislukte pogingen, en met
+ * opzet NIET een delay() in het verzoekpad: dit is de synchrone server die de
+ * LoRa-timing deelt, en een halve seconde blokkeren daar is precies wat niet mag.
+ * We onthouden dus alleen een TIJDSTIP waarvoor de volgende poging geweigerd wordt;
+ * de server blijft ondertussen gewoon draaien. De teller en het tijdstip leven in
+ * RAM (een herstart of een geslaagde login wist ze), want dit is een rem tegen
+ * raden op afstand en geen boekhouding die de reboot hoeft te overleven. */
+static uint8_t       g_login_fails = 0;
+static unsigned long g_login_next_ms = 0;
+
+/* Twee hex-tekens uit een byte. */
+static void webHexByte(uint8_t b, char* o) {
+  static const char* H = "0123456789abcdef";
+  o[0] = H[b >> 4];
+  o[1] = H[b & 0x0f];
+}
+
+/* Vergelijking in (vrijwel) constante tijd: geen vroege uitstap op het eerste
+ * verschillende teken, zodat het antwoordtijdstip niets over de inhoud verraadt.
+ * Voor de willekeurige 128-bits tokens is dit ruim overbodig, voor het wachtwoord
+ * is het netjes. Vergelijkt tot de NUL van beide en telt een lengteverschil mee. */
+static bool webCtEqual(const char* a, const char* b) {
+  size_t la = strlen(a), lb = strlen(b);
+  size_t n = la < lb ? la : lb;
+  unsigned char d = (unsigned char)(la ^ lb);
+  for (size_t i = 0; i < n; i++) d |= (unsigned char)(a[i] ^ b[i]);
+  return d == 0;
+}
+
+/* millis()-overloop-veilig: is 'deadline' al voorbij? */
+static bool webPast(unsigned long deadline) {
+  return (long)(millis() - deadline) >= 0;
+}
+
+/* Het token uit de Cookie-kop halen naar out. Vereist dat collectHeaders("Cookie")
+ * in routes() is aangeroepen. Kopieert de kop eerst naar een STATISCHE buffer (niet
+ * op de gedeelde loop-stapel) en ontleedt daar op zijn plaats -- en dat kopiëren
+ * gebeurt BINNEN de strlcpy-expressie, dus zonder de tijdelijke-String-val die
+ * getArgStrict de das omdeed. Geeft false als er geen mu_sess-cookie is. */
+static char g_cookie_buf[320];
+static bool webCookieToken(WebServer& s, char* out, size_t out_len) {
+  out[0] = 0;
+  if (!s.hasHeader("Cookie")) return false;
+  strlcpy(g_cookie_buf, s.header("Cookie").c_str(), sizeof(g_cookie_buf));
+
+  const char* key = WEB_COOKIE_NAME "=";
+  size_t keylen = strlen(key);
+  char* p = strstr(g_cookie_buf, key);
+  /* Alleen op een cookie-grens matchen (begin, of na "; "), zodat een cookie met de
+   * naam "xmu_sess" niet per ongeluk raak is. */
+  while (p) {
+    if (p == g_cookie_buf || p[-1] == ' ' || p[-1] == ';') break;
+    p = strstr(p + 1, key);
+  }
+  if (!p) return false;
+  p += keylen;
+
+  size_t o = 0;
+  while (*p && *p != ';' && *p != ' ' && o + 1 < out_len) out[o++] = *p++;
+  out[o] = 0;
+  return o > 0;
+}
+
+/* Verlopen sessies opruimen -- lui, bij elke toets. */
+static void webSessionSweep() {
+  for (int i = 0; i < WEB_SESS_MAX; i++) {
+    if (g_sess[i].used && webPast(g_sess[i].expires_ms)) g_sess[i].used = false;
+  }
+}
+
+/* Een nieuwe sessie maken en het token (32 hex + NUL) in out zetten. Neemt een
+ * vrij/verlopen vakje, en anders het vakje dat het eerst zou verlopen (dan wint de
+ * verste sessie -- oudere gebruikers worden verdrongen, niet nieuwere geweigerd). */
+static void webSessionCreate(char* out /* [WEB_SESS_HEX+1] */) {
+  uint8_t r[WEB_SESS_HEX / 2];
+  for (size_t i = 0; i < sizeof(r); i++) r[i] = (uint8_t)(esp_random() & 0xff);
+  for (size_t i = 0; i < sizeof(r); i++) webHexByte(r[i], out + i * 2);
+  out[WEB_SESS_HEX] = 0;
+
+  int slot = -1;
+  for (int i = 0; i < WEB_SESS_MAX; i++) {
+    if (!g_sess[i].used || webPast(g_sess[i].expires_ms)) { slot = i; break; }
+  }
+  if (slot < 0) {
+    slot = 0;
+    for (int i = 1; i < WEB_SESS_MAX; i++) {
+      if ((long)(g_sess[i].expires_ms - g_sess[slot].expires_ms) < 0) slot = i;
+    }
+  }
+  strlcpy(g_sess[slot].tok, out, sizeof(g_sess[slot].tok));
+  g_sess[slot].expires_ms = millis() + WEB_SESS_TTL_MS;
+  g_sess[slot].used = true;
+}
+
+/* De sessie bij dit token weggooien (afmelden). */
+static void webSessionDestroy(const char* tok) {
+  for (int i = 0; i < WEB_SESS_MAX; i++) {
+    if (g_sess[i].used && webCtEqual(g_sess[i].tok, tok)) g_sess[i].used = false;
+  }
+}
+
 /* ---------------------- buffers voor het nodebeheer ----------------------- */
 
 /* DE OPDRACHTBUFFER. 176 en niet 160, en handleCommand krijgt een MUTEERBARE
@@ -275,6 +421,10 @@ void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
 void web_route_cli()       { if (g_self) g_self->handleCli(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
 void web_route_webcred()   { if (g_self) g_self->handleWebCred(); }
+void web_route_credreset() { if (g_self) g_self->handleWebCredReset(); }
+void web_route_login()     { if (g_self) g_self->handleLogin(); }
+void web_route_loginpost() { if (g_self) g_self->handleLoginPost(); }
+void web_route_logout()    { if (g_self) g_self->handleLogout(); }
 void web_route_sim()       { if (g_self) g_self->handleSim(); }
 void web_route_simclear()  { if (g_self) g_self->handleSimClear(); }
 void web_route_alerttest() { if (g_self) g_self->handleAlertTest(); }
@@ -312,11 +462,40 @@ static int getArgStrict(WebServer& s, const char* name, char* out, size_t out_le
   int n = s.args();
   for (int i = 0; i < n; i++) {
     if (strcmp(s.argName(i).c_str(), name) == 0) {
-      const char* v = s.arg(i).c_str();
-      size_t len = strlen(v);
-      if (len >= out_len) return -2;      /* zou afkappen -> weigeren */
-      strlcpy(out, v, out_len);
-      return (int)len;
+      /* DE BUG DIE /web/cred KAPOT MAAKTE -- EN WAAROM getArg() HET WEL DEED.
+       *
+       * Hier stond:
+       *     const char* v = s.arg(i).c_str();
+       *     size_t len = strlen(v);
+       *     ... strlcpy(out, v, out_len);
+       *
+       * s.arg(i) geeft een String TERUG PER WAARDE -- een tijdelijk object. Zijn
+       * .c_str() wijst naar de INTERNE buffer van dat tijdelijke object. De
+       * ESP32-String heeft "small string optimisation": voor korte waarden
+       * (o.a. "admin", "meshcore") zit die buffer IN het object zelf (sso.buff),
+       * niet op de heap. Aan het einde van de statement (de puntkomma) wordt het
+       * tijdelijke object vernietigd en komt zijn stapelruimte vrij; 'v' bengelt
+       * dan naar geheugen dat de eerstvolgende regel (strlen, de vergelijking, de
+       * strlcpy-oproep) meteen hergebruikt. strlen(v) las dus overschreven bytes en
+       * gaf een lengte die niet klopte -- bij korte credentials deterministisch 0.
+       * Vandaar dat handleWebCred "user ontbreekt of is leeg" teruggaf, OOK met
+       * user/pass in de querystring: het lag niet aan het lezen van de argumenten
+       * (dat werkte) maar aan use-after-free NA het lezen.
+       *
+       * getArg() ontsnapte hieraan puur door de vorm: daar staat
+       *     strlcpy(out, s.arg(i).c_str(), out_len);
+       * en dan leeft het tijdelijke String-object tot NA de strlcpy (het einde van
+       * DIE volledige expressie), dus tijdens het kopiëren is de buffer nog geldig.
+       * Zelfde bibliotheek, zelfde s.args()/argName()/arg() -- het enige verschil
+       * was dat getArgStrict de pointer over een puntkomma heen bewaarde.
+       *
+       * DE FIX: nooit een .c_str() van een tijdelijke String in een pointer
+       * bewaren. We meten de lengte en kopiëren, elk BINNEN zijn eigen volledige
+       * expressie (elke s.arg(i) is een eigen, kortlevende tijdelijke), en meten
+       * daarna de definitieve lengte uit de VASTE uitvoerbuffer. */
+      if (s.arg(i).length() >= out_len) return -2;   /* zou afkappen -> weigeren */
+      strlcpy(out, s.arg(i).c_str(), out_len);
+      return (int)strlen(out);
     }
   }
   return -1;
@@ -703,6 +882,7 @@ letter-spacing:.13em;color:var(--muted)}
 <div class="top">
 <h1>MeshUptime<span id="sub">bewaking &middot; heltec v3</span></h1>
 <button id="thm" title="Wissel licht/donker thema">thema</button>
+<button id="lo" title="Sessie afmelden">afmelden</button>
 </div>
 
 <nav class="tabs">
@@ -1196,15 +1376,21 @@ autocomplete="new-password" placeholder="nieuw"></label>
 
 <div id="webal"></div>
 <details><summary>Web-login &mdash; de eigen inlog van deze node</summary><div>
-<p class="note">Dit is de <b>Basic-auth</b> waarmee je nu op deze pagina bent
-ingelogd &mdash; iets anders dan het beheerderswachtwoord hierboven, want dat is de
+<p class="note">Dit is de login van <b>deze webpagina</b> &mdash; waarmee je via
+/login een sessie krijgt, en waarmee de MeshManager-server met Basic-auth headless
+binnenkomt. Iets anders dan het beheerderswachtwoord hierboven, want dat is de
 login over het <i>mesh</i>. Elke node hoort hier zijn <b>eigen</b> gebruiker en
 wachtwoord te hebben: staan ze nog op de gebakken standaard, dan is het dezelfde
 login als op elke andere node en de repeater, en opent &eacute;&eacute;n gelekte
 credential de hele vloot. Opgeslagen wint van gebakken, net als bij WiFi.<br>
-<b>Na opslaan</b> vraagt de browser bij het volgende verzoek om de nieuwe
-inloggegevens &mdash; de lopende sessie loopt gewoon af. Het wachtwoord wordt nooit
-getoond of teruggelezen, en <b>leeg laten kan niet</b> (dat zou de node openzetten).<br>
+<b>Na opslaan</b> blijf je gewoon ingelogd: je sessiecookie staat los van de
+gebruiker/wachtwoord, dus die verandert niet mee. Pas bij het VOLGENDE inloggen (of
+voor de MeshManager-server, die met Basic-auth komt) geldt de nieuwe login. Het
+wachtwoord wordt nooit getoond of teruggelezen, en <b>leeg laten kan niet</b> (dat
+zou de node openzetten).<br>
+<b>Terug naar de gebakken standaard</b> (admin/meshcore) kan met de knop hieronder:
+die verwijdert de opgeslagen login (/web.cfg), waarna de gebakken waarden weer
+gelden. Handig na een flash om van een geroteerde login af te komen.<br>
 <b>Eerlijk over de grens:</b> Basic-auth gaat over onversleuteld HTTP, dus ook een
 eigen wachtwoord gaat leesbaar (base64) over het LAN. Dit verkleint de schade van
 &eacute;&eacute;n lek tot deze ene node, maar het <b>vervangt geen TLS</b> of een
@@ -1215,7 +1401,10 @@ autocomplete="username"></label>
 <label>Wachtwoord<input id="wcp" type="password" maxlength="64"
 autocomplete="new-password" placeholder="nieuw"></label>
 </div>
+<div class="quick">
 <button id="wcgo">Opslaan</button>
+<button id="wcreset" class="dng">terug naar standaard (admin/meshcore)</button>
+</div>
 </div></details>
 
 <details><summary>WiFi</summary><div>
@@ -1259,6 +1448,25 @@ niet in dat lijstje staan; zoeken op naam werkt wel.</p>
 </section>
 
 <script>
+/* ===================== sessie: 401 -> naar de login =======================
+ *
+ * De pagina praat alleen via fetch() met de node, en een fetch() opent GEEN
+ * inlogpopup bij een 401 (anders dan een navigatie of een <img>). Als een sessie
+ * verloopt terwijl de pagina openstaat, komt dat dus terug als een 401 in elke
+ * verversing. We vangen dat op EEN plek op door fetch() eenmalig te omwikkelen: bij
+ * een 401 sturen we de browser naar de eigen inlogpagina in plaats van de gebruiker
+ * met stille fouten te laten zitten. Alle bestaande aanroepen (status.json, cli,
+ * acl.json, cfg.json, web/cred, ...) lopen hier vanzelf doorheen. */
+(function(){var of=window.fetch;window.fetch=function(u,o){
+return of(u,o).then(function(r){if(r.status==401){location.replace("login")}return r})}})();
+
+/* Afmelden: de sessie wissen (POST /logout wist ze ook aan de nodekant) en naar de
+   inlogpagina. Faalt de POST, dan toch naar /login -- de cookie is dan hoogstens nog
+   lokaal geldig en de login vraagt sowieso opnieuw. */
+document.getElementById("lo").onclick=function(){
+fetch("logout",{method:"POST"}).then(function(){location.replace("login")})
+.catch(function(){location.replace("login")})};
+
 /* ============================ het thema ==================================
  *
  * Drie standen, één knop die er rondloopt: systeem -> licht -> donker -> systeem.
@@ -2232,15 +2440,30 @@ var p=document.getElementById("wcp").value;
 if(!u){logline("(web-login)","gebruiker mag niet leeg zijn",0);return}
 if(!p){logline("(web-login)","wachtwoord mag niet leeg zijn — een lege pass "+
 "zet de node open",0);return}
-if(!confirm("Web-login van DEZE node wijzigen?\n\nGebruiker: "+u+"\n\nNa opslaan "+
-"vraagt de browser bij het volgende verzoek om de nieuwe inloggegevens. Het "+
-"beheerderswachtwoord (login over het mesh) verandert hier NIET mee.")){return}
+if(!confirm("Web-login van DEZE node wijzigen?\n\nGebruiker: "+u+"\n\nJe blijft "+
+"ingelogd (je sessiecookie verandert niet mee); de nieuwe login geldt bij het "+
+"volgende inloggen. Het beheerderswachtwoord (login over het mesh) verandert hier "+
+"NIET mee.")){return}
 fetch("web/cred",{method:"POST",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"user="+encodeURIComponent(u)+"&pass="+encodeURIComponent(p)})
 .then(function(r){return r.text().then(function(t){
-if(r.ok){logline("(web-login)","opgeslagen; log opnieuw in met de nieuwe "+
-"gegevens",1);document.getElementById("wcp").value="";cfg()}
+if(r.ok){logline("(web-login)","opgeslagen; geldt bij het volgende inloggen",1);
+document.getElementById("wcp").value="";cfg()}
+else{logline("(web-login)",t.trim()||("fout "+r.status),0)}})})
+.catch(function(){logline("(web-login)","geen verbinding met de node",0)})}
+
+/* Terug naar de gebakken standaard (admin/meshcore): POST /web/cred/reset wist
+   /web.cfg. Twee keer bevestigen zit er niet op, maar de tekst is duidelijk over
+   het gevolg. Je blijft ingelogd; de standaard geldt bij het volgende inloggen. */
+document.getElementById("wcreset").onclick=function(){
+if(!confirm("Web-login terugzetten op de GEBAKKEN standaard admin/meshcore?\n\nDe "+
+"opgeslagen eigen login (/web.cfg) wordt verwijderd. Dat is de vlootbrede standaard "+
+"-- geef deze node daarna weer een eigen login. Doorgaan?")){return}
+fetch("web/cred/reset",{method:"POST"})
+.then(function(r){return r.text().then(function(t){
+if(r.ok){logline("(web-login)","teruggezet op admin/meshcore; geldt bij het "+
+"volgende inloggen",1);cfg()}
 else{logline("(web-login)",t.trim()||("fout "+r.status),0)}})})
 .catch(function(){logline("(web-login)","geen verbinding met de node",0)})}
 
@@ -2483,7 +2706,20 @@ void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
 }
 
 void WebTask::routes() {
+  /* De Cookie-kop MOET verzameld worden voordat handleClient() draait, anders geeft
+   * header("Cookie") altijd leeg terug en ziet geen enkele sessie er ooit uit als
+   * geldig. Authorization (Basic) wordt altijd al gelezen; deze regel is alleen voor
+   * de sessiecookie. Eenmalig bij het opstarten. */
+  static const char* COLLECT_HEADERS[] = { "Cookie" };
+  _server->collectHeaders(COLLECT_HEADERS, 1);
+
   _server->on("/", HTTP_GET, web_route_root);
+  /* De eigen inlogpagina en het afmelden -- de mens-gerichte kant van de auth.
+   * /login is met opzet NIET achter de auth (anders kon je nooit inloggen); de POST
+   * heeft zijn eigen brute-force-rem. /logout wist de sessie. */
+  _server->on("/login", HTTP_GET, web_route_login);
+  _server->on("/login", HTTP_POST, web_route_loginpost);
+  _server->on("/logout", HTTP_POST, web_route_logout);
   _server->on("/status.json", HTTP_GET, web_route_status);
   _server->on("/wifi", HTTP_POST, web_route_wifi);
   /* Uptime Kuma laat de methode vrij; beide kunnen dus. */
@@ -2513,6 +2749,10 @@ void WebTask::routes() {
    * zijn die een browser of een linkchecker kan volgen, en dit verandert het
    * wachtwoord van de node. */
   _server->on("/web/cred", HTTP_POST, web_route_webcred);
+  /* De reset naar de gebakken standaard (admin/meshcore). POST-only en achter de
+   * auth: de eigenaar roept hem NA het flashen aan met de HUIDIGE (geroteerde)
+   * login. Zie de uitleg boven handleWebCredReset(). */
+  _server->on("/web/cred/reset", HTTP_POST, web_route_credreset);
   /* Simuleren en testen. POST-only, en hier om twee redenen: een GET die een
    * sensor forceert is een link waarmee iemand de bewaking van een kanaal
    * uitzet, en een GET die een testbericht stuurt is een link die zendtijd kost
@@ -2566,19 +2806,49 @@ void WebTask::loop() {
 /* Elke route zit hierachter. Mislukt het, dan een 401 met de realm, zodat een
  * browser om inloggegevens vraagt en een script (Uptime Kuma) een duidelijke
  * fout krijgt in plaats van stilte. */
+/* Draagt dit verzoek een geldige sessiecookie? Alleen de cookie -- Basic-auth zit
+ * in authOk() ernaast. */
+bool WebTask::sessionValid() {
+  char tok[WEB_SESS_HEX + 1];
+  if (!webCookieToken(*_server, tok, sizeof(tok))) return false;
+  if (strlen(tok) != WEB_SESS_HEX) return false;
+  webSessionSweep();
+  for (int i = 0; i < WEB_SESS_MAX; i++) {
+    if (g_sess[i].used && webCtEqual(g_sess[i].tok, tok)) return true;
+  }
+  return false;
+}
+
+/* De twee wegen samen: cookie (de mens) OF Basic-auth (de server). De cookie eerst,
+ * want die is goedkoop en het gewone geval voor een browser; anders de Basic-toets
+ * tegen de OPGESLAGEN credential (g_web_user/g_web_pass -- niet de gebakken macro's;
+ * die zijn enkel de terugval bij een verse node, zie begin()). */
+bool WebTask::authOk() {
+  if (sessionValid()) return true;
+  return _server->authenticate(g_web_user, g_web_pass);
+}
+
 bool WebTask::requireAuth() {
-  /* Tegen de OPGESLAGEN credential, niet tegen de gebakken macro's: die zijn alleen
-   * de terugval bij een verse node (zie begin()). g_web_user/g_web_pass dragen de
-   * waarde die nu geldt, en een rotatie via /web/cred of de console zet ze om --
-   * pas voor het VOLGENDE verzoek, want dit wordt aan het begin van elk verzoek
-   * gelezen en de rotatie schrijft ze pas na de auth. */
-  if (_server->authenticate(g_web_user, g_web_pass)) return true;
+  /* De API-poort. Geldig via cookie of Basic -> door. Anders een 401 met de
+   * Basic-uitdaging: de MeshManager-server (die Basic vooraf meestuurt) werkt zo
+   * gewoon door, en een browser-fetch() krijgt de 401 zonder dat er een inlogpopup
+   * opent -- de pagina stuurt zichzelf dan naar /login (zie de fetch-wikkel in
+   * PAGE_HTML). Zo blijft de machineweg heel terwijl de popup voor mensen weg is. */
+  if (authOk()) return true;
   _server->requestAuthentication(BASIC_AUTH, WEB_REALM);
   return false;
 }
 
 void WebTask::handleRoot() {
-  if (!requireAuth()) return;
+  /* De MENS-gerichte pagina. Zonder geldige sessie/Basic NIET met een 401 antwoorden
+   * (dat opent de lelijke popup bij een navigatie) maar netjes doorsturen naar de
+   * eigen inlogpagina. */
+  if (!authOk()) {
+    _server->sendHeader("Location", "/login");
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(302, "text/plain", "");
+    return;
+  }
   _server->sendHeader("Cache-Control", "no-store");
   _server->send_P(200, "text/html", PAGE_HTML);
 }
@@ -4176,4 +4446,233 @@ void WebTask::handleWebCred() {
 
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", "{\"ok\":1}");
+}
+
+/* ============================ de sessie-login ============================= */
+
+/* De inlogpagina. Zelfstandig (geen CDN, geen externe fonts -- de node heeft geen
+ * internet), en in dezelfde vormtaal als de hoofdpagina: dezelfde MeshManager-
+ * kleurtokens, dezelfde drie themastanden (systeem/licht/donker), dezelfde mono-
+ * en sans-stapels. Het formulier POST't gewoon (geen fetch), zodat inloggen ook
+ * zonder JavaScript werkt; de 302 van de server regelt de rest. Een klein stukje JS
+ * toont alleen de foutmelding uit de querystring (?bad of ?wait=N) -- de server
+ * schrijft geen tekst in deze pagina, dus hij blijft een statisch PROGMEM-document.
+ *
+ * De EERLIJKE veiligheidsnoot staat op de pagina zelf: cookie + login over
+ * onversleuteld HTTP is geen TLS. */
+static const char LOGIN_HTML[] PROGMEM = R"HTML(<!DOCTYPE html>
+<html lang="nl"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MeshUptime &middot; inloggen</title>
+<script>
+try{var t=localStorage.getItem("mu-theme");
+if(t=="light"||t=="dark"){document.documentElement.setAttribute("data-theme",t)}}
+catch(e){}
+</script>
+<style>
+:root{
+--bg:#0b0f14;--card:#121a23;--border:#1e2b3a;--text:#d7e2ea;--muted:#7d8fa0;
+--accent:#35e08c;--amber:#ffb454;--cyan:#4cc9f0;--red:#ff5c5c;
+--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+--mono:ui-monospace,"Cascadia Code",Consolas,monospace}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){
+--bg:#eef3f1;--card:#ffffff;--border:#d2ddd7;--text:#16241d;--muted:#5b6b63;
+--accent:#0e9c60;--amber:#b8741a;--cyan:#0b7fa8;--red:#cf3b3b}}
+:root[data-theme="light"]{
+--bg:#eef3f1;--card:#ffffff;--border:#d2ddd7;--text:#16241d;--muted:#5b6b63;
+--accent:#0e9c60;--amber:#b8741a;--cyan:#0b7fa8;--red:#cf3b3b}
+*{box-sizing:border-box}
+body{font-family:var(--sans);font-size:15px;line-height:1.45;margin:0;
+min-height:100vh;display:flex;align-items:center;justify-content:center;
+padding:1.2rem;color:var(--text);background:var(--bg)}
+.box{width:100%;max-width:22rem}
+h1{font-size:1.15rem;letter-spacing:.02em;margin:0 0 .15rem}
+h1 span{font-family:var(--mono);font-size:.66rem;text-transform:uppercase;
+letter-spacing:.16em;color:var(--muted);display:block;margin-top:.25rem}
+.card{background:linear-gradient(180deg,rgba(255,255,255,.025),transparent 55%),
+var(--card);border:1px solid var(--border);border-radius:10px;padding:1.1rem;
+margin-top:1rem}
+label{display:block;font-family:var(--mono);font-size:.64rem;text-transform:uppercase;
+letter-spacing:.12em;color:var(--muted);margin:.7rem 0 0}
+label:first-child{margin-top:0}
+input{width:100%;margin-top:.3rem;padding:.5rem .6rem;font-family:var(--mono);
+font-size:.95rem;color:var(--text);background:var(--bg);border:1px solid var(--border);
+border-radius:6px}
+input:focus{outline:none;border-color:var(--cyan)}
+button{margin-top:1rem;width:100%;padding:.55rem 1.1rem;font-family:var(--mono);
+font-size:.72rem;text-transform:uppercase;letter-spacing:.12em;cursor:pointer;
+color:var(--bg);background:var(--accent);border:1px solid var(--accent);border-radius:6px}
+button:hover{filter:brightness(1.1)}
+#err{font-family:var(--mono);font-size:.8rem;min-height:1.2rem;margin-top:.7rem;
+color:var(--red)}
+.note{font-size:.8rem;color:var(--muted);margin:1rem 0 0}
+.note b{color:var(--text);font-weight:600}
+.thm{margin-top:.9rem;text-align:right}
+.thm button{width:auto;margin:0;padding:.3rem .7rem;background:transparent;
+color:var(--muted);border-color:var(--border);text-transform:none;letter-spacing:0}
+.thm button:hover{color:var(--cyan);border-color:var(--cyan);filter:none}
+</style></head><body>
+<div class="box">
+<h1>MeshUptime<span>bewaking &middot; inloggen</span></h1>
+<div class="card">
+<form method="post" action="/login" autocomplete="on">
+<label>Gebruiker<input name="user" autocomplete="username" autofocus
+spellcheck="false"></label>
+<label>Wachtwoord<input name="pass" type="password" autocomplete="current-password"></label>
+<button type="submit">inloggen</button>
+</form>
+<div id="err"></div>
+<p class="note"><b>Dit is de lokale terugval-beheertoegang van deze node.</b> Het
+echte beheer loopt over LoRa-DM's; dit web is er voor als je erbij moet zonder mesh.
+Na inloggen krijg je een sessiecookie (12&nbsp;uur geldig); afmelden kan op de
+pagina.</p>
+<p class="note"><b>Eerlijk over de grens:</b> deze login en de cookie gaan over
+<b>onversleuteld HTTP</b>. Wie het LAN kan meelezen, leest ze mee &mdash; dit
+vervangt de inlogpopup, niet TLS. Zet deze node niet open naar buiten; gebruik een
+VPN of een TLS-proxy als het van buiten moet.</p>
+<div class="thm"><button id="thm" type="button">thema</button></div>
+</div>
+</div>
+<script>
+/* De foutmelding uit de querystring (?bad of ?wait=N). De server schrijft niets in
+   deze pagina; dit houdt hem statisch en injectievrij. */
+(function(){var q=location.search,e=document.getElementById("err");
+var m=q.match(/[?&]wait=(\d+)/);
+if(m){e.textContent="Te veel mislukte pogingen. Wacht "+m[1]+" s en probeer opnieuw."}
+else if(/[?&]bad/.test(q)){e.textContent="Gebruiker of wachtwoord onjuist."}})();
+/* Zelfde themaknop-logica als de hoofdpagina, in het klein. */
+var THEMES=["system","light","dark"],THNAME={system:"systeem",light:"licht",dark:"donker"};
+function thGet(){try{var t=localStorage.getItem("mu-theme");
+return(t=="light"||t=="dark")?t:"system"}catch(e){return"system"}}
+function thApply(t){try{if(t=="system"){localStorage.removeItem("mu-theme");
+document.documentElement.removeAttribute("data-theme")}
+else{localStorage.setItem("mu-theme",t);
+document.documentElement.setAttribute("data-theme",t)}}catch(e){}
+document.getElementById("thm").textContent="thema: "+THNAME[t]}
+document.getElementById("thm").onclick=function(){
+var i=THEMES.indexOf(thGet());thApply(THEMES[(i+1)%THEMES.length])};
+thApply(thGet());
+</script>
+</body></html>)HTML";
+
+/* De groeiende wachttijd tussen mislukte inlogpogingen. Pas vanaf de derde fout
+ * (twee vertypen mag zonder straf), daarna 5 s per extra fout, tot ten hoogste
+ * 300 s. Niet-blokkerend: dit is de wachttijd die de POST-handler AFDWINGT via een
+ * tijdstip, niet een delay(). */
+static unsigned long webBruteWaitMs(uint8_t fails) {
+  if (fails < 3) return 0;
+  unsigned long secs = (unsigned long)(fails - 2) * 5UL;
+  if (secs > 300) secs = 300;
+  return secs * 1000UL;
+}
+
+void WebTask::handleLogin() {
+  /* Al ingelogd? Dan niet nog eens het formulier tonen, maar door naar de pagina. */
+  if (authOk()) {
+    _server->sendHeader("Location", "/");
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(302, "text/plain", "");
+    return;
+  }
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send_P(200, "text/html", LOGIN_HTML);
+}
+
+void WebTask::handleLoginPost() {
+  /* De brute-force-rem: staat de klok nog vóór het vrijgavetijdstip, dan weigeren we
+   * zonder zelfs maar te toetsen, met de resterende wachttijd in de melding. */
+  unsigned long now = millis();
+  if (!webPast(g_login_next_ms)) {
+    unsigned long left = (g_login_next_ms - now + 999) / 1000;
+    char loc[48];
+    snprintf(loc, sizeof(loc), "/login?wait=%lu", left);
+    _server->sendHeader("Location", loc);
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(302, "text/plain", "");
+    return;
+  }
+
+  /* De ingevoerde login lezen met de VEILIGE lezer (getArg -- geen bengelende
+   * pointer). Afkappen is hier onschuldig: een afgekapt wachtwoord is gewoon een
+   * verkeerd wachtwoord en faalt de toets. */
+  char user[WEB_USER_LEN], pass[WEB_PASS_LEN];
+  if (!getArg(*_server, "user", user, sizeof(user))) user[0] = 0;
+  if (!getArg(*_server, "pass", pass, sizeof(pass))) pass[0] = 0;
+
+  bool ok = user[0] && pass[0] &&
+            webCtEqual(user, g_web_user) && webCtEqual(pass, g_web_pass);
+
+  if (ok) {
+    g_login_fails = 0;
+    g_login_next_ms = millis();
+    char tok[WEB_SESS_HEX + 1];
+    webSessionCreate(tok);
+    char cookie[128];
+    /* Geen 'Secure' (zie de noot bij de sessietabel: dat zou over HTTP elke cookie
+     * onderdrukken). HttpOnly + SameSite=Strict + Path=/ + Max-Age. */
+    snprintf(cookie, sizeof(cookie),
+             "%s=%s; Max-Age=%lu; Path=/; HttpOnly; SameSite=Strict",
+             WEB_COOKIE_NAME, tok, (unsigned long)(WEB_SESS_TTL_MS / 1000UL));
+    _server->sendHeader("Set-Cookie", cookie);
+    _server->sendHeader("Location", "/");
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(302, "text/plain", "");
+    return;
+  }
+
+  /* Mislukt: teller op, groeiende wachttijd zetten, terug naar het formulier met een
+   * nette melding. */
+  if (g_login_fails < 255) g_login_fails++;
+  g_login_next_ms = millis() + webBruteWaitMs(g_login_fails);
+  _server->sendHeader("Location", "/login?bad=1");
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(302, "text/plain", "");
+}
+
+void WebTask::handleLogout() {
+  /* Geen auth nodig: afmelden mag altijd, en meer dan de eigen sessie wissen kan het
+   * niet. Beide kanten: het vakje in de tabel en de cookie in de browser. */
+  char tok[WEB_SESS_HEX + 1];
+  if (webCookieToken(*_server, tok, sizeof(tok))) webSessionDestroy(tok);
+  _server->sendHeader("Set-Cookie",
+      WEB_COOKIE_NAME "=; Max-Age=0; Path=/; HttpOnly; SameSite=Strict");
+  _server->sendHeader("Location", "/login");
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(302, "text/plain", "");
+}
+
+/* POST /web/cred/reset -- terug naar de GEBAKKEN standaard (admin/meshcore).
+ *
+ * HOE DE EIGENAAR admin/meshcore TERUGKRIJGT:
+ *   SPIFFS overleeft een flash van de firmware. De node staat nu op een geroteerde
+ *   login (mm-...) in /web.cfg, en die blijft dus staan na het flashen van deze
+ *   firmware. Deze route verwijdert /web.cfg; daardoor valt begin() (en elke
+ *   requireAuth erna) terug op de gebakken WEB_USER/WEB_PASS = admin/meshcore.
+ *
+ * Roep hem NA het flashen aan MET DE HUIDIGE (geroteerde) login, bv.:
+ *   curl -u mm-USER:mm-PASS -X POST http://<node-ip>/web/cred/reset
+ * Antwoord {"ok":1}; daarna is de login admin/meshcore. (Ook via de eigen sessie te
+ * doen: log in met de huidige login en de knop 'terug naar standaard' onder
+ * Web-login op het node-tabblad doet hetzelfde.)
+ *
+ * Ben je de huidige login kwijt, dan is de terugval een volledige flash-wis
+ * (`pio run -e meshuptime -t erase` en opnieuw flashen): dat wist heel SPIFFS, dus
+ * ook /web.cfg -- maar ook de monitors en de wifi-instelling. Daarom is deze route
+ * de schone weg en de erase de noodrem.
+ *
+ * De lopende sessies laten we staan: de credential verandert, maar wie nu is
+ * ingelogd is dezelfde beheerder en hoeft er niet uit gegooid te worden. */
+void WebTask::handleWebCredReset() {
+  if (!requireAuth()) return;
+
+  if (!MonitorStore::clearWebCred(SPIFFS)) {
+    _server->send(500, "text/plain", "kon /web.cfg niet verwijderen\n");
+    return;
+  }
+  strlcpy(g_web_user, WEB_USER, sizeof(g_web_user));
+  strlcpy(g_web_pass, WEB_PASS, sizeof(g_web_pass));
+  g_web_custom = false;
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", "{\"ok\":1,\"reset\":1}");
 }

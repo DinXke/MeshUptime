@@ -370,3 +370,15 @@ bool MonitorStore::saveWebCred(fs::FS& fs, const char* user, const char* pass) {
   f.close();
   return true;
 }
+
+bool MonitorStore::clearWebCred(fs::FS& fs) {
+  /* Geen bestand = al terug op de gebakken standaard; dat is geen fout maar het
+   * gewenste eindresultaat, dus true. */
+  if (!fs.exists(WEB_CFG_PATH)) {
+    MESH_DEBUG_PRINTLN("MonitorStore: %s bestond niet, gebakken web-login geldt", WEB_CFG_PATH);
+    return true;
+  }
+  bool ok = fs.remove(WEB_CFG_PATH);
+  MESH_DEBUG_PRINTLN("MonitorStore: %s verwijderd (%s)", WEB_CFG_PATH, ok ? "ok" : "MISLUKT");
+  return ok;
+}

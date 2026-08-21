@@ -108,10 +108,49 @@ private:
   const char*     _fw = "";
   bool            _serving = false;
 
+  /* DE AUTHENTICATIE VAN DEZE NODE -- TWEE WEGEN, EEN SLOT.
+   *
+   * authOk() is de kern: een verzoek is toegelaten als het OFWEL een geldige
+   * sessiecookie draagt (de mens, ingelogd via /login) OFWEL door HTTP Basic-auth
+   * komt tegen de opgeslagen credential (de MeshManager-server, headless). Beide
+   * paden geven dezelfde toegang; ze verschillen alleen in HOE je je aanmeldt.
+   *
+   * requireAuth() is de API-poort: authOk() of anders een 401 met een Basic-
+   * uitdaging. De server (curl -u, MeshManager) stuurt Basic vooraf mee en werkt dus
+   * gewoon door; een browser die /status.json ophaalt zonder geldige sessie krijgt
+   * de 401 in zijn fetch() -- GEEN inlogpopup, want fetch() opent er geen -- en de
+   * pagina stuurt zichzelf dan naar /login. Zo is de lelijke Basic-popup weg voor
+   * mensen zonder dat de machineweg breekt.
+   *
+   * sessionValid() toetst alleen de cookie. Zie WebTask.cpp voor de sessietabel en
+   * de afweging (statische RAM-tabel i.p.v. ondertekende stateless tokens). */
+  bool authOk();
+  bool sessionValid();
   bool requireAuth();
   void routes();
 
   void handleRoot();
+
+  /* DE EIGEN INLOGPAGINA -- vervangt de browser-Basic-popup.
+   *
+   * handleLogin()      GET  /login  -- de nette inlogpagina (of 302 naar / als je al
+   *                                     een geldige sessie hebt).
+   * handleLoginPost()  POST /login  -- controleert user+pass tegen de opgeslagen
+   *                                     credential, zet bij succes de sessiecookie en
+   *                                     stuurt naar /; bij fout terug naar /login met
+   *                                     een melding, met een niet-blokkerende anti-
+   *                                     brute-force-rem (groeiende wachttijd).
+   * handleLogout()     POST /logout -- wist de sessie aan beide kanten (tabel +
+   *                                     verlopen cookie) en stuurt naar /login. */
+  void handleLogin();
+  void handleLoginPost();
+  void handleLogout();
+
+  /* POST /web/cred/reset -- zet de web-login terug op de GEBAKKEN standaard
+   * (admin/meshcore) door /web.cfg te verwijderen. Achter dezelfde auth als de rest:
+   * de eigenaar roept hem NA het flashen aan met de HUIDIGE (geroteerde) login. Zie
+   * de uitleg boven de implementatie in WebTask.cpp. */
+  void handleWebCredReset();
   void handleStatus();
   void handleWifi();
   void handleHook();
@@ -204,6 +243,10 @@ private:
   friend void web_route_cli();
   friend void web_route_cfgjson();
   friend void web_route_webcred();
+  friend void web_route_credreset();
+  friend void web_route_login();
+  friend void web_route_loginpost();
+  friend void web_route_logout();
   friend void web_route_sim();
   friend void web_route_simclear();
   friend void web_route_alerttest();

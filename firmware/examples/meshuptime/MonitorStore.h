@@ -289,4 +289,11 @@ public:
   /* Schrijft /web.cfg. Weigert (false) een lege user of een lege pass: een lege
    * pass zou de node openzetten, en dat mag nooit -- ook niet op verzoek. */
   static bool saveWebCred(fs::FS& fs, const char* user, const char* pass);
+
+  /* Verwijdert /web.cfg, zodat de node terugvalt op de GEBAKKEN WEB_USER/WEB_PASS
+   * (admin/meshcore) -- de "opgeslagen wint van gebakken"-regel omgekeerd. Dit is
+   * de schone weg om een geroteerde login terug te zetten naar de standaard zonder
+   * de rest van SPIFFS (monitors, wifi) te wissen. Geeft true als het bestand daarna
+   * weg is (verwijderd of het bestond al niet); false als remove() faalde. */
+  static bool clearWebCred(fs::FS& fs);
 };
