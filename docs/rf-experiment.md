@@ -56,3 +56,25 @@ productiewerkweg; de mesh-weg is de redundante.
 De eigenaar had de systeemkennis (de 1-byte-filter) die de reviewer miste, en de
 reviewer trok te vroeg een fysieke conclusie. Meten wees de goede kant op zodra de
 juiste hypothese getest werd — maar de juiste hypothese kwam van de eigenaar.
+
+
+---
+
+## Beslissing (21 aug): server-monitoring blijft WiFi
+
+De eigenaar heeft bepaald: DinX-Home blijft de monitor en het hele
+server-monitoring-verhaal (de node uitlezen) mag over WiFi/IP blijven zoals het
+nu is. De mesh-telemetrie-uitlezing naar DinX-Home wordt daarmee NIET verder
+nagejaagd -- het is geen open bug meer maar een bewuste keuze.
+
+Mesh-first geldt onverkort voor de KERN van de node, en die is al mesh-native:
+- de app bericht de node over LoRa (DM-commando's list/get/status/add/edit/del/
+  ping/ok) -- werkt, node staat daarom op adv.type=chat;
+- de node alarmeert de companion over LoRa (alertIf, herhaal-tot-ok).
+
+De IP-wegen (server-poll van telemetrie, web-UI, web-push) zijn expliciet de
+TERUGVAL/lokale laag, niet de kern. path.hash.mode blijft op 1 (2-byte): dat is
+sowieso robuuster op een mesh waar een repeater 1-byte-hashes filtert, en het
+kost de app-DM's niets merkbaars.
+
+Niet meer heropenen tenzij de eigenaar de mesh-read expliciet wél wil.
