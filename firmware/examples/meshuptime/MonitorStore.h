@@ -96,6 +96,28 @@
 #define MON_CFG_PATH   "/monitors.cfg"
 #define MON_TMP_PATH   "/monitors.tmp"
 
+/* De EIGEN web-inloggegevens van deze node -- een apart, klein bestand.
+ *
+ * WAAROM NIET IN /monitors.cfg. Dat bestand is van MonitorSensors: die leest het
+ * bij het opstarten in zijn eigen MonitorCfg en HERSCHRIJFT het volledig bij elke
+ * monitorwijziging. WebTask kan die MonitorCfg in RAM niet aanraken zonder
+ * MonitorSensors.* te wijzigen (buiten deze opdracht gehouden). Zou WebTask de
+ * web-login in /monitors.cfg zetten, dan gooit de eerstvolgende save() van
+ * MonitorSensors hem er weer uit -- twee schrijvers op één bestand lopen uit
+ * elkaar en dan is er geen manier meer te zien welke de waarheid is.
+ *
+ * Een eigen bestand geeft WebTask het VOLLEDIGE eigenaarschap: niemand anders leest
+ * of schrijft /web.cfg, geen race, geen coördinatie. Het is precies de opzet van de
+ * wifi-instelling (/wifi.cfg, ook een apart tweeregelig bestand), en die filosofie
+ * -- opgeslagen wint van gebakken -- geldt hier één op één.
+ *
+ * FORMAAT: twee regels, net als /wifi.cfg. Regel 1 de gebruiker, regel 2 het
+ * wachtwoord. Tekst, met "cat" te lezen over de seriële console; geen struct, geen
+ * uitlijning om je aan te vergissen. */
+#define WEB_CFG_PATH   "/web.cfg"
+#define WEB_USER_LEN   33      /* 32 tekens + afsluiter */
+#define WEB_PASS_LEN   65      /* 64 tekens + afsluiter */
+
 /* Grenzen van het ping-interval, hier en niet in MonitorSensors.cpp: het
  * inleesfilter en het instellingenfilter moeten dezelfde grenzen aanhouden,
  * anders keurt de een af wat de ander wegschrijft.
@@ -254,4 +276,17 @@ public:
 
   /* Schrijft via MON_TMP_PATH en noemt dat daarna om. */
   static bool save(fs::FS& fs, const MonitorCfg& cfg);
+
+  /* --- de eigen web-inloggegevens (zie WEB_CFG_PATH hierboven) --- */
+
+  /* Leest /web.cfg. Geeft alleen true als er een BRUIKBARE login staat: beide
+   * regels aanwezig en geen van beide leeg. Een lege pass telt niet als geldig --
+   * die zou de node openzetten. Bij false blijven user/pass leeg en valt de
+   * aanroeper terug op de gebakken WEB_USER/WEB_PASS. */
+  static bool loadWebCred(fs::FS& fs, char* user, size_t user_len,
+                          char* pass, size_t pass_len);
+
+  /* Schrijft /web.cfg. Weigert (false) een lege user of een lege pass: een lege
+   * pass zou de node openzetten, en dat mag nooit -- ook niet op verzoek. */
+  static bool saveWebCred(fs::FS& fs, const char* user, const char* pass);
 };

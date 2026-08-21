@@ -321,3 +321,52 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
 
   return true;
 }
+
+/* ----------------------- de eigen web-inloggegevens ----------------------- */
+
+bool MonitorStore::loadWebCred(fs::FS& fs, char* user, size_t user_len,
+                               char* pass, size_t pass_len) {
+  if (user == nullptr || user_len < 2 || pass == nullptr || pass_len < 2) return false;
+  user[0] = 0;
+  pass[0] = 0;
+
+  if (!fs.exists(WEB_CFG_PATH)) {
+    MESH_DEBUG_PRINTLN("MonitorStore: %s bestaat niet, gebakken web-login", WEB_CFG_PATH);
+    return false;
+  }
+
+  fs::File f = fs.open(WEB_CFG_PATH, "r");
+  if (!f) return false;
+
+  /* readLine() haalt zelf al de '\r' weg en geeft -1 als er niets meer te lezen
+   * was. Een afgekapt bestand (wel user, geen pass) valt daarmee vanzelf op false:
+   * de tweede regel is er dan niet. */
+  int nu = readLine(f, user, user_len);
+  int np = readLine(f, pass, pass_len);
+  f.close();
+
+  /* Beide regels moeten er zijn en geen van beide leeg. Een lege pass telt met
+   * opzet NIET als een geldige login -- zie de noot in de header. */
+  if (nu <= 0 || np <= 0 || user[0] == 0 || pass[0] == 0) {
+    user[0] = 0;
+    pass[0] = 0;
+    return false;
+  }
+  MESH_DEBUG_PRINTLN("MonitorStore: eigen web-login geladen (user %s)", user);
+  return true;
+}
+
+bool MonitorStore::saveWebCred(fs::FS& fs, const char* user, const char* pass) {
+  /* Nooit een lege user of pass wegschrijven: een lege pass zet de node open. Deze
+   * zeef staat hier zodat GEEN enkele schrijver (route, console) hem kan omzeilen. */
+  if (user == nullptr || pass == nullptr || user[0] == 0 || pass[0] == 0) return false;
+
+  fs::File f = fs.open(WEB_CFG_PATH, "w");
+  if (!f) {
+    MESH_DEBUG_PRINTLN("MonitorStore: %s niet te schrijven", WEB_CFG_PATH);
+    return false;
+  }
+  f.printf("%s\n%s\n", user, pass);
+  f.close();
+  return true;
+}

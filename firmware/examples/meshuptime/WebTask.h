@@ -166,6 +166,17 @@ private:
   void handleCfgJson();
   void runDeferred();
 
+  /* DE EIGEN WEB-LOGIN VAN DEZE NODE.
+   *
+   * handleWebCred() is POST /web/cred: de rotatieroute. De statsserver roept hem
+   * aan MET de HUIDIGE Basic-auth en zet er de nieuwe user/pass mee; dat is de
+   * enige manier waarop de vloot van de gebakken standaard-login afkomt. De
+   * credential leeft in /web.cfg (MonitorStore), niet in NodePrefs en niet in de
+   * gebakken WEB_USER/WEB_PASS -- opgeslagen wint van gebakken, net als bij WiFi.
+   * requireAuth() toetst tegen de opgeslagen waarde; het wachtwoord wordt nooit
+   * getoond of teruggelezen. */
+  void handleWebCred();
+
   /* Toegangsbeheer. Eén GET met de hele stand en drie POSTs die er iets aan
    * veranderen; net als bij de monitors gaat er niets veranderends via GET. Bij
    * een toegangslijst weegt dat zwaarder dan bij een monitor: een GET die
@@ -192,6 +203,7 @@ private:
   friend void web_route_aclstrict();
   friend void web_route_cli();
   friend void web_route_cfgjson();
+  friend void web_route_webcred();
   friend void web_route_sim();
   friend void web_route_simclear();
   friend void web_route_alerttest();

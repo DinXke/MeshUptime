@@ -146,6 +146,23 @@ static_assert(80 + MAX_CLIENTS * 165 + MAX_NEIGHBOURS * 185 + ACL_TAIL <= sizeof
 
 static char g_ssid_shown[33] = {0};   // alleen om te tonen; nooit het wachtwoord
 
+/* DE WEB-INLOGGEGEVENS DIE NU GELDEN.
+ *
+ * Bij begin() geladen uit /web.cfg; staat daar niets bruikbaars, dan de gebakken
+ * WEB_USER/WEB_PASS. Zelfde "opgeslagen wint van gebakken" als bij de wifi-
+ * instelling, en om dezelfde reden: een node die roteert of verhuist hoeft niet
+ * opnieuw geflasht te worden. requireAuth() toetst HIERTEGEN, niet tegen de
+ * macro's.
+ *
+ * Het wachtwoord staat in RAM omdat Basic-auth het bij ELK verzoek nodig heeft;
+ * het wordt nooit in cfg.json gezet, nooit teruggestuurd en nooit in de console
+ * getoond -- net als de wifi-pass. g_web_custom is de vlag "eigen credential
+ * gezet": false betekent dat deze node nog op de gebakken, vlootbrede standaard
+ * staat, en dat is een zwakte die de pagina zichtbaar hoort te maken. */
+static char g_web_user[WEB_USER_LEN];
+static char g_web_pass[WEB_PASS_LEN];
+static bool g_web_custom = false;
+
 /* ---------------------- buffers voor het nodebeheer ----------------------- */
 
 /* DE OPDRACHTBUFFER. 176 en niet 160, en handleCommand krijgt een MUTEERBARE
@@ -193,10 +210,11 @@ static char g_reply[320];
  *   node_name (32) en owner_info (120), ontsnapt tot 6x per teken,
  *   maar AFGEKAPT op CFG_TXT_MAX zodat de som klopt              2 x ~ 200
  *   de eigen publieke sleutel, 64 hextekens                          ~  75
+ *   de web-gebruiker (32), ontsnapt, plus de "webcustom"-vlag        ~  60
  *                                                                 ----------
- *                                                                  ~ 1275
+ *                                                                  ~ 1335
  *
- * 1792 geeft daar ruim 500 byte marge boven. */
+ * 1792 geeft daar ruim 450 byte marge boven. */
 static char g_cfg[1792];
 
 /* Wat er hoogstens van een tekstveld in cfg.json terechtkomt. Zonder deze grens
@@ -256,6 +274,7 @@ void web_route_acldel()    { if (g_self) g_self->handleAclDel(); }
 void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
 void web_route_cli()       { if (g_self) g_self->handleCli(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
+void web_route_webcred()   { if (g_self) g_self->handleWebCred(); }
 void web_route_sim()       { if (g_self) g_self->handleSim(); }
 void web_route_simclear()  { if (g_self) g_self->handleSimClear(); }
 void web_route_alerttest() { if (g_self) g_self->handleAlertTest(); }
@@ -280,6 +299,27 @@ static bool getArg(WebServer& s, const char* name, char* out, size_t out_len) {
     }
   }
   return false;
+}
+
+/* Als getArg, maar ZONDER stil af te kappen. Geeft -1 als het argument ontbreekt,
+ * -2 als de waarde niet in out past (die zou getArg afkappen), anders de lengte --
+ * en dan is out gevuld. Voor de web-credential: een afgekapt wachtwoord is een
+ * ander wachtwoord, en dat wil je weigeren en niet stil bewaren. Er komt geen eigen
+ * String bij; s.arg() is dezelfde die de bibliotheek toch al aanmaakt, precies als
+ * in getArg(). */
+static int getArgStrict(WebServer& s, const char* name, char* out, size_t out_len) {
+  out[0] = 0;
+  int n = s.args();
+  for (int i = 0; i < n; i++) {
+    if (strcmp(s.argName(i).c_str(), name) == 0) {
+      const char* v = s.arg(i).c_str();
+      size_t len = strlen(v);
+      if (len >= out_len) return -2;      /* zou afkappen -> weigeren */
+      strlcpy(out, v, out_len);
+      return (int)len;
+    }
+  }
+  return -1;
 }
 
 /* HIER STOND EEN EIGEN NAAMZEEF (validHookName). Die is weg: de keuring van
@@ -1152,6 +1192,30 @@ autocomplete="new-password" placeholder="nieuw"></label>
 autocomplete="new-password" placeholder="nieuw"></label>
 </div>
 <button id="pwgo">Opslaan</button>
+</div></details>
+
+<div id="webal"></div>
+<details><summary>Web-login &mdash; de eigen inlog van deze node</summary><div>
+<p class="note">Dit is de <b>Basic-auth</b> waarmee je nu op deze pagina bent
+ingelogd &mdash; iets anders dan het beheerderswachtwoord hierboven, want dat is de
+login over het <i>mesh</i>. Elke node hoort hier zijn <b>eigen</b> gebruiker en
+wachtwoord te hebben: staan ze nog op de gebakken standaard, dan is het dezelfde
+login als op elke andere node en de repeater, en opent &eacute;&eacute;n gelekte
+credential de hele vloot. Opgeslagen wint van gebakken, net als bij WiFi.<br>
+<b>Na opslaan</b> vraagt de browser bij het volgende verzoek om de nieuwe
+inloggegevens &mdash; de lopende sessie loopt gewoon af. Het wachtwoord wordt nooit
+getoond of teruggelezen, en <b>leeg laten kan niet</b> (dat zou de node openzetten).<br>
+<b>Eerlijk over de grens:</b> Basic-auth gaat over onversleuteld HTTP, dus ook een
+eigen wachtwoord gaat leesbaar (base64) over het LAN. Dit verkleint de schade van
+&eacute;&eacute;n lek tot deze ene node, maar het <b>vervangt geen TLS</b> of een
+beheer-VLAN. Zet deze node niet open naar buiten.</p>
+<div class="row">
+<label>Gebruiker<input id="wcu" maxlength="32" spellcheck="false"
+autocomplete="username"></label>
+<label>Wachtwoord<input id="wcp" type="password" maxlength="64"
+autocomplete="new-password" placeholder="nieuw"></label>
+</div>
+<button id="wcgo">Opslaan</button>
 </div></details>
 
 <details><summary>WiFi</summary><div>
@@ -2114,7 +2178,8 @@ document.getElementById("baked").textContent=
 bk.freq+" MHz · "+bk.bw+" kHz · sf "+bk.sf+" · cr "+bk.cr;
 document.getElementById("idname").value=d.name||"";
 document.getElementById("idkey").value=d.pubkey||"";
-pwalarm(d);budget(d)})})}
+document.getElementById("wcu").value=d.webuser||"";
+pwalarm(d);webal(d);budget(d)})})}
 
 /* HET WACHTWOORDALARM. Rood zolang het beheerderswachtwoord nog de gebakken
    standaard is (of leeg), en dan GROEN als het gezet is -- niet weg. Een
@@ -2138,6 +2203,46 @@ else{e.className="alarm ok";
 e.innerHTML="<b>beheerderswachtwoord is gezet</b>Het wijkt af van de gebakken "+
 "standaard. Wie over het mesh op deze node wil inloggen heeft het nodig, en "+
 "alleen dan wordt hij als beheerder in de toegangslijst gezet."}}
+
+/* HET WEB-LOGIN-ALARM. Rood zolang de web-login (de Basic-auth van deze pagina) nog
+   de gebakken, vlootbrede standaard is, en groen zodra deze node een eigen login
+   heeft. Zelfde vorm en zelfde reden als het wachtwoordalarm: een node op de
+   gedeelde standaard is een zwakte die zichtbaar hoort te zijn, want één lek opent
+   dan de hele vloot. De gebruikersnaam gaat NIET rauw in innerHTML (dat zou een
+   injectiegat zijn); hij staat veilig in het invoerveld hieronder, gezet in cfg(). */
+function webal(d){
+var e=document.getElementById("webal");if(!e){return}
+if(!d.webcustom){
+e.className="alarm";
+e.innerHTML="<b>de web-login staat nog op de gebakken standaard</b>"+
+"De ingebouwde gebruiker en het ingebouwde wachtwoord zijn dezelfde vlootbrede "+
+"login als op elke andere node en de repeater — één lek opent ze "+
+"allemaal. Geef deze node onder <i>Web-login</i> hieronder een eigen gebruiker en "+
+"wachtwoord."}
+else{e.className="alarm ok";
+e.innerHTML="<b>eigen web-login gezet</b>Deze node heeft een eigen gebruiker en "+
+"wachtwoord, los van de rest van de vloot. Het wachtwoord wordt nooit getoond."}}
+
+/* De web-login zetten: POST /web/cred, form-urlencoded, precies het contract dat de
+   statsserver ook gebruikt. Na succes vraagt de browser bij het volgende verzoek om
+   de nieuwe inlog; we wissen het wachtwoordveld en verversen cfg(). */
+document.getElementById("wcgo").onclick=function(){
+var u=document.getElementById("wcu").value.trim();
+var p=document.getElementById("wcp").value;
+if(!u){logline("(web-login)","gebruiker mag niet leeg zijn",0);return}
+if(!p){logline("(web-login)","wachtwoord mag niet leeg zijn — een lege pass "+
+"zet de node open",0);return}
+if(!confirm("Web-login van DEZE node wijzigen?\n\nGebruiker: "+u+"\n\nNa opslaan "+
+"vraagt de browser bij het volgende verzoek om de nieuwe inloggegevens. Het "+
+"beheerderswachtwoord (login over het mesh) verandert hier NIET mee.")){return}
+fetch("web/cred",{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"user="+encodeURIComponent(u)+"&pass="+encodeURIComponent(p)})
+.then(function(r){return r.text().then(function(t){
+if(r.ok){logline("(web-login)","opgeslagen; log opnieuw in met de nieuwe "+
+"gegevens",1);document.getElementById("wcp").value="";cfg()}
+else{logline("(web-login)",t.trim()||("fout "+r.status),0)}})})
+.catch(function(){logline("(web-login)","geen verbinding met de node",0)})}
 
 /* HET KANAALBUDGET. Drie getallen die naast elkaar horen: hoeveel vakjes bezet
    zijn, hoeveel nummers ooit vergeven zijn, en hoeveel er nog nieuw uit te delen
@@ -2339,6 +2444,21 @@ void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
 #endif
   }
 
+  /* De eigen web-login, langs dezelfde weg en om dezelfde reden: opgeslagen wint
+   * van gebakken. Eén keer hier lezen (een File-object alloceert intern), nooit in
+   * een verzoekpad -- requireAuth() leest daarna alleen deze RAM-buffers. Staat er
+   * geen bruikbare login opgeslagen, dan de gebakken vlaggen, zodat een verse node
+   * meteen bereikbaar is; g_web_custom=false maakt op de pagina zichtbaar dat hij
+   * nog op die vlootbrede standaard staat. */
+  if (MonitorStore::loadWebCred(SPIFFS, g_web_user, sizeof(g_web_user),
+                                g_web_pass, sizeof(g_web_pass))) {
+    g_web_custom = true;
+  } else {
+    strlcpy(g_web_user, WEB_USER, sizeof(g_web_user));
+    strlcpy(g_web_pass, WEB_PASS, sizeof(g_web_pass));
+    g_web_custom = false;
+  }
+
   /* De stand van de kanaaltoewijzer uit /monitors.cfg. EEN keer, hier, en nooit
    * in een verzoekpad: dit is dezelfde afspraak als bij loadWifiConfig() -- een
    * File-object alloceert intern, en dat mag bij het opstarten en niet per
@@ -2388,6 +2508,11 @@ void WebTask::routes() {
    * browser hem voorlaadt, en dat is de ergste knop die dit apparaat heeft. */
   _server->on("/cfg.json", HTTP_GET, web_route_cfgjson);
   _server->on("/cli", HTTP_POST, web_route_cli);
+  /* De eigen web-login. POST-only, en achter dezelfde Basic-auth als de rest: dit
+   * is de route waarmee de statsserver de credential roteert. Een GET zou een link
+   * zijn die een browser of een linkchecker kan volgen, en dit verandert het
+   * wachtwoord van de node. */
+  _server->on("/web/cred", HTTP_POST, web_route_webcred);
   /* Simuleren en testen. POST-only, en hier om twee redenen: een GET die een
    * sensor forceert is een link waarmee iemand de bewaking van een kanaal
    * uitzet, en een GET die een testbericht stuurt is een link die zendtijd kost
@@ -2442,7 +2567,12 @@ void WebTask::loop() {
  * browser om inloggegevens vraagt en een script (Uptime Kuma) een duidelijke
  * fout krijgt in plaats van stilte. */
 bool WebTask::requireAuth() {
-  if (_server->authenticate(WEB_USER, WEB_PASS)) return true;
+  /* Tegen de OPGESLAGEN credential, niet tegen de gebakken macro's: die zijn alleen
+   * de terugval bij een verse node (zie begin()). g_web_user/g_web_pass dragen de
+   * waarde die nu geldt, en een rotatie via /web/cred of de console zet ze om --
+   * pas voor het VOLGENDE verzoek, want dit wordt aan het begin van elk verzoek
+   * gelezen en de rotatie schrijft ze pas na de auth. */
+  if (_server->authenticate(g_web_user, g_web_pass)) return true;
   _server->requestAuthentication(BASIC_AUTH, WEB_REALM);
   return false;
 }
@@ -3613,6 +3743,13 @@ void WebTask::handleCfgJson() {
   const bool pw_empty = (p->password[0] == 0);
   const bool pw_def   = (strcmp(p->password, ADMIN_PASSWORD) == 0);
 
+  /* De web-GEBRUIKER mag getoond worden, het wachtwoord NOOIT -- net als bij de
+   * wifi-instelling. Ontsnappen is nodig want de gebruiker mag (via /web/cred) elk
+   * teken bevatten. g_web_custom is de vlag "eigen credential gezet": staat hij op
+   * false, dan draait deze node nog op de gebakken, vlootbrede login. */
+  char webuser_esc[WEB_USER_LEN * 6 + 1];
+  jsonEscape(g_web_user, webuser_esc, sizeof(webuser_esc));
+
   int n = snprintf(g_cfg, sizeof(g_cfg),
       "{\"name\":\"%s\",\"owner\":\"%s\",\"pubkey\":\"%s\",\"role\":\"%s\","
       "\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u,"
@@ -3624,6 +3761,7 @@ void WebTask::handleCfgJson() {
       "\"dtxdelay\":\"%s\",\"multiack\":%u,\"hashmode\":%u,"
       "\"cad\":\"%s\",\"intthr\":%u,\"rdonly\":\"%s\",\"adcmult\":\"%s\","
       "\"pwdef\":%d,\"pwempty\":%d,"
+      "\"webuser\":\"%s\",\"webcustom\":%d,"
       "\"mon_used\":%d,\"mon_max\":%u,\"ch_first\":%u,\"ch_last\":%u,"
       "\"ch_ever\":%d,\"ch_free\":%d,"
       "\"baked\":{\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u}}",
@@ -3643,6 +3781,7 @@ void WebTask::handleCfgJson() {
       p->cad_enabled ? "on" : "off", (unsigned)p->interference_threshold,
       p->allow_read_only ? "on" : "off", adc,
       pw_def ? 1 : 0, pw_empty ? 1 : 0,
+      webuser_esc, g_web_custom ? 1 : 0,
       mon_used, (unsigned)MonitorSensors::MAX_MONITORS,
       (unsigned)MonitorSensors::CH_MONITOR_FIRST,
       (unsigned)MonitorSensors::CH_MONITOR_LAST,
@@ -3794,6 +3933,74 @@ void WebTask::handleCli() {
     return;
   }
 
+  /* --------------------- de eigen web-login via de console ---------------- */
+  /* 'sensor set web.user <naam>' en 'sensor set web.pass <ww>' zetten de EIGEN
+   * web-login van deze node (/web.cfg). We onderscheppen ze hier -- net als 'ping'
+   * -- en sturen ze NIET door: de sleutel 'web.*' is van ons en leeft niet in
+   * MonitorSensors. 'sensor get web.user' toont de gebruiker en de vlag; het
+   * wachtwoord wordt NOOIT teruggelezen, net als de wifi-pass.
+   *
+   * LET OP -- dit is de weg langs DEZE (web)console. De seriële console en een DM
+   * gaan rechtstreeks naar SensorMesh/MonitorSensors, en daar is 'web.*' een
+   * onbekende sleutel; wie het ook daar wil, voegt één tak toe in
+   * MonitorSensors::setSettingValue (buiten deze opdracht gehouden). De route
+   * POST /web/cred en het formulier op het beheertabblad dekken de gevraagde twee
+   * zetwegen volledig. Deze onderschepping raakt CommonCLI's opdrachtbuffer niet
+   * eens, dus de ~119-tekengrens speelt hier niet; we toetsen zelf op de
+   * afgesproken maten (user 32, pass 64). */
+  if (cmdIs(cmd, "sensor set web.user ") || cmdIs(cmd, "sensor set web.pass ")) {
+    bool is_user = cmdIs(cmd, "sensor set web.user ");
+    const char* val = cmd + 20;   /* "sensor set web.user "/"...pass " zijn beide 20 tekens */
+    while (*val == ' ') val++;
+    if (val[0] == 0) {
+      _server->send(400, "text/plain", is_user ? "web.user <naam>\n" : "web.pass <ww>\n");
+      return;
+    }
+    size_t maxlen = is_user ? (size_t)(WEB_USER_LEN - 1) : (size_t)(WEB_PASS_LEN - 1);
+    if (strlen(val) > maxlen) {
+      snprintf(g_reply, sizeof(g_reply),
+          "geweigerd: web.%s hoogstens %u tekens\n",
+          is_user ? "user" : "pass", (unsigned)maxlen);
+      _server->send(400, "text/plain", g_reply);
+      return;
+    }
+
+    /* Het niet-gewijzigde veld houdt zijn huidige waarde. Zet iemand alleen
+     * web.pass terwijl de user nog de gebakken standaard is, dan bewaren we die
+     * user -- maar nooit een LEGE pass (dat weigert saveWebCred sowieso). */
+    char nu[WEB_USER_LEN], np[WEB_PASS_LEN];
+    strlcpy(nu, is_user ? val : g_web_user, sizeof(nu));
+    strlcpy(np, is_user ? g_web_pass : val, sizeof(np));
+    if (np[0] == 0) {
+      _server->send(400, "text/plain",
+          "er is nog geen wachtwoord; zet eerst 'sensor set web.pass <ww>'\n");
+      return;
+    }
+    if (!MonitorStore::saveWebCred(SPIFFS, nu, np)) {
+      _server->send(500, "text/plain", "opslaan mislukt\n");
+      return;
+    }
+    strlcpy(g_web_user, nu, sizeof(g_web_user));
+    strlcpy(g_web_pass, np, sizeof(g_web_pass));
+    g_web_custom = true;
+    snprintf(g_reply, sizeof(g_reply),
+        "ok web.%s gezet; geldt bij het volgende verzoek\n", is_user ? "user" : "pass");
+    _server->send(200, "text/plain", g_reply);
+    return;
+  }
+  if (strcmp(cmd, "sensor get web.user") == 0) {
+    snprintf(g_reply, sizeof(g_reply),
+        "web.user=%s (eigen credential: %s)\n", g_web_user,
+        g_web_custom ? "ja" : "nee, nog de gebakken standaard");
+    _server->send(200, "text/plain", g_reply);
+    return;
+  }
+  if (strcmp(cmd, "sensor get web.pass") == 0) {
+    _server->send(200, "text/plain",
+        "verborgen -- het wachtwoord wordt nooit teruggelezen\n");
+    return;
+  }
+
   /* ------------------------------ de weigeringen -------------------------- */
 
   if (strstr(cmd, "prv.key") != NULL) {
@@ -3905,4 +4112,68 @@ void WebTask::runDeferred() {
 
   g_reply[0] = 0;
   _acl->handleCommand(0, cmd, g_reply);
+}
+
+/* POST /web/cred   user=<nieuw>&pass=<nieuw>   (form-urlencoded)
+ *
+ * DE ROTATIEROUTE -- het CONTRACT met de statsserver, vastgespijkerd:
+ *
+ *   - body is form-urlencoded (net als elke andere POST op deze server), met de
+ *     velden 'user' en 'pass';
+ *   - ontbreekt of leeg één van beide  -> 400. Een LEGE pass mag nooit: dat zou de
+ *     node openzetten;
+ *   - te lang (user > 32, pass > 64)   -> 400. Afkappen zou een ander wachtwoord
+ *     bewaren dan verstuurd is;
+ *   - bij succes 200 met body {"ok":1}. De server bewaart daarna de nieuwe
+ *     credential aan zijn kant.
+ *
+ * De server roept dit aan MET de HUIDIGE Basic-auth (requireAuth hieronder toetst
+ * nog tegen de oude waarde). De NIEUWE credential geldt pas bij het VOLGENDE
+ * verzoek: g_web_user/g_web_pass worden hier pas NA de auth en NA het opstellen van
+ * het antwoord gezet, dus de lopende sessie wordt niet mid-request omgegooid.
+ *
+ * VEILIGHEIDSNOOT, en die hoort hier eerlijk te staan: dit is Basic-auth over
+ * onversleuteld HTTP. Ook een per-node credential gaat leesbaar (base64) over het
+ * LAN bij elk verzoek. Dit verkleint de schade van één lek -- niet langer de hele
+ * vloot, alleen deze node -- maar het VERVANGT GEEN TLS of beheer-VLAN. Roteer over
+ * een net waar niemand meeleest, en zet deze node niet open naar buiten.
+ */
+void WebTask::handleWebCred() {
+  if (!requireAuth()) return;
+
+  char user[WEB_USER_LEN], pass[WEB_PASS_LEN];
+
+  int ur = getArgStrict(*_server, "user", user, sizeof(user));
+  if (ur == -2) {
+    _server->send(400, "text/plain", "user te lang (hoogstens 32 tekens)\n");
+    return;
+  }
+  if (ur <= 0) {   /* -1 afwezig of 0 leeg */
+    _server->send(400, "text/plain", "user ontbreekt of is leeg\n");
+    return;
+  }
+
+  int pr = getArgStrict(*_server, "pass", pass, sizeof(pass));
+  if (pr == -2) {
+    _server->send(400, "text/plain", "pass te lang (hoogstens 64 tekens)\n");
+    return;
+  }
+  if (pr <= 0) {
+    /* Een lege pass zou de node openzetten -- weigeren, ook al vraagt de server erom. */
+    _server->send(400, "text/plain", "pass ontbreekt of is leeg\n");
+    return;
+  }
+
+  if (!MonitorStore::saveWebCred(SPIFFS, user, pass)) {
+    _server->send(500, "text/plain", "opslaan mislukt\n");
+    return;
+  }
+
+  /* Pas NU laten gelden: het antwoord hieronder gaat nog over de oude sessie. */
+  strlcpy(g_web_user, user, sizeof(g_web_user));
+  strlcpy(g_web_pass, pass, sizeof(g_web_pass));
+  g_web_custom = true;
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", "{\"ok\":1}");
 }
