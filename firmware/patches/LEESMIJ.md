@@ -12,6 +12,14 @@ Er is er op dit moment **één**, en dat moet zo blijven.
 
 `0001-sensor-manager-class-heltec-v3.patch`, tegen tag `companion-v1.17.0`.
 
+In het **zelfstandige project** (voorkeur, zie [../../docs/bouwen.md](../../docs/bouwen.md)
+weg 1) hoef je hier niets met de hand te doen: de pre-build hook
+[`../apply_patches.py`](../apply_patches.py) brengt deze patch idempotent aan op
+de gevendorde submodule `firmware/vendor/MeshCore` bij elke `pio run`. De
+gevendorde boom blijft daardoor in de repo onaangeraakt op de gepinde commit.
+
+Voor de losse bouwkopie (weg 2) nog wel met de hand:
+
     cd <meshcore-kopie>
     git apply ../MeshUptime/firmware/patches/0001-sensor-manager-class-heltec-v3.patch
 

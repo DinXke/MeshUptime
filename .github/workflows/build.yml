@@ -1,66 +1,89 @@
-# Firmware-CI: bouwt examples/meshuptime tegen MeshCore op de gepinde tag.
+# Firmware-CI: bouwt het ZELFSTANDIGE project (firmware/platformio.ini, env
+# meshuptime) tegen MeshCore op meerdere upstream-tags.
 #
-# WAAROM: de drie soorten buildbreuk die een nacht gekost hebben -- ontbrekende
-# symbolen, kapotte literalen en main.cpp-drift -- zijn alle drie compilefouten.
-# Deze workflow herhaalt wat een mens lokaal doet (kloon op de tag, patch erop,
-# toepassing erin, pio run), zodat zo'n breuk bij de push opvalt en niet bij het
-# flashen.
+# WAAROM: de drie soorten buildbreuk die ooit een nacht gekost hebben --
+# ontbrekende symbolen, kapotte literalen en main.cpp-drift -- zijn alle drie
+# compilefouten. Deze workflow doet exact wat een mens lokaal doet:
 #
-# De opzet spiegelt de lokale bouwkopie:
-#   1. MeshCore ondiep klonen op companion-v1.17.0 (dezelfde tag als lokaal);
-#   2. de ENE variants-patch aanbrengen (firmware/patches/0001-...): zonder die
-#      patch kent variants/heltec_v3 SENSOR_MANAGER_CLASS niet;
-#   3. examples/meshuptime erin kopieren;
-#   4. firmware/platformio.ci.ini (zonder wifi-gegevens) neerleggen als
-#      platformio.local.ini -- MeshCore's platformio.ini leest die via
-#      extra_configs, net als lokaal;
-#   5. pio run -e meshuptime.
+#     git clone --branch <tag> ... firmware/vendor/MeshCore
+#     cd firmware && pio run -e meshuptime
+#
+# De variants-patch wordt door de pre-build hook (firmware/apply_patches.py)
+# aangebracht; geen kopieerstappen meer, geen platformio.local.ini in de CI.
+#
+# TAG-MATRIX: de gepinde tag companion-v1.17.0 MOET groen zijn (required). De
+# laatste upstream-tag wordt dynamisch opgezocht en apart gebouwd; die mag falen
+# (continue-on-error) zodat een MeshCore-release die onze build breekt zichtbaar
+# wordt als rode stap ZONDER de required build rood te maken. Zo wordt een
+# toekomstige upgrade een vink vooraf in plaats van een avond werk achteraf.
 name: firmware
 
 on:
   push:
     paths:
       - 'firmware/**'
+      - '.gitmodules'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'firmware/**'
+      - '.gitmodules'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
 jobs:
-  build:
+  # De laatste upstream companion-tag opzoeken, zodat de informational build hem
+  # niet hardgecodeerd hoeft te hebben en elke nieuwe release automatisch getest
+  # wordt.
+  ontdek:
     runs-on: ubuntu-latest
+    outputs:
+      laatste: ${{ steps.tag.outputs.laatste }}
+    steps:
+      - id: tag
+        run: |
+          laatste=$(git ls-remote --tags --refs \
+            https://github.com/meshcore-dev/MeshCore.git 'companion-v*' \
+            | awk -F/ '{print $NF}' | sort -V | tail -1)
+          echo "laatste=$laatste" >> "$GITHUB_OUTPUT"
+          echo "Laatste upstream companion-tag: $laatste"
+
+  build:
+    needs: ontdek
+    runs-on: ubuntu-latest
+    name: build (${{ matrix.tag }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # De gepinde tag: dit is de bron van waarheid en MOET groen zijn.
+          - tag: companion-v1.17.0
+            required: true
+          # De laatste upstream-tag: informatief. Faalt hij, dan is er een
+          # release die onze patch of build breekt -- zichtbaar, maar niet fataal.
+          - tag: ${{ needs.ontdek.outputs.laatste }}
+            required: false
+    # Alleen de informational leg mag falen zonder de run rood te maken.
+    continue-on-error: ${{ !matrix.required }}
     steps:
       - name: MeshUptime uitchecken
         uses: actions/checkout@v4
 
-      - name: MeshCore klonen op de gepinde tag
+      - name: MeshCore klonen op ${{ matrix.tag }}
+        # Vers in de submodule-map; de pre-build hook heeft een git-boom nodig om
+        # de patch op aan te brengen. Geen submodule-init: we sturen de tag zelf.
         run: |
-          git clone --depth 1 --branch companion-v1.17.0 \
-            https://github.com/meshcore-dev/MeshCore.git meshcore
-
-      - name: Variants-patch aanbrengen
-        # De enige patch op de kern; zie firmware/patches/LEESMIJ.md. git apply
-        # faalt hard als de tag ooit niet meer past -- en dat is de bedoeling:
-        # dan is er echt iets te herzien en mag geen CI groen liegen.
-        run: |
-          cd meshcore
-          git apply ../firmware/patches/0001-sensor-manager-class-heltec-v3.patch
-
-      - name: Toepassing en CI-env inleggen
-        run: |
-          mkdir -p meshcore/examples/meshuptime
-          cp firmware/examples/meshuptime/* meshcore/examples/meshuptime/
-          cp firmware/platformio.ci.ini meshcore/platformio.local.ini
+          rm -rf firmware/vendor/MeshCore
+          git clone --depth 1 --branch "${{ matrix.tag }}" \
+            https://github.com/meshcore-dev/MeshCore.git firmware/vendor/MeshCore
 
       - name: Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # De toolchain- en frameworkpakketten zijn ~1 GB download; zonder cache
-      # duurt elke bouw een kwartier en met cache een paar minuten.
+      # De toolchain- en frameworkpakketten zijn ~1 GB; met cache duurt een bouw
+      # minuten in plaats van een kwartier.
       - name: PlatformIO-pakketten uit de cache
         uses: actions/cache@v4
         with:
@@ -68,16 +91,30 @@ jobs:
             ~/.platformio/packages
             ~/.platformio/platforms
             ~/.cache/pip
-          key: pio-${{ runner.os }}-companion-v1.17.0-${{ hashFiles('firmware/platformio.ci.ini') }}
+          key: pio-${{ runner.os }}-${{ matrix.tag }}-${{ hashFiles('firmware/platformio.ini') }}
           restore-keys: |
-            pio-${{ runner.os }}-companion-v1.17.0-
+            pio-${{ runner.os }}-${{ matrix.tag }}-
+            pio-${{ runner.os }}-
 
       - name: PlatformIO installeren
-        # Dezelfde versie als de lokale bouwkopie, zodat "werkt in CI" en
-        # "werkt op de werkbank" over hetzelfde gereedschap gaan.
+        # Dezelfde versie als de werkbank, zodat "werkt in CI" en "werkt lokaal"
+        # over hetzelfde gereedschap gaan.
         run: pip install platformio==6.1.19
 
       - name: Bouwen
+        id: bouw
         run: |
-          cd meshcore
+          cd firmware
           pio run -e meshuptime
+
+      - name: Resultaat in de samenvatting
+        if: always()
+        run: |
+          uit="${{ steps.bouw.outcome }}"
+          req="${{ matrix.required }}"
+          echo "| tag | required | resultaat |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ${{ matrix.tag }} | $req | $uit |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$req" = "false" ] && [ "$uit" = "failure" ]; then
+            echo "::warning::Informational build tegen ${{ matrix.tag }} FAALT -- upstream heeft iets veranderd; herzien vóór upgraden."
+          fi

@@ -396,21 +396,24 @@ mesh.
 
 ## Bouwen en flashen
 
-De WiFi-gegevens staan **niet** in deze repo. Kopieer
-[../firmware/wifi.ini.voorbeeld](../firmware/wifi.ini.voorbeeld) naar de
-`platformio.local.ini` van je MeshCore-bouwkopie (dat bestand staat in MeshCore's
-eigen `.gitignore`) en vul je eigen netwerk in.
+MeshUptime is een **zelfstandig PlatformIO-project**; MeshCore is een gepinde
+git-submodule onder `firmware/vendor/MeshCore`. De volledige uitleg — beide
+bouwwegen, de tag-matrix in de CI en waarom de patch via een pre-build hook loopt
+— staat in [bouwen.md](bouwen.md).
 
-Er is één patch op MeshCore nodig,
-[0001-sensor-manager-class-heltec-v3.patch](../firmware/patches/0001-sensor-manager-class-heltec-v3.patch):
-de global `sensors` is in `variants/heltec_v3/target.{h,cpp}` hardgecodeerd op
-`EnvironmentSensorManager`, en zonder die drie regels is er geen enkele plek waar
-een toepassing een andere `SensorManager` kan opgeven zonder de variant te
-forken. Zonder de macro's bouwt de variant exact wat hij ervoor bouwde, dus
-upstream-gedrag blijft ongewijzigd.
-
+    git submodule update --init firmware/vendor/MeshCore
+    cd firmware
     python -m platformio run -e meshuptime
     python -m platformio run -e meshuptime -t upload --upload-port COM4
+
+De WiFi-gegevens staan **niet** in deze repo (plaatshouders in
+`firmware/platformio.ini`; zie [../firmware/wifi.ini.voorbeeld](../firmware/wifi.ini.voorbeeld)).
+De ene patch op MeshCore,
+[0001-sensor-manager-class-heltec-v3.patch](../firmware/patches/0001-sensor-manager-class-heltec-v3.patch),
+zet de hardgecodeerde global `sensors` in `variants/heltec_v3/target.{h,cpp}` om
+naar een macro met terugval — zonder die macro's bouwt de variant exact wat hij
+ervoor bouwde, dus upstream-gedrag blijft ongewijzigd. In het zelfstandige project
+wordt die patch door de pre-build hook automatisch aangebracht.
 
 `upload` schrijft alleen de programmapartitie en niet SPIFFS: de identiteit in
 `/identity/_main.id` en het instellingenbestand blijven dus staan. Wil je een

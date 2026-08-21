@@ -81,18 +81,22 @@ verkeerde dienst.
 
 ## Bouwen en flashen
 
-De WiFi-gegevens staan **niet** in deze repo. Kopieer
-[firmware/wifi.ini.voorbeeld](firmware/wifi.ini.voorbeeld) naar de
-`platformio.local.ini` van je MeshCore-bouwkopie (dat bestand staat in MeshCore's
-eigen `.gitignore`) en vul je eigen netwerk in.
+MeshUptime is een **zelfstandig PlatformIO-project**; MeshCore is een gepinde
+git-submodule onder `firmware/vendor/MeshCore` (tag `companion-v1.17.0`). Volledige
+uitleg — beide bouwwegen, CI, de patch — staat in
+[docs/bouwen.md](docs/bouwen.md).
 
-Er is één patch op MeshCore nodig, in
-[firmware/patches/](firmware/patches/): de global `sensors` is in de Heltec
-V3-variant hardgecodeerd, en zonder die drie regels kan een toepassing geen eigen
-`SensorManager` opgeven zonder de variant te forken.
-
+    git submodule update --init firmware/vendor/MeshCore
+    cd firmware
     python -m platformio run -e meshuptime
     python -m platformio run -e meshuptime -t upload --upload-port COM4
+
+De WiFi-gegevens staan **niet** in deze repo (plaatshouders in
+`firmware/platformio.ini`; de op het toestel opgeslagen instelling is de baas,
+zie [firmware/wifi.ini.voorbeeld](firmware/wifi.ini.voorbeeld)). De ene patch op
+MeshCore in [firmware/patches/](firmware/patches/) — de global `sensors` is in de
+Heltec V3-variant hardgecodeerd — wordt door de pre-build hook automatisch
+aangebracht; met de hand hoeft dat alleen nog in de losse bouwkopie.
 
 `upload` schrijft alleen de programmapartitie en niet SPIFFS: de identiteit in
 `/identity/_main.id` en het instellingenbestand blijven staan.
@@ -106,6 +110,8 @@ V3-variant hardgecodeerd, en zonder die drie regels kan een toepassing geen eige
 - [docs/metingen.md](docs/metingen.md) — de metingen met hun getallen en datum
 - [docs/beslissingen.md](docs/beslissingen.md) — de keuzes met de reden, ook de
   keuzes die later zijn omgedraaid
+- [docs/bouwen.md](docs/bouwen.md) — de twee bouwwegen, de submodule als gepinde
+  afhankelijkheid, de patch-hook en de CI-tagmatrix
 - [firmware/patches/LEESMIJ.md](firmware/patches/LEESMIJ.md) — de patches, en de
   patch die er met opzet niet is
 - [docs/meting-voeding-2026-08-19.log](docs/meting-voeding-2026-08-19.log) — de

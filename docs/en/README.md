@@ -15,6 +15,7 @@ code first, so if the two ever disagree, the Dutch page is the newer one.
 | [how-it-works.md](how-it-works.md) | roles, channel map, web interface, CLI, DM commands, access control, alerts |
 | [measurements.md](measurements.md) | every number with its date: power thresholds, WiFi behaviour on battery, heap per build, the byte budget |
 | [decisions.md](decisions.md) | the choices with their reasons, explicitly including the ones that were later reversed |
+| [building.md](building.md) | the two build ways, MeshCore as a pinned submodule dependency, the patch hook, and the CI tag matrix |
 
 The raw measurement series is language-neutral:
 [meting-voeding-2026-08-19.log](../meting-voeding-2026-08-19.log).
@@ -47,18 +48,22 @@ whole point:
 
 ## Building
 
-WiFi credentials are **not** in this repository. Copy
-[`firmware/wifi.ini.voorbeeld`](../../firmware/wifi.ini.voorbeeld) into the
-`platformio.local.ini` of your MeshCore build copy (that file is in MeshCore's own
-`.gitignore`) and fill in your own network.
+MeshUptime is a **standalone PlatformIO project**; MeshCore is a pinned git
+submodule under `firmware/vendor/MeshCore` (tag `companion-v1.17.0`). The full
+story — both build ways, the CI tag matrix, why the patch runs via a pre-build
+hook — is in [`building.md`](building.md).
 
-One patch against MeshCore is required, in
-[`firmware/patches/`](../../firmware/patches/): the `sensors` global is hardcoded
-in the Heltec V3 variant, and without those three lines an application cannot
-supply its own `SensorManager` without forking the variant.
-
+    git submodule update --init firmware/vendor/MeshCore
+    cd firmware
     python -m platformio run -e meshuptime
     python -m platformio run -e meshuptime -t upload --upload-port COM4
+
+WiFi credentials are **not** in this repository (placeholders in
+`firmware/platformio.ini`; see
+[`firmware/wifi.ini.voorbeeld`](../../firmware/wifi.ini.voorbeeld)). The single
+patch against MeshCore in [`firmware/patches/`](../../firmware/patches/) — the
+`sensors` global is hardcoded in the Heltec V3 variant — is applied automatically
+by the pre-build hook; you only apply it by hand for the legacy build copy.
 
 `upload` writes the program partition only, not SPIFFS, so the identity in
 `/identity/_main.id` and the settings file survive.
