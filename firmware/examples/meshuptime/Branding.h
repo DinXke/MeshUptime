@@ -14,12 +14,14 @@
  *            semantiek, virtuele sensor-nodes, per-sleutel-ACL, kanaalbeheer-panel,
  *            handmatig advert, ping-fix en de room/DM-commandoset.
  *   v2.2.0 = async netwerk-taak-engine (port/http/scan/traceroute) + node-side
- *            SNMP-sensor. (in opbouw)
+ *            SNMP-sensor + bot (CHAT/notifier) + GUI-declutter.
+ *   v2.2.1 = boot-stack-overflow-fix (dikke MonitorCfg van de stapel) + de bot
+ *            als TWEERICHTINGS mesh-diagnose-responder (ping/path/help).
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.2.0"
+  #define MESHUPTIME_VERSION   "v2.2.1"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

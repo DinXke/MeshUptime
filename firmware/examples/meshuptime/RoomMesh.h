@@ -485,6 +485,16 @@ private:
   unsigned long _bot_next_local_advert, _bot_next_flood_advert;
   BotRecip      _bot_recips[MAX_BOT_RECIPS];
 
+  /* TWEERICHTING. true tijdens onRecvPacket-dispatch als het geadresseerde pakket
+   * voor de bot-identiteit was (naast _active_slot/_active_snode). Dan ontsleutelt
+   * de basisklasse met _bot_id en gaat inkomende data naar het bot-diagnosepad. */
+  bool          _active_is_bot;
+  /* De afzenders die op de src-hash van een inkomend bot-pakket passen (volledige
+   * pubkeys; uit de buurtlijst én de ontvangerslijst). searchPeersByHash vult dit,
+   * getPeerSharedSecret/onPeerDataRecv lezen het. MEMBER, niet op de stapel. */
+  uint8_t       _bot_match_pub[4][PUB_KEY_SIZE];
+  int           _bot_match_n;
+
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
   RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
@@ -554,6 +564,11 @@ private:
   void          sendBotAdvertisement(int delay_millis, bool flood);
   int           botRecipFindFree() const;
   void          handleBotCommand(char* args, char* reply);
+  /* Inkomende DM op de bot-identiteit: het kleine mesh-diagnose-commandoset
+   * (ping/path/help). Antwoordt als schone DM VANAF de bot naar de afzender. De
+   * antwoordbuffer is static (niet op de loopTask-stapel). */
+  void          handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
+                            const uint8_t* secret, uint8_t* data, size_t len);
 
   /* ---- adverts + telemetrie voor sensor-nodes ---- */
   mesh::Packet* createSensorNodeAdvert(RoomSlot& slot);

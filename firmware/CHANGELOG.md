@@ -7,7 +7,28 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
-## v2.2.0 — async netwerk-engine + SNMP (in opbouw)
+## v2.2.1 — boot-stack-fix + tweerichtings-bot
+
+- **Boot-stack-overflow gefixt** (regressie in v2.2.0): de SNMP-velden bliezen een
+  `MonitorCfg` op tot ~6 kB; `MonitorStore::load` en `WebTask::begin` hielden er één
+  OP DE STAPEL, waardoor de 8 kB Arduino-loopTask overliep tijdens de SPIFFS-lees
+  bij boot (stack-canary-panic vlak na "Room-server ID"). Beide buffers zijn nu
+  `static`; de SNMP-BER-opbouwbuffers idem. `SET_LOOP_TASK_STACK_SIZE(16 kB)` +
+  een stapel-waakhond (laagste vrije loopTask-stapel, eens/30 s) als marge.
+- **Bot als TWEERICHTINGS mesh-diagnose-responder**: de bot ontvangt nu ook DM's
+  (voorheen alleen-zenden — inkomende pakketten aan de bot vielen door naar
+  rooms[0] en werden met de verkeerde sleutel ontsleuteld). `onRecvPacket` matcht nu
+  ook `_bot_id`; de afzender-pubkey wordt uit de buurtlijst/ontvangerslijst
+  opgelost (geen wachtwoord-login) en het gedeelde geheim eruit berekend. Klein,
+  eigen commandoset (GEEN monitoring-console):
+  - `ping` → `Pong`
+  - `path` → `ack @[<naam>] | <hop-hashes csv> (<N> hops) | SNR: <x.x> dB | RSSI: <y> dBm | Received at: <HH:MM:SS>`
+  - `help` → som de bot-commando's op; onbekende tekst → korte hint.
+  Antwoord als schone DM vanaf de bot (met ACK op het inkomende bericht). De
+  velden komen uit het inkomende pakket (pad/hops, SNR×4→dB, RSSI, RTC-tijd).
+  Antwoordbuffers static (niet op de loopTask-stapel).
+
+## v2.2.0 — async netwerk-engine + SNMP
 
 - **Async netwerk-taak-engine**: coöperatief, niet-blokkerend, gestapt vanuit
   `loop()` — verstoort de LoRa-timing niet. Eén taak tegelijk; resultaat komt terug

@@ -99,6 +99,8 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   _bot_name[0] = 0;
   _bot_next_local_advert = _bot_next_flood_advert = 0;
   memset(_bot_recips, 0, sizeof(_bot_recips));
+  _active_is_bot = false;
+  _bot_match_n = 0;
 
   memset(rooms, 0, sizeof(rooms));
   for (int i = 0; i < MAX_ROOMS; i++) {
@@ -644,6 +646,7 @@ mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
       if (rooms[s].id.isHashMatch(&dest_hash)) {
         _active_slot = s;
         _active_snode = -1;
+        _active_is_bot = false;
         self_id = rooms[s].id;   // basisklasse ontsleutelt met de juiste sleutel
         return mesh::Mesh::onRecvPacket(pkt);
       }
@@ -654,18 +657,31 @@ mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
       if (snodes[s].id.isHashMatch(&dest_hash)) {
         _active_snode = s;
         _active_slot = 0;        // veilige waarde; activeSlot() kiest op _active_snode
+        _active_is_bot = false;
         self_id = snodes[s].id;
         return mesh::Mesh::onRecvPacket(pkt);
       }
     }
+    /* Geen room/snode-treffer: is het pakket voor de BOT-identiteit? Dan met de
+     * botsleutel ontsleutelen. Zo wordt de bot tweerichting (het ontbrekende stuk
+     * dat inkomende DM's naar hem liet vallen naar rooms[0].id). */
+    if (_bot_active && _bot_id.isHashMatch(&dest_hash)) {
+      _active_slot = 0;
+      _active_snode = -1;
+      _active_is_bot = true;
+      self_id = _bot_id;
+      return mesh::Mesh::onRecvPacket(pkt);
+    }
     _active_slot = 0;
     _active_snode = -1;
+    _active_is_bot = false;
     self_id = rooms[0].id;
     return mesh::Mesh::onRecvPacket(pkt);
   }
 
   _active_slot = 0;
   _active_snode = -1;
+  _active_is_bot = false;
   self_id = rooms[0].id;
   return mesh::Mesh::onRecvPacket(pkt);
 }
@@ -690,6 +706,33 @@ void RoomMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint
 }
 
 int RoomMesh::searchPeersByHash(const uint8_t* hash) {
+  /* BOT: er is geen ACL/login. De afzender-pubkey komt uit de buurtlijst (adverts)
+   * en/of de ontvangerslijst; we bewaren de VOLLEDIGE pubkeys zodat
+   * getPeerSharedSecret het gedeelde geheim eruit kan berekenen. Zo kan de bot een
+   * DM ontsleutelen van iedereen wiens advert hij hoorde (of die op de lijst staat),
+   * zonder wachtwoord-login. */
+  if (_active_is_bot) {
+    _bot_match_n = 0;
+    /* Buurtlijst: iedereen wiens advert we hoorden (volledige pubkey bekend). */
+    for (int i = 0; i < neighbours.getNumEntries() && _bot_match_n < 4; i++) {
+      const NeighbourEntry* e = neighbours.getEntryByIdx(i);
+      if (e && e->pub_key[0] == hash[0]) {
+        memcpy(_bot_match_pub[_bot_match_n++], e->pub_key, PUB_KEY_SIZE);
+      }
+    }
+    /* Ontvangerslijst: de eigenaar/vertrouwden staan hier met volledige pubkey,
+     * ook als hun advert (net) niet in de buurtlijst zit. Dubbels vermijden. */
+    for (int r = 0; r < MAX_BOT_RECIPS && _bot_match_n < 4; r++) {
+      if (_bot_recips[r].level == 0) continue;
+      if (_bot_recips[r].pub_key[0] != hash[0]) continue;
+      bool dup = false;
+      for (int j = 0; j < _bot_match_n; j++)
+        if (memcmp(_bot_match_pub[j], _bot_recips[r].pub_key, PUB_KEY_SIZE) == 0) { dup = true; break; }
+      if (!dup) memcpy(_bot_match_pub[_bot_match_n++], _bot_recips[r].pub_key, PUB_KEY_SIZE);
+    }
+    return _bot_match_n;
+  }
+
   ClientACL& acl = activeSlot().acl;
   int n = 0;
   for (int i = 0; i < acl.getNumClients() && n < MAX_CLIENTS; i++) {
@@ -701,6 +744,11 @@ int RoomMesh::searchPeersByHash(const uint8_t* hash) {
 }
 
 void RoomMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
+  if (_active_is_bot) {
+    if (peer_idx >= 0 && peer_idx < _bot_match_n)
+      _bot_id.calcSharedSecret(dest_secret, _bot_match_pub[peer_idx]);
+    return;
+  }
   ClientACL& acl = activeSlot().acl;
   int i = matching_peer_indexes[peer_idx];
   if (i >= 0 && i < acl.getNumClients()) {
@@ -714,6 +762,9 @@ void RoomMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
 void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
                               const mesh::Identity& sender, uint8_t* data, size_t len) {
   if (packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ) return;
+  /* De bot kent geen room-login/ACL: een (afwijkende) ANON_REQ aan de bot mag NIET
+   * in room 0 belanden. De bot praat alleen het TXT-diagnosepad (onPeerDataRecv). */
+  if (_active_is_bot) return;
   if (len < 9) return;   // 4 ts + 4 sync_since + minstens de nul van het wachtwoord
 
   RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
@@ -817,6 +868,17 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
 /* ------------------------------------------------------------------ */
 void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx,
                               const uint8_t* secret, uint8_t* data, size_t len) {
+  /* BOT: het inkomende mesh-diagnose-pad (ping/path/help). Geen ACL, geen posts. */
+  if (_active_is_bot) {
+    if (type != PAYLOAD_TYPE_TXT_MSG || len <= 5) return;
+    uint8_t flags = (data[4] >> 2);
+    if (!(flags == TXT_TYPE_PLAIN || flags == TXT_TYPE_CLI_DATA)) return;
+    if (sender_idx < 0 || sender_idx >= _bot_match_n) return;
+    data[len] = 0;
+    handleBotDm(packet, _bot_match_pub[sender_idx], secret, data, len);
+    return;
+  }
+
   RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
   int i = matching_peer_indexes[sender_idx];
   if (i < 0 || i >= slot.acl.getNumClients()) return;
@@ -953,6 +1015,10 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
 bool RoomMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret,
                               uint8_t* path, uint8_t path_len, uint8_t extra_type,
                               uint8_t* extra, uint8_t extra_len) {
+  /* BOT: geen ACL en geen padopslag (de bot antwoordt geflood). matching_peer_indexes
+   * draagt in de bot-dispatch bovendien geen ACL-index -- niet aanraken. */
+  if (_active_is_bot) return false;
+
   RoomSlot& slot = activeSlot();
   int i = matching_peer_indexes[sender_idx];
   if (i >= 0 && i < slot.acl.getNumClients()) {
@@ -1651,6 +1717,89 @@ void RoomMesh::sendBotAlertDM(const uint8_t* pubkey, AlertTask* t) {
   if (pkt) sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
   t->send_expiry = futureMillis(ALERT_ACK_EXPIRY_MILLIS);
   self_id = rooms[0].id;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Bot: inkomend mesh-diagnose-pad (ping / path / help)               */
+/* ------------------------------------------------------------------ */
+/* De bot is GEEN monitoring-console: hij is een mesh-diagnose-responder met een
+ * klein eigen setje. self_id is hier al _bot_id (in onRecvPacket gezet), en het
+ * gedeelde geheim is al berekend, dus we antwoorden rechtstreeks als schone DM
+ * vanaf de bot. De buffers zijn STATIC (niet op de loopTask-stapel), en er is
+ * hoogstens één inkomend bot-pakket tegelijk (coöperatief vanuit de mesh-lus). */
+void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
+                           const uint8_t* secret, uint8_t* data, size_t len) {
+  (void)len;
+  const char* text = (const char*)&data[5];
+  while (*text == ' ') text++;
+  char verb[12]; int vi = 0;
+  while (text[vi] && text[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = text[vi]; vi++; }
+  verb[vi] = 0;
+
+  /* De lokale kloktijd (RTC, evt. NTP-gesynct) op ontvangstmoment, HH:MM:SS. */
+  uint32_t now_s = getRTCClock()->getCurrentTime();
+  int hh = (int)((now_s / 3600) % 24), mm = (int)((now_s / 60) % 60), ss = (int)(now_s % 60);
+
+  static char reply[200];
+  reply[0] = 0;
+
+  if (!strcasecmp(verb, "ping")) {
+    snprintf(reply, sizeof(reply), "Pong (%02d:%02d:%02d)", hh, mm, ss);
+  } else if (!strcasecmp(verb, "path")) {
+    /* Afzendernaam uit de buurtlijst (adverts); val terug op de pubkey-prefix. */
+    char name[28];
+    const NeighbourEntry* ne = neighbours.find(sender_pub, PUB_KEY_SIZE);
+    if (ne && ne->name[0]) {
+      StrHelper::strncpy(name, ne->name, sizeof(name));
+    } else {
+      char hx[13]; mesh::Utils::toHex(hx, sender_pub, 6); hx[12] = 0;
+      snprintf(name, sizeof(name), "%s", hx);
+    }
+    /* Padbytes van het INKOMENDE pakket als komma-gescheiden hex. Begrensd zodat de
+     * hele regel ruim binnen één pakket (MAX_TEXT_LEN=160) blijft; bij een heel lang
+     * pad kappen we met ".." (de vaste velden erna zijn belangrijker). */
+    char hops[54]; int ho = 0; hops[0] = 0;
+    uint8_t nbytes = packet->getPathByteLen();
+    int nhops = (int)packet->getPathHashCount();
+    for (int i = 0; i < nbytes; i++) {
+      if (ho >= (int)sizeof(hops) - 4) { snprintf(hops + ho, sizeof(hops) - ho, ".."); break; }
+      ho += snprintf(hops + ho, sizeof(hops) - ho, "%s%02x", i ? "," : "", packet->path[i]);
+    }
+    if (nbytes == 0) StrHelper::strncpy(hops, "-", sizeof(hops));
+    /* packet->_snr is SNR x 4 (zoals de buurtlijst het bewaart); RSSI van de radio. */
+    float snr_db = ((float)packet->_snr) / 4.0f;
+    int rssi = (int)radio_driver.getLastRSSI();
+    snprintf(reply, sizeof(reply),
+             "ack @[%s] | %s (%d hops) | SNR: %.1f dB | RSSI: %d dBm | Received at: %02d:%02d:%02d",
+             name, hops, nhops, snr_db, rssi, hh, mm, ss);
+  } else if (!strcasecmp(verb, "help") || verb[0] == '?') {
+    snprintf(reply, sizeof(reply),
+             "mesh-diagnose-bot: `ping` -> Pong; `path` -> route-info van jouw bericht naar mij; `help`");
+  } else {
+    snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
+  }
+
+  /* 1) ACK het inkomende bericht, zodat de app niet blijft herzenden. De ack-hash
+   *    gaat over de ORIGINELE berichtbytes + de afzender-pubkey (zoals het room-pad). */
+  uint32_t ack_hash;
+  mesh::Utils::sha256((uint8_t*)&ack_hash, 4, data, 5 + strlen((char*)&data[5]), sender_pub, PUB_KEY_SIZE);
+  mesh::Packet* ack = createAck(ack_hash);
+  if (ack) sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
+
+  /* 2) Het antwoord als schone DM vanaf de bot (self_id is al _bot_id). Eén pakket:
+   *    ping/path/help passen ruim binnen MAX_PACKET_PAYLOAD; kap voor de zekerheid. */
+  static uint8_t out[MAX_PACKET_PAYLOAD];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(out, &ts, 4);
+  out[4] = (TXT_TYPE_PLAIN << 2);
+  int rlen = (int)strlen(reply);
+  /* Eén pakket: MeshCore's tekstlimiet is 160 (MAX_TEXT_LEN). Kap voor de zekerheid;
+   * ping/help en een normale path-regel passen daar ruim binnen. */
+  if (rlen > 160) rlen = 160;
+  memcpy(&out[5], reply, rlen);
+  mesh::Identity dest(sender_pub);
+  mesh::Packet* rpkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, dest, secret, out, 5 + rlen);
+  if (rpkt) sendFloodScoped(default_scope, rpkt, TXT_ACK_DELAY + SERVER_RESPONSE_DELAY, _prefs.path_hash_mode + 1);
 }
 
 /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Enqueue als een
