@@ -99,6 +99,31 @@ static void mon_ping_timeout(esp_ping_handle_t hdl, void* args) {
   s_ping.state = 2;
 }
 
+/* ---- traceroute via TTL-oplopende esp_ping ----
+ * Eigen esp_ping-sessie + eigen toestand, LOS van s_ping, zodat de gewone
+ * monitorbewaking ongestoord doorloopt. Per TTL één echo-request: een
+ * tussenliggende router laat de TTL verlopen (ICMP time-exceeded -> geen
+ * echo-reply -> timeout), de bestemming antwoordt wél. De eerste TTL die een
+ * reply oplevert = de hop-AFSTAND. Tussenliggende hop-IP's zijn hier niet te
+ * krijgen (esp_ping onthult de time-exceeded-bron niet). */
+static struct {
+  volatile uint8_t  state;     /* 0 bezig, 1 reply (bestemming), 2 timeout (hop verlopen) */
+  volatile uint32_t ms;        /* rondetijd bij reply */
+  esp_ping_handle_t handle;    /* NULL = geen sessie open */
+} s_trace = { 0, 0, NULL };
+
+static void trace_ping_success(esp_ping_handle_t hdl, void* args) {
+  uint32_t elapsed = 0;
+  esp_ping_get_profile(hdl, ESP_PING_PROF_TIMEGAP, &elapsed, sizeof(elapsed));
+  s_trace.ms = elapsed;
+  s_trace.state = 1;   /* als laatste */
+}
+static void trace_ping_timeout(esp_ping_handle_t hdl, void* args) {
+  s_trace.state = 2;
+}
+#define TRACE_MAX_HOPS    30    /* bovengrens aan het aantal TTL-stappen */
+#define TRACE_TTL_TIMEOUT 1200  /* ms per TTL: geen reply -> hop verlopen/geen antwoord */
+
 static void mon_dns_found(const char* name, const ip_addr_t* ipaddr, void* arg) {
   if (ipaddr != NULL && IP_IS_V4(ipaddr)) {
     s_ping.dns_addr = ip4_addr_get_u32(ip_2_ip4(ipaddr));
@@ -2417,26 +2442,19 @@ void MonitorSensors::loopNetDiag() {
         _netdiag.deadline = now + 9000;
         return;
       }
-      if (_netdiag.kind == NET_TRACE) {
-        /* EERLIJK: esp_ping/lwIP op deze build onthult geen tussenliggende hop-IP's
-         * (ICMP time-exceeded-bron). Een echte traceroute zou een raw-ICMP-socket
-         * vergen die hier niet beschikbaar is. We leveren daarom de best haalbare
-         * variant zonder te faken: de HOP-AFSTAND is niet betrouwbaar te meten,
-         * dus verwijs naar ping/port voor bereikbaarheid. */
-        snprintf(_netdiag.result, sizeof(_netdiag.result),
-                 "traceroute %s: hop-IP's niet beschikbaar op deze lwIP-build "
-                 "(geen raw-ICMP time-exceeded). Gebruik 'ping %s' voor "
-                 "bereikbaarheid/RTT of 'port %s <poort>' voor een dienst.",
-                 _netdiag.host, _netdiag.host, _netdiag.host);
-        _netdiag.state = NETS_DONE;
-        return;
-      }
-      /* port / http: eerst de naam oplossen (of een IP-literal meteen gebruiken). */
+      /* port / http / traceroute: eerst de naam oplossen (of een IP-literal meteen gebruiken). */
       StrHelper::strncpy(s_net.host, _netdiag.host, sizeof(s_net.host));
       s_net.dns_state = 0; s_net.dns_addr = 0;
       ip4_addr_t lit;
       if (ip4addr_aton(_netdiag.host, &lit)) {
-        s_net.addr = ip4_addr_get_u32(&lit);
+        uint32_t a = ip4_addr_get_u32(&lit);
+        if (_netdiag.kind == NET_TRACE) {
+          _netdiag.trace_addr = a; _netdiag.trace_ttl = 1;
+          traceStartTtl();
+          _netdiag.state = NETS_TRACE; _netdiag.deadline = now + TRACE_TTL_TIMEOUT + 800;
+          return;
+        }
+        s_net.addr = a;
         s_net.kind = _netdiag.kind; s_net.port = _netdiag.port;
         if (_netdiag.kind == NET_HTTP)
           s_net.reqlen = (uint16_t)snprintf(s_net.req, sizeof(s_net.req),
@@ -2459,6 +2477,12 @@ void MonitorSensors::loopNetDiag() {
 
     case NETS_RESOLVE: {
       if (s_net.dns_state == 1) {
+        if (_netdiag.kind == NET_TRACE) {
+          _netdiag.trace_addr = s_net.dns_addr; _netdiag.trace_ttl = 1;
+          traceStartTtl();
+          _netdiag.state = NETS_TRACE; _netdiag.deadline = now + TRACE_TTL_TIMEOUT + 800;
+          return;
+        }
         s_net.addr = s_net.dns_addr;
         s_net.kind = _netdiag.kind; s_net.port = _netdiag.port;
         if (_netdiag.kind == NET_HTTP)
@@ -2528,7 +2552,77 @@ void MonitorSensors::loopNetDiag() {
 #endif
       return;
     }
+
+    case NETS_TRACE: {
+#if defined(ESP32)
+      /* Wacht op de reply/timeout van de esp_ping op de huidige TTL. */
+      if (s_trace.state == 1) {
+        /* Echo-reply: de bestemming is bereikt op deze TTL = hop-afstand. */
+        if (s_trace.handle) { esp_ping_stop(s_trace.handle); esp_ping_delete_session(s_trace.handle); s_trace.handle = NULL; }
+        snprintf(_netdiag.result, sizeof(_netdiag.result),
+                 "traceroute %s: bereikt na %u hop%s (RTT %lu ms). Tussenliggende "
+                 "hop-IP's zijn op dit platform niet beschikbaar.",
+                 _netdiag.host, (unsigned)_netdiag.trace_ttl,
+                 _netdiag.trace_ttl == 1 ? "" : "s", (unsigned long)s_trace.ms);
+        _netdiag.state = NETS_DONE;
+      } else if (s_trace.state == 2 || (long)(now - _netdiag.deadline) >= 0) {
+        /* Geen reply op deze TTL (hop verlopen of geen antwoord): TTL ophogen. */
+        if (s_trace.handle) { esp_ping_stop(s_trace.handle); esp_ping_delete_session(s_trace.handle); s_trace.handle = NULL; }
+        if (_netdiag.trace_ttl >= TRACE_MAX_HOPS) {
+          snprintf(_netdiag.result, sizeof(_netdiag.result),
+                   "traceroute %s: niet bereikt binnen %u hops (host stil of firewall "
+                   "blokkeert ICMP).", _netdiag.host, (unsigned)TRACE_MAX_HOPS);
+          _netdiag.state = NETS_DONE;
+        } else {
+          _netdiag.trace_ttl++;
+          traceStartTtl();
+          _netdiag.deadline = now + TRACE_TTL_TIMEOUT + 800;
+        }
+      }
+#endif
+      return;
+    }
   }
+}
+
+/* Start één esp_ping-echo op de huidige TTL; de callbacks zetten s_trace. */
+void MonitorSensors::traceStartTtl() {
+#if defined(ESP32)
+  esp_ping_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.count           = 1;
+  cfg.interval_ms     = 1000;
+  cfg.timeout_ms      = TRACE_TTL_TIMEOUT;
+  cfg.data_size       = 32;
+  cfg.tos             = 0;
+  cfg.ttl             = _netdiag.trace_ttl;   /* de kern van de truc */
+  cfg.task_stack_size = 3072;
+  cfg.task_prio       = 2;
+  cfg.interface       = 0;
+  ip_addr_set_ip4_u32(&cfg.target_addr, _netdiag.trace_addr);
+
+  esp_ping_callbacks_t cbs;
+  memset(&cbs, 0, sizeof(cbs));
+  cbs.cb_args         = NULL;
+  cbs.on_ping_success = trace_ping_success;
+  cbs.on_ping_timeout = trace_ping_timeout;
+  cbs.on_ping_end     = NULL;
+
+  s_trace.state = 0;
+  s_trace.ms    = 0;
+  if (s_trace.handle != NULL) { esp_ping_delete_session(s_trace.handle); s_trace.handle = NULL; }
+  if (esp_ping_new_session(&cfg, &cbs, &s_trace.handle) != ESP_OK) {
+    s_trace.handle = NULL;
+    snprintf(_netdiag.result, sizeof(_netdiag.result), "traceroute %s: kon geen ping-sessie maken", _netdiag.host);
+    _netdiag.state = NETS_DONE;
+    return;
+  }
+  if (esp_ping_start(s_trace.handle) != ESP_OK) {
+    esp_ping_delete_session(s_trace.handle); s_trace.handle = NULL;
+    snprintf(_netdiag.result, sizeof(_netdiag.result), "traceroute %s: kon de ping niet starten", _netdiag.host);
+    _netdiag.state = NETS_DONE;
+  }
+#endif
 }
 
 /* ---- SNMP-poller: één GET tegelijk, round-robin over de due SNMP-monitors ---- */

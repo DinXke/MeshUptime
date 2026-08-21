@@ -698,7 +698,7 @@ public:
    * cross-task-toegang tot de pcb. `scan` gebruikt WiFi.scanNetworks(async).
    * `traceroute` is best-effort (zie de .cpp voor de grenzen). */
   enum NetKind : uint8_t { NET_PORT = 1, NET_HTTP, NET_SCAN, NET_TRACE };
-  enum NetState : uint8_t { NETS_NONE = 0, NETS_NEW, NETS_RESOLVE, NETS_CONNECT, NETS_SCAN, NETS_DONE };
+  enum NetState : uint8_t { NETS_NONE = 0, NETS_NEW, NETS_RESOLVE, NETS_CONNECT, NETS_SCAN, NETS_TRACE, NETS_DONE };
   /* host = doelnaam/-IP, port (port/http), path (http, "/..."). Zonder wifi of bij
    * bezet: meteen een klare uitslag. Geeft SIM_OK als de taak gestart is. */
   SimResult   startNetDiag(uint8_t kind, const char* host, uint16_t port, const char* path);
@@ -1169,8 +1169,11 @@ private:
     char          path[80];
     unsigned long deadline;      /* millis; te lang bezig -> afbreken */
     char          result[200];
-  } _netdiag = { 0, NETS_NONE, {0}, 0, {0}, 0, {0} };
+    uint8_t       trace_ttl;     /* traceroute: huidige TTL (= hop-nr in test) */
+    uint32_t      trace_addr;    /* traceroute: opgelost doel-IP (host-order u32) */
+  } _netdiag = { 0, NETS_NONE, {0}, 0, {0}, 0, {0}, 0, 0 };
   void loopNetDiag();
+  void traceStartTtl();         /* traceroute: start één esp_ping op _netdiag.trace_ttl */
 
   /* SNMP-poller (één GET tegelijk, round-robin over de SNMP-monitors). Niet-
    * blokkerend via WiFiUDP (send + parsePacket-poll). De WiFiUDP + de BER-codec

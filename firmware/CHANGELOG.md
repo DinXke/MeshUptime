@@ -14,7 +14,9 @@ tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalwe
   naar de oorsprong (room/DM) via de bestaande oorsprong-routing.
 - **Netwerk-diagnoses** (room/DM, read-niveau): `port <host> <poort>` (non-blocking
   TCP-connect), `scan` (WiFi-scan, async), `http <url>` (statuscode + responstijd),
-  `traceroute <host>` (best-effort).
+  `traceroute <host>` (hop-AFSTAND via TTL-oplopende esp_ping: verhoog de TTL tot de
+  bestemming antwoordt; die TTL = het aantal hops. Begrensd op 30 hops, ~1,2 s per
+  TTL. Tussenliggende hop-IP's zijn op dit platform niet beschikbaar).
 - **SNMP als monitor-soort**: de node doet zelf een niet-blokkerende SNMP-GET
   (BER/ASN.1 over UDP:161, v2c). De gepollde waarde stroomt door de bestaande
   telemetrie/alert-pijplijn (CayenneLPP → sensor-nodes → mesh → MeshManager; alerts
