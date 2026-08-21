@@ -24,6 +24,10 @@
 #include "lwip/ip_addr.h"
 #include "lwip/dns.h"
 #include "lwip/tcpip.h"
+#include "lwip/tcp.h"
+#if defined(ESP32)
+  #include <WiFi.h>
+#endif
 
 /* Grenzen waarbinnen een drempel nog ergens op lijkt. Ruim genomen: dit is
  * geen ijking maar een zeef tegen typefouten ("sensor set mains.hi 41.2"). */
@@ -116,6 +120,99 @@ static void mon_do_resolve(void* ctx) {
   /* ERR_INPROGRESS: mon_dns_found() komt straks langs. */
 }
 
+/* ============== async netwerk-diagnose: port / http (raw lwIP TCP) ==============
+ *
+ * Zelfde discipline als de ping-DNS: ALLE lwIP-aanrakingen (tcp_new/_connect/_write/
+ * _close/_abort en de callbacks) lopen in de lwIP-taak, neergezet via
+ * tcpip_try_callback(). De hoofdtaak leest alleen s_net.done (als LAATSTE gezet) en
+ * de resultaatvelden; s_net.pcb wordt NOOIT vanuit de hoofdtaak aangeraakt. Zo is
+ * er geen cross-task-race en geen blokkering. */
+static struct {
+  volatile uint8_t  done;        /* 0 bezig, 1 klaar */
+  volatile uint8_t  ok;          /* 1 = open/http-antwoord, 2 = dicht/onbereikbaar */
+  volatile uint32_t rtt;         /* ms tot connect (port) of statusregel (http) */
+  volatile uint16_t status;      /* http-statuscode */
+  volatile uint8_t  dns_state;   /* 0 bezig, 1 gelukt, 2 mislukt */
+  volatile uint32_t dns_addr;    /* IPv4 network-order */
+  struct tcp_pcb*   pcb;         /* alleen in de lwIP-taak */
+  uint32_t          addr;        /* doel-IPv4 network-order */
+  uint16_t          port;
+  uint8_t           kind;        /* MonitorSensors::NET_PORT / NET_HTTP (1/2) */
+  unsigned long     start_ms;
+  char              host[64];
+  char              req[200];    /* http-verzoek */
+  uint16_t          reqlen;
+} s_net = {0};
+
+static void net_dns_found(const char* name, const ip_addr_t* ipaddr, void* arg) {
+  if (ipaddr != NULL && IP_IS_V4(ipaddr)) {
+    s_net.dns_addr = ip4_addr_get_u32(ip_2_ip4(ipaddr));
+    s_net.dns_state = 1;
+  } else s_net.dns_state = 2;
+}
+static void net_do_resolve(void* ctx) {
+  ip_addr_t addr;
+  err_t e = dns_gethostbyname(s_net.host, &addr, net_dns_found, NULL);
+  if (e == ERR_OK) net_dns_found(s_net.host, &addr, NULL);
+  else if (e != ERR_INPROGRESS) s_net.dns_state = 2;
+}
+static err_t net_recv_cb(void* arg, struct tcp_pcb* pcb, struct pbuf* p, err_t err) {
+  if (p == NULL) {   /* peer sloot -> klaar met wat we hadden */
+    if (!s_net.done) { s_net.ok = 1; s_net.done = 1; }
+    if (pcb) tcp_close(pcb);
+    s_net.pcb = NULL;
+    return ERR_OK;
+  }
+  if (!s_net.done) {
+    char line[24] = {0};
+    uint16_t c = p->tot_len < (uint16_t)23 ? p->tot_len : (uint16_t)23;
+    pbuf_copy_partial(p, line, c, 0);
+    int st = 0; char* sp = strchr(line, ' '); if (sp) st = atoi(sp + 1);
+    s_net.status = (uint16_t)st;
+    s_net.rtt = millis() - s_net.start_ms;
+    s_net.ok = 1; s_net.done = 1;
+  }
+  tcp_recved(pcb, p->tot_len);
+  pbuf_free(p);
+  tcp_close(pcb);
+  s_net.pcb = NULL;
+  return ERR_OK;
+}
+static err_t net_connected_cb(void* arg, struct tcp_pcb* pcb, err_t err) {
+  if (err != ERR_OK) { s_net.ok = 2; s_net.done = 1; s_net.pcb = NULL; return ERR_OK; }
+  s_net.rtt = millis() - s_net.start_ms;
+  if (s_net.kind == 1) {   /* NET_PORT: connect = open, klaar */
+    s_net.ok = 1; s_net.done = 1;
+    tcp_close(pcb); s_net.pcb = NULL;
+    return ERR_OK;
+  }
+  /* NET_HTTP: verzoek versturen, dan op de statusregel wachten. */
+  tcp_recv(pcb, net_recv_cb);
+  tcp_write(pcb, s_net.req, s_net.reqlen, TCP_WRITE_FLAG_COPY);
+  tcp_output(pcb);
+  return ERR_OK;
+}
+static void net_err_cb(void* arg, err_t err) {
+  s_net.pcb = NULL;   /* lwIP heeft de pcb al vrijgegeven */
+  if (!s_net.done) { s_net.ok = 2; s_net.done = 1; }
+}
+static void net_do_connect(void* ctx) {
+  struct tcp_pcb* pcb = tcp_new();
+  if (!pcb) { s_net.ok = 2; s_net.done = 1; return; }
+  s_net.pcb = pcb;
+  s_net.start_ms = millis();
+  s_net.done = 0; s_net.ok = 0;
+  tcp_arg(pcb, NULL);
+  tcp_err(pcb, net_err_cb);
+  ip_addr_t a; ip_addr_set_ip4_u32(&a, s_net.addr);
+  if (tcp_connect(pcb, &a, s_net.port, net_connected_cb) != ERR_OK) {
+    s_net.ok = 2; s_net.done = 1; s_net.pcb = NULL;
+  }
+}
+static void net_do_abort(void* ctx) {
+  if (s_net.pcb) { tcp_abort(s_net.pcb); s_net.pcb = NULL; }
+}
+
 bool MonitorSensors::begin() {
   bool ok = EnvironmentSensorManager::begin();
 
@@ -185,6 +282,7 @@ void MonitorSensors::loop() {
   }
 
   loopMonitors();
+  loopNetDiag();   // async port/http/scan/traceroute; coöperatief, niet-blokkerend
 
   /* OP EEN TIK VAN 250 ms EN NIET ELKE RONDE.
    *
@@ -2086,6 +2184,9 @@ void MonitorSensors::finishAdhoc(const char* note) {
 }
 
 const char* MonitorSensors::adhocResultText() const {
+  /* Netwerk-diagnose klaar? Die uitslag heeft voorrang (deelt het slot). */
+  if (_netdiag.state == NETS_DONE) return _netdiag.result;
+
   static char buf[220];
   int n = snprintf(buf, sizeof(buf), "ping %s:", _adhoc.host);
 
@@ -2129,10 +2230,161 @@ const char* MonitorSensors::adhocResultText() const {
 }
 
 void MonitorSensors::adhocClear() {
+  /* Was er een netwerk-diagnose klaar? Die eerst vrijgeven (hij deelt het slot). */
+  if (_netdiag.state == NETS_DONE) { _netdiag.state = NETS_NONE; return; }
   /* Alleen de vlag: de velden worden bij de volgende startAdhocPing gewist. Zo
    * blijft de laatste uitslag leesbaar tot hij echt overschreven wordt. DONE ->
    * NONE betekent bovendien dat een nieuwe ping niet meer op BUSY afketst. */
   _adhoc.state = ADHOC_NONE;
+}
+
+/* ---- async netwerk-diagnose: start + coöperatieve stap-lus ---- */
+MonitorSensors::SimResult MonitorSensors::startNetDiag(uint8_t kind, const char* host, uint16_t port, const char* path) {
+  /* Één deferred taak tegelijk (deelt het uitslagslot met de ad-hoc ping). */
+  if (_adhoc.state == ADHOC_PENDING || _adhoc.state == ADHOC_BUSY) return SIM_ERR_BUSY;
+  if (_netdiag.state != NETS_NONE && _netdiag.state != NETS_DONE) return SIM_ERR_BUSY;
+
+  memset(&_netdiag, 0, sizeof(_netdiag));
+  _netdiag.kind = kind;
+  _netdiag.port = port;
+  if (host) StrHelper::strncpy(_netdiag.host, host, sizeof(_netdiag.host));
+  if (path) StrHelper::strncpy(_netdiag.path, path, sizeof(_netdiag.path));
+
+  if ((kind == NET_PORT || kind == NET_HTTP || kind == NET_TRACE) && !validHost(host)) {
+    return SIM_ERR_INDEX;
+  }
+  _netdiag.state = NETS_NEW;
+  _netdiag.deadline = millis() + 10000;   // ruime bovengrens; de fasen zetten kortere
+  return SIM_OK;
+}
+
+void MonitorSensors::loopNetDiag() {
+  unsigned long now = millis();
+  switch (_netdiag.state) {
+    case NETS_NONE:
+    case NETS_DONE:
+      return;
+
+    case NETS_NEW: {
+#if defined(ESP32)
+      if (_netdiag.kind == NET_SCAN) {
+        WiFi.scanNetworks(true /*async*/, false, false, 300);
+        _netdiag.state = NETS_SCAN;
+        _netdiag.deadline = now + 9000;
+        return;
+      }
+      if (_netdiag.kind == NET_TRACE) {
+        /* EERLIJK: esp_ping/lwIP op deze build onthult geen tussenliggende hop-IP's
+         * (ICMP time-exceeded-bron). Een echte traceroute zou een raw-ICMP-socket
+         * vergen die hier niet beschikbaar is. We leveren daarom de best haalbare
+         * variant zonder te faken: de HOP-AFSTAND is niet betrouwbaar te meten,
+         * dus verwijs naar ping/port voor bereikbaarheid. */
+        snprintf(_netdiag.result, sizeof(_netdiag.result),
+                 "traceroute %s: hop-IP's niet beschikbaar op deze lwIP-build "
+                 "(geen raw-ICMP time-exceeded). Gebruik 'ping %s' voor "
+                 "bereikbaarheid/RTT of 'port %s <poort>' voor een dienst.",
+                 _netdiag.host, _netdiag.host, _netdiag.host);
+        _netdiag.state = NETS_DONE;
+        return;
+      }
+      /* port / http: eerst de naam oplossen (of een IP-literal meteen gebruiken). */
+      StrHelper::strncpy(s_net.host, _netdiag.host, sizeof(s_net.host));
+      s_net.dns_state = 0; s_net.dns_addr = 0;
+      ip4_addr_t lit;
+      if (ip4addr_aton(_netdiag.host, &lit)) {
+        s_net.addr = ip4_addr_get_u32(&lit);
+        s_net.kind = _netdiag.kind; s_net.port = _netdiag.port;
+        if (_netdiag.kind == NET_HTTP)
+          s_net.reqlen = (uint16_t)snprintf(s_net.req, sizeof(s_net.req),
+            "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: MeshUptime\r\nConnection: close\r\n\r\n",
+            _netdiag.path[0] ? _netdiag.path : "/", _netdiag.host);
+        s_net.done = 0;
+        tcpip_try_callback(net_do_connect, NULL);
+        _netdiag.state = NETS_CONNECT; _netdiag.deadline = now + 6000;
+        return;
+      }
+      tcpip_try_callback(net_do_resolve, NULL);
+      _netdiag.state = NETS_RESOLVE; _netdiag.deadline = now + 5000;
+      return;
+#else
+      snprintf(_netdiag.result, sizeof(_netdiag.result), "geen netwerk");
+      _netdiag.state = NETS_DONE;
+      return;
+#endif
+    }
+
+    case NETS_RESOLVE: {
+      if (s_net.dns_state == 1) {
+        s_net.addr = s_net.dns_addr;
+        s_net.kind = _netdiag.kind; s_net.port = _netdiag.port;
+        if (_netdiag.kind == NET_HTTP)
+          s_net.reqlen = (uint16_t)snprintf(s_net.req, sizeof(s_net.req),
+            "GET %s HTTP/1.0\r\nHost: %s\r\nUser-Agent: MeshUptime\r\nConnection: close\r\n\r\n",
+            _netdiag.path[0] ? _netdiag.path : "/", _netdiag.host);
+        s_net.done = 0;
+        tcpip_try_callback(net_do_connect, NULL);
+        _netdiag.state = NETS_CONNECT; _netdiag.deadline = now + 6000;
+      } else if (s_net.dns_state == 2 || (long)(now - _netdiag.deadline) >= 0) {
+        snprintf(_netdiag.result, sizeof(_netdiag.result), "%s: naam niet op te lossen", _netdiag.host);
+        _netdiag.state = NETS_DONE;
+      }
+      return;
+    }
+
+    case NETS_CONNECT: {
+      if (s_net.done) {
+        if (_netdiag.kind == NET_PORT) {
+          if (s_net.ok == 1)
+            snprintf(_netdiag.result, sizeof(_netdiag.result),
+                     "poort %u op %s is OPEN (%lu ms)", (unsigned)_netdiag.port, _netdiag.host, (unsigned long)s_net.rtt);
+          else
+            snprintf(_netdiag.result, sizeof(_netdiag.result),
+                     "poort %u op %s: dicht/onbereikbaar", (unsigned)_netdiag.port, _netdiag.host);
+        } else {   // NET_HTTP
+          if (s_net.ok == 1 && s_net.status > 0)
+            snprintf(_netdiag.result, sizeof(_netdiag.result),
+                     "http %s%s -> %u (%lu ms)", _netdiag.host, _netdiag.path, (unsigned)s_net.status, (unsigned long)s_net.rtt);
+          else if (s_net.ok == 1)
+            snprintf(_netdiag.result, sizeof(_netdiag.result),
+                     "http %s%s: verbonden maar geen geldige statusregel (%lu ms)", _netdiag.host, _netdiag.path, (unsigned long)s_net.rtt);
+          else
+            snprintf(_netdiag.result, sizeof(_netdiag.result),
+                     "http %s%s: geen verbinding", _netdiag.host, _netdiag.path);
+        }
+        _netdiag.state = NETS_DONE;
+      } else if ((long)(now - _netdiag.deadline) >= 0) {
+        tcpip_try_callback(net_do_abort, NULL);
+        snprintf(_netdiag.result, sizeof(_netdiag.result),
+                 "%s%s%u: timeout (geen antwoord binnen ~6s)",
+                 _netdiag.kind == NET_PORT ? "poort " : "http ",
+                 _netdiag.kind == NET_PORT ? "" : _netdiag.host,
+                 _netdiag.kind == NET_PORT ? _netdiag.port : 0);
+        _netdiag.state = NETS_DONE;
+      }
+      return;
+    }
+
+    case NETS_SCAN: {
+#if defined(ESP32)
+      int nn = WiFi.scanComplete();
+      if (nn >= 0) {
+        int off = snprintf(_netdiag.result, sizeof(_netdiag.result), "wifi-scan (%d):", nn);
+        int shown = nn < 6 ? nn : 6;   // top-6, gekapt
+        for (int i = 0; i < shown && (size_t)off < sizeof(_netdiag.result) - 40; i++) {
+          off += snprintf(_netdiag.result + off, sizeof(_netdiag.result) - off,
+                          " %s(%d)", WiFi.SSID(i).c_str(), (int)WiFi.RSSI(i));
+        }
+        WiFi.scanDelete();
+        _netdiag.state = NETS_DONE;
+      } else if (nn == WIFI_SCAN_FAILED || (long)(now - _netdiag.deadline) >= 0) {
+        WiFi.scanDelete();
+        snprintf(_netdiag.result, sizeof(_netdiag.result), "wifi-scan mislukt of timeout");
+        _netdiag.state = NETS_DONE;
+      }
+#endif
+      return;
+    }
+  }
 }
 
 /* ---------------- het testbericht ----------------

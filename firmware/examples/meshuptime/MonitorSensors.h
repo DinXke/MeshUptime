@@ -670,14 +670,33 @@ public:
    * pingen. */
   SimResult startAdhocPing(const char* host, uint8_t n);
 
-  AdhocState  adhocState() const { return (AdhocState)_adhoc.state; }
-  bool        adhocReady() const { return _adhoc.state == ADHOC_DONE; }
+  /* adhocState/Ready/Result/Clear weerspiegelen OF de ad-hoc ping OF een async
+   * netwerk-diagnose (port/http/scan/traceroute) -- er draait er hoogstens één
+   * tegelijk, en beide gebruiken hetzelfde deferred-uitslagslot zodat DmCommands
+   * het resultaat via dezelfde oorsprong-routing (room/DM) bezorgt. */
+  AdhocState  adhocState() const {
+    if (_netdiag.state != NETS_NONE) return _netdiag.state == NETS_DONE ? ADHOC_DONE : ADHOC_BUSY;
+    return (AdhocState)_adhoc.state;
+  }
+  bool        adhocReady() const { return _adhoc.state == ADHOC_DONE || _netdiag.state == NETS_DONE; }
   /* De uitslagtekst: per ping de tijd of "timeout", plus een slotregel
    * "x/y ok, min/gem/max ms" en hoe oud de uitslag is. Zinvol zodra adhocReady().
-   * Geen String; vaste buffer. */
+   * Geen String; vaste buffer. Bij een netwerk-diagnose de diag-uitslag. */
   const char* adhocResultText() const;
   /* De uitslag is verstuurd (of de vrager is weg): slot vrijgeven. */
   void        adhocClear();
+
+  /* ==================== ASYNC NETWERK-DIAGNOSES ====================
+   * Niet-blokkerende port/http/scan/traceroute, coöperatief gestapt vanuit loop().
+   * De TCP-diagnoses (port/http) draaien in de lwIP-taak via tcpip_try_callback,
+   * exact het bewezen patroon van de ping-DNS -- dus geen blokkering en geen
+   * cross-task-toegang tot de pcb. `scan` gebruikt WiFi.scanNetworks(async).
+   * `traceroute` is best-effort (zie de .cpp voor de grenzen). */
+  enum NetKind : uint8_t { NET_PORT = 1, NET_HTTP, NET_SCAN, NET_TRACE };
+  enum NetState : uint8_t { NETS_NONE = 0, NETS_NEW, NETS_RESOLVE, NETS_CONNECT, NETS_SCAN, NETS_DONE };
+  /* host = doelnaam/-IP, port (port/http), path (http, "/..."). Zonder wifi of bij
+   * bezet: meteen een klare uitslag. Geeft SIM_OK als de taak gestart is. */
+  SimResult   startNetDiag(uint8_t kind, const char* host, uint16_t port, const char* path);
   /* Het adres waar we nu mee bezig zijn -- voor de "bezig met <adres>"-weigering
    * en voor het help/statusantwoord. */
   const char* adhocHost() const { return _adhoc.host; }
@@ -1129,6 +1148,19 @@ private:
     const char*   note;          /* korte reden bij een vroeg einde (wifi weg e.d.) */
   };
   AdhocPing _adhoc = { ADHOC_NONE, {0}, 0, 0, 0, 0, {0}, 0, 0, 0, false, 0, NULL };
+
+  /* De hoog-niveau-toestand van een async netwerk-diagnose; de vluchtige lwIP-
+   * transportvelden staan file-scope (s_net) in de .cpp, net als s_ping. */
+  struct NetDiag {
+    uint8_t       kind;          /* NetKind */
+    uint8_t       state;         /* NetState */
+    char          host[64];
+    uint16_t      port;
+    char          path[80];
+    unsigned long deadline;      /* millis; te lang bezig -> afbreken */
+    char          result[200];
+  } _netdiag = { 0, NETS_NONE, {0}, 0, {0}, 0, {0} };
+  void loopNetDiag();
 
   void startAdhocResolve();
   void startAdhocOnePing();

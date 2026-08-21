@@ -107,9 +107,10 @@ public:
   const char* dmHelpExtra() override {
     static char h[440];
     snprintf(h, sizeof(h),
-      "%s || diagnose(read): dns <host>, ping <host> [n], neighbors/nb, wifi, sys, "
-      "history <s> | bedien(readwrite): checknow <s>, mute <s> [sec], unmute <s>, "
-      "snooze [sec], test | beheer(admin): reboot, ntp",
+      "%s || diagnose(read): dns <host>, ping <host> [n], port <host> <poort>, "
+      "http <url>, scan, traceroute <host>, neighbors/nb, wifi, sys, history <s> | "
+      "bedien(readwrite): checknow <s>, mute <s> [sec], unmute <s>, snooze [sec], "
+      "test | beheer(admin): reboot, ntp",
       MonitorSensors::dmCommandHelp());
     return h;
   }
@@ -274,6 +275,50 @@ int MonitorDmSource::dmNodeCommand(const char* line, uint8_t role, char* out, si
              (unsigned long)sensors.monitorPingMs(slot), (unsigned long)sensors.monitorFails(slot),
              (unsigned long)sensors.monitorChecks(slot),
              ms ? " [gemute]" : "");
+    return (int)strlen(out);
+  }
+
+  /* ---------- ASYNC NETWERK-DIAGNOSES (read; uitslag volgt zo) ---------- */
+  if (!strcasecmp(verb, "port")) {
+    char host[64]; int hi = 0; const char* q = arg;
+    while (*q && *q != ' ' && hi < 63) host[hi++] = *q++; host[hi] = 0;
+    while (*q == ' ') q++;
+    int pt = atoi(q);
+    if (!host[0] || pt <= 0 || pt > 65535) { snprintf(out, out_len, "gebruik: port <host> <poort>"); return (int)strlen(out); }
+    MonitorSensors::SimResult r = sensors.startNetDiag(MonitorSensors::NET_PORT, host, (uint16_t)pt, nullptr);
+    if (r == MonitorSensors::SIM_OK) snprintf(out, out_len, "port-check %s:%d gestart; uitslag volgt zo", host, pt);
+    else if (r == MonitorSensors::SIM_ERR_BUSY) snprintf(out, out_len, "netwerk-diagnose bezig, probeer zo opnieuw");
+    else snprintf(out, out_len, "ongeldig adres");
+    return (int)strlen(out);
+  }
+  if (!strcasecmp(verb, "http")) {
+    if (!*arg) { snprintf(out, out_len, "gebruik: http <url>  (bv http://host[:poort]/pad)"); return (int)strlen(out); }
+    const char* u = arg;
+    if (!strncasecmp(u, "http://", 7)) u += 7;
+    char host[64]; int hi = 0;
+    while (*u && *u != '/' && *u != ':' && hi < 63) host[hi++] = *u++; host[hi] = 0;
+    uint16_t pt = 80;
+    if (*u == ':') { u++; pt = (uint16_t)atoi(u); while (*u && *u != '/') u++; }
+    char path[80]; StrHelper::strncpy(path, (*u == '/') ? u : "/", sizeof(path));
+    if (!host[0]) { snprintf(out, out_len, "http: geen host in de url"); return (int)strlen(out); }
+    MonitorSensors::SimResult r = sensors.startNetDiag(MonitorSensors::NET_HTTP, host, pt, path);
+    if (r == MonitorSensors::SIM_OK) snprintf(out, out_len, "http-check %s%s gestart; uitslag volgt zo", host, path);
+    else if (r == MonitorSensors::SIM_ERR_BUSY) snprintf(out, out_len, "netwerk-diagnose bezig, probeer zo opnieuw");
+    else snprintf(out, out_len, "ongeldig adres");
+    return (int)strlen(out);
+  }
+  if (!strcasecmp(verb, "scan")) {
+    MonitorSensors::SimResult r = sensors.startNetDiag(MonitorSensors::NET_SCAN, "scan", 0, nullptr);
+    if (r == MonitorSensors::SIM_OK) snprintf(out, out_len, "wifi-scan gestart; uitslag volgt zo");
+    else snprintf(out, out_len, "netwerk-diagnose bezig, probeer zo opnieuw");
+    return (int)strlen(out);
+  }
+  if (!strcasecmp(verb, "traceroute") || !strcasecmp(verb, "trace")) {
+    if (!*arg) { snprintf(out, out_len, "gebruik: traceroute <host>"); return (int)strlen(out); }
+    MonitorSensors::SimResult r = sensors.startNetDiag(MonitorSensors::NET_TRACE, arg, 0, nullptr);
+    if (r == MonitorSensors::SIM_OK) snprintf(out, out_len, "traceroute %s gestart; uitslag volgt zo", arg);
+    else if (r == MonitorSensors::SIM_ERR_BUSY) snprintf(out, out_len, "netwerk-diagnose bezig, probeer zo opnieuw");
+    else snprintf(out, out_len, "ongeldig adres");
     return (int)strlen(out);
   }
 
