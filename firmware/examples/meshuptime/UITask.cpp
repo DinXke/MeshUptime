@@ -1,93 +1,151 @@
 #include "UITask.h"
 #include <Arduino.h>
 #include <helpers/CommonCLI.h>
+#include <target.h>              // board, radio_driver, en de globale `sensors`
+#include "MonitorSensors.h"
+#include "Branding.h"
+
+#ifndef FIRMWARE_VERSION
+  #define FIRMWARE_VERSION "v1.17.0"   // MeshCore-versie; branding staat in Branding.h
+#endif
 
 #ifndef USER_BTN_PRESSED
 #define USER_BTN_PRESSED LOW
 #endif
 
-#define AUTO_OFF_MILLIS      20000  // 20 seconds
-#define BOOT_SCREEN_MILLIS   4000   // 4 seconds
+#define AUTO_OFF_MILLIS      0       // 0 = scherm blijft aan (bewakingsnode)
+#define BOOT_SCREEN_MILLIS   4000
+#define SLIDE_MS             4000    // rustig doorschuiven
+#define REFRESH_MS           1000
 
-// 'meshcore', 128x13px
-static const uint8_t meshcore_logo [] PROGMEM = {
-    0x3c, 0x01, 0xe3, 0xff, 0xc7, 0xff, 0x8f, 0x03, 0x87, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 0x1f, 0xfe, 
-    0x3c, 0x03, 0xe3, 0xff, 0xc7, 0xff, 0x8e, 0x03, 0x8f, 0xfe, 0x3f, 0xfe, 0x1f, 0xff, 0x1f, 0xfe, 
-    0x3e, 0x03, 0xc3, 0xff, 0x8f, 0xff, 0x0e, 0x07, 0x8f, 0xfe, 0x7f, 0xfe, 0x1f, 0xff, 0x1f, 0xfc, 
-    0x3e, 0x07, 0xc7, 0x80, 0x0e, 0x00, 0x0e, 0x07, 0x9e, 0x00, 0x78, 0x0e, 0x3c, 0x0f, 0x1c, 0x00, 
-    0x3e, 0x0f, 0xc7, 0x80, 0x1e, 0x00, 0x0e, 0x07, 0x1e, 0x00, 0x70, 0x0e, 0x38, 0x0f, 0x3c, 0x00, 
-    0x7f, 0x0f, 0xc7, 0xfe, 0x1f, 0xfc, 0x1f, 0xff, 0x1c, 0x00, 0x70, 0x0e, 0x38, 0x0e, 0x3f, 0xf8, 
-    0x7f, 0x1f, 0xc7, 0xfe, 0x0f, 0xff, 0x1f, 0xff, 0x1c, 0x00, 0xf0, 0x0e, 0x38, 0x0e, 0x3f, 0xf8, 
-    0x7f, 0x3f, 0xc7, 0xfe, 0x0f, 0xff, 0x1f, 0xff, 0x1c, 0x00, 0xf0, 0x1e, 0x3f, 0xfe, 0x3f, 0xf0, 
-    0x77, 0x3b, 0x87, 0x00, 0x00, 0x07, 0x1c, 0x0f, 0x3c, 0x00, 0xe0, 0x1c, 0x7f, 0xfc, 0x38, 0x00, 
-    0x77, 0xfb, 0x8f, 0x00, 0x00, 0x07, 0x1c, 0x0f, 0x3c, 0x00, 0xe0, 0x1c, 0x7f, 0xf8, 0x38, 0x00, 
-    0x73, 0xf3, 0x8f, 0xff, 0x0f, 0xff, 0x1c, 0x0e, 0x3f, 0xf8, 0xff, 0xfc, 0x70, 0x78, 0x7f, 0xf8, 
-    0xe3, 0xe3, 0x8f, 0xff, 0x1f, 0xfe, 0x3c, 0x0e, 0x3f, 0xf8, 0xff, 0xfc, 0x70, 0x3c, 0x7f, 0xf8, 
-    0xe3, 0xe3, 0x8f, 0xff, 0x1f, 0xfc, 0x3c, 0x0e, 0x1f, 0xf8, 0xff, 0xf8, 0x70, 0x3c, 0x7f, 0xf8, 
-};
+/* Layout. UI_TOP > 0: NIETS op y=0 -- op de Heltec V3 sneed de bovenrand soms een
+ * regel af. Alles wordt bovendien als BLOK verticaal gecentreerd, zodat er noch
+ * boven noch onder iets buiten de 64 px valt. */
+#define UI_TOP    3
+#define LINE_H    11
+#define SCR_W     128
+#define SCR_H     64
+
+#ifdef ROOM_SERVER_VARIANT
+  #define NODE_TYPE_STR  "< Room Server >"
+#else
+  #define NODE_TYPE_STR  "< Sensor >"
+#endif
 
 void UITask::begin(NodePrefs* node_prefs, const char* build_date, const char* firmware_version) {
+  (void)firmware_version;   // branding komt uit Branding.h, niet uit de meegegeven tekst
   _prevBtnState = HIGH;
-  _auto_off = millis() + AUTO_OFF_MILLIS;
+  _auto_off = AUTO_OFF_MILLIS ? (millis() + AUTO_OFF_MILLIS) : 0;
   _node_prefs = node_prefs;
   _display->turnOn();
+  snprintf(_version_info, sizeof(_version_info), "%s", build_date);
+}
 
-  // strip off dash and commit hash by changing dash to null terminator
-  // e.g: v1.2.3-abcdef -> v1.2.3
-  char *version = strdup(firmware_version);
-  char *dash = strchr(version, '-');
-  if(dash){
-    *dash = 0;
+/* Verzamelt de neer-staande items (voor het STORING-scherm en om te beslissen of
+ * de slideshow onderbroken wordt). Geeft het aantal terug; vult hoogstens
+ * max_lines regels van <=21 tekens. */
+int UITask::collectAlerts(char lines[][22], int max_lines) {
+  int n = 0;
+  float v = (float)board.getBattMilliVolts() / 1000.0f;
+  if (v < 3.6f && n < max_lines) { snprintf(lines[n++], 22, "accu laag %.2fV", v); }
+  if (!sensors.isMains() && n < max_lines) { snprintf(lines[n++], 22, "netvoeding weg"); }
+  if (!sensors.isWifiOnline() && n < max_lines) { snprintf(lines[n++], 22, "wifi weg"); }
+  for (int i = 0; i < MonitorSensors::MAX_MONITORS && n < max_lines; i++) {
+    if (sensors.monitorUsed(i) && sensors.monitorSeeded(i) &&
+        !sensors.monitorsPaused() && !sensors.monitorIsUp(i)) {
+      snprintf(lines[n++], 22, "%s neer", sensors.monitorName(i));
+    }
   }
+  return n;
+}
 
-  // v1.2.3 (1 Jan 2025)
-  snprintf(_version_info, sizeof(_version_info), "%s (%s)", version, build_date);
-  free(version);
+/* Tekent een titel (gecentreerd) plus regels (links uitgelijnd), als BLOK
+ * verticaal gecentreerd binnen 64 px. */
+static void drawBlock(DisplayDriver* d, const char* title, char lines[][22], int nlines) {
+  int rows = (title ? 1 : 0) + nlines;
+  int total = rows * LINE_H;
+  int y = (SCR_H - total) / 2;
+  if (y < UI_TOP) y = UI_TOP;
+
+  d->setTextSize(1);
+  if (title) {
+    d->setColor(UIColor::corp_blue);
+    uint16_t w = d->getTextWidth(title);
+    int x = (SCR_W - (int)w) / 2; if (x < 0) x = 0;
+    d->setCursor(x, y);
+    d->print(title);
+    y += LINE_H;
+  }
+  d->setColor(UIColor::primary_txt);
+  for (int i = 0; i < nlines; i++) {
+    d->setCursor(4, y);
+    d->print(lines[i]);
+    y += LINE_H;
+  }
 }
 
 void UITask::renderCurrScreen() {
-  char tmp[80];
-  if (millis() < BOOT_SCREEN_MILLIS) { // boot screen
-    // meshcore logo
-    _display->setColor(UIColor::corp_blue);
-    int logoWidth = 128;
-    _display->drawXbm((_display->width() - logoWidth) / 2, 3, meshcore_logo, logoWidth, 13);
+  char lines[6][22];
 
-    // meshcore website
-    const char* website = "https://meshcore.io";
-    _display->setColor(UIColor::primary_txt);
-    _display->setTextSize(1);
-    uint16_t websiteWidth = _display->getTextWidth(website);
-    _display->setCursor((_display->width() - websiteWidth) / 2, 22);
-    _display->print(website);
+  // ---- bootscherm: MeshUptime-branding + MeshCore-versie ----
+  if (millis() < BOOT_SCREEN_MILLIS) {
+    snprintf(lines[0], 22, "MeshUptime %s", MESHUPTIME_VERSION);
+    snprintf(lines[1], 22, "by %s", MESHUPTIME_AUTHOR);
+    snprintf(lines[2], 22, "MeshCore %s", FIRMWARE_VERSION);
+    snprintf(lines[3], 22, "%s", NODE_TYPE_STR);
+    drawBlock(_display, NULL, lines, 4);
+    return;
+  }
 
-    // version info
-    _display->setTextSize(1);
-    uint16_t versionWidth = _display->getTextWidth(_version_info);
-    _display->setCursor((_display->width() - versionWidth) / 2, 35);
-    _display->print(_version_info);
+  // ---- STORING-scherm: heeft voorrang op de slideshow ----
+  int na = collectAlerts(lines, 5);
+  if (na > 0) {
+    char title[22];
+    snprintf(title, sizeof(title), "STORING (%d)", na);
+    drawBlock(_display, title, lines, na);
+    return;
+  }
 
-    // node type
-    const char* node_type = "< Sensor >";
-    uint16_t typeWidth = _display->getTextWidth(node_type);
-    _display->setCursor((_display->width() - typeWidth) / 2, 48);
-    _display->print(node_type);
-  } else {  // home screen
-    // node name
-    _display->setCursor(0, 0);
-    _display->setTextSize(1);
-    _display->setColor(UIColor::primary_txt);
-    _display->print(_node_prefs->node_name);
+  // ---- slideshow: bereken het aantal pagina's en wrap _page ----
+  int nused = 0;
+  for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) if (sensors.monitorUsed(i)) nused++;
+  int mon_pages = (nused + 2) / 3;             // 3 monitors per pagina
+  int total_pages = 2 + mon_pages;             // 0=info, 1=voeding, rest=monitors
+  int page = (total_pages > 0) ? (_page % total_pages) : 0;
 
-    // freq / sf
-    _display->setCursor(0, 20);
-    sprintf(tmp, "FREQ: %06.3f SF%d", _node_prefs->freq, _node_prefs->sf);
-    _display->print(tmp);
-
-    // bw / cr
-    _display->setCursor(0, 30);
-    sprintf(tmp, "BW: %03.2f CR: %d", _node_prefs->bw, _node_prefs->cr);
-    _display->print(tmp);
+  if (page == 0) {
+    char title[22];
+    snprintf(title, 22, "%s", _node_prefs->node_name);
+    snprintf(lines[0], 22, "%s", NODE_TYPE_STR);
+    snprintf(lines[1], 22, "MeshCore %s", FIRMWARE_VERSION);
+    snprintf(lines[2], 22, "F%.3f SF%d", _node_prefs->freq, (int)_node_prefs->sf);
+    snprintf(lines[3], 22, "BW%.0f CR%d", _node_prefs->bw, (int)_node_prefs->cr);
+    drawBlock(_display, title, lines, 4);
+  } else if (page == 1) {
+    float v = (float)board.getBattMilliVolts() / 1000.0f;
+    snprintf(lines[0], 22, "accu   %.2f V", v);
+    snprintf(lines[1], 22, "net    %s", sensors.isMains() ? "aan" : "UIT");
+    snprintf(lines[2], 22, "wifi   %s", sensors.isWifiOnline() ? "online" : "WEG");
+    drawBlock(_display, "Voeding / net", lines, 3);
+  } else {
+    int mp = page - 2;                 // welke monitorpagina
+    int shown = 0, skipped = 0;
+    int start = mp * 3;
+    char title[22];
+    snprintf(title, 22, "Monitors %d/%d", mp + 1, mon_pages);
+    for (int i = 0; i < MonitorSensors::MAX_MONITORS && shown < 3; i++) {
+      if (!sensors.monitorUsed(i)) continue;
+      if (skipped < start) { skipped++; continue; }
+      const char* st;
+      if (sensors.monitorsPaused()) st = "pauze";
+      else if (!sensors.monitorSeeded(i)) st = "?";
+      else st = sensors.monitorIsUp(i) ? "op" : "NEER";
+      snprintf(lines[shown], 22, "%-9.9s %s %lu", sensors.monitorName(i), st,
+               (unsigned long)sensors.monitorPingMs(i));
+      shown++;
+    }
+    if (shown == 0) snprintf(lines[shown++], 22, "(geen monitors)");
+    drawBlock(_display, title, lines, shown);
   }
 }
 
@@ -96,29 +154,34 @@ void UITask::loop() {
   if (millis() >= _next_read) {
     int btnState = digitalRead(PIN_USER_BTN);
     if (btnState != _prevBtnState) {
-      if (btnState == USER_BTN_PRESSED) {  // pressed?
+      if (btnState == USER_BTN_PRESSED) {
         if (_display->isOn()) {
-          // TODO: any action ?
+          _page++;                 // knopdruk = volgende pagina
+          _next_slide = millis() + SLIDE_MS;
         } else {
           _display->turnOn();
         }
-        _auto_off = millis() + AUTO_OFF_MILLIS;   // extend auto-off timer
+        if (AUTO_OFF_MILLIS) _auto_off = millis() + AUTO_OFF_MILLIS;
       }
       _prevBtnState = btnState;
     }
-    _next_read = millis() + 200;  // 5 reads per second
+    _next_read = millis() + 200;
   }
 #endif
+
+  if (millis() >= _next_slide) {
+    _page++;
+    _next_slide = millis() + SLIDE_MS;
+  }
 
   if (_display->isOn()) {
     if (millis() >= _next_refresh) {
       _display->startFrame();
       renderCurrScreen();
       _display->endFrame();
-
-      _next_refresh = millis() + 1000;   // refresh every second
+      _next_refresh = millis() + REFRESH_MS;
     }
-    if (millis() > _auto_off) {
+    if (AUTO_OFF_MILLIS && _auto_off && millis() > _auto_off) {
       _display->turnOff();
     }
   }

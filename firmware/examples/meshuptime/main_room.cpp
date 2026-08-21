@@ -261,7 +261,9 @@ void setup() {
     } else {
       wifi_task.begin(WIFI_SSID, WIFI_PWD);
     }
-    web_task.begin(&wifi_task, FIRMWARE_VERSION);
+    /* De webinterface toont de MeshUptime-branding + MeshCore-versie in de
+     * voettekst/statusregel (via het bewaarde _fw). */
+    web_task.begin(&wifi_task, MESHUPTIME_BRAND_FULL(FIRMWARE_VERSION));
     /* De webinterface wordt aan de room-server gekoppeld via IWebNode: /cli,
      * /cfg.json, buurtlijst en toegangsbeheer (room 0) werken zoals op de
      * sensor-node. */

@@ -72,6 +72,8 @@
   #define FIRMWARE_VERSION   "v1.17.0"
 #endif
 
+#include "Branding.h"
+
 #define FIRMWARE_ROLE "room_server"
 
 /* Alarm-bezorgroutes, als bitmasker. Zelfde waarden als in MonitorSensors, want
@@ -245,7 +247,10 @@ public:
   void        requestSensorReadNow() override { last_read_time = 0; }
 
   /* ---- CommonCLICallbacks ---- */
-  const char* getFirmwareVer() override { return FIRMWARE_VERSION; }
+  /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
+   * informatief (alleen de `ver`-CLI leest dit); het protocol-versieveld is het
+   * losse FIRMWARE_VER_LEVEL-byte, dus dit raakt de compatibiliteit niet. */
+  const char* getFirmwareVer() override { return MESHUPTIME_BRAND_FULL(FIRMWARE_VERSION); }
   const char* getBuildDate() override { return FIRMWARE_BUILD_DATE; }
   const char* getRole() override { return FIRMWARE_ROLE; }
   const char* getNodeName() { return _prefs.node_name; }
