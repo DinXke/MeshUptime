@@ -4,6 +4,7 @@
 #include "MonitorStore.h"
 #include "SensorMesh.h"
 #include "IWebNode.h"
+#include "TimeFmt.h"
 
 #include <WebServer.h>
 #include <WiFi.h>
@@ -60,6 +61,7 @@
 #define WEB_PORT        80
 #define WEB_REALM       "MeshUptime"
 #define WIFI_CFG_PATH   "/wifi.cfg"
+#define TIME_CFG_PATH   "/time.cfg"
 
 /* Vaste buffers, in statisch geheugen en niet op de stapel: de loop-taak deelt
  * zijn stapel met de meshstapel, en een kilobyte antwoord hoort daar niet op.
@@ -149,6 +151,10 @@ static_assert(80 + MAX_CLIENTS * 165 + MAX_NEIGHBOURS * 185 + ACL_TAIL <= sizeof
               "g_acl te klein voor MAX_CLIENTS/MAX_NEIGHBOURS -- zie de rekensom hierboven");
 
 static char g_ssid_shown[33] = {0};   // alleen om te tonen; nooit het wachtwoord
+/* NTP-server + POSIX-TZ, één keer bij begin() uit /time.cfg gelezen en bij /time
+ * bijgewerkt -- zodat cfg.json ze zonder flash-lees per verzoek kan tonen. */
+static char g_ntp_shown[48] = {0};
+static char g_tz_shown[48]  = {0};
 
 /* DE WEB-INLOGGEGEVENS DIE NU GELDEN.
  *
@@ -364,7 +370,7 @@ static char g_reply[320];
  *                                                                  ~ 1335
  *
  * 1792 geeft daar ruim 450 byte marge boven. */
-static char g_cfg[1792];
+static char g_cfg[2200];   /* incl. de tijd-velden (ntp/tz/lokale tijd/sync-status) */
 
 /* Wat er hoogstens van een tekstveld in cfg.json terechtkomt. Zonder deze grens
  * is de maat van g_cfg niet na te rekenen: jsonEscape() kan één teken tot zes
@@ -414,6 +420,7 @@ static WebTask* g_self = nullptr;
 void web_route_root()   { if (g_self) g_self->handleRoot(); }
 void web_route_status() { if (g_self) g_self->handleStatus(); }
 void web_route_wifi()   { if (g_self) g_self->handleWifi(); }
+void web_route_time()   { if (g_self) g_self->handleTime(); }
 void web_route_hook()   { if (g_self) g_self->handleHook(); }
 void web_route_monadd() { if (g_self) g_self->handleMonAdd(); }
 void web_route_mondel() { if (g_self) g_self->handleMonDel(); }
@@ -1505,6 +1512,23 @@ autocomplete="new-password" placeholder="nieuw"></label>
 <p class="note">Opgeslagen instellingen gaan voor op de ingebouwde. Pas actief na
 herstart.</p>
 </form>
+</div></details>
+
+<details><summary>Tijd &mdash; NTP + tijdzone</summary><div>
+<div class="row">
+<label>NTP-server<input id="ntp" maxlength="47" spellcheck="false" placeholder="pool.ntp.org"></label>
+<label>Tijdzone (POSIX-TZ)<input id="tz" maxlength="47" spellcheck="false" placeholder="CET-1CEST,M3.5.0/2,M10.5.0/3"></label>
+</div>
+<div class="quick"><button type="button" id="tsave">Opslaan + nu syncen</button>
+<span id="tnow" style="align-self:center;color:var(--muted);font-size:.85rem"></span></div>
+<div id="tmsg"></div>
+<p class="note">De RTC en de MeshCore-<b>protocoltijd</b> (adverts, berichtvolgorde)
+blijven <b>UTC</b>; alleen de menselijke <b>weergave</b> &mdash; bv. de bot-<code>path</code>
+&quot;Received at&quot; &mdash; is lokaal via de ingestelde tijdzone (met de
+zone-afkorting, CET/CEST). Standaard is Europe/Brussels, DST-bewust. Een
+<b>LAN-tijdserver</b> mag ook: handig als de node zelf geen internet heeft maar de
+router wel een klok. Vóór de eerste geslaagde sync toont de node geen tijd maar
+&quot;niet gesynct&quot;. Laatste sync: <b id="tsync">&mdash;</b>.</p>
 </div></details>
 
 <details><summary>De andere twee wegen naar deze node</summary><div>
@@ -2723,7 +2747,31 @@ bk.freq+" MHz · "+bk.bw+" kHz · sf "+bk.sf+" · cr "+bk.cr;
 document.getElementById("idname").value=d.name||"";
 document.getElementById("idkey").value=d.pubkey||"";
 document.getElementById("wcu").value=d.webuser||"";
-pwalarm(d);webal(d);budget(d)})})}
+pwalarm(d);webal(d);budget(d);timeui(d)})})}
+
+/* ---- tijd: NTP-server + tijdzone + sync-status ---- */
+function timeui(d){
+var ntp=document.getElementById("ntp"),tz=document.getElementById("tz");
+if(ntp&&document.activeElement!=ntp)ntp.value=d.ntp||"";
+if(tz&&document.activeElement!=tz)tz.value=d.tz||"";
+var now=document.getElementById("tnow");if(now)now.textContent=d.tlocal?("nu: "+d.tlocal):"";
+var sy=document.getElementById("tsync");
+if(sy){if(d.tsync){var a=d.tsyncage||0,ago=a<90?(a+" s"):(a<5400?(Math.round(a/60)+" min"):(Math.round(a/3600)+" u"));
+sy.textContent=(d.tsyncmsg||"gesynct")+" ("+ago+" geleden)"}
+else sy.textContent=(d.tsyncmsg&&d.tsyncmsg.length)?d.tsyncmsg:"nog niet gesynct"}}
+(function(){var b=document.getElementById("tsave");if(!b)return;
+b.onclick=function(){var ntp=document.getElementById("ntp").value.trim(),
+tz=document.getElementById("tz").value.trim();
+fetch("time",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"ntp="+encodeURIComponent(ntp)+"&tz="+encodeURIComponent(tz)})
+.then(function(r){return r.json().catch(function(){return{ok:r.ok}})})
+.then(function(j){var m=document.getElementById("tmsg");
+if(j.ok){m.textContent="opgeslagen; sync aangevraagd";m.className="ok";
+setTimeout(cfg,1500);setTimeout(cfg,6000)}
+else{m.textContent="mislukt: "+(j.error||"");m.className="x"}
+if(m.textContent)setTimeout(function(){if(m.textContent.indexOf("opgeslagen")==0)m.textContent=""},6000)})
+.catch(function(){var m=document.getElementById("tmsg");m.textContent="mislukt";m.className="x"})}})();
 
 /* HET WACHTWOORDALARM. Rood zolang het beheerderswachtwoord nog de gebakken
    standaard is (of leeg), en dan GROEN als het gezet is -- niet weg. Een
@@ -3432,6 +3480,39 @@ bool saveWifiConfig(const char* ssid, const char* pwd) {
   return true;
 }
 
+/* Tijd-config: regel 1 = NTP-server(host), regel 2 = POSIX-TZ. Ontbreekt het
+ * bestand of een regel, dan gelden DEFAULT_NTP / DEFAULT_TZ. Zelfde discipline als
+ * de wifi-config: File-alloc alleen bij boot en bij opslaan, nooit per verzoek. */
+bool loadTimeConfig(char* ntp, size_t ntp_len, char* tz, size_t tz_len) {
+  if (ntp && ntp_len) strlcpy(ntp, DEFAULT_NTP, ntp_len);
+  if (tz && tz_len)   strlcpy(tz, DEFAULT_TZ, tz_len);
+  File f = SPIFFS.open(TIME_CFG_PATH, FILE_READ);
+  if (!f) return false;   // standaarden staan al
+  if (ntp && ntp_len > 1) {
+    size_t n = f.readBytesUntil('\n', ntp, ntp_len - 1);
+    ntp[n] = 0;
+    for (char* p = ntp; *p; p++) if (*p == '\r') { *p = 0; break; }
+    if (ntp[0] == 0) strlcpy(ntp, DEFAULT_NTP, ntp_len);
+  }
+  if (tz && tz_len > 1) {
+    size_t n = f.readBytesUntil('\n', tz, tz_len - 1);
+    tz[n] = 0;
+    for (char* p = tz; *p; p++) if (*p == '\r') { *p = 0; break; }
+    if (tz[0] == 0) strlcpy(tz, DEFAULT_TZ, tz_len);
+  }
+  f.close();
+  return true;
+}
+
+bool saveTimeConfig(const char* ntp, const char* tz) {
+  File f = SPIFFS.open(TIME_CFG_PATH, FILE_WRITE);
+  if (!f) return false;
+  f.printf("%s\n%s\n", (ntp && ntp[0]) ? ntp : DEFAULT_NTP,
+                       (tz && tz[0]) ? tz : DEFAULT_TZ);
+  f.close();
+  return true;
+}
+
 /* ------------------------------- WebTask ---------------------------------- */
 
 void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
@@ -3448,6 +3529,10 @@ void WebTask::begin(WifiTask* wifi, const char* firmware_version) {
     strlcpy(g_ssid_shown, WIFI_SSID, sizeof(g_ssid_shown));
 #endif
   }
+
+  /* NTP-server + tijdzone voor het formulier (opgeslagen of de standaard). Eén keer
+   * hier gelezen; cfg.json toont daarna deze RAM-buffers. */
+  loadTimeConfig(g_ntp_shown, sizeof(g_ntp_shown), g_tz_shown, sizeof(g_tz_shown));
 
   /* De eigen web-login, langs dezelfde weg en om dezelfde reden: opgeslagen wint
    * van gebakken. Eén keer hier lezen (een File-object alloceert intern), nooit in
@@ -3505,6 +3590,7 @@ void WebTask::routes() {
   _server->on("/logout", HTTP_POST, web_route_logout);
   _server->on("/status.json", HTTP_GET, web_route_status);
   _server->on("/wifi", HTTP_POST, web_route_wifi);
+  _server->on("/time", HTTP_POST, web_route_time);
   /* Uptime Kuma laat de methode vrij; beide kunnen dus. */
   _server->on("/hook", HTTP_GET, web_route_hook);
   _server->on("/hook", HTTP_POST, web_route_hook);
@@ -4014,6 +4100,34 @@ void WebTask::handleWifi() {
   _server->send(200, "text/html",
       "<!DOCTYPE html><meta charset=\"utf-8\"><p>Opgeslagen. Herstart de node om "
       "het nieuwe netwerk te gebruiken.<p><a href=\"/\">terug</a>");
+}
+
+/* POST /time  (ntp, tz) -- NTP-server + tijdzone (POSIX-TZ) bewaren en METEEN
+ * toepassen: de TZ op het proces (weergave) en de server aan WifiTask, gevolgd door
+ * een her-sync. RTC en de MeshCore-PROTOCOLtijd blijven UTC; alleen de menselijke
+ * WEERGAVE wordt lokaal. Anders dan /wifi hoeft dit GEEN herstart. */
+void WebTask::handleTime() {
+  if (!requireAuth()) return;
+
+  char ntp[48], tz[48];
+  if (!getArg(*_server, "ntp", ntp, sizeof(ntp)) || ntp[0] == 0)
+    strlcpy(ntp, DEFAULT_NTP, sizeof(ntp));
+  if (!getArg(*_server, "tz", tz, sizeof(tz)) || tz[0] == 0)
+    strlcpy(tz, DEFAULT_TZ, sizeof(tz));
+
+  if (!saveTimeConfig(ntp, tz)) {
+    _server->send(500, "application/json", "{\"ok\":false,\"error\":\"opslaan mislukt\"}");
+    return;
+  }
+  strlcpy(g_ntp_shown, ntp, sizeof(g_ntp_shown));
+  strlcpy(g_tz_shown, tz, sizeof(g_tz_shown));
+
+  applyTimeZone(tz);                     // weergave meteen lokaal
+  if (_wifi) {
+    _wifi->setNtpServer(ntp);
+    _wifi->syncNow();                    // her-sync met de nieuwe server (indien online)
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
 }
 
 /* Een geheel getal uit een argument, met grenzen. Geeft false bij rommel; een
@@ -5568,6 +5682,21 @@ void WebTask::handleCfgJson() {
   char webuser_esc[WEB_USER_LEN * 6 + 1];
   jsonEscape(g_web_user, webuser_esc, sizeof(webuser_esc));
 
+  /* TIJD: NTP-server + TZ (voor het formulier) en de sync-status (voor de weergave).
+   * De lokale tijd wordt uit de RTC (UTC) omgezet via de ingestelde TZ. De
+   * escape-buffers zijn STATIC (niet op de loopTask-stapel): handleCfgJson draait
+   * op één web-verzoek tegelijk, dus dat is veilig -- en het houdt het frame klein
+   * (les van v2.2.0). */
+  static char ntp_esc[sizeof(g_ntp_shown) * 6 + 1], tz_esc[sizeof(g_tz_shown) * 6 + 1];
+  jsonEscape(g_ntp_shown, ntp_esc, sizeof(ntp_esc));
+  jsonEscape(g_tz_shown, tz_esc, sizeof(tz_esc));
+  static char tlocal[40]; fmtLocalDateTime(_acl->nowSecs(), tlocal, sizeof(tlocal));
+  static char tlocal_esc[80]; jsonEscape(tlocal, tlocal_esc, sizeof(tlocal_esc));
+  static char tsyncmsg_esc[64 * 6 + 1];
+  jsonEscape(_wifi ? _wifi->lastSyncMsg() : "", tsyncmsg_esc, sizeof(tsyncmsg_esc));
+  const int  t_synced = (_wifi && _wifi->timeSynced()) ? 1 : 0;
+  const unsigned long t_age = _wifi ? _wifi->secsSinceSync() : 0;
+
   int n = snprintf(g_cfg, sizeof(g_cfg),
       "{\"name\":\"%s\",\"owner\":\"%s\",\"pubkey\":\"%s\",\"role\":\"%s\","
       "\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u,"
@@ -5582,6 +5711,8 @@ void WebTask::handleCfgJson() {
       "\"webuser\":\"%s\",\"webcustom\":%d,"
       "\"mon_used\":%d,\"mon_max\":%u,\"ch_first\":%u,\"ch_last\":%u,"
       "\"ch_ever\":%d,\"ch_free\":%d,"
+      "\"ntp\":\"%s\",\"tz\":\"%s\",\"tlocal\":\"%s\",\"tsync\":%d,"
+      "\"tsyncmsg\":\"%s\",\"tsyncage\":%lu,"
       "\"baked\":{\"freq\":\"%s\",\"bw\":\"%s\",\"sf\":%u,\"cr\":%u}}",
       g_cfg_name, g_cfg_owner, pubkey, _acl->getRoleName(),
       freq, bw, (unsigned)p->sf, (unsigned)p->cr,
@@ -5604,6 +5735,7 @@ void WebTask::handleCfgJson() {
       (unsigned)MonitorSensors::CH_MONITOR_FIRST,
       (unsigned)MonitorSensors::CH_MONITOR_LAST,
       ever, (int)MonitorSensors::MAX_MONITORS - ever,
+      ntp_esc, tz_esc, tlocal_esc, t_synced, tsyncmsg_esc, t_age,
       bfreq, bbw, (unsigned)LORA_SF, (unsigned)LORA_CR);
 
   if (n < 0 || (size_t)n >= sizeof(g_cfg)) {   /* kan niet; vangnet */

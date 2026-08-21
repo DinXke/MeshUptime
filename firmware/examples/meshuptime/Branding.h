@@ -17,11 +17,14 @@
  *            SNMP-sensor + bot (CHAT/notifier) + GUI-declutter.
  *   v2.2.1 = boot-stack-overflow-fix (dikke MonitorCfg van de stapel) + de bot
  *            als TWEERICHTINGS mesh-diagnose-responder (ping/path/help).
+ *   v2.2.2 = NTP-server + tijdzone instelbaar (web-GUI), menselijke tijden lokaal
+ *            (CET/CEST), protocol/RTC blijven UTC; bot-`path` toont de
+ *            tussenliggende repeaters met naam.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.2.1"
+  #define MESHUPTIME_VERSION   "v2.2.2"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

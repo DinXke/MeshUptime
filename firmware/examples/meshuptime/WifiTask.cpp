@@ -42,6 +42,9 @@ static const char* stateName(int s) {
 /* Ruim: de klok is nergens dringend voor, en een SNTP-poging die de radio in de
  * weg zit is erger dan een klok die een minuut later goed staat. */
 #define SNTP_WAIT_MS         45000
+/* Periodiek her-syncen: de ESP32-klok drijft en heeft geen batterijklok. Zes uur
+ * is ruim genoeg om de drift klein te houden zonder de tijdserver te belasten. */
+#define NTP_RESYNC_MS        (6UL * 60UL * 60UL * 1000UL)
 
 static volatile uint8_t g_last_reason = 0;
 static volatile bool    g_got_ip = false;
@@ -223,6 +226,12 @@ void WifiTask::loop() {
       if (WiFi.status() != WL_CONNECTED) {
         setState(RETRYING);
         _next_action = now + RETRY_DELAY_MS;
+      } else if (_time_synced && _sntp_deadline == 0 &&
+                 (long)(now - _synced_at) >= (long)NTP_RESYNC_MS) {
+        /* PERIODIEK HER-SYNCEN. De ESP32 heeft geen batterijklok en zijn oscillator
+         * drijft; zonder herhaling loopt de tijd over dagen weg. Alleen als er niet
+         * al een sync loopt (_sntp_deadline==0) en we online zijn. */
+        startTimeSync();
       }
       break;
 

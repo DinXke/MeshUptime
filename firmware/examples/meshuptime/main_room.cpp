@@ -15,6 +15,7 @@
 
 #include "RoomMesh.h"
 #include "DmCommands.h"
+#include "TimeFmt.h"
 #if defined(ESP32)
   #include <WiFi.h>
 #endif
@@ -499,6 +500,15 @@ void setup() {
 
 #ifdef WIFI_SSID
   {
+    /* Tijd-config (NTP-server + tijdzone) VÓÓR wifi begint: setNtpServer moet staan
+     * voordat de eerste sync (bij connect) draait, en de TZ moet gezet zijn voordat
+     * er een menselijke tijd getoond wordt. RTC/protocol blijven UTC; alleen de
+     * WEERGAVE is lokaal (zie TimeFmt.h). */
+    char ntp[48], tz[48];
+    loadTimeConfig(ntp, sizeof(ntp), tz, sizeof(tz));
+    applyTimeZone(tz);
+    wifi_task.setNtpServer(ntp);
+
     char ssid[33], pwd[65];
     if (loadWifiConfig(ssid, sizeof(ssid), pwd, sizeof(pwd))) {
       wifi_task.begin(ssid, pwd);

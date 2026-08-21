@@ -153,6 +153,7 @@ private:
   void handleWebCredReset();
   void handleStatus();
   void handleWifi();
+  void handleTime();   /* POST /time: NTP-server + tijdzone (POSIX-TZ) */
   void handleHook();
   void handleMonAdd();
   void handleMonDel();
@@ -298,6 +299,7 @@ private:
   friend void web_route_root();
   friend void web_route_status();
   friend void web_route_wifi();
+  friend void web_route_time();
   friend void web_route_hook();
   friend void web_route_monadd();
   friend void web_route_mondel();
@@ -354,3 +356,9 @@ bool loadWifiConfig(char* ssid, size_t ssid_len, char* pwd, size_t pwd_len);
  * een instelling ook van elders (mesh-opdracht, seriële console) gezet kan
  * worden zonder de webserver na te bouwen. */
 bool saveWifiConfig(const char* ssid, const char* pwd);
+
+/* Tijd-config (/time.cfg): NTP-server + POSIX-TZ. Ontbreekt het bestand/een regel,
+ * dan gelden DEFAULT_NTP/DEFAULT_TZ (Europe/Brussels). Openbaar zodat main.cpp ze
+ * bij boot kan laden en toepassen, en de web-POST ze kan bewaren. */
+bool loadTimeConfig(char* ntp, size_t ntp_len, char* tz, size_t tz_len);
+bool saveTimeConfig(const char* ntp, const char* tz);

@@ -1,4 +1,5 @@
 #include "RoomMesh.h"
+#include "TimeFmt.h"
 
 /* ============================================================================
  * RoomMesh -- implementatie. Zie RoomMesh.h voor het waarom.
@@ -1736,18 +1737,19 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   while (text[vi] && text[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = text[vi]; vi++; }
   verb[vi] = 0;
 
-  /* De lokale kloktijd (RTC, evt. NTP-gesynct) op ontvangstmoment, HH:MM:SS. */
+  /* De lokale kloktijd op ontvangstmoment (RTC = UTC -> lokaal via de TZ), met de
+   * zone-afkorting (CET/CEST). Onder TIME_FLOOR: "niet gesynct". */
   uint32_t now_s = getRTCClock()->getCurrentTime();
-  int hh = (int)((now_s / 3600) % 24), mm = (int)((now_s / 60) % 60), ss = (int)(now_s % 60);
+  char rxt[40]; fmtLocalHMS(now_s, rxt, sizeof(rxt));
 
   static char reply[200];
   reply[0] = 0;
 
   if (!strcasecmp(verb, "ping")) {
-    snprintf(reply, sizeof(reply), "Pong (%02d:%02d:%02d)", hh, mm, ss);
+    snprintf(reply, sizeof(reply), "Pong (%s)", rxt);
   } else if (!strcasecmp(verb, "path")) {
     /* Afzendernaam uit de buurtlijst (adverts); val terug op de pubkey-prefix. */
-    char name[28];
+    char name[24];
     const NeighbourEntry* ne = neighbours.find(sender_pub, PUB_KEY_SIZE);
     if (ne && ne->name[0]) {
       StrHelper::strncpy(name, ne->name, sizeof(name));
@@ -1755,26 +1757,48 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
       char hx[13]; mesh::Utils::toHex(hx, sender_pub, 6); hx[12] = 0;
       snprintf(name, sizeof(name), "%s", hx);
     }
-    /* Padbytes van het INKOMENDE pakket als komma-gescheiden hex. Begrensd zodat de
-     * hele regel ruim binnen één pakket (MAX_TEXT_LEN=160) blijft; bij een heel lang
-     * pad kappen we met ".." (de vaste velden erna zijn belangrijker). */
-    char hops[54]; int ho = 0; hops[0] = 0;
-    uint8_t nbytes = packet->getPathByteLen();
+    /* TUSSENLIGGENDE REPEATERS MET NAAM. Elke pad-hash (hsize byte) is afgeleid van
+     * de pubkey van de doorgevende node; los hem op via de buurtlijst (hash == de
+     * eerste hsize byte van de pubkey) en toon de NAAM. Onbekend -> de hex-hash.
+     * Begrensd op ~64 tekens met "…" zodat de regel in één pakket past. */
+    uint8_t hsize = packet->getPathHashSize();
+    if (hsize == 0) hsize = 1;
     int nhops = (int)packet->getPathHashCount();
-    for (int i = 0; i < nbytes; i++) {
-      if (ho >= (int)sizeof(hops) - 4) { snprintf(hops + ho, sizeof(hops) - ho, ".."); break; }
-      ho += snprintf(hops + ho, sizeof(hops) - ho, "%s%02x", i ? "," : "", packet->path[i]);
+    char route[96]; int ro = 0; route[0] = 0;
+    for (int h = 0; h < nhops; h++) {
+      if (ro > 62) { ro += snprintf(route + ro, sizeof(route) - ro, "%s…", h ? " > " : ""); break; }
+      const uint8_t* hh = &packet->path[h * hsize];
+      const char* rn = NULL;
+      for (int k = 0; k < neighbours.getNumEntries(); k++) {
+        const NeighbourEntry* e = neighbours.getEntryByIdx(k);
+        if (e && memcmp(e->pub_key, hh, hsize) == 0 && e->name[0]) { rn = e->name; break; }
+      }
+      char hn[18];
+      if (rn) {
+        StrHelper::strncpy(hn, rn, sizeof(hn));
+      } else {
+        int nb = hsize > 4 ? 4 : hsize; char hx[9];
+        mesh::Utils::toHex(hx, hh, nb); hx[nb * 2] = 0;
+        StrHelper::strncpy(hn, hx, sizeof(hn));
+      }
+      ro += snprintf(route + ro, sizeof(route) - ro, "%s[%s]", h ? " > " : "", hn);
     }
-    if (nbytes == 0) StrHelper::strncpy(hops, "-", sizeof(hops));
     /* packet->_snr is SNR x 4 (zoals de buurtlijst het bewaart); RSSI van de radio. */
     float snr_db = ((float)packet->_snr) / 4.0f;
     int rssi = (int)radio_driver.getLastRSSI();
-    snprintf(reply, sizeof(reply),
-             "ack @[%s] | %s (%d hops) | SNR: %.1f dB | RSSI: %d dBm | Received at: %02d:%02d:%02d",
-             name, hops, nhops, snr_db, rssi, hh, mm, ss);
+    if (nhops == 0) {
+      snprintf(reply, sizeof(reply),
+               "ack @[%s] (direct) | SNR: %.1f dB | RSSI: %d dBm | Received at: %s",
+               name, snr_db, rssi, rxt);
+    } else {
+      snprintf(reply, sizeof(reply),
+               "ack @[%s] via %s (%d hops) | SNR: %.1f dB | RSSI: %d dBm | Received at: %s",
+               name, route, nhops, snr_db, rssi, rxt);
+    }
   } else if (!strcasecmp(verb, "help") || verb[0] == '?') {
     snprintf(reply, sizeof(reply),
-             "mesh-diagnose-bot: `ping` -> Pong; `path` -> route-info van jouw bericht naar mij; `help`");
+             "mesh-diagnose-bot: `ping` -> Pong; `path` -> afzender + tussenliggende "
+             "repeaters + SNR/RSSI + tijd; `help`");
   } else {
     snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
   }

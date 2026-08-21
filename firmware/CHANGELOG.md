@@ -7,6 +7,25 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.2.2 — NTP/tijdzone instelbaar + lokale tijd + path-repeaters
+
+- **NTP-server + tijdzone via de web-GUI** (paneel *Tijd*, `/time.cfg`, POST `/time`):
+  de NTP-server is instelbaar (bv. een LAN-tijdserver) en een POSIX-TZ-string zet de
+  tijdzone (standaard Europe/Brussels `CET-1CEST,M3.5.0/2,M10.5.0/3`, DST-bewust).
+  Opslaan past de TZ meteen toe en vraagt een her-sync aan; de GUI toont de huidige
+  lokale tijd en de laatste-sync-status.
+- **Robuustere sync**: al bij WiFi-connect én nu ook periodiek (elke 6 u) her-syncen,
+  zodat de driftende ESP32-klok bijblijft.
+- **Menselijke tijden LOKAAL, protocol/RTC UTC**: de bot-`path` "Received at" (en
+  andere weergaven) tonen lokale tijd mét zone-afkorting (bv. `00:35:11 CEST`) via
+  de ingestelde TZ; de RTC en de MeshCore-protocoltijdstempels blijven UTC. Vóór de
+  eerste geslaagde sync: "niet gesynct" i.p.v. een garbage-tijd (`TimeFmt.h`,
+  `TIME_FLOOR`). De oude `epoch % 86400`-formattering (die per definitie UTC toonde)
+  is vervangen door `localtime_r`/`strftime %Z`.
+- **`path` toont de tussenliggende repeaters met NAAM**: elke pad-hash wordt via de
+  buurtlijst opgelost naar een node-naam (terugval op de hex-hash), route als
+  `via [A] > [B] > [C]`. Begrensd zodat het antwoord in één pakket past.
+
 ## v2.2.1 — boot-stack-fix + tweerichtings-bot
 
 - **Boot-stack-overflow gefixt** (regressie in v2.2.0): de SNMP-velden bliezen een

@@ -1,5 +1,6 @@
 #include "SensorMesh.h"
 #include "DmCommands.h"
+#include "TimeFmt.h"
 
 /* Veiligheidsmarge op de loopTask-stack (zie main_room.cpp). De gedeelde
  * MonitorStore::load/WebTask::begin dragen de dikke MonitorCfg nu static i.p.v.
@@ -266,6 +267,13 @@ void setup() {
      * verhuist niet opnieuw geflasht te worden, en zo is een node die je
      * weggeeft schoon te maken door de opslag te wissen. De gebakken waarde
      * blijft het laatste redmiddel. */
+    /* Tijd-config (NTP + tijdzone) vóór wifi: zie main_room.cpp. RTC/protocol UTC;
+     * weergave lokaal. */
+    char ntp[48], tz[48];
+    loadTimeConfig(ntp, sizeof(ntp), tz, sizeof(tz));
+    applyTimeZone(tz);
+    wifi_task.setNtpServer(ntp);
+
     char ssid[33], pwd[65];   // WifiTask kopieert ze, dus lokaal mag
     if (loadWifiConfig(ssid, sizeof(ssid), pwd, sizeof(pwd))) {
       wifi_task.begin(ssid, pwd);
