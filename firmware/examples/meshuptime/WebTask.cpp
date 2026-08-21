@@ -663,7 +663,7 @@ animation:pulse 2.5s infinite}
 .off{background:var(--red);box-shadow:0 0 6px rgba(255,92,92,.5)}
 .warn{background:var(--amber);box-shadow:0 0 6px var(--amber)}
 .unk{background:var(--muted)}
-@keyframes pulse{50%{box-shadow:0 0 3px var(--accent)}}
+@keyframes pulse{50%{box-shadow:0 0 3px var(--accent)}}@media(prefers-reduced-motion:reduce){*{animation-duration:.001ms!important;animation-iteration-count:1!important;transition-duration:.001ms!important}}
 .st{font-family:var(--mono);font-size:.85rem;white-space:nowrap}
 .c-on{color:var(--accent)}.c-off{color:var(--red)}.c-warn{color:var(--amber)}
 .c-unk{color:var(--muted)}
