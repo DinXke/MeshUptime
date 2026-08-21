@@ -443,6 +443,8 @@ void web_route_snodeedit()    { if (g_self) g_self->handleSNodeEdit(); }
 void web_route_snodedel()     { if (g_self) g_self->handleSNodeDel(); }
 void web_route_roomacl()      { if (g_self) g_self->handleRoomAcl(); }
 void web_route_snodeacl()     { if (g_self) g_self->handleSNodeAcl(); }
+void web_route_roomadvert()   { if (g_self) g_self->handleRoomAdvert(); }
+void web_route_snodeadvert()  { if (g_self) g_self->handleSNodeAdvert(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -1521,6 +1523,9 @@ stealth (niet adverteren)</label>
 <b>wissen</b> (room weer open volgens de leesregels)</label>
 <div class="quick"><button type="button" id="re-save">Opslaan</button>
 <button type="button" class="sec" onclick="roomEditClose()">annuleer</button></div>
+<div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Advert nu:</span>
+<button type="button" onclick="nodeAdvert(0,REI,1)">flood</button>
+<button type="button" onclick="nodeAdvert(0,REI,0)">zero-hop</button></div>
 <p class="note">Lege velden laten <b>naam</b>, <b>beheerder</b> en <b>gast</b>
 ongewijzigd &mdash; de wachtwoorden worden nooit teruggelezen, dus ze staan hier
 leeg. Vul alleen in wat je wilt veranderen; vink <b>gastwachtwoord wissen</b> aan om
@@ -1536,7 +1541,17 @@ maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
 <p class="note">Een sleutel in deze lijst krijgt <b>zonder wachtwoord</b> toegang op
 het gekozen niveau (read = lezen/joinen, readwrite = + posten, admin = + beheer van
 deze room). <b>Toevoegen</b> vraagt de volledige pubkey (64 hex); <b>verwijderen</b>
-mag op een prefix (min. 12 hex).</p></div>
+mag op een prefix (min. 12 hex).</p>
+<h3 style="margin:.6rem 0 .3rem">Kanalen &mdash; welke sensoren in deze room posten</h3>
+<div class="card pad0"><table id="rchan"></table></div>
+<div class="frow"><input id="rchan-name" placeholder="naam" maxlength="16" spellcheck="false" style="width:8rem">
+<input id="rchan-host" placeholder="adres (of - voor gemeld)" maxlength="40" spellcheck="false" style="flex:1;min-width:8rem">
+<input id="rchan-int" type="number" min="10" max="3600" value="60" style="width:5rem" title="interval s">
+<button type="button" id="rchan-add">nieuw + koppel</button></div>
+<div id="rchanmsg"></div>
+<p class="note">Vinkje = deze sensor hoort bij deze room (de <b>rm</b>-bit). Uitvinken
+<b>ontkoppelt</b> alleen (de monitor blijft bestaan). <b>bewerk</b> wijzigt naam/adres/
+interval. Een monitor <b>globaal</b> verwijderen doe je op het tabblad bewaking.</p></div>
 
 <h2>Room toevoegen</h2>
 <div class="card"><form id="radd">
@@ -1597,6 +1612,9 @@ tabblad <b>bewaking</b>.</p></form></div>
 stealth (niet adverteren)</label>
 <div class="quick"><button type="button" id="sne-save">Opslaan</button>
 <button type="button" class="sec" onclick="snodeEditClose()">annuleer</button></div>
+<div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Advert nu:</span>
+<button type="button" onclick="nodeAdvert(1,SNEI,1)">flood</button>
+<button type="button" onclick="nodeAdvert(1,SNEI,0)">zero-hop</button></div>
 <h3 style="margin:.6rem 0 .3rem">Toegang &mdash; wachtwoordloos per sleutel</h3>
 <div class="card pad0"><table id="sacl"></table></div>
 <div class="frow"><input id="sacl-pub" placeholder="volledige pubkey (64 hex)"
@@ -1607,7 +1625,17 @@ maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
 <div id="saclmsg"></div>
 <p class="note">Een sleutel hier krijgt <b>zonder wachtwoord</b> toegang tot de
 telemetrie van deze sensor-node op het gekozen niveau. Toevoegen: volledige pubkey;
-verwijderen mag op prefix.</p></div>
+verwijderen mag op prefix.</p>
+<h3 style="margin:.6rem 0 .3rem">Kanalen &mdash; welke sensoren op deze sensor-node</h3>
+<div class="card pad0"><table id="schan"></table></div>
+<div class="frow"><input id="schan-name" placeholder="naam" maxlength="16" spellcheck="false" style="width:8rem">
+<input id="schan-host" placeholder="adres (of - voor gemeld)" maxlength="40" spellcheck="false" style="flex:1;min-width:8rem">
+<input id="schan-int" type="number" min="10" max="3600" value="60" style="width:5rem" title="interval s">
+<button type="button" id="schan-add">nieuw + koppel</button></div>
+<div id="schanmsg"></div>
+<p class="note">Vinkje = deze sensor verschijnt als telemetrie op deze sensor-node (de
+<b>sn</b>-bit). Uitvinken <b>ontkoppelt</b> alleen; de monitor blijft bestaan.
+Globaal verwijderen: tabblad bewaking.</p></div>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -2312,8 +2340,9 @@ function u3(){fetch("acl.json").then(function(r){
 if(!r.ok){return r.text().then(function(t){say2(t.trim(),0)})}
 return r.json().then(function(d){lock(d);acltab(d);nbtab(d)})})}
 
+var MONS=[];   // laatste status.json-monitors, voor het kanaalbeheer-panel
 function u2(){return fetch("status.json").then(function(r){return r.json()})
-.then(function(d){tiles(d);simban(d);pingres(d);table(d);tbud(d);deliv(d);recui(d);
+.then(function(d){MONS=d.mon||[];tiles(d);simban(d);pingres(d);table(d);tbud(d);deliv(d);recui(d);
 var s=document.getElementById("ssid");if(!s.value){s.value=d.ssid}
 document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})
 /* EEN MISLUKTE VERVERSING MOET ZICH MELDEN. Zonder deze tak bleef de pagina
@@ -2895,6 +2924,7 @@ document.getElementById("re-guest").value="";
 document.getElementById("re-guestclear").checked=false;
 document.getElementById("re-stealth").checked=!!rm.stealth;
 renderAcl("racl",0,rm.idx,rm.acl);
+renderChannels("rchan",0,rm.idx);
 document.getElementById("redit").scrollIntoView({block:"nearest"})}
 function roomEditClose(){document.getElementById("redit").hidden=true;REI=-1}
 document.getElementById("re-save").onclick=function(){if(REI<0)return;
@@ -2988,6 +3018,7 @@ document.getElementById("snedit-t").textContent="Bewerken: sensor-node "+sn.idx+
 document.getElementById("sne-name").value=sn.name;
 document.getElementById("sne-stealth").checked=!!sn.stealth;
 renderAcl("sacl",1,sn.idx,sn.acl);
+renderChannels("schan",1,sn.idx);
 document.getElementById("snedit").scrollIntoView({block:"nearest"})}
 function snodeEditClose(){document.getElementById("snedit").hidden=true;SNEI=-1}
 document.getElementById("sne-save").onclick=function(){if(SNEI<0)return;
@@ -3056,6 +3087,77 @@ document.getElementById("sacl-add").onclick=function(){
 var pub=document.getElementById("sacl-pub").value.trim(),lvl=document.getElementById("sacl-lvl").value;
 if(SNEI<0||!pub)return;
 aclSet(1,SNEI,pub,lvl,"saclmsg",function(){document.getElementById("sacl-pub").value="";aclRefresh(1)})};
+
+/* ===================== kanaalbeheer (node-centrisch) ===================
+   Dezelfde rm/sn-maskers als per-sensor, maar PER room/sensor-node getoond.
+   Koppelen/ontkoppelen = de rm- resp. sn-bit zetten/wissen via /mon/alarm (ch).
+   Nieuw kanaal = monitor aanmaken (/monitor) + meteen aan deze node koppelen. */
+function chanMask(m,kind){return kind?(m.sn||0):(m.rm||0)}
+function renderChannels(tblId,kind,idx){var e=document.getElementById(tblId);if(!e)return;e.innerHTML="";
+var h=e.insertRow();["kan","naam","aan",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+MONS.forEach(function(m){if(m.ch<5)return;   // vaste kanalen 1-4 hebben geen rm/sn
+var r=e.insertRow();
+var c=r.insertCell();c.className="num";c.textContent=m.ch;
+r.insertCell().textContent=m.n;
+c=r.insertCell();var cb=document.createElement("input");cb.type="checkbox";
+cb.checked=!!(chanMask(m,kind)&(1<<idx));
+cb.onchange=function(){coupleChannel(kind,idx,m,cb.checked)};c.appendChild(cb);
+c=r.insertCell();c.className="acts";
+var be=document.createElement("button");be.textContent="bewerk";
+be.onclick=function(){chanEdit(m,kind,idx)};c.appendChild(be)})}
+function coupleChannel(kind,idx,m,on){
+var mask=chanMask(m,kind);mask=on?(mask|(1<<idx)):(mask&~(1<<idx));
+var body="ch="+m.ch+"&am="+(m.am||3)+"&rm="+(kind?(m.rm||0):mask)+"&sn="+(kind?mask:(m.sn||1));
+var mid=kind?"schanmsg":"rchanmsg";
+fetch("mon/alarm",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg(mid,"kanaal "+m.ch+(on?" gekoppeld":" ontkoppeld"),1);
+if(kind)m.sn=mask;else m.rm=mask}
+else{rmsg(mid,"mislukt: "+(j.error||""),0)}}).catch(function(){rmsg(mid,"mislukt",0)})}
+function chanEdit(m,kind,idx){
+var nn=prompt("Naam voor kanaal "+m.ch+":",m.n);if(nn===null)return;
+var nh=prompt("Adres voor kanaal "+m.ch+" (of - voor een gemelde dienst):",m.h);if(nh===null)return;
+var ni=prompt("Interval (s) voor kanaal "+m.ch+":",""+m.i);if(ni===null)return;
+var cmds=[];
+if(nn&&nn!=m.n)cmds.push("sensor set mon."+m.ch+".name "+nn);
+if(nh&&nh!=m.h)cmds.push("sensor set mon."+m.ch+".host "+nh);
+if(ni&&parseInt(ni,10)!=m.i)cmds.push("sensor set mon."+m.ch+".int "+parseInt(ni,10));
+var mid=kind?"schanmsg":"rchanmsg";
+if(!cmds.length){rmsg(mid,"niets gewijzigd",1);return}
+cliSeq(cmds,function(good,bad,last){rmsg(mid,bad?("deels geweigerd: "+last.trim()):"kanaal bijgewerkt",!bad);
+u2().then(function(){renderChannels(kind?"schan":"rchan",kind,idx)})})}
+function chanAdd(kind,idx,pfx){if(idx<0)return;var mid=pfx+"msg";
+var name=document.getElementById(pfx+"-name").value.trim(),
+host=document.getElementById(pfx+"-host").value.trim(),
+iv=document.getElementById(pfx+"-int").value;
+if(!name||!host){rmsg(mid,"naam en adres verplicht",0);return}
+fetch("monitor",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(name)+"&host="+encodeURIComponent(host)+"&int="+encodeURIComponent(iv)})
+.then(function(r){return r.text()}).then(function(t){
+var mm=t.match(/kanaal (\d+)/);
+if(!mm){rmsg(mid,"aanmaken mislukt: "+t.trim(),0);return}
+var ch=parseInt(mm[1],10);
+var body=kind?("ch="+ch+"&am=3&rm=1&sn="+(1<<idx)):("ch="+ch+"&am=3&rm="+(1<<idx));
+fetch("mon/alarm",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+.then(function(r){return r.json()}).then(function(j){
+rmsg(mid,j.ok?("kanaal "+ch+" aangemaakt + gekoppeld"):("koppelen mislukt: "+(j.error||"")),j.ok);
+document.getElementById(pfx+"-name").value="";document.getElementById(pfx+"-host").value="";
+u2().then(function(){renderChannels(pfx,kind,idx)})})})
+.catch(function(){rmsg(mid,"aanmaken mislukt",0)})}
+document.getElementById("rchan-add").onclick=function(){chanAdd(0,REI,"rchan")};
+document.getElementById("schan-add").onclick=function(){chanAdd(1,SNEI,"schan")};
+
+/* Handmatig advert (kind 0=room, 1=snode; flood 1/0). */
+function nodeAdvert(kind,idx,flood){if(idx<0)return;var mid=kind?"snmsg":"rmsg";
+fetch((kind?"snode":"room")+"/advert",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"idx="+idx+"&flood="+flood})
+.then(function(r){return r.json()}).then(function(j){
+rmsg(mid,j.ok?("advert verstuurd ("+(flood?"flood":"zero-hop")+")"):("advert mislukt: "+(j.error||"")),j.ok)})
+.catch(function(){rmsg(mid,"advert mislukt",0)})}
 
 u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
@@ -3231,6 +3333,9 @@ void WebTask::routes() {
   /* Per-sleutel toegangsgrants (wachtwoordloos) op een room/snode-slot. */
   _server->on("/room/acl", HTTP_POST, web_route_roomacl);
   _server->on("/snode/acl", HTTP_POST, web_route_snodeacl);
+  /* Handmatig advert (flood/zero-hop) per room/snode. */
+  _server->on("/room/advert", HTTP_POST, web_route_roomadvert);
+  _server->on("/snode/advert", HTTP_POST, web_route_snodeadvert);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -4676,6 +4781,32 @@ void WebTask::handleAclEndpoint(int kind) {
 
 void WebTask::handleRoomAcl()  { handleAclEndpoint(0); }
 void WebTask::handleSNodeAcl() { handleAclEndpoint(1); }
+
+/* POST /room/advert of /snode/advert (idx, flood=0/1). */
+void WebTask::handleRoomAdvert() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+  int idx = getArgInt(*_server, "idx", -1);
+  char fl[4]; bool flood = getArg(*_server, "flood", fl, sizeof(fl)) && fl[0] == '1';
+  if (idx < 0 || !_acl->webRoomAdvert(idx, flood)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige of inactieve room\"}");
+    return;
+  }
+  char msg[64]; snprintf(msg, sizeof(msg), "{\"ok\":true,\"flood\":%d}", flood ? 1 : 0);
+  _server->send(200, "application/json", msg);
+}
+void WebTask::handleSNodeAdvert() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+  int idx = getArgInt(*_server, "idx", -1);
+  char fl[4]; bool flood = getArg(*_server, "flood", fl, sizeof(fl)) && fl[0] == '1';
+  if (idx < 0 || !_acl->webSNodeAdvert(idx, flood)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige of inactieve sensor-node\"}");
+    return;
+  }
+  char msg[64]; snprintf(msg, sizeof(msg), "{\"ok\":true,\"flood\":%d}", flood ? 1 : 0);
+  _server->send(200, "application/json", msg);
+}
 
 /* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
  *

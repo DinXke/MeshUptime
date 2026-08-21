@@ -1482,6 +1482,17 @@ void RoomMesh::handleRoomCommand(char* args, char* reply) {
     handleAclSubcommand(ACL_KIND_ROOM, args + 3, reply);
     return;
   }
+  if (memcmp(args, "advert ", 7) == 0) {
+    char* q = args + 7;
+    int idx = atoi(q);
+    while (*q && *q != ' ') q++;
+    while (*q == ' ') q++;
+    bool flood = (memcmp(q, "flood", 5) == 0);
+    if (idx < 0 || idx >= MAX_ROOMS || !rooms[idx].active) { strcpy(reply, "Err - idx"); return; }
+    sendRoomAdvertisement(rooms[idx], 0, flood);
+    sprintf(reply, "OK advert room %d (%s)", idx, flood ? "flood" : "zero-hop");
+    return;
+  }
   if (strncmp(args, "list", 4) == 0) {
     int n = 0;
     char* p = reply;
@@ -1580,6 +1591,17 @@ void RoomMesh::handleSensorNodeCommand(char* args, char* reply) {
 
   if (memcmp(args, "acl", 3) == 0 && (args[3] == ' ' || args[3] == 0)) {
     handleAclSubcommand(ACL_KIND_SNODE, args + 3, reply);
+    return;
+  }
+  if (memcmp(args, "advert ", 7) == 0) {
+    char* q = args + 7;
+    int idx = atoi(q);
+    while (*q && *q != ' ') q++;
+    while (*q == ' ') q++;
+    bool flood = (memcmp(q, "flood", 5) == 0);
+    if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) { strcpy(reply, "Err - idx"); return; }
+    sendSensorNodeAdvertisement(snodes[idx], 0, flood);
+    sprintf(reply, "OK advert snode %d (%s)", idx, flood ? "flood" : "zero-hop");
     return;
   }
   if (strncmp(args, "list", 4) == 0) {

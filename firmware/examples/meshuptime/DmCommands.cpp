@@ -445,6 +445,17 @@ void DmCommands::loop() {
    * toen -- we sturen alsnog; kan hij niet meer ontsleutelen, dan is dat zijn
    * verlies en geen fout hier. */
   if (_ping_wait && _data != nullptr && _data->dmAdhocReady() && _num_chunks == 0) {
+    /* KWAM HET UIT EEN ROOM? Dan het resultaat IN die room posten (via de callback
+     * -> RoomMesh::addServerPost), niet als DM. Zo komt elk resultaat terug waar
+     * het gevraagd is. */
+    if (_ping_from_room && _room_post_fn != nullptr) {
+      _room_post_fn(_room_post_ctx, _ping_room_idx, _data->dmAdhocResult());
+      _data->dmAdhocClear();
+      _ping_wait = false;
+      _ping_from_room = false;
+      return;   // klaar; niets via het DM-pad
+    }
+    /* DM-oorsprong (of geen callback): het bestaande DM-pad. */
     startReplyStored(_ping_id, _ping_secret, _ping_path, _ping_path_len);
     appendText(_data->dmAdhocResult());
     _data->dmAdhocClear();
@@ -564,6 +575,18 @@ int DmCommands::renderReply(const ClientInfo& from, int room_idx, const char* li
     const char* r = _data->dmMonCommand(line2);
     if (r != nullptr) {
       strlcpy(out, r, out_len);
+      /* Ad-hoc ping vanuit een ROOM: onthoud de OORSPRONG-room, zodat het
+       * uitgestelde resultaat IN die room gepost wordt (zie loop() + de callback),
+       * en NIET als aparte DM. */
+      if (_data->dmAdhocState() != 0 && !_data->dmAdhocReady()) {
+        _ping_wait = true;
+        _ping_from_room = true;
+        _ping_room_idx = room_idx;
+        /* Reword: in de room-context komt de uitslag in de room, dus laat de
+         * "als aparte DM"-bewoording weg (die is voor het DM-pad). */
+        char* dm = strstr(out, " als aparte DM");
+        if (dm) memmove(dm, dm + 14, strlen(dm + 14) + 1);
+      }
       return (int)strlen(out);
     }
     /* Geen herkend commando: gewone room-post, geen vraag -> niets terug. */

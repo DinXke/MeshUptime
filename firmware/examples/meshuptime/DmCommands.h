@@ -182,6 +182,14 @@ public:
 
   bool isBusy() const { return _num_chunks > 0; }
 
+  /* ROOM-OORSPRONG VOOR UITGESTELDE RESULTATEN. Een ad-hoc ping (en later andere
+   * uitgestelde commando's) die IN een room gevraagd is, hoort zijn resultaat IN
+   * die room terug te krijgen -- niet als DM. main_room.cpp geeft hier een callback
+   * die de tekst met addServerPost naar de oorsprong-room post. Zonder callback valt
+   * het terug op het DM-pad (het oude gedrag). */
+  typedef void (*RoomPostFn)(void* ctx, int room_idx, const char* text);
+  void setRoomPostCallback(RoomPostFn fn, void* ctx) { _room_post_fn = fn; _room_post_ctx = ctx; }
+
   /* Optioneel: main.cpp kan getNodePrefs()->path_hash_mode + 1 doorgeven, zoals
    * SensorMesh zelf doet bij het verzenden van waarschuwingen. Zonder deze
    * aanroep geldt 1, de standaard van sendFlood(). */
@@ -201,10 +209,17 @@ private:
    * pas rondes later en de ClientInfo achter de referentie kan dan overschreven
    * zijn. _ping_wait zegt of er een uitslag verwacht wordt. */
   bool          _ping_wait = false;
+  /* Kwam de lopende ping uit een ROOM? Dan gaat het resultaat via de callback naar
+   * die room (_ping_room_idx), niet als DM. */
+  bool          _ping_from_room = false;
+  int           _ping_room_idx = -1;
   mesh::Identity _ping_id;
   uint8_t       _ping_secret[PUB_KEY_SIZE];
   uint8_t       _ping_path[MAX_PATH_SIZE];
   uint8_t       _ping_path_len = 0;
+
+  RoomPostFn    _room_post_fn = nullptr;
+  void*         _room_post_ctx = nullptr;
   uint8_t        _to_secret[PUB_KEY_SIZE];
   uint8_t        _to_path[MAX_PATH_SIZE];
   uint8_t        _to_path_len;

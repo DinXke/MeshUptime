@@ -125,4 +125,9 @@ public:
                                           { (void)kind; (void)slot; (void)pub_hex; (void)level; return -1; }
   virtual int  webAclDel(int kind, int slot, const char* prefix_hex)
                                           { (void)kind; (void)slot; (void)prefix_hex; return -1; }
+
+  /* Handmatig een advert sturen voor een room/sensor-node. flood = geflood
+   * (multi-hop) i.p.v. zero-hop lokaal. */
+  virtual bool webRoomAdvert(int idx, bool flood)  { (void)idx; (void)flood; return false; }
+  virtual bool webSNodeAdvert(int idx, bool flood) { (void)idx; (void)flood; return false; }
 };

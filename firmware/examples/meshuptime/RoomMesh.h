@@ -335,6 +335,14 @@ public:
   bool webAclGet(int kind, int slot, int i, char* pub64, size_t out_len, int* level) override;
   int  webAclSet(int kind, int slot, const char* pub_hex, int level) override;
   int  webAclDel(int kind, int slot, const char* prefix_hex) override;
+  bool webRoomAdvert(int idx, bool flood) override {
+    if (idx < 0 || idx >= MAX_ROOMS || !rooms[idx].active) return false;
+    sendRoomAdvertisement(rooms[idx], 0, flood); return true;
+  }
+  bool webSNodeAdvert(int idx, bool flood) override {
+    if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) return false;
+    sendSensorNodeAdvertisement(snodes[idx], 0, flood); return true;
+  }
 
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur

@@ -248,6 +248,13 @@ void setup() {
 
   the_mesh.dm.begin(&the_mesh, &dm_source);
   the_mesh.dm.setPathHashSize(the_mesh.getNodePrefs()->path_hash_mode + 1);
+  /* Uitgestelde resultaten (ad-hoc ping e.d.) die IN een room gevraagd zijn, terug
+   * in DIE room posten i.p.v. als DM. De callback is captureless -> functiepointer. */
+  the_mesh.dm.setRoomPostCallback(
+      [](void* ctx, int room_idx, const char* text) {
+        ((RoomMesh*)ctx)->addServerPost(room_idx, text);
+      },
+      &the_mesh);
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);

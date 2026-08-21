@@ -257,6 +257,10 @@ private:
   void handleSNodeAcl();
   void handleAclEndpoint(int kind);   // kind 0=room, 1=snode
 
+  /* Handmatig advert per room/snode (POST /room/advert, /snode/advert; flood=0/1). */
+  void handleRoomAdvert();
+  void handleSNodeAdvert();
+
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
    * Loopt via de bestaande CLI ('sensor set mon.<ch>.alert/rooms') zodat er geen
@@ -300,6 +304,8 @@ private:
   friend void web_route_snodedel();
   friend void web_route_roomacl();
   friend void web_route_snodeacl();
+  friend void web_route_roomadvert();
+  friend void web_route_snodeadvert();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).
