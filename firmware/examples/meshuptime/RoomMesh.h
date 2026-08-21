@@ -110,6 +110,31 @@
   #define MAX_SENSOR_NODES   4
 #endif
 
+/* PER-SLEUTEL TOEGANGSGRANTS (wachtwoordloze toegang op basis van de pubkey).
+ *
+ * Naast het wachtwoord-pad kan elke room- én sensor-node-slot een lijst van
+ * (pubkey -> niveau) dragen. Staat de afzender-pubkey erin met voldoende niveau,
+ * dan wordt toegang verleend ZONDER wachtwoord (de pubkey is cryptografisch
+ * gebonden: het antwoord wordt met het uit die pubkey afgeleide ECDH-geheim
+ * versleuteld, dus een sleutel die je niet bezit is nutteloos).
+ *
+ * Deze GRANTS-tabel is bewust apart van de runtime-ClientACL: die ACL mengt
+ * vluchtige login-sessies met expliciete grants; de tabel bevat ALLEEN de
+ * expliciete grants en is de persistente bron (/acl_grants). Bij een login
+ * (onAnonDataRecv) wordt de tabel geraadpleegd; een treffer maakt/ververst de
+ * runtime-ACL-ingang met het grant-niveau, zonder wachtwoord.
+ *
+ * Niveau = de bestaande MeshCore ClientACL-rolbits (PERM_ACL_*):
+ *   read      -> PERM_ACL_READ_ONLY  (1)
+ *   readwrite -> PERM_ACL_READ_WRITE (2)
+ *   admin     -> PERM_ACL_ADMIN      (3)
+ * level == 0 (GUEST) = vrije/ongebruikte ingang. */
+#define ACL_KIND_ROOM   0
+#define ACL_KIND_SNODE  1
+#ifndef MAX_ACL_GRANTS
+  #define MAX_ACL_GRANTS  16
+#endif
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -185,6 +210,15 @@ struct RoomSlot {
   unsigned long next_push;
   unsigned long next_local_advert, next_flood_advert;
   unsigned long dirty_contacts_expiry;
+};
+
+/* Een expliciete per-sleutel toegangsgrant op een room- of sensor-node-slot.
+ * level == 0 (GUEST) = vrije ingang. Zie de uitleg bij MAX_ACL_GRANTS. */
+struct AclGrant {
+  uint8_t kind;                    // ACL_KIND_ROOM / ACL_KIND_SNODE
+  uint8_t slot;                    // slot-index binnen dat type
+  uint8_t level;                   // PERM_ACL_READ_ONLY/READ_WRITE/ADMIN; 0 = vrij
+  uint8_t pub_key[PUB_KEY_SIZE];   // VOLLEDIGE pubkey (nodig voor het ECDH-geheim)
 };
 
 /* Alarmtaak voor het DM-pad (met ACK-herhaling per contact). Overgenomen van
@@ -286,6 +320,22 @@ public:
   bool webSNodeEdit(int idx, const char* name, int stealth) override;
   bool webSNodeDel(int idx) override;
 
+  /* ---- Per-sleutel toegangsgrants (CLI + web). kind = ACL_KIND_ROOM/SNODE. ----
+   * aclGrantSet: TOEVOEGEN/wijzigen -- vereist de VOLLEDIGE pubkey (key_len ==
+   *   PUB_KEY_SIZE), want het gedeelde geheim wordt eruit berekend. level 1..3.
+   *   Retour: 0 ok, -1 ongeldig slot, -2 ongeldige key_len/level, -3 tabel vol.
+   * aclGrantDel: VERWIJDEREN -- mag op een prefix (key_len >= 6). Weigert als de
+   *   prefix op MEER dan één grant past. Retour: 1 verwijderd, -1 ongeldig slot,
+   *   -2 niet gevonden, -3 dubbelzinnig (meerdere treffers). */
+  int  aclGrantSet(int kind, int slot, const uint8_t* pubkey, int key_len, uint8_t level);
+  int  aclGrantDel(int kind, int slot, const uint8_t* prefix, int key_len);
+
+  /* ---- IWebNode: ACL-weergave/-beheer voor de web-GUI/server ---- */
+  int  webAclCount(int kind, int slot) override;
+  bool webAclGet(int kind, int slot, int i, char* pub64, size_t out_len, int* level) override;
+  int  webAclSet(int kind, int slot, const char* pub_hex, int level) override;
+  int  webAclDel(int kind, int slot, const char* prefix_hex) override;
+
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
    * informatief (alleen de `ver`-CLI leest dit); het protocol-versieveld is het
@@ -369,10 +419,17 @@ private:
   int           _num_active_snodes;
   int           _active_snode;
 
+  /* Persistente per-sleutel toegangsgrants (wachtwoordloos). Zie MAX_ACL_GRANTS. */
+  AclGrant      _grants[MAX_ACL_GRANTS];
+
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
   RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
   bool          activeIsSnode() const { return _active_snode >= 0; }
+  /* &rooms[idx] of &snodes[idx] als die actief is; anders NULL. */
+  RoomSlot*     slotRef(int kind, int idx);
+  /* Het grant-niveau (PERM_ACL_*) voor deze pubkey op dit slot, of 0 (geen). */
+  uint8_t       grantLookup(int kind, int slot, const uint8_t* pubkey);
 
   PostInfo      _post_pool[MAX_TOTAL_POSTS];
 
@@ -436,10 +493,15 @@ private:
   void          loadOrCreateSensorNodeIdentity(int idx);
   void          saveSensorNodeConfig();
   void          loadSensorNodeConfig();
+  void          saveAclGrants();
+  void          loadAclGrants();
 
   /* ---- CLI ---- */
   void          handleRoomCommand(char* args, char* reply);
   void          handleSensorNodeCommand(char* args, char* reply);
+  /* Gedeelde "acl <idx> list|add <pubkey> <niveau>|del <prefix>" voor room + snode. */
+  void          handleAclSubcommand(int kind, char* args, char* reply);
+  static uint8_t aclLevelFromWord(const char* w);   // read/readwrite/admin -> 1/2/3, 0 = fout
 
   static bool   saveFilter(ClientInfo* client) { return client->isAdmin(); }
 };

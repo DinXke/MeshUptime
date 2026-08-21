@@ -251,6 +251,12 @@ private:
   void handleSNodeEdit();
   void handleSNodeDel();
 
+  /* Per-sleutel toegangsgrants op een room/snode-slot (POST /room/acl, /snode/acl).
+   * Velden idx, pubkey, level (read|readwrite|admin) of del=1. Gedeelde kern. */
+  void handleRoomAcl();
+  void handleSNodeAcl();
+  void handleAclEndpoint(int kind);   // kind 0=room, 1=snode
+
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
    * Loopt via de bestaande CLI ('sensor set mon.<ch>.alert/rooms') zodat er geen
@@ -292,6 +298,8 @@ private:
   friend void web_route_snodeadd();
   friend void web_route_snodeedit();
   friend void web_route_snodedel();
+  friend void web_route_roomacl();
+  friend void web_route_snodeacl();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

@@ -113,4 +113,16 @@ public:
   virtual bool webSNodeEdit(int idx, const char* name, int stealth)
                                           { (void)idx; (void)name; (void)stealth; return false; }
   virtual bool webSNodeDel(int idx)        { (void)idx; return false; }
+
+  /* ---- PER-SLEUTEL TOEGANGSGRANTS (web-GUI/server) --------------------------
+   * kind: 0 = room, 1 = sensor-node (zie ACL_KIND_* in RoomMesh.h). Niveau =
+   * 1 read, 2 readwrite, 3 admin. Alleen de room-server implementeert dit; de
+   * pubkey is publiek (nooit een geheim/gedeelde sleutel teruggeven). */
+  virtual int  webAclCount(int kind, int slot) { (void)kind; (void)slot; return 0; }
+  virtual bool webAclGet(int kind, int slot, int i, char* pub64, size_t out_len, int* level)
+                                          { (void)kind; (void)slot; (void)i; (void)pub64; (void)out_len; (void)level; return false; }
+  virtual int  webAclSet(int kind, int slot, const char* pub_hex, int level)
+                                          { (void)kind; (void)slot; (void)pub_hex; (void)level; return -1; }
+  virtual int  webAclDel(int kind, int slot, const char* prefix_hex)
+                                          { (void)kind; (void)slot; (void)prefix_hex; return -1; }
 };

@@ -441,6 +441,8 @@ void web_route_monalarm()     { if (g_self) g_self->handleMonAlarm(); }
 void web_route_snodeadd()     { if (g_self) g_self->handleSNodeAdd(); }
 void web_route_snodeedit()    { if (g_self) g_self->handleSNodeEdit(); }
 void web_route_snodedel()     { if (g_self) g_self->handleSNodeDel(); }
+void web_route_roomacl()      { if (g_self) g_self->handleRoomAcl(); }
+void web_route_snodeacl()     { if (g_self) g_self->handleSNodeAcl(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -538,6 +540,23 @@ static void jsonEscape(const char* in, char* out, size_t out_len) {
     else                       { out[o++] = c; }
   }
   out[o] = 0;
+}
+
+/* Schrijft ,"acl":[{"pub":"<64hex>","level":N}, ...] voor een room/snode-slot in
+ * buf achter positie n. kind = ACL_KIND_ROOM(0)/ACL_KIND_SNODE(1). NOOIT geheimen
+ * -- alleen de PUBLIEKE sleutel + het niveau (1 read, 2 readwrite, 3 admin). */
+static int appendAclJson(IWebNode* acl, char* buf, size_t cap, int n, int kind, int slot) {
+  n += snprintf(buf + n, cap - n, ",\"acl\":[");
+  int cnt = acl->webAclCount(kind, slot);
+  char pub[PUB_KEY_SIZE * 2 + 1];
+  int level = 0;
+  for (int i = 0; i < cnt; i++) {
+    if ((size_t)n > cap - 120) break;
+    if (!acl->webAclGet(kind, slot, i, pub, sizeof(pub), &level)) continue;
+    n += snprintf(buf + n, cap - n, "%s{\"pub\":\"%s\",\"level\":%d}", i ? "," : "", pub, level);
+  }
+  n += snprintf(buf + n, cap - n, "]");
+  return n;
 }
 
 static const char* wifiStateName(const WifiTask* w) {
@@ -1505,7 +1524,19 @@ stealth (niet adverteren)</label>
 <p class="note">Lege velden laten <b>naam</b>, <b>beheerder</b> en <b>gast</b>
 ongewijzigd &mdash; de wachtwoorden worden nooit teruggelezen, dus ze staan hier
 leeg. Vul alleen in wat je wilt veranderen; vink <b>gastwachtwoord wissen</b> aan om
-het weg te halen. Een nieuwe naam gaat direct het advert in.</p></div>
+het weg te halen. Een nieuwe naam gaat direct het advert in.</p>
+<h3 style="margin:.6rem 0 .3rem">Toegang &mdash; wachtwoordloos per sleutel</h3>
+<div class="card pad0"><table id="racl"></table></div>
+<div class="frow"><input id="racl-pub" placeholder="volledige pubkey (64 hex)"
+maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<select id="racl-lvl" style="width:auto"><option value="read">read</option>
+<option value="readwrite">readwrite</option><option value="admin">admin</option></select>
+<button type="button" id="racl-add">grant</button></div>
+<div id="raclmsg"></div>
+<p class="note">Een sleutel in deze lijst krijgt <b>zonder wachtwoord</b> toegang op
+het gekozen niveau (read = lezen/joinen, readwrite = + posten, admin = + beheer van
+deze room). <b>Toevoegen</b> vraagt de volledige pubkey (64 hex); <b>verwijderen</b>
+mag op een prefix (min. 12 hex).</p></div>
 
 <h2>Room toevoegen</h2>
 <div class="card"><form id="radd">
@@ -1565,7 +1596,18 @@ tabblad <b>bewaking</b>.</p></form></div>
 <label class="cb" style="margin-top:.5rem"><input type="checkbox" id="sne-stealth">
 stealth (niet adverteren)</label>
 <div class="quick"><button type="button" id="sne-save">Opslaan</button>
-<button type="button" class="sec" onclick="snodeEditClose()">annuleer</button></div></div>
+<button type="button" class="sec" onclick="snodeEditClose()">annuleer</button></div>
+<h3 style="margin:.6rem 0 .3rem">Toegang &mdash; wachtwoordloos per sleutel</h3>
+<div class="card pad0"><table id="sacl"></table></div>
+<div class="frow"><input id="sacl-pub" placeholder="volledige pubkey (64 hex)"
+maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<select id="sacl-lvl" style="width:auto"><option value="read">read</option>
+<option value="readwrite">readwrite</option><option value="admin">admin</option></select>
+<button type="button" id="sacl-add">grant</button></div>
+<div id="saclmsg"></div>
+<p class="note">Een sleutel hier krijgt <b>zonder wachtwoord</b> toegang tot de
+telemetrie van deze sensor-node op het gekozen niveau. Toevoegen: volledige pubkey;
+verwijderen mag op prefix.</p></div>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -2852,6 +2894,7 @@ document.getElementById("re-pass").value="";
 document.getElementById("re-guest").value="";
 document.getElementById("re-guestclear").checked=false;
 document.getElementById("re-stealth").checked=!!rm.stealth;
+renderAcl("racl",0,rm.idx,rm.acl);
 document.getElementById("redit").scrollIntoView({block:"nearest"})}
 function roomEditClose(){document.getElementById("redit").hidden=true;REI=-1}
 document.getElementById("re-save").onclick=function(){if(REI<0)return;
@@ -2944,6 +2987,7 @@ function snodeEdit(sn){SNEI=sn.idx;document.getElementById("snedit").hidden=fals
 document.getElementById("snedit-t").textContent="Bewerken: sensor-node "+sn.idx+" ("+sn.name+")";
 document.getElementById("sne-name").value=sn.name;
 document.getElementById("sne-stealth").checked=!!sn.stealth;
+renderAcl("sacl",1,sn.idx,sn.acl);
 document.getElementById("snedit").scrollIntoView({block:"nearest"})}
 function snodeEditClose(){document.getElementById("snedit").hidden=true;SNEI=-1}
 document.getElementById("sne-save").onclick=function(){if(SNEI<0)return;
@@ -2967,6 +3011,51 @@ headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"idx="+sn.idx}
 if(j.ok){rmsg("snmsg","sensor-node "+sn.idx+" verwijderd",1);snodeEditClose();roomShareClose();snodesLoad()}
 else rmsg("snmsg","verwijderen mislukt: "+(j.error||""),0)})
 .catch(function(){rmsg("snmsg","verwijderen mislukt",0)})}
+
+/* ===================== ACL: wachtwoordloze grants ======================
+   Per room (kind 0) en sensor-node (kind 1) een lijst (pubkey -> niveau). De data
+   komt uit /rooms.json (rooms[].acl / snodes[].acl). Endpoints /room/acl en
+   /snode/acl. */
+function aclLevelName(l){return l==3?"admin":l==2?"readwrite":l==1?"read":"?"}
+function renderAcl(tblId,kind,idx,list){var e=document.getElementById(tblId);if(!e)return;e.innerHTML="";
+var h=e.insertRow();["sleutel","niveau",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+(list||[]).forEach(function(g){var r=e.insertRow();
+var c=r.insertCell();c.className="key";c.textContent=g.pub.slice(0,8)+"…"+g.pub.slice(-4);
+c.title=g.pub+"  (klik om te kopieren)";
+c.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(g.pub)};
+r.insertCell().textContent=aclLevelName(g.level);
+c=r.insertCell();c.className="acts";var b=document.createElement("button");b.textContent="wis";
+b.onclick=function(){aclDel(kind,idx,g.pub)};c.appendChild(b)})}
+function aclRefresh(kind){roomsGet().then(function(d){if(!d)return;
+if(kind){var sn=(d.snodes||[]).filter(function(x){return x.idx==SNEI})[0];
+renderAcl("sacl",1,SNEI,sn?sn.acl:[])}
+else{var rm=(d.rooms||[]).filter(function(x){return x.idx==REI})[0];
+renderAcl("racl",0,REI,rm?rm.acl:[])}}).catch(function(){})}
+function aclSet(kind,idx,pub,level,msgId,after){
+fetch(kind?"snode/acl":"room/acl",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"idx="+idx+"&pubkey="+encodeURIComponent(pub)+"&level="+encodeURIComponent(level)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg(msgId,"grant gezet ("+aclLevelName(j.level)+")",1);if(after)after()}
+else rmsg(msgId,"mislukt: "+(j.error||""),0)}).catch(function(){rmsg(msgId,"mislukt",0)})}
+function aclDel(kind,idx,pub){
+var msgId=kind?"saclmsg":"raclmsg";
+if(!confirm("Grant voor "+pub.slice(0,8)+"… van "+(kind?"sensor-node":"room")+" "+idx+" verwijderen?"))return;
+fetch(kind?"snode/acl":"room/acl",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"idx="+idx+"&pubkey="+encodeURIComponent(pub)+"&del=1"})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg(msgId,"grant weg",1);aclRefresh(kind)}else rmsg(msgId,"mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg(msgId,"mislukt",0)})}
+document.getElementById("racl-add").onclick=function(){
+var pub=document.getElementById("racl-pub").value.trim(),lvl=document.getElementById("racl-lvl").value;
+if(REI<0||!pub)return;
+aclSet(0,REI,pub,lvl,"raclmsg",function(){document.getElementById("racl-pub").value="";aclRefresh(0)})};
+document.getElementById("sacl-add").onclick=function(){
+var pub=document.getElementById("sacl-pub").value.trim(),lvl=document.getElementById("sacl-lvl").value;
+if(SNEI<0||!pub)return;
+aclSet(1,SNEI,pub,lvl,"saclmsg",function(){document.getElementById("sacl-pub").value="";aclRefresh(1)})};
 
 u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
@@ -3139,6 +3228,9 @@ void WebTask::routes() {
   _server->on("/snode/add", HTTP_POST, web_route_snodeadd);
   _server->on("/snode/edit", HTTP_POST, web_route_snodeedit);
   _server->on("/snode/del", HTTP_POST, web_route_snodedel);
+  /* Per-sleutel toegangsgrants (wachtwoordloos) op een room/snode-slot. */
+  _server->on("/room/acl", HTTP_POST, web_route_roomacl);
+  _server->on("/snode/acl", HTTP_POST, web_route_snodeacl);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -4283,11 +4375,13 @@ void WebTask::handleRoomsJson() {
     jsonEscape(uri, euri, sizeof(euri));
     n += snprintf(g_json + n, sizeof(g_json) - n,
         "%s{\"idx\":%d,\"name\":\"%s\",\"stealth\":%s,\"guest\":%s,\"posts\":%d,"
-        "\"pub\":\"%s\",\"uri\":\"%s\",\"kind\":\"room\"}",
+        "\"pub\":\"%s\",\"uri\":\"%s\",\"kind\":\"room\"",
         first ? "" : ",", i, esc,
         _acl->webRoomStealth(i) ? "true" : "false",
         _acl->webRoomHasGuest(i) ? "true" : "false",
         _acl->webRoomPosts(i), pub, euri);
+    n = appendAclJson(_acl, g_json, sizeof(g_json), n, 0, i);   // 0 = room
+    n += snprintf(g_json + n, sizeof(g_json) - n, "}");
     first = false;
   }
 
@@ -4331,7 +4425,9 @@ void WebTask::handleRoomsJson() {
                       (unsigned)_mon->monitorChannel(s)); fc = false;
       }
     }
-    n += snprintf(g_json + n, sizeof(g_json) - n, "]}");
+    n += snprintf(g_json + n, sizeof(g_json) - n, "]");   // sluit channels
+    n = appendAclJson(_acl, g_json, sizeof(g_json), n, 1, i);   // 1 = sensor-node
+    n += snprintf(g_json + n, sizeof(g_json) - n, "}");
   }
   strlcat(g_json, "]}", sizeof(g_json));
 
@@ -4516,6 +4612,70 @@ void WebTask::handleSNodeDel() {
   }
   _server->send(200, "application/json", "{\"ok\":true}");
 }
+
+/* read/readwrite/admin -> 1/2/3; 0 = onbekend. */
+static int aclLevelWord(const char* w) {
+  if (!strcasecmp(w, "read") || !strcasecmp(w, "ro") || !strcasecmp(w, "readonly")) return 1;
+  if (!strcasecmp(w, "readwrite") || !strcasecmp(w, "rw") || !strcasecmp(w, "write")) return 2;
+  if (!strcasecmp(w, "admin")) return 3;
+  int n = atoi(w);
+  return (n >= 1 && n <= 3) ? n : 0;
+}
+
+/* POST /room/acl of /snode/acl. Velden: idx, pubkey, level (read|readwrite|admin)
+ * OF del=1 (dan pubkey = prefix). TOEVOEGEN vraagt de VOLLEDIGE pubkey (64 hex);
+ * VERWIJDEREN mag op een prefix (>=12 hex), geweigerd bij >1 treffer. */
+void WebTask::handleAclEndpoint(int kind) {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  int idx = getArgInt(*_server, "idx", -1);
+  if (idx < 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"idx ontbreekt\"}");
+    return;
+  }
+  char pk[PUB_KEY_SIZE * 2 + 8];
+  if (!getArg(*_server, "pubkey", pk, sizeof(pk)) || pk[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"pubkey ontbreekt\"}");
+    return;
+  }
+  char del[4];
+  bool isdel = getArg(*_server, "del", del, sizeof(del)) && del[0] == '1';
+
+  if (isdel) {
+    int rc = _acl->webAclDel(kind, idx, pk);
+    if (rc == 1) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+    const char* err = (rc == -3) ? "prefix past op meerdere ingangen"
+                    : (rc == -2) ? "niet gevonden of ongeldige prefix (min. 12 hex)"
+                    : "ongeldig slot";
+    char msg[128]; snprintf(msg, sizeof(msg), "{\"ok\":false,\"error\":\"%s\"}", err);
+    _server->send(400, "application/json", msg);
+    return;
+  }
+
+  char lvlw[16];
+  getArg(*_server, "level", lvlw, sizeof(lvlw));
+  int level = aclLevelWord(lvlw);
+  if (level == 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"level: read|readwrite|admin\"}");
+    return;
+  }
+  int rc = _acl->webAclSet(kind, idx, pk, level);
+  if (rc == 0) {
+    char msg[64]; snprintf(msg, sizeof(msg), "{\"ok\":true,\"level\":%d}", level);
+    _server->send(200, "application/json", msg);
+    return;
+  }
+  const char* err = (rc == -3) ? "grant-tabel vol"
+                  : (rc == -2) ? "toevoegen vraagt de VOLLEDIGE pubkey (64 hex)"
+                  : "ongeldig slot";
+  char msg[128]; snprintf(msg, sizeof(msg), "{\"ok\":false,\"error\":\"%s\"}", err);
+  _server->send(400, "application/json", msg);
+}
+
+void WebTask::handleRoomAcl()  { handleAclEndpoint(0); }
+void WebTask::handleSNodeAcl() { handleAclEndpoint(1); }
 
 /* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
  *

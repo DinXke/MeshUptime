@@ -98,6 +98,7 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
     snodes[i].next_client_idx = 0;
     snodes[i].stealth = false;
   }
+  memset(_grants, 0, sizeof(_grants));   // level 0 = vrij
   for (int i = 0; i < MAX_TOTAL_POSTS; i++) {
     memset(&_post_pool[i], 0, sizeof(PostInfo));
     _post_pool[i].room_idx = 0xFF;
@@ -190,6 +191,11 @@ void RoomMesh::begin(FILESYSTEM* fs) {
     snodes[i].guest_password[0] = 0;
   }
   if (!had_snode_cfg) saveSensorNodeConfig();
+
+  /* Per-sleutel toegangsgrants laden en op de (nu actieve) slots toepassen. Moet
+   * NA het activeren van rooms + sensor-nodes gebeuren, want applyPermissions
+   * gebruikt de slot-identiteit voor het gedeelde geheim. */
+  loadAclGrants();
 
   /* Alleen room 0's ACL wordt bewaard (in het bestaande contacts-bestand); de
    * ACL's van de extra rooms en de sensor-nodes leven in RAM en worden opnieuw
@@ -416,6 +422,177 @@ void RoomMesh::loadSensorNodeConfig() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Per-sleutel toegangsgrants (wachtwoordloze toegang op basis van key) */
+/* ------------------------------------------------------------------ */
+#define ACL_GRANTS_PATH  "/acl_grants"
+
+RoomSlot* RoomMesh::slotRef(int kind, int idx) {
+  if (kind == ACL_KIND_ROOM) {
+    if (idx >= 0 && idx < MAX_ROOMS && rooms[idx].active) return &rooms[idx];
+  } else if (kind == ACL_KIND_SNODE) {
+    if (idx >= 0 && idx < MAX_SENSOR_NODES && snodes[idx].active) return &snodes[idx];
+  }
+  return NULL;
+}
+
+uint8_t RoomMesh::grantLookup(int kind, int slot, const uint8_t* pubkey) {
+  for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+    if (_grants[i].level == 0) continue;
+    if (_grants[i].kind == kind && _grants[i].slot == slot &&
+        memcmp(_grants[i].pub_key, pubkey, PUB_KEY_SIZE) == 0) {
+      return _grants[i].level;
+    }
+  }
+  return 0;
+}
+
+int RoomMesh::aclGrantSet(int kind, int slot, const uint8_t* pubkey, int key_len, uint8_t level) {
+  if (slotRef(kind, slot) == NULL) return -1;
+  if (key_len != PUB_KEY_SIZE) return -2;                 // toevoegen vraagt VOLLEDIGE key
+  level &= PERM_ACL_ROLE_MASK;
+  if (level < PERM_ACL_READ_ONLY) return -2;              // 1..3
+  /* Bestaande grant voor (kind,slot,pubkey) bijwerken, anders een vrije nemen. */
+  int free_i = -1;
+  for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+    if (_grants[i].level == 0) { if (free_i < 0) free_i = i; continue; }
+    if (_grants[i].kind == kind && _grants[i].slot == slot &&
+        memcmp(_grants[i].pub_key, pubkey, PUB_KEY_SIZE) == 0) {
+      _grants[i].level = level;
+      RoomSlot* s = slotRef(kind, slot);
+      if (s) s->acl.applyPermissions(s->id, pubkey, PUB_KEY_SIZE, level);  // live
+      saveAclGrants();
+      return 0;
+    }
+  }
+  if (free_i < 0) return -3;                              // tabel vol
+  _grants[free_i].kind = (uint8_t)kind;
+  _grants[free_i].slot = (uint8_t)slot;
+  _grants[free_i].level = level;
+  memcpy(_grants[free_i].pub_key, pubkey, PUB_KEY_SIZE);
+  RoomSlot* s = slotRef(kind, slot);
+  if (s) s->acl.applyPermissions(s->id, pubkey, PUB_KEY_SIZE, level);      // live nu al
+  saveAclGrants();
+  return 0;
+}
+
+int RoomMesh::aclGrantDel(int kind, int slot, const uint8_t* prefix, int key_len) {
+  if (slotRef(kind, slot) == NULL) return -1;
+  if (key_len < 6 || key_len > PUB_KEY_SIZE) return -2;
+  int match = -1, count = 0;
+  for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+    if (_grants[i].level == 0) continue;
+    if (_grants[i].kind == kind && _grants[i].slot == slot &&
+        memcmp(_grants[i].pub_key, prefix, key_len) == 0) { match = i; count++; }
+  }
+  if (count == 0) return -2;
+  if (count > 1) return -3;                               // dubbelzinnige prefix
+  /* Uit de runtime-ACL halen (applyPermissions met GUEST verwijdert), dan grant vrij. */
+  RoomSlot* s = slotRef(kind, slot);
+  if (s) s->acl.applyPermissions(s->id, _grants[match].pub_key, PUB_KEY_SIZE, PERM_ACL_GUEST);
+  _grants[match].level = 0;
+  saveAclGrants();
+  return 1;
+}
+
+/* Persistentie: één regel per grant  ->  g <kind> <slot> <level> <pubkeyhex> */
+void RoomMesh::saveAclGrants() {
+  if (_fs == NULL) return;
+  File f = _fs->open(ACL_GRANTS_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUACL1\n");
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+    if (_grants[i].level == 0) continue;
+    mesh::Utils::toHex(hex, _grants[i].pub_key, PUB_KEY_SIZE);
+    f.printf("g %d %d %d %s\n", (int)_grants[i].kind, (int)_grants[i].slot,
+             (int)_grants[i].level, hex);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadAclGrants() {
+  if (_fs == NULL || !_fs->exists(ACL_GRANTS_PATH)) return;
+  File f = _fs->open(ACL_GRANTS_PATH, "r");
+  if (!f) return;
+  char line[160];
+  bool first = true;
+  int gi = 0;
+  while (f.available() && gi < MAX_ACL_GRANTS) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int c = f.read();
+      if (c < 0 || c == '\n') break;
+      if (c == '\r') continue;
+      line[len++] = (char)c;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'g') continue;
+    // g <kind> <slot> <level> <hex>
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    int kind = atoi(p);   while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    int slot = atoi(p);   while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    int level = atoi(p);  while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    char* hex = p;
+    if ((kind != ACL_KIND_ROOM && kind != ACL_KIND_SNODE) ||
+        level < PERM_ACL_READ_ONLY || level > PERM_ACL_ADMIN) continue;
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (strlen(hex) < PUB_KEY_SIZE * 2) continue;
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) continue;
+    _grants[gi].kind = (uint8_t)kind;
+    _grants[gi].slot = (uint8_t)slot;
+    _grants[gi].level = (uint8_t)level;
+    memcpy(_grants[gi].pub_key, pubkey, PUB_KEY_SIZE);
+    /* Live in de runtime-ACL zetten als het slot actief is. */
+    RoomSlot* s = slotRef(kind, slot);
+    if (s) s->acl.applyPermissions(s->id, pubkey, PUB_KEY_SIZE, (uint8_t)level);
+    gi++;
+  }
+  f.close();
+}
+
+/* ---- IWebNode: ACL-weergave/-beheer ---- */
+int RoomMesh::webAclCount(int kind, int slot) {
+  int n = 0;
+  for (int i = 0; i < MAX_ACL_GRANTS; i++)
+    if (_grants[i].level != 0 && _grants[i].kind == kind && _grants[i].slot == slot) n++;
+  return n;
+}
+
+bool RoomMesh::webAclGet(int kind, int slot, int idx, char* pub64, size_t out_len, int* level) {
+  if (out_len < (size_t)(PUB_KEY_SIZE * 2 + 1)) return false;
+  int n = 0;
+  for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+    if (_grants[i].level == 0 || _grants[i].kind != kind || _grants[i].slot != slot) continue;
+    if (n == idx) {
+      mesh::Utils::toHex(pub64, _grants[i].pub_key, PUB_KEY_SIZE);
+      if (level) *level = _grants[i].level;
+      return true;
+    }
+    n++;
+  }
+  return false;
+}
+
+int RoomMesh::webAclSet(int kind, int slot, const char* pub_hex, int level) {
+  uint8_t pubkey[PUB_KEY_SIZE];
+  if (!pub_hex || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -2;
+  if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, pub_hex)) return -2;
+  return aclGrantSet(kind, slot, pubkey, PUB_KEY_SIZE, (uint8_t)level);
+}
+
+int RoomMesh::webAclDel(int kind, int slot, const char* prefix_hex) {
+  if (!prefix_hex) return -2;
+  int hexlen = (int)strlen(prefix_hex);
+  if (hexlen < 12 || (hexlen & 1) || hexlen > PUB_KEY_SIZE * 2) return -2;
+  uint8_t prefix[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(prefix, hexlen / 2, prefix_hex)) return -2;
+  return aclGrantDel(kind, slot, prefix, hexlen / 2);
+}
+
+/* ------------------------------------------------------------------ */
 /*  onRecvPacket -- multiroom-dispatch (SIREN-patroon)                  */
 /* ------------------------------------------------------------------ */
 mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
@@ -519,8 +696,31 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
   memcpy(&sender_sync_since, &data[4], 4);
   data[len] = 0;
 
+  const int a_kind = activeIsSnode() ? ACL_KIND_SNODE : ACL_KIND_ROOM;
+  const int a_slot = activeIsSnode() ? _active_snode : _active_slot;
+
   ClientInfo* client = NULL;
-  if (data[8] == 0) {   // leeg wachtwoord: alleen als de afzender al bekend is
+
+  /* PASSWORD-LESS: staat de afzender-pubkey als GRANT op dit slot? Dan honoreren we
+   * dat niveau ZONDER wachtwoord (de ACL wint vóór de wachtwoordcheck). */
+  uint8_t grant = grantLookup(a_kind, a_slot, sender.pub_key);
+  if (grant >= PERM_ACL_READ_ONLY) {
+    client = slot.acl.getClient(sender.pub_key, PUB_KEY_SIZE);
+    bool is_new = (client == NULL);
+    if (is_new) client = slot.acl.putClient(sender, 0);
+    if (client == NULL) return;   // ACL vol
+    if (!is_new && sender_timestamp <= client->last_timestamp) {
+      MESH_DEBUG_PRINTLN("slot[%d] possible replay attack (grant)", (uint32_t)a_slot);
+      return;
+    }
+    client->last_timestamp = sender_timestamp;
+    if (is_new) client->extra.room.sync_since = sender_sync_since;
+    client->extra.room.pending_ack = 0;
+    client->extra.room.push_failures = 0;
+    client->last_activity = getRTCClock()->getCurrentTime();
+    client->permissions = (uint8_t)((client->permissions & ~PERM_ACL_ROLE_MASK) | grant);
+    memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
+  } else if (data[8] == 0) {   // leeg wachtwoord: alleen als de afzender al bekend is
     client = slot.acl.getClient(sender.pub_key, PUB_KEY_SIZE);
   }
 
@@ -1278,6 +1478,10 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
 void RoomMesh::handleRoomCommand(char* args, char* reply) {
   while (*args == ' ') args++;
 
+  if (memcmp(args, "acl", 3) == 0 && (args[3] == ' ' || args[3] == 0)) {
+    handleAclSubcommand(ACL_KIND_ROOM, args + 3, reply);
+    return;
+  }
   if (strncmp(args, "list", 4) == 0) {
     int n = 0;
     char* p = reply;
@@ -1374,6 +1578,10 @@ void RoomMesh::handleRoomCommand(char* args, char* reply) {
 void RoomMesh::handleSensorNodeCommand(char* args, char* reply) {
   while (*args == ' ') args++;
 
+  if (memcmp(args, "acl", 3) == 0 && (args[3] == ' ' || args[3] == 0)) {
+    handleAclSubcommand(ACL_KIND_SNODE, args + 3, reply);
+    return;
+  }
   if (strncmp(args, "list", 4) == 0) {
     int n = 0;
     char* p = reply;
@@ -1449,6 +1657,75 @@ void RoomMesh::handleSensorNodeCommand(char* args, char* reply) {
     return;
   }
   strcpy(reply, "sensornode list|add|del|stealth|set name");
+}
+
+/* read/readwrite/admin (+ aliassen) -> PERM_ACL_* ; 0 = onbekend. */
+uint8_t RoomMesh::aclLevelFromWord(const char* w) {
+  if (strcasecmp(w, "read") == 0 || strcasecmp(w, "ro") == 0 || strcasecmp(w, "readonly") == 0) return PERM_ACL_READ_ONLY;
+  if (strcasecmp(w, "readwrite") == 0 || strcasecmp(w, "rw") == 0 || strcasecmp(w, "write") == 0) return PERM_ACL_READ_WRITE;
+  if (strcasecmp(w, "admin") == 0) return PERM_ACL_ADMIN;
+  return 0;
+}
+
+/* "acl <idx> list | add <pubkey> <read|readwrite|admin> | del <prefix>" voor room
+ * (kind=ACL_KIND_ROOM) én sensor-node (kind=ACL_KIND_SNODE). */
+void RoomMesh::handleAclSubcommand(int kind, char* args, char* reply) {
+  while (*args == ' ') args++;
+  int idx = atoi(args);
+  char* p = args;
+  while (*p && *p != ' ') p++;   // idx
+  while (*p == ' ') p++;
+  const char* kn = (kind == ACL_KIND_SNODE) ? "snode" : "room";
+  if (slotRef(kind, idx) == NULL) { sprintf(reply, "Err - %s %d niet actief", kn, idx); return; }
+
+  if (strncmp(p, "list", 4) == 0) {
+    static const char* LVL[] = { "guest", "read", "readwrite", "admin" };
+    char* r = reply;
+    r += sprintf(r, "acl %s %d:", kn, idx);
+    int n = 0;
+    for (int i = 0; i < MAX_ACL_GRANTS; i++) {
+      if (_grants[i].level == 0 || _grants[i].kind != kind || _grants[i].slot != idx) continue;
+      char hex12[13]; mesh::Utils::toHex(hex12, _grants[i].pub_key, 6); hex12[12] = 0;
+      r += sprintf(r, " %s=%s", hex12, LVL[_grants[i].level & 3]);
+      n++;
+    }
+    if (n == 0) strcpy(reply, "geen grants");
+    return;
+  }
+  if (memcmp(p, "add ", 4) == 0) {
+    p += 4; while (*p == ' ') p++;
+    char* hex = p;
+    while (*p && *p != ' ') p++;
+    if (*p) *p++ = 0;
+    while (*p == ' ') p++;
+    uint8_t level = aclLevelFromWord(p);
+    if (level == 0) { strcpy(reply, "Err - niveau: read|readwrite|admin"); return; }
+    if (strlen(hex) != PUB_KEY_SIZE * 2) { strcpy(reply, "Err - VOLLEDIGE pubkey (64 hex) vereist"); return; }
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) { strcpy(reply, "Err - bad pubkey"); return; }
+    int rc = aclGrantSet(kind, idx, pubkey, PUB_KEY_SIZE, level);
+    if (rc == 0) sprintf(reply, "OK grant gezet");
+    else if (rc == -3) strcpy(reply, "Err - grant-tabel vol");
+    else strcpy(reply, "Err - geweigerd");
+    return;
+  }
+  if (memcmp(p, "del ", 4) == 0) {
+    p += 4; while (*p == ' ') p++;
+    char* hex = p;
+    while (*p && *p != ' ') p++; *p = 0;
+    int hexlen = (int)strlen(hex);
+    if (hexlen < 12 || (hexlen & 1)) { strcpy(reply, "Err - prefix min. 12 hex, even aantal"); return; }
+    int nbytes = hexlen / 2; if (nbytes > PUB_KEY_SIZE) nbytes = PUB_KEY_SIZE;
+    uint8_t prefix[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(prefix, nbytes, hex)) { strcpy(reply, "Err - bad prefix"); return; }
+    int rc = aclGrantDel(kind, idx, prefix, nbytes);
+    if (rc == 1) strcpy(reply, "OK grant weg");
+    else if (rc == -3) strcpy(reply, "Err - prefix past op meerdere");
+    else if (rc == -2) strcpy(reply, "Err - niet gevonden");
+    else strcpy(reply, "Err");
+    return;
+  }
+  strcpy(reply, "acl <idx> list|add <pubkey> <read|readwrite|admin>|del <prefix>");
 }
 
 /* ================================================================== */
