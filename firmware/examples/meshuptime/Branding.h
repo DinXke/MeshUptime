@@ -8,11 +8,18 @@
  * apart byte (FIRMWARE_VER_LEVEL) en adverts dragen geen versietekst, dus deze
  * branding is puur voor display/web/`ver` en raakt de compatibiliteit niet.
  *
- * MESHUPTIME_VERSION is onze eigen mijlpaal; v2.0.0 = de multiroom-versie.
+ * MESHUPTIME_VERSION is onze eigen mijlpaal (semantisch), LOS van MeshCore:
+ *   v2.0.0 = de multiroom room-server-basis.
+ *   v2.1.0 = web-GUI room-beheer + QR + backup/restore, /mon/alarm + guest-
+ *            semantiek, virtuele sensor-nodes, per-sleutel-ACL, kanaalbeheer-panel,
+ *            handmatig advert, ping-fix en de room/DM-commandoset.
+ *   v2.2.0 = async netwerk-taak-engine (port/http/scan/traceroute) + node-side
+ *            SNMP-sensor. (in opbouw)
+ * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.0.0"
+  #define MESHUPTIME_VERSION   "v2.1.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
