@@ -37,6 +37,7 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
   for (int i = 0; i < MON_FA_COUNT; i++) {
     cfg.fixed_alert_mode[i] = MON_ALERT_DEFAULT;
     cfg.fixed_rooms_mask[i] = MON_ROOMS_DEFAULT;
+    cfg.fixed_sensornodes[i] = MON_SNODES_DEFAULT;
   }
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
@@ -121,8 +122,10 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       break;
     }
 
-    char* parts[8];
-    int n = splitTokens(line, parts, 8);
+    /* Ruim genoeg voor de langste regel: de m-regel telt nu tot 9 velden
+     * (m ch int naam adres send_ms alert rooms snodes). */
+    char* parts[10];
+    int n = splitTokens(line, parts, 10);
     if (n < 2) continue;               /* onvolledige regel: overslaan */
 
     if (strcmp(parts[0], "hi") == 0) {
@@ -177,6 +180,10 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
           uint8_t m = (uint8_t)(atoi(parts[2]) & MON_ALERT_BOTH);
           staged.fixed_alert_mode[fi] = m ? m : MON_ALERT_DEFAULT;
           staged.fixed_rooms_mask[fi] = (uint16_t)strtoul(parts[3], NULL, 10);
+          /* Veld 5 (sensor-node-set) optioneel: oude bestanden krijgen de
+           * standaard. */
+          staged.fixed_sensornodes[fi] = (n >= 5)
+              ? (uint16_t)strtoul(parts[4], NULL, 10) : MON_SNODES_DEFAULT;
         }
       }
     } else if (strcmp(parts[0], "m") == 0) {
@@ -209,6 +216,10 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
         uint8_t am = (n >= 7) ? (uint8_t)(atoi(parts[6]) & MON_ALERT_BOTH) : MON_ALERT_DEFAULT;
         e.alert_mode = am ? am : MON_ALERT_DEFAULT;
         e.rooms_mask = (n >= 8) ? (uint16_t)strtoul(parts[7], NULL, 10) : MON_ROOMS_DEFAULT;
+        /* Veld 9 (sensor-node-set) optioneel: oude bestanden krijgen de standaard
+         * (sensor-node 0), zodat een monitor na een update op de standaard-node
+         * blijft verschijnen. */
+        e.sensornodes = (n >= 9) ? (uint16_t)strtoul(parts[8], NULL, 10) : MON_SNODES_DEFAULT;
       }
       num_mons++;
     }
@@ -298,10 +309,11 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "phb %u\n", (unsigned)cfg.push_hb_s);
   f.write((const uint8_t*)line, len);
 
-  /* Alarm-bezorging van de vaste bronnen (MON_FA_*): route + room-set. */
+  /* Alarm-bezorging van de vaste bronnen (MON_FA_*): route + room-set + snode-set. */
   for (int i = 0; i < MON_FA_COUNT; i++) {
-    len = snprintf(line, sizeof(line), "fa %d %u %u\n", i,
-                   (unsigned)cfg.fixed_alert_mode[i], (unsigned)cfg.fixed_rooms_mask[i]);
+    len = snprintf(line, sizeof(line), "fa %d %u %u %u\n", i,
+                   (unsigned)cfg.fixed_alert_mode[i], (unsigned)cfg.fixed_rooms_mask[i],
+                   (unsigned)cfg.fixed_sensornodes[i]);
     f.write((const uint8_t*)line, len);
   }
 
@@ -313,10 +325,11 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
      * bij het LEZEN is hij optioneel (voor oudere bestanden). Zo staat er na één
      * schrijfronde een expliciete waarde in het bestand en hoeft niemand te
      * raden wat de standaard was toen dit weggeschreven werd. */
-    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u\n",
+    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u %u\n",
                    (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host,
                    (unsigned)(e.send_ms ? 1 : 0),
-                   (unsigned)e.alert_mode, (unsigned)e.rooms_mask);
+                   (unsigned)e.alert_mode, (unsigned)e.rooms_mask,
+                   (unsigned)e.sensornodes);
     if (f.write((const uint8_t*)line, len) != (size_t)len) {
       /* Schijf vol of stuk: het kladbestand is nu onbetrouwbaar, dus laten we
        * de bestaande .cfg met rust. */

@@ -41,6 +41,8 @@
 /* Bestandsnamen voor persistentie. Room 0's identiteit staat in "_main" (de
  * bestaande hoofdsleutel); extra rooms krijgen "/room_id_N". */
 #define ROOM_CFG_PATH   "/room_cfg"
+/* Sensor-node-config (namen/actief/stealth) en identiteiten (/snode_id_N). */
+#define SNODE_CFG_PATH  "/snode_cfg"
 
 struct ServerStats {
   uint16_t batt_milli_volts;
@@ -73,6 +75,8 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   _fs = NULL;
   _num_active_rooms = 0;
   _active_slot = 0;
+  _num_active_snodes = 0;
+  _active_snode = -1;
   last_millis = 0;
   uptime_millis = 0;
   _logging = false;
@@ -88,6 +92,11 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   for (int i = 0; i < MAX_ROOMS; i++) {
     rooms[i].next_client_idx = 0;
     rooms[i].stealth = false;
+  }
+  memset(snodes, 0, sizeof(snodes));
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    snodes[i].next_client_idx = 0;
+    snodes[i].stealth = false;
   }
   for (int i = 0; i < MAX_TOTAL_POSTS; i++) {
     memset(&_post_pool[i], 0, sizeof(PostInfo));
@@ -161,9 +170,30 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   if (!had_room_cfg) saveRoomConfig();
 
+  /* ---- VIRTUELE SENSOR-NODES ----
+   * Config (namen/actief/stealth) laden; bij een verse node één actieve sensor-
+   * node met de vertrouwde uptime-naam. Elke actieve node krijgt een eigen
+   * sleutelpaar (persistent, /snode_id_N) en het beheerderswachtwoord van deze
+   * node, zodat de MeshCore-app na inloggen de telemetrie ziet. */
+  bool had_snode_cfg = (_fs != NULL) && _fs->exists(SNODE_CFG_PATH);
+  loadSensorNodeConfig();
+  if (!had_snode_cfg && !snodes[0].active) {
+    snodes[0].active = true;
+    _num_active_snodes++;
+    StrHelper::strncpy(snodes[0].name, "BE-HSS-DinX-Up", sizeof(snodes[0].name));
+  }
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active) continue;
+    loadOrCreateSensorNodeIdentity(i);
+    if (snodes[i].password[0] == 0)
+      StrHelper::strncpy(snodes[i].password, _prefs.password, sizeof(snodes[i].password));
+    snodes[i].guest_password[0] = 0;
+  }
+  if (!had_snode_cfg) saveSensorNodeConfig();
+
   /* Alleen room 0's ACL wordt bewaard (in het bestaande contacts-bestand); de
-   * ACL's van de extra rooms leven in RAM en worden opnieuw opgebouwd zodra een
-   * client inlogt -- zoals in SIREN's fase 1. */
+   * ACL's van de extra rooms en de sensor-nodes leven in RAM en worden opnieuw
+   * opgebouwd zodra een client inlogt -- zoals in SIREN's fase 1. */
   rooms[0].acl.load(_fs, rooms[0].id);
 
   region_map.load(_fs);
@@ -297,6 +327,95 @@ void RoomMesh::loadRoomConfig() {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Sensor-node identiteit + config persistentie                       */
+/* ------------------------------------------------------------------ */
+void RoomMesh::saveSensorNodeIdentity(int idx) {
+  if (_fs == NULL || idx < 0 || idx >= MAX_SENSOR_NODES) return;
+  char path[24];
+  snprintf(path, sizeof(path), "/snode_id_%d", idx);
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*_fs, "");
+#else
+  IdentityStore store(*_fs, "/identity");
+#endif
+  store.save(path, snodes[idx].id);
+}
+
+void RoomMesh::loadOrCreateSensorNodeIdentity(int idx) {
+  if (_fs == NULL || idx < 0 || idx >= MAX_SENSOR_NODES) return;
+  char path[24];
+  snprintf(path, sizeof(path), "/snode_id_%d", idx);
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*_fs, "");
+#else
+  IdentityStore store(*_fs, "/identity");
+#endif
+  if (!store.load(path, snodes[idx].id)) {
+    snodes[idx].id = radio_new_identity();
+    int count = 0;
+    while (count < 10 && (snodes[idx].id.pub_key[0] == 0x00 || snodes[idx].id.pub_key[0] == 0xFF)) {
+      snodes[idx].id = radio_new_identity(); count++;
+    }
+    store.save(path, snodes[idx].id);
+  }
+}
+
+/* Sensor-node-config als tekst, één regel per actieve node:
+ *   s <idx> <stealth> <naam>
+ * (geen wachtwoorden: die nemen de node-standaard over bij begin()). */
+void RoomMesh::saveSensorNodeConfig() {
+  if (_fs == NULL) return;
+  File f = _fs->open(SNODE_CFG_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUSNODE1\n");
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active) continue;
+    f.printf("s %d %d %s\n", i, snodes[i].stealth ? 1 : 0, snodes[i].name);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadSensorNodeConfig() {
+  if (_fs == NULL || !_fs->exists(SNODE_CFG_PATH)) return;
+  File f = _fs->open(SNODE_CFG_PATH, "r");
+  if (!f) return;
+
+  char line[96];
+  bool first = true;
+  while (f.available()) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int c = f.read();
+      if (c < 0 || c == '\n') break;
+      if (c == '\r') continue;
+      line[len++] = (char)c;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }   // kenregel overslaan
+    if (line[0] == '.' || line[0] == 0) continue;
+    if (line[0] != 's') continue;
+
+    // s <idx> <stealth> <naam>
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    int idx = atoi(p);
+    while (*p && *p != ' ') p++;   // idx
+    while (*p == ' ') p++;
+    int stealth = atoi(p);
+    while (*p && *p != ' ') p++;   // stealth
+    while (*p == ' ') p++;
+    char* name = p;                // rest = naam (mag spaties bevatten)
+
+    if (idx < 0 || idx >= MAX_SENSOR_NODES) continue;
+    if (!snodes[idx].active) { snodes[idx].active = true; _num_active_snodes++; }
+    snodes[idx].stealth = stealth ? true : false;
+    if (name[0]) StrHelper::strncpy(snodes[idx].name, name, sizeof(snodes[idx].name));
+  }
+  f.close();
+}
+
+/* ------------------------------------------------------------------ */
 /*  onRecvPacket -- multiroom-dispatch (SIREN-patroon)                  */
 /* ------------------------------------------------------------------ */
 mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
@@ -320,16 +439,29 @@ mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
       if (!rooms[s].active) continue;
       if (rooms[s].id.isHashMatch(&dest_hash)) {
         _active_slot = s;
+        _active_snode = -1;
         self_id = rooms[s].id;   // basisklasse ontsleutelt met de juiste sleutel
         return mesh::Mesh::onRecvPacket(pkt);
       }
     }
+    /* Geen room-treffer: kijk of het pakket voor een virtuele sensor-node is. */
+    for (int s = 0; s < MAX_SENSOR_NODES; s++) {
+      if (!snodes[s].active) continue;
+      if (snodes[s].id.isHashMatch(&dest_hash)) {
+        _active_snode = s;
+        _active_slot = 0;        // veilige waarde; activeSlot() kiest op _active_snode
+        self_id = snodes[s].id;
+        return mesh::Mesh::onRecvPacket(pkt);
+      }
+    }
     _active_slot = 0;
+    _active_snode = -1;
     self_id = rooms[0].id;
     return mesh::Mesh::onRecvPacket(pkt);
   }
 
   _active_slot = 0;
+  _active_snode = -1;
   self_id = rooms[0].id;
   return mesh::Mesh::onRecvPacket(pkt);
 }
@@ -354,7 +486,7 @@ void RoomMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint
 }
 
 int RoomMesh::searchPeersByHash(const uint8_t* hash) {
-  ClientACL& acl = rooms[_active_slot].acl;
+  ClientACL& acl = activeSlot().acl;
   int n = 0;
   for (int i = 0; i < acl.getNumClients() && n < MAX_CLIENTS; i++) {
     if (acl.getClientByIdx(i)->id.isHashMatch(hash)) {
@@ -365,7 +497,7 @@ int RoomMesh::searchPeersByHash(const uint8_t* hash) {
 }
 
 void RoomMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
-  ClientACL& acl = rooms[_active_slot].acl;
+  ClientACL& acl = activeSlot().acl;
   int i = matching_peer_indexes[peer_idx];
   if (i >= 0 && i < acl.getNumClients()) {
     memcpy(dest_secret, acl.getClientByIdx(i)->shared_secret, PUB_KEY_SIZE);
@@ -380,7 +512,7 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
   if (packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ) return;
   if (len < 9) return;   // 4 ts + 4 sync_since + minstens de nul van het wachtwoord
 
-  RoomSlot& slot = rooms[_active_slot];
+  RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
 
   uint32_t sender_timestamp, sender_sync_since;
   memcpy(&sender_timestamp, data, 4);
@@ -420,7 +552,8 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
     client->permissions |= perm;
     memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
 
-    if (_active_slot == 0) slot.dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+    /* Alleen room 0 bewaart zijn ACL naar flash; sensor-node-ACL's leven in RAM. */
+    if (!activeIsSnode() && _active_slot == 0) slot.dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
   }
 
   if (packet->isRouteFlood()) client->out_path_len = OUT_PATH_UNKNOWN;
@@ -457,7 +590,7 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
 /* ------------------------------------------------------------------ */
 void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx,
                               const uint8_t* secret, uint8_t* data, size_t len) {
-  RoomSlot& slot = rooms[_active_slot];
+  RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
   int i = matching_peer_indexes[sender_idx];
   if (i < 0 || i >= slot.acl.getNumClients()) return;
   ClientInfo* client = slot.acl.getClientByIdx(i);
@@ -491,7 +624,9 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
           } else temp[5] = 0;
         } else temp[5] = 0;
       } else {   // TXT_TYPE_PLAIN = een room-post
-        if ((client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) {
+        /* Een sensor-node kent GEEN posts (het is een telemetrie-node, geen room):
+         * negeer de tekst stil. Alleen rooms bewaren en beantwoorden posts. */
+        if (activeIsSnode() || (client->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) {
           temp[5] = 0;
         } else {
           if (!is_retry) {
@@ -560,7 +695,9 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
         mesh::Utils::sha256((uint8_t*)&ack_hash, 4, data, 9, client->id.pub_key, PUB_KEY_SIZE);
         auto reply = createAck(ack_hash);
         if (reply) {
-          reply->payload[reply->payload_len++] = getUnsyncedCount(slot, client);
+          /* Een sensor-node heeft geen posts -> altijd 0 ongesynchroniseerd (en
+           * getUnsyncedCount rekent met &slot - rooms, wat alleen voor rooms geldt). */
+          reply->payload[reply->payload_len++] = activeIsSnode() ? 0 : getUnsyncedCount(slot, client);
           sendDirect(reply, client->out_path, client->out_path_len, SERVER_RESPONSE_DELAY);
         }
       }
@@ -589,7 +726,7 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
 bool RoomMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret,
                               uint8_t* path, uint8_t path_len, uint8_t extra_type,
                               uint8_t* extra, uint8_t extra_len) {
-  RoomSlot& slot = rooms[_active_slot];
+  RoomSlot& slot = activeSlot();
   int i = matching_peer_indexes[sender_idx];
   if (i >= 0 && i < slot.acl.getNumClients()) {
     ClientInfo* client = slot.acl.getClientByIdx(i);
@@ -787,10 +924,35 @@ void RoomMesh::sendRoomAdvertisement(RoomSlot& slot, int delay_millis, bool floo
   else sendZeroHop(pkt, delay_millis);
 }
 
+/* Sensor-node-advert: identiek aan de room-advert maar met ADV_TYPE_SENSOR, zodat
+ * de MeshCore-app het contact als SENSOR ziet en telemetrie toont. Ook hier het
+ * standaardformaat via AdvertDataBuilder (nooit met de hand). */
+mesh::Packet* RoomMesh::createSensorNodeAdvert(RoomSlot& slot) {
+  uint8_t app_data[MAX_ADVERT_DATA_SIZE];
+  AdvertDataBuilder builder(ADV_TYPE_SENSOR, slot.name);
+  uint8_t app_data_len = builder.encodeTo(app_data);
+
+  self_id = slot.id;
+  return createAdvert(slot.id, app_data, app_data_len);
+}
+
+void RoomMesh::sendSensorNodeAdvertisement(RoomSlot& slot, int delay_millis, bool flood) {
+  mesh::Packet* pkt = createSensorNodeAdvert(slot);
+  if (!pkt) return;
+  if (flood) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+  else sendZeroHop(pkt, delay_millis);
+}
+
 void RoomMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
   for (int i = 0; i < MAX_ROOMS; i++) {
     if (!rooms[i].active || rooms[i].stealth) continue;
     sendRoomAdvertisement(rooms[i], delay_millis + (uint32_t)i * 1000, flood);
+  }
+  /* De virtuele sensor-nodes erachteraan (verschoven in tijd zodat ze niet samen
+   * de ether op gaan). */
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active || snodes[i].stealth) continue;
+    sendSensorNodeAdvertisement(snodes[i], delay_millis + (uint32_t)(MAX_ROOMS + i) * 1000, flood);
   }
 }
 
@@ -802,6 +964,13 @@ void RoomMesh::updateAdvertTimer() {
       rooms[i].next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)i * 15000);
     }
   }
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active || snodes[i].stealth || _prefs.advert_interval == 0) {
+      snodes[i].next_local_advert = 0;
+    } else {
+      snodes[i].next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
+    }
+  }
 }
 
 void RoomMesh::updateFloodAdvertTimer() {
@@ -810,6 +979,13 @@ void RoomMesh::updateFloodAdvertTimer() {
       rooms[i].next_flood_advert = 0;
     } else {
       rooms[i].next_flood_advert = futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000 + (uint32_t)i * 15000);
+    }
+  }
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active || snodes[i].stealth || _prefs.flood_advert_interval == 0) {
+      snodes[i].next_flood_advert = 0;
+    } else {
+      snodes[i].next_flood_advert = futureMillis((uint32_t)_prefs.flood_advert_interval * 60 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
     }
   }
 }
@@ -849,7 +1025,11 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     if ((sender->permissions & PERM_ACL_ROLE_MASK) == PERM_ACL_GUEST) perm_mask = 0x00;
-    sensors.querySensors(perm_mask, telemetry);
+    /* Voor een virtuele sensor-node: alleen de kanalen die aan DIE node gekoppeld
+     * zijn (subset), zodat sensoren over meerdere nodes verdeeld kunnen worden.
+     * Voor een room: de volledige set (ongewijzigd). */
+    if (activeIsSnode()) sensors.querySensorsForNode(_active_snode, perm_mask, telemetry);
+    else                 sensors.querySensors(perm_mask, telemetry);
     float temperature = board.getMCUTemperature();
     if (!isnan(temperature)) telemetry.addTemperature(TELEM_CHANNEL_SELF, temperature);
     uint8_t tlen = telemetry.getSize();
@@ -929,6 +1109,21 @@ void RoomMesh::loop() {
     if (slot.dirty_contacts_expiry && millisHasNowPassed(slot.dirty_contacts_expiry)) {
       if (i == 0) rooms[0].acl.save(_fs, RoomMesh::saveFilter);
       slot.dirty_contacts_expiry = 0;
+    }
+  }
+
+  /* Sensor-node-adverts. GEEN loopSlot: een sensor-node kent geen posts, dus er is
+   * niets te pushen; alleen het advert houdt de app-zichtbaarheid in stand. */
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if (!snodes[i].active || snodes[i].stealth) continue;
+    RoomSlot& slot = snodes[i];
+    if (slot.next_flood_advert && millisHasNowPassed(slot.next_flood_advert)) {
+      sendSensorNodeAdvertisement(slot, 0, true);
+      slot.next_flood_advert = futureMillis(FLOOD_ADVERT_INTERVAL_MS + (uint32_t)(MAX_ROOMS + i) * 15000);
+      slot.next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
+    } else if (slot.next_local_advert && millisHasNowPassed(slot.next_local_advert)) {
+      sendSensorNodeAdvertisement(slot, 0, false);
+      slot.next_local_advert = futureMillis((uint32_t)_prefs.advert_interval * 2 * 60 * 1000 + (uint32_t)(MAX_ROOMS + i) * 15000);
     }
   }
 
@@ -1059,6 +1254,8 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     while (*msg == ' ' || *msg == '\t') msg++;
     if (*msg == 0) strcpy(reply, "ERR lege tekst");
     else { addServerPost(0, msg); strcpy(reply, "OK"); }
+  } else if (memcmp(command, "sensornode ", 11) == 0) {
+    handleSensorNodeCommand(command + 11, reply);
   } else if (memcmp(command, "room ", 5) == 0) {
     handleRoomCommand(command + 5, reply);
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
@@ -1166,6 +1363,92 @@ void RoomMesh::handleRoomCommand(char* args, char* reply) {
     return;
   }
   strcpy(reply, "room list|add|del|stealth|set name|pass|guest");
+}
+
+/* sensornode list | add <naam> | del <idx> | set name <idx> <naam> |
+ * stealth <idx> on|off
+ *
+ * Symmetrisch met handleRoomCommand, maar voor de VIRTUELE SENSOR-NODES. Een
+ * sensor-node kent geen wachtwoord-velden of gastwachtwoord (hij neemt het
+ * beheerderswachtwoord van deze node over); wel een naam en stealth. */
+void RoomMesh::handleSensorNodeCommand(char* args, char* reply) {
+  while (*args == ' ') args++;
+
+  if (strncmp(args, "list", 4) == 0) {
+    int n = 0;
+    char* p = reply;
+    p += sprintf(p, "snodes:");
+    for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+      if (!snodes[i].active) continue;
+      p += sprintf(p, " [%d]%s%s", i, snodes[i].name, snodes[i].stealth ? "(stealth)" : "");
+      n++;
+    }
+    if (n == 0) strcpy(reply, "geen sensor-nodes");
+    return;
+  }
+  if (memcmp(args, "add ", 4) == 0) {
+    char* name = args + 4;
+    while (*name == ' ') name++;
+    if (*name == 0) { strcpy(reply, "Err - naam?"); return; }
+    int idx = -1;
+    for (int i = 0; i < MAX_SENSOR_NODES; i++) { if (!snodes[i].active) { idx = i; break; } }
+    if (idx < 0) { strcpy(reply, "Err - vol"); return; }
+    snodes[idx].active = true;
+    _num_active_snodes++;
+    StrHelper::strncpy(snodes[idx].name, name, sizeof(snodes[idx].name));
+    StrHelper::strncpy(snodes[idx].password, _prefs.password, sizeof(snodes[idx].password));
+    snodes[idx].guest_password[0] = 0;
+    snodes[idx].stealth = false;
+    loadOrCreateSensorNodeIdentity(idx);
+    saveSensorNodeConfig();
+    updateAdvertTimer();
+    updateFloodAdvertTimer();
+    sendSensorNodeAdvertisement(snodes[idx], 2000, false);
+    sprintf(reply, "OK snode %d '%s'", idx, snodes[idx].name);
+    return;
+  }
+  if (memcmp(args, "del ", 4) == 0) {
+    int idx = atoi(args + 4);
+    if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) { strcpy(reply, "Err - idx"); return; }
+    snodes[idx].active = false;
+    _num_active_snodes--;
+    saveSensorNodeConfig();
+    sprintf(reply, "OK snode %d weg", idx);
+    return;
+  }
+  if (memcmp(args, "stealth ", 8) == 0) {
+    char* q = args + 8;
+    int idx = atoi(q);
+    while (*q && *q != ' ') q++;
+    while (*q == ' ') q++;
+    if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) { strcpy(reply, "Err - idx"); return; }
+    snodes[idx].stealth = (memcmp(q, "on", 2) == 0);
+    saveSensorNodeConfig();
+    updateAdvertTimer();
+    updateFloodAdvertTimer();
+    if (!snodes[idx].stealth) sendSensorNodeAdvertisement(snodes[idx], 2000, false);
+    sprintf(reply, "OK snode %d stealth=%d", idx, snodes[idx].stealth ? 1 : 0);
+    return;
+  }
+  if (memcmp(args, "set ", 4) == 0) {
+    char* q = args + 4;                 // "name <idx> <waarde>"
+    char* field = q;
+    while (*q && *q != ' ') q++;
+    if (*q) *q++ = 0;
+    while (*q == ' ') q++;
+    int idx = atoi(q);
+    while (*q && *q != ' ') q++;
+    while (*q == ' ') q++;
+    char* val = q;
+    if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) { strcpy(reply, "Err - idx"); return; }
+    if (strcmp(field, "name") != 0) { strcpy(reply, "Err - alleen 'name'"); return; }
+    StrHelper::strncpy(snodes[idx].name, val, sizeof(snodes[idx].name));
+    saveSensorNodeConfig();
+    if (!snodes[idx].stealth) sendSensorNodeAdvertisement(snodes[idx], 2000, false);
+    sprintf(reply, "OK snode %d naam gezet", idx);
+    return;
+  }
+  strcpy(reply, "sensornode list|add|del|stealth|set name");
 }
 
 /* ================================================================== */
@@ -1293,6 +1576,63 @@ bool RoomMesh::webRoomDel(int idx) {
   return strncmp(reply, "OK", 2) == 0;
 }
 
+/* ---- IWebNode: virtuele sensor-nodes (web-GUI). Lopen via handleSensorNodeCommand. */
+bool RoomMesh::webSNodePubHex(int idx, char* out, size_t out_len) {
+  if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) return false;
+  if (out_len < (size_t)(PUB_KEY_SIZE * 2 + 1)) return false;
+  mesh::Utils::toHex(out, snodes[idx].id.pub_key, PUB_KEY_SIZE);
+  return true;
+}
+
+bool RoomMesh::webSNodeJoinUri(int idx, char* out, size_t out_len) {
+  if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) return false;
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, snodes[idx].id.pub_key, PUB_KEY_SIZE);
+  char enc[sizeof(snodes[idx].name) * 3 + 1];
+  roomUrlEncode(snodes[idx].name, enc, sizeof(enc));
+  /* type=4 = ADV_TYPE_SENSOR (Sensor). Formaat uit MeshCore docs/qr_codes.md. */
+  int n = snprintf(out, out_len,
+                   "meshcore://contact/add?name=%s&public_key=%s&type=4", enc, hex);
+  return n > 0 && (size_t)n < out_len;
+}
+
+int RoomMesh::webSNodeAdd(const char* name) {
+  if (!name || name[0] == 0) return -1;
+  char cmd[8 + sizeof(snodes[0].name) + 8];
+  char reply[96];
+  snprintf(cmd, sizeof(cmd), "add %s", name);
+  handleSensorNodeCommand(cmd, reply);
+  if (strncmp(reply, "OK snode ", 9) == 0) {
+    int idx = atoi(reply + 9);
+    if (idx >= 0 && idx < MAX_SENSOR_NODES) return idx;
+  }
+  return -1;
+}
+
+bool RoomMesh::webSNodeEdit(int idx, const char* name, int stealth) {
+  if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) return false;
+  char cmd[16 + 64];
+  char reply[96];
+  if (name && name[0]) {
+    snprintf(cmd, sizeof(cmd), "set name %d %s", idx, name);
+    handleSensorNodeCommand(cmd, reply);
+  }
+  if (stealth >= 0) {
+    snprintf(cmd, sizeof(cmd), "stealth %d %s", idx, stealth ? "on" : "off");
+    handleSensorNodeCommand(cmd, reply);
+  }
+  return true;
+}
+
+bool RoomMesh::webSNodeDel(int idx) {
+  if (idx < 0 || idx >= MAX_SENSOR_NODES || !snodes[idx].active) return false;
+  char cmd[16];
+  char reply[96];
+  snprintf(cmd, sizeof(cmd), "del %d", idx);
+  handleSensorNodeCommand(cmd, reply);
+  return strncmp(reply, "OK", 2) == 0;
+}
+
 /* Backup: platte JSON met de VOLLEDIGE room-config INCL. identiteiten (prv+pub,
  * 96 byte -> 192 hex). GEVOELIG. Geeft de geschreven lengte terug, of 0. */
 int RoomMesh::webRoomsBackup(char* out, size_t out_len) {
@@ -1320,6 +1660,25 @@ int RoomMesh::webRoomsBackup(char* out, size_t out_len) {
         "\"room%d_guest\":\"%s\",\"room%d_pass\":\"%s\",\"room%d_id\":\"%s\"",
         i, i, nesc, i, rooms[i].stealth ? 1 : 0, i, gesc, i, pesc, i, idhex);
   }
+
+  /* Virtuele sensor-nodes: naam, stealth en identiteit (prv||pub). Geen aparte
+   * wachtwoorden (die volgen de node-standaard). */
+  n += snprintf(out + n, out_len - n, ",\"snode_max\":%d", MAX_SENSOR_NODES);
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    if ((size_t)n > out_len - 512) return 0;
+    if (!snodes[i].active) {
+      n += snprintf(out + n, out_len - n, ",\"snode%d_active\":\"0\"", i);
+      continue;
+    }
+    roomJsonEscape(snodes[i].name, nesc, sizeof(nesc));
+    size_t idn = snodes[i].id.writeTo(idbuf, sizeof(idbuf));
+    mesh::Utils::toHex(idhex, idbuf, idn);
+    n += snprintf(out + n, out_len - n,
+        ",\"snode%d_active\":\"1\",\"snode%d_name\":\"%s\",\"snode%d_stealth\":\"%d\","
+        "\"snode%d_id\":\"%s\"",
+        i, i, nesc, i, snodes[i].stealth ? 1 : 0, i, idhex);
+  }
+
   n += snprintf(out + n, out_len - n, "}");
   memset(idbuf, 0, sizeof(idbuf));   // sleutelmateriaal van de stapel vegen
   return ((size_t)n < out_len) ? n : 0;
@@ -1399,7 +1758,48 @@ bool RoomMesh::webRoomsRestore(const char* json) {
     memset(idhex, 0, sizeof(idhex));
   }
 
+  /* ---- Virtuele sensor-nodes herstellen (naam/stealth/identiteit) ---- */
+  for (int i = 0; i < MAX_SENSOR_NODES; i++) {
+    char key[24];
+    char active[4] = {0};
+    snprintf(key, sizeof(key), "snode%d_active", i);
+    if (!roomExtractField(json, key, active, sizeof(active))) continue;  // veld afwezig -> ongemoeid
+    bool want = (active[0] == '1');
+
+    if (!want) {
+      if (snodes[i].active) { snodes[i].active = false; _num_active_snodes--; }
+      continue;
+    }
+    if (!snodes[i].active) { snodes[i].active = true; _num_active_snodes++; }
+
+    char sname[sizeof(snodes[0].name)] = {0};
+    char sst[4] = {0};
+    char sidhex[(PRV_KEY_SIZE + PUB_KEY_SIZE) * 2 + 1] = {0};
+    snprintf(key, sizeof(key), "snode%d_name", i);
+    if (roomExtractField(json, key, sname, sizeof(sname)) && sname[0])
+      StrHelper::strncpy(snodes[i].name, sname, sizeof(snodes[i].name));
+    snprintf(key, sizeof(key), "snode%d_stealth", i);
+    if (roomExtractField(json, key, sst, sizeof(sst))) snodes[i].stealth = (sst[0] == '1');
+    if (snodes[i].password[0] == 0)
+      StrHelper::strncpy(snodes[i].password, _prefs.password, sizeof(snodes[i].password));
+
+    snprintf(key, sizeof(key), "snode%d_id", i);
+    if (roomExtractField(json, key, sidhex, sizeof(sidhex)) &&
+        strlen(sidhex) == (PRV_KEY_SIZE + PUB_KEY_SIZE) * 2) {
+      uint8_t sidbuf[PRV_KEY_SIZE + PUB_KEY_SIZE];
+      if (mesh::Utils::fromHex(sidbuf, sizeof(sidbuf), sidhex)) {
+        snodes[i].id.readFrom(sidbuf, sizeof(sidbuf));
+        saveSensorNodeIdentity(i);
+      }
+      memset(sidbuf, 0, sizeof(sidbuf));
+    } else {
+      loadOrCreateSensorNodeIdentity(i);   // geen (geldige) sleutel -> er een geven
+    }
+    memset(sidhex, 0, sizeof(sidhex));
+  }
+
   saveRoomConfig();
+  saveSensorNodeConfig();
   savePrefs();   // room 0's naam/wachtwoord kan naar NodePrefs zijn geschreven
   updateAdvertTimer();
   updateFloodAdvertTimer();

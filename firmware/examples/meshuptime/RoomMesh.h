@@ -98,6 +98,18 @@
   #define MAX_ROOMS   4
 #endif
 
+/* Aantal VIRTUELE SENSOR-NODES op EEN toestel. Elk is een aparte identiteit die
+ * als ADV_TYPE_SENSOR adverteert, zodat de MeshCore-app telemetrie toont (de app
+ * toont die alleen voor contacten van het sensor-type; onze rooms zijn ROOM-type).
+ * Een sensor-node hergebruikt de RoomSlot-machinerie (login/ACL/telemetrie) maar
+ * kent GEEN posts. Sensoren worden per stuk aan nul of meer sensor-nodes gekoppeld
+ * (MonitorCfgEntry.sensornodes); zo kan de telemetrie over meerdere nodes verdeeld
+ * worden, elk binnen de één-pakket-CayenneLPP-limiet. Bescheiden i.v.m. RAM (geen
+ * PSRAM): elke slot draagt een eigen ClientACL. Zie het RAM-rapport. */
+#ifndef MAX_SENSOR_NODES
+  #define MAX_SENSOR_NODES   4
+#endif
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -262,6 +274,18 @@ public:
   int  webRoomsBackup(char* out, size_t out_len) override;
   bool webRoomsRestore(const char* json) override;
 
+  /* ---- IWebNode: virtuele sensor-nodes (web-GUI). Symmetrisch met de rooms. ---- */
+  int  webSNodeMax() override         { return MAX_SENSOR_NODES; }
+  int  webSNodeActiveCount() override { return _num_active_snodes; }
+  bool webSNodeActive(int idx) override  { return idx >= 0 && idx < MAX_SENSOR_NODES && snodes[idx].active; }
+  const char* webSNodeName(int idx) override { return (idx >= 0 && idx < MAX_SENSOR_NODES) ? snodes[idx].name : ""; }
+  bool webSNodeStealth(int idx) override { return (idx >= 0 && idx < MAX_SENSOR_NODES) ? snodes[idx].stealth : false; }
+  bool webSNodePubHex(int idx, char* out, size_t out_len) override;
+  bool webSNodeJoinUri(int idx, char* out, size_t out_len) override;
+  int  webSNodeAdd(const char* name) override;
+  bool webSNodeEdit(int idx, const char* name, int stealth) override;
+  bool webSNodeDel(int idx) override;
+
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
    * informatief (alleen de `ver`-CLI leest dit); het protocol-versieveld is het
@@ -337,6 +361,19 @@ private:
   int           _num_active_rooms;
   int           _active_slot;
 
+  /* Virtuele sensor-nodes (ADV_TYPE_SENSOR). Hergebruiken de RoomSlot-struct maar
+   * kennen geen posts. _active_snode >= 0 tijdens onRecvPacket-dispatch als het
+   * geadresseerde pakket voor een sensor-node was; anders -1 (dan telt _active_slot,
+   * een room). */
+  RoomSlot      snodes[MAX_SENSOR_NODES];
+  int           _num_active_snodes;
+  int           _active_snode;
+
+  /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
+   * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
+  RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
+  bool          activeIsSnode() const { return _active_snode >= 0; }
+
   PostInfo      _post_pool[MAX_TOTAL_POSTS];
 
   uint32_t      last_millis;
@@ -386,14 +423,23 @@ private:
   /* ---- DM-alarmpad ---- */
   void          sendAlertDM(const ClientInfo* c, AlertTask* t);
 
+  /* ---- adverts + telemetrie voor sensor-nodes ---- */
+  mesh::Packet* createSensorNodeAdvert(RoomSlot& slot);
+  void          sendSensorNodeAdvertisement(RoomSlot& slot, int delay_millis, bool flood);
+
   /* ---- persistentie ---- */
   void          saveRoomIdentity(int idx);
   void          loadOrCreateRoomIdentity(int idx);
   void          saveRoomConfig();
   void          loadRoomConfig();
+  void          saveSensorNodeIdentity(int idx);
+  void          loadOrCreateSensorNodeIdentity(int idx);
+  void          saveSensorNodeConfig();
+  void          loadSensorNodeConfig();
 
   /* ---- CLI ---- */
   void          handleRoomCommand(char* args, char* reply);
+  void          handleSensorNodeCommand(char* args, char* reply);
 
   static bool   saveFilter(ClientInfo* client) { return client->isAdmin(); }
 };

@@ -97,7 +97,7 @@
  * volgende stap dezelfde: de monitorlijst uit status.json halen en apart en
  * langzamer ophalen, met alleen de METINGEN op 5 s.
  */
-static char g_json[10240];
+static char g_json[11264];
 #define JSON_TAIL  320      /* ruimte die altijd vrij blijft voor één regel + "]}" */
 
 /* Dwingt de rekensom hierboven af bij het compileren in plaats van bij het eerste
@@ -106,7 +106,9 @@ static char g_json[10240];
  * mee. */
 /* 820 voor de kopblokken: vaste velden ~300 + budget ~200 + ad-hoc ~300 (de
  * ping-uitslagtekst) + sim/rec/rep/test ~320 -- ruim afgerond. */
-static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 235 + 130 + JSON_TAIL
+/* 250 (was 235) per monitor: sinds de room-variant draagt elke regel ook "am",
+ * "rm" en "sn" (de sensor-node-set), ~15 byte extra. */
+static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 250 + 130 + JSON_TAIL
               <= sizeof(g_json),
               "g_json te klein voor MON_MAX_MONITORS -- zie de rekensom hierboven");
 
@@ -436,6 +438,9 @@ void web_route_roomdel()      { if (g_self) g_self->handleRoomDel(); }
 void web_route_roomsbackup()  { if (g_self) g_self->handleRoomsBackup(); }
 void web_route_roomsrestore() { if (g_self) g_self->handleRoomsRestore(); }
 void web_route_monalarm()     { if (g_self) g_self->handleMonAlarm(); }
+void web_route_snodeadd()     { if (g_self) g_self->handleSNodeAdd(); }
+void web_route_snodeedit()    { if (g_self) g_self->handleSNodeEdit(); }
+void web_route_snodedel()     { if (g_self) g_self->handleSNodeDel(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -897,6 +902,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button class="on" data-p="1">bewaking</button>
 <button data-p="2">toegang</button>
 <button id="tabrooms" data-p="4" hidden>rooms</button>
+<button id="tabsnodes" data-p="5" hidden>sensor-nodes</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -1524,7 +1530,42 @@ Room&nbsp;0 (hoofdidentiteit) wordt bij restore standaard <b>niet</b> overschrev
 type="file" id="rrestore" accept="application/json,.json" hidden></label></div>
 <label class="cb" style="margin-top:.6rem"><input type="checkbox" id="rov">
 bij restore <b>ook room&nbsp;0</b> (hoofdidentiteit) overschrijven</label>
+<p class="note">De backup omvat ook de <b>virtuele sensor-nodes</b> (namen + sleutels);
+restore zet ze samen met de rooms terug.</p>
 <div id="rrmsg"></div></div>
+</section>
+
+<section id="p5" hidden>
+<h2>Sensor-nodes &mdash; virtuele telemetrie-nodes</h2>
+<p class="why"><b>Waarom dit bestaat:</b> de MeshCore-app toont telemetrie alleen
+voor contacten van het <b>sensor</b>-type; onze rooms zijn van het room-type. Een
+virtuele sensor-node is een aparte identiteit die als <b>sensor</b> adverteert, dus
+de app toont er telemetrie voor. Je kunt er meerdere hebben en per sensor kiezen op
+<b>welke</b> sensor-nodes hij verschijnt (tabblad <b>bewaking</b>, kolom
+<i>rooms/nodes</i>) &mdash; zo verdeel je de kanalen over meerdere nodes en til je
+het totaal voorbij de limiet van &eacute;&eacute;n CayenneLPP-pakket. Elke node
+heeft een eigen sleutelpaar; delen gaat via de QR/join-link (contacttype
+<i>sensor</i>).</p>
+<div class="card pad0"><table id="snl"></table></div>
+<div id="snmsg"></div>
+
+<h2>Sensor-node toevoegen</h2>
+<div class="card"><form id="snadd">
+<label>Naam<input name="name" maxlength="23" required spellcheck="false"
+placeholder="bv. BE-HSS-DinX-Up2"></label>
+<button>Toevoegen</button>
+<div id="snaddmsg"></div>
+<p class="note">Een nieuwe sensor-node krijgt een <b>eigen sleutelpaar</b> en neemt
+het beheerderswachtwoord van deze node over. Koppel er daarna sensoren aan op het
+tabblad <b>bewaking</b>.</p></form></div>
+
+<div id="snedit" class="card" hidden>
+<h3 id="snedit-t" style="margin:0 0 .4rem">Sensor-node bewerken</h3>
+<div class="row"><label>Naam<input id="sne-name" maxlength="23" spellcheck="false"></label></div>
+<label class="cb" style="margin-top:.5rem"><input type="checkbox" id="sne-stealth">
+stealth (niet adverteren)</label>
+<div class="quick"><button type="button" id="sne-save">Opslaan</button>
+<button type="button" class="sec" onclick="snodeEditClose()">annuleer</button></div></div>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -1864,11 +1905,15 @@ var iI=inp(cells[3],""+m.i,4,"n3");
    room-variant; op een sensor-node worden ze bewaard maar genegeerd. am/rm komen
    uit status.json. */
 function m2l(mk){var a=[];for(var b=0;b<16;b++){if(mk&(1<<b))a.push(b)}return a.join(",")}
+function l2m(s){var m=0;(""+s).split(",").forEach(function(x){var n=parseInt(x,10);if(n>=0&&n<16)m|=(1<<n)});return m}
 var iA=document.createElement("select");iA.className="n3";
 [["1","dm"],["2","room"],["3","both"]].forEach(function(o){var op=document.createElement("option");op.value=o[0];op.textContent=o[1];if(o[0]===String(m.am||3))op.selected=true;iA.appendChild(op)});
-var iR=document.createElement("input");iR.className="n3";iR.maxLength=12;iR.value=m2l(m.rm||1);iR.title="rooms, bv 0,1";
-cells[3].appendChild(document.createTextNode(" "));cells[3].appendChild(iA);
-cells[3].appendChild(document.createTextNode(" "));cells[3].appendChild(iR);
+var iR=document.createElement("input");iR.className="n3";iR.maxLength=12;iR.value=m2l(m.rm||1);iR.title="rooms (post-tekst), bv 0,1";
+/* sn = op welke sensor-nodes dit kanaal als telemetrie verschijnt (bv 0,1). */
+var iS=document.createElement("input");iS.className="n3";iS.maxLength=12;iS.value=m2l(m.sn||1);iS.title="sensor-nodes (telemetrie), bv 0,1";
+cells[3].appendChild(document.createTextNode(" a:"));cells[3].appendChild(iA);
+cells[3].appendChild(document.createTextNode(" r:"));cells[3].appendChild(iR);
+cells[3].appendChild(document.createTextNode(" s:"));cells[3].appendChild(iS);
 
 cells[CACTS].textContent="";
 var ok=document.createElement("button");ok.textContent="opslaan";ok.className="go";
@@ -1926,8 +1971,26 @@ var cmds=[];
 if(nn!=m.n)  {cmds.push("sensor set mon."+m.ch+".name "+nn)}
 if(nh!=oh)   {cmds.push("sensor set mon."+m.ch+".host "+nh)}
 if(iv!=m.i)  {cmds.push("sensor set mon."+m.ch+".int "+iv)}
-if(!cmds.length){tsay("niets veranderd aan kanaal "+m.ch,1);
-no.onclick();return}
+
+/* Alarm-route (am) + room-set (rm) + sensor-node-set (sn) gaan NIET via 'sensor
+   set' maar via /mon/alarm (op het stabiele kanaal m.ch). Alleen versturen als er
+   iets aan veranderd is. */
+var nam=parseInt(iA.value,10),nrm=l2m(iR.value),nsn=l2m(iS.value);
+var alarmChg=(nam!=(m.am||3))||(nrm!=(m.rm||1))||(nsn!=(m.sn||1));
+function saveAlarm(cb){
+if(!alarmChg){if(cb)cb();return}
+fetch("mon/alarm",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"ch="+m.ch+"&am="+nam+"&rm="+nrm+"&sn="+nsn})
+.then(function(r){return r.json().catch(function(){return{ok:r.ok}})})
+.then(function(j){if(!j.ok)tsay("alarm/koppeling kanaal "+m.ch+" geweigerd: "+(j.error||""),0);
+if(cb)cb()}).catch(function(){tsay("alarm/koppeling niet opgeslagen",0);if(cb)cb()})}
+
+if(!cmds.length){
+if(alarmChg){ok.disabled=true;no.disabled=true;
+saveAlarm(function(){EDIT=0;u2();cfg();tsay("alarm/koppeling van kanaal "+m.ch+" opgeslagen",1)})}
+else{tsay("niets veranderd aan kanaal "+m.ch,1);no.onclick()}
+return}
 
 for(var i=0;i<cmds.length;i++){
 if(!fits(cmds[i].slice(11))){
@@ -1947,7 +2010,7 @@ cliSeq(cmds,function(good,bad,last){
 /* De uitslag gaat naar tsay() en niet naar rowsay(): EDIT gaat hier op 0 en dan
    herbouwt u2() de hele tabel, inclusief de meldregel. Onder de tabel blijft de
    uitslag staan -- en juist die wil je lezen. */
-EDIT=0;rowsayClear(r);u2();cfg();
+EDIT=0;rowsayClear(r);saveAlarm();u2();cfg();
 /* De node antwoordt op een geweigerde 'sensor set' met "can't find custom var"
    -- dat is zijn enige foutmelding en hij zegt dus niet WAAROM. Vandaar dat het
    antwoord hier letterlijk doorgegeven wordt en er een hint bij staat: bijna
@@ -2229,9 +2292,10 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=4;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+for(var k=1;k<=5;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
 if(p=="3"){cfg()}
-if(p=="4"){roomsLoad()}}}
+if(p=="4"){roomsLoad()}
+if(p=="5"){snodesLoad()}}}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -2722,7 +2786,8 @@ if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
 
 /* Bij het laden: is dit een room-node? Zo ja, toon de tab. */
 function roomsProbe(){roomsGet().then(function(d){
-var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0)})
+var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0);
+var ts=document.getElementById("tabsnodes");if(ts)ts.hidden=!(d&&d.snode_max>0)})
 .catch(function(){})}
 
 function roomsLoad(){roomsGet().then(function(d){
@@ -2839,6 +2904,69 @@ headers:{"Content-Type":"application/json"},body:txt})
 else rmsg("rrmsg","restore mislukt: "+(j.error||"onbekend"),0)})
 .catch(function(){rmsg("rrmsg","restore mislukt",0)});ev.target.value=""};
 rd.readAsText(f)};
+
+/* ============================ sensor-nodes ==============================
+   Hergebruikt roomShare()/drawQR() (QR + deel) en rmsg(). De lijst komt uit de
+   "snodes"-array van /rooms.json. */
+function snodesLoad(){roomsGet().then(function(d){
+var e=document.getElementById("snl");
+if(!d){e.innerHTML="<tr><td>Deze node kent geen sensor-nodes.</td></tr>";return}
+snodesRender(d.snodes||[])}).catch(function(){rmsg("snmsg","kon sensor-nodes niet laden",0)})}
+
+function snodesRender(list){var e=document.getElementById("snl");e.innerHTML="";
+var h=e.insertRow();["#","naam","stealth","kanalen",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+list.forEach(function(sn){var r=e.insertRow();
+var c=r.insertCell();c.className="num";c.textContent=sn.idx;
+r.insertCell().textContent=sn.name;
+c=r.insertCell();c.textContent=sn.stealth?"aan":"–";if(sn.stealth)c.className="c-warn";
+c=r.insertCell();c.className="num";c.textContent=(sn.channels&&sn.channels.length)?sn.channels.join(","):"–";
+c=r.insertCell();c.className="acts";
+var bs=document.createElement("button");bs.textContent="deel";bs.className="go";
+bs.onclick=function(){roomShare(sn)};c.appendChild(bs);
+var be=document.createElement("button");be.textContent="bewerk";
+be.onclick=function(){snodeEdit(sn)};c.appendChild(be);
+var bd=document.createElement("button");bd.textContent="wis";
+bd.onclick=function(){snodeDel(sn)};c.appendChild(bd)})}
+
+document.getElementById("snadd").onsubmit=function(ev){ev.preventDefault();
+var f=ev.target.elements,nm=f["name"].value.trim();if(!nm)return;
+fetch("snode/add",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(nm)}).then(function(r){return r.json()})
+.then(function(j){if(j.ok){f["name"].value="";
+rmsg("snaddmsg","sensor-node "+j.idx+" toegevoegd",1);snodesLoad()}
+else rmsg("snaddmsg","toevoegen mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("snaddmsg","toevoegen mislukt",0)})};
+
+var SNEI=-1;
+function snodeEdit(sn){SNEI=sn.idx;document.getElementById("snedit").hidden=false;
+document.getElementById("snedit-t").textContent="Bewerken: sensor-node "+sn.idx+" ("+sn.name+")";
+document.getElementById("sne-name").value=sn.name;
+document.getElementById("sne-stealth").checked=!!sn.stealth;
+document.getElementById("snedit").scrollIntoView({block:"nearest"})}
+function snodeEditClose(){document.getElementById("snedit").hidden=true;SNEI=-1}
+document.getElementById("sne-save").onclick=function(){if(SNEI<0)return;
+var b="idx="+SNEI,nm=document.getElementById("sne-name").value.trim(),
+st=document.getElementById("sne-stealth").checked?1:0;
+if(nm)b+="&name="+encodeURIComponent(nm);
+b+="&stealth="+st;
+fetch("snode/edit",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg("snmsg","sensor-node "+SNEI+" opgeslagen",1);snodeEditClose();snodesLoad()}
+else rmsg("snmsg","opslaan mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("snmsg","opslaan mislukt",0)})};
+
+function snodeDel(sn){
+if(!confirm("Sensor-node "+sn.idx+" ('"+sn.name+"') verwijderen? De sleutel gaat "+
+"verloren; bestaande contacten en QR-codes worden ongeldig."))return;
+fetch("snode/del",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"idx="+sn.idx})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg("snmsg","sensor-node "+sn.idx+" verwijderd",1);snodeEditClose();roomShareClose();snodesLoad()}
+else rmsg("snmsg","verwijderen mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("snmsg","verwijderen mislukt",0)})}
 
 u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
@@ -3007,6 +3135,10 @@ void WebTask::routes() {
   /* Per-sensor alarmroute (am) + room-set (rm). POST-only: hij zet de bewaking van
    * een kanaal op een andere bezorgweg, dus geen GET-link die een browser volgt. */
   _server->on("/mon/alarm", HTTP_POST, web_route_monalarm);
+  /* Virtuele sensor-nodes: symmetrisch met /room/*. Lijst via /rooms.json. */
+  _server->on("/snode/add", HTTP_POST, web_route_snodeadd);
+  _server->on("/snode/edit", HTTP_POST, web_route_snodeedit);
+  _server->on("/snode/del", HTTP_POST, web_route_snodedel);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -3379,7 +3511,7 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           ",{\"ch\":%u,\"n\":\"%s\",\"h\":\"%s\",\"i\":%u,\"st\":\"%s\","
           "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\","
           "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d,"
-          "\"am\":%u,\"rm\":%u}",
+          "\"am\":%u,\"rm\":%u,\"sn\":%u}",
           (unsigned)_mon->monitorChannel(i),
           _mon->monitorName(i),
           push ? "(gemeld)" : _mon->monitorHost(i),
@@ -3401,10 +3533,12 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           _mon->monitorSendsMs(i) ? 1 : 0,
           (unsigned)_mon->monitorTelemBytes(i),
           _mon->monitorDropped(i) ? 1 : 0,
-          /* am = alarm-route (1=dm,2=room,3=both), rm = room-set bitmasker. Alleen
-           * betekenisvol in de room-variant; de sensor-node negeert ze. */
+          /* am = alarm-route (1=dm,2=room,3=both), rm = room-set bitmasker,
+           * sn = sensor-node-set bitmasker (welke virtuele sensor-nodes dit kanaal
+           * als telemetrie tonen). Alleen betekenisvol in de room-variant. */
           (unsigned)_mon->monitorAlertMode(i),
-          (unsigned)_mon->monitorRoomsMask(i));
+          (unsigned)_mon->monitorRoomsMask(i),
+          (unsigned)_mon->monitorSensorNodesMask(i));
     }
   }
 
@@ -4149,12 +4283,55 @@ void WebTask::handleRoomsJson() {
     jsonEscape(uri, euri, sizeof(euri));
     n += snprintf(g_json + n, sizeof(g_json) - n,
         "%s{\"idx\":%d,\"name\":\"%s\",\"stealth\":%s,\"guest\":%s,\"posts\":%d,"
-        "\"pub\":\"%s\",\"uri\":\"%s\"}",
+        "\"pub\":\"%s\",\"uri\":\"%s\",\"kind\":\"room\"}",
         first ? "" : ",", i, esc,
         _acl->webRoomStealth(i) ? "true" : "false",
         _acl->webRoomHasGuest(i) ? "true" : "false",
         _acl->webRoomPosts(i), pub, euri);
     first = false;
+  }
+
+  /* Virtuele sensor-nodes: aparte array, symmetrisch met "rooms". Per node de
+   * kanalen die eraan hangen (via het sensornodes-masker) zodat MeshManager de
+   * groepering kan tonen. */
+  const int smax = _acl->webSNodeMax();
+  n += snprintf(g_json + n, sizeof(g_json) - n,
+      "],\"snode_max\":%d,\"snode_active\":%d,\"snodes\":[", smax, _acl->webSNodeActiveCount());
+  first = true;
+  for (int i = 0; i < smax; i++) {
+    if (!_acl->webSNodeActive(i)) continue;
+    if ((size_t)n > sizeof(g_json) - 700) break;
+    jsonEscape(_acl->webSNodeName(i), esc, sizeof(esc));
+    pub[0] = 0;  _acl->webSNodePubHex(i, pub, sizeof(pub));
+    uri[0] = 0;  _acl->webSNodeJoinUri(i, uri, sizeof(uri));
+    jsonEscape(uri, euri, sizeof(euri));
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+        "%s{\"idx\":%d,\"name\":\"%s\",\"stealth\":%s,\"pub\":\"%s\",\"uri\":\"%s\","
+        "\"kind\":\"sensor\",\"channels\":[",
+        first ? "" : ",", i, esc,
+        _acl->webSNodeStealth(i) ? "true" : "false", pub, euri);
+    first = false;
+    /* De kanalen die aan deze sensor-node hangen. */
+    if (_mon != nullptr) {
+      bool fc = true;
+      /* Vaste bronnen (kanaal 2/3/4) volgen hun eigen snode-masker. */
+      if (_mon->fixedSensorNodesMask(MON_FA_MAINS) & (1u << i)) {
+        n += snprintf(g_json + n, sizeof(g_json) - n, "%s%u,%u", fc ? "" : ",",
+                      (unsigned)MonitorSensors::CH_MAINS, (unsigned)MonitorSensors::CH_BATTERY); fc = false;
+      }
+      if (_mon->fixedSensorNodesMask(MON_FA_WIFI) & (1u << i)) {
+        n += snprintf(g_json + n, sizeof(g_json) - n, "%s%u", fc ? "" : ",",
+                      (unsigned)MonitorSensors::CH_WIFI); fc = false;
+      }
+      for (int s = 0; s < MonitorSensors::MAX_MONITORS; s++) {
+        if (!_mon->monitorUsed(s)) continue;
+        if (!(_mon->monitorSensorNodesMask(s) & (1u << i))) continue;
+        if ((size_t)n > sizeof(g_json) - 40) break;
+        n += snprintf(g_json + n, sizeof(g_json) - n, "%s%u", fc ? "" : ",",
+                      (unsigned)_mon->monitorChannel(s)); fc = false;
+      }
+    }
+    n += snprintf(g_json + n, sizeof(g_json) - n, "]}");
   }
   strlcat(g_json, "]}", sizeof(g_json));
 
@@ -4279,6 +4456,67 @@ void WebTask::handleRoomsRestore() {
   _server->send(200, "application/json", "{\"ok\":true}");
 }
 
+/* ---- VIRTUELE SENSOR-NODES (symmetrisch met /room/*) ---- */
+
+/* POST /snode/add (name) -> {"ok":true,"idx":N,"uri":"..."} */
+void WebTask::handleSNodeAdd() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+  char name[24];
+  if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}");
+    return;
+  }
+  int idx = _acl->webSNodeAdd(name);
+  if (idx < 0) {
+    _server->send(503, "application/json", "{\"ok\":false,\"error\":\"geen vrije sensor-node-slot\"}");
+    return;
+  }
+  char uri[200] = {0};
+  _acl->webSNodeJoinUri(idx, uri, sizeof(uri));
+  char euri[300]; jsonEscape(uri, euri, sizeof(euri));
+  char msg[360];
+  snprintf(msg, sizeof(msg), "{\"ok\":true,\"idx\":%d,\"uri\":\"%s\"}", idx, euri);
+  _server->send(200, "application/json", msg);
+}
+
+/* POST /snode/edit (idx, optioneel name, stealth=0/1) -> {"ok":true} */
+void WebTask::handleSNodeEdit() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+  int idx = getArgInt(*_server, "idx", -1);
+  if (idx < 0 || idx >= _acl->webSNodeMax() || !_acl->webSNodeActive(idx)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige idx\"}");
+    return;
+  }
+  char name[24], st[4];
+  bool has_name = getArg(*_server, "name", name, sizeof(name));
+  bool has_st   = getArg(*_server, "stealth", st, sizeof(st));
+  const char* namep = (has_name && name[0]) ? name : nullptr;
+  int stealth = has_st ? (st[0] == '1' ? 1 : 0) : -1;
+  if (!_acl->webSNodeEdit(idx, namep, stealth)) {
+    _server->send(503, "application/json", "{\"ok\":false,\"error\":\"bewerken mislukt\"}");
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /snode/del (idx) -> {"ok":true} */
+void WebTask::handleSNodeDel() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+  int idx = getArgInt(*_server, "idx", -1);
+  if (idx < 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige idx\"}");
+    return;
+  }
+  if (!_acl->webSNodeDel(idx)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige of inactieve sensor-node\"}");
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
 /* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
  *
  * DE IDENTIFICATIE. De MeshManager-server nam `idx` = de POSITIE in de mon[]-array
@@ -4370,25 +4608,47 @@ void WebTask::handleMonAlarm() {
   }
   if (ro == 0) strcpy(rooms, "none"); else rooms[ro] = 0;
 
+  /* Optioneel: `sn` = sensor-node-bitmasker (welke virtuele sensor-nodes deze
+   * sensor als telemetrie-kanaal tonen). Afwezig -> ongewijzigd. */
+  const int sn = getArgInt(*_server, "sn", -1);
+  char snlist[48];
+  if (sn >= 0) {
+    int so = 0;
+    for (int b = 0; b < 16; b++) {
+      if (sn & (1 << b)) {
+        if (so) snlist[so++] = ',';
+        so += snprintf(snlist + so, sizeof(snlist) - so, "%d", b);
+      }
+    }
+    if (so == 0) strcpy(snlist, "none"); else snlist[so] = 0;
+  }
+
   /* am gaat als getal direct door (parseAlertMode accepteert 1/2/3). */
   snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.alert %d", ch, am);
   _acl->handleCommandWeb(0, g_cmd, g_reply);
   snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.rooms %s", ch, rooms);
   _acl->handleCommandWeb(0, g_cmd, g_reply);
+  if (sn >= 0) {
+    snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.snodes %s", ch, snlist);
+    _acl->handleCommandWeb(0, g_cmd, g_reply);
+  }
 
   /* Definitieve controle via de getters -- niet de CLI-tekst parsen. */
   bool ok = ((int)_mon->monitorAlertMode(slot) == am) &&
-            ((int)_mon->monitorRoomsMask(slot) == rm);
+            ((int)_mon->monitorRoomsMask(slot) == rm) &&
+            (sn < 0 || (int)_mon->monitorSensorNodesMask(slot) == sn);
   if (!ok) {
-    char msg[160];
+    char msg[192];
     snprintf(msg, sizeof(msg),
-        "{\"ok\":false,\"error\":\"node nam am/rm niet over (am=%u rm=%u)\",\"ch\":%d}",
-        (unsigned)_mon->monitorAlertMode(slot), (unsigned)_mon->monitorRoomsMask(slot), ch);
+        "{\"ok\":false,\"error\":\"node nam am/rm/sn niet over (am=%u rm=%u sn=%u)\",\"ch\":%d}",
+        (unsigned)_mon->monitorAlertMode(slot), (unsigned)_mon->monitorRoomsMask(slot),
+        (unsigned)_mon->monitorSensorNodesMask(slot), ch);
     _server->send(500, "application/json", msg);
     return;
   }
-  char msg[64];
-  snprintf(msg, sizeof(msg), "{\"ok\":true,\"ch\":%d,\"am\":%d,\"rm\":%d}", ch, am, rm);
+  char msg[96];
+  snprintf(msg, sizeof(msg), "{\"ok\":true,\"ch\":%d,\"am\":%d,\"rm\":%d,\"sn\":%d}",
+           ch, am, rm, (int)_mon->monitorSensorNodesMask(slot));
   _server->send(200, "application/json", msg);
 }
 

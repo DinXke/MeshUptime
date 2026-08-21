@@ -294,11 +294,22 @@ public:
    * (bitmasker van room-indexen). De sensor-variant negeert deze. */
   uint8_t     monitorAlertMode(int slot) const;
   uint16_t    monitorRoomsMask(int slot) const;
+  /* SENSOR-NODE-set per monitor: op welke virtuele sensor-nodes deze sensor als
+   * telemetrie-kanaal verschijnt (bitmasker). */
+  uint16_t    monitorSensorNodesMask(int slot) const;
   /* Idem voor de vaste bronnen (MON_FA_* uit MonitorStore.h). */
   uint8_t     fixedAlertMode(int idx) const;
   uint16_t    fixedRoomsMask(int idx) const;
+  uint16_t    fixedSensorNodesMask(int idx) const;
   bool        setFixedAlertMode(int idx, uint8_t mode);
   bool        setFixedRoomsMask(int idx, uint16_t mask);
+  bool        setFixedSensorNodesMask(int idx, uint16_t mask);
+
+  /* SUBSET-telemetrie voor een virtuele sensor-node: als querySensors(), maar met
+   * ALLEEN de kanalen van de sensoren die aan sensor-node `snode_idx` gekoppeld
+   * zijn (via hun sensornodes-masker). Zo kunnen sensoren over meerdere sensor-
+   * nodes verdeeld worden, elk binnen de één-pakket-CayenneLPP-limiet. */
+  bool        querySensorsForNode(int snode_idx, uint8_t requester_permissions, CayenneLPP& telemetry);
   bool        monitorIsUp(int slot) const;
   bool        monitorSeeded(int slot) const;             /* al ooit een uitslag? */
   uint32_t    monitorPingMs(int slot) const;
@@ -896,6 +907,12 @@ public:
   static bool validHost(const char* s);
 
 private:
+  /* Gedeelde kern van querySensors()/querySensorsForNode(): schrijft de node-
+   * toestandsschakelaars (netvoeding/batterij/wifi) en de monitorkanalen in de
+   * CayenneLPP. snode_filter < 0 = ALLE kanalen (volledige telemetrie); >= 0 =
+   * alleen de kanalen waarvan het sensornodes-masker die node bevat (subset). */
+  void emitStateAndMonitors(uint8_t requester_permissions, CayenneLPP& telemetry, int snode_filter);
+
   /* De toestandsmachine. Alle drie de getallen komen uit de meting van
    * 19 augustus 2026 (docs/meting-voeding-2026-08-19.log) en niet uit een
    * datasheet; dit bord heeft geen PMU en dus geen VBUS-detectie, netspanning

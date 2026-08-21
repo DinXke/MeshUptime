@@ -752,10 +752,12 @@ uint16_t    MonitorSensors::monitorInterval(int slot) const  { return monitorUse
  * een monitor uit een oud bestand nooit stil ongealarmeerd blijft. */
 uint8_t     MonitorSensors::monitorAlertMode(int slot) const { uint8_t m = monitorUsed(slot) ? _cfg.mons[slot].alert_mode : 0; return m ? m : MON_ALERT_DEFAULT; }
 uint16_t    MonitorSensors::monitorRoomsMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].rooms_mask : MON_ROOMS_DEFAULT; }
+uint16_t    MonitorSensors::monitorSensorNodesMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].sensornodes : MON_SNODES_DEFAULT; }
 
 /* Alarm-bezorging van de vaste bronnen (MON_FA_*). */
 uint8_t     MonitorSensors::fixedAlertMode(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_ALERT_DEFAULT; uint8_t m = _cfg.fixed_alert_mode[idx]; return m ? m : MON_ALERT_DEFAULT; }
 uint16_t    MonitorSensors::fixedRoomsMask(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_ROOMS_DEFAULT; return _cfg.fixed_rooms_mask[idx]; }
+uint16_t    MonitorSensors::fixedSensorNodesMask(int idx) const { if (idx < 0 || idx >= MON_FA_COUNT) return MON_SNODES_DEFAULT; return _cfg.fixed_sensornodes[idx]; }
 
 /* Zetters voor de vaste-bron-config (via CLI/web). mode 0 = ongewijzigd laten
  * (ongeldig); rooms_mask mag 0 zijn ("geen room", dan enkel DM als de mode DM
@@ -771,6 +773,12 @@ bool MonitorSensors::setFixedAlertMode(int idx, uint8_t mode) {
 bool MonitorSensors::setFixedRoomsMask(int idx, uint16_t mask) {
   if (idx < 0 || idx >= MON_FA_COUNT) return false;
   _cfg.fixed_rooms_mask[idx] = mask;
+  markDirty();
+  return true;
+}
+bool MonitorSensors::setFixedSensorNodesMask(int idx, uint16_t mask) {
+  if (idx < 0 || idx >= MON_FA_COUNT) return false;
+  _cfg.fixed_sensornodes[idx] = mask;
   markDirty();
   return true;
 }
@@ -1743,6 +1751,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       const char* v = eq + 1;
       const char* field = NULL;
       if (strcmp(k, "rooms") == 0) field = "rooms";
+      else if (strcmp(k, "snodes") == 0) field = "snodes";
       else if (strcmp(k, "alert") == 0 || strcmp(k, "mode") == 0) field = "alert";
       if (field) {
         char setting[24];
@@ -1815,7 +1824,8 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       else if (strcmp(key, "ms")    == 0) field = "ms";
       else if (strcmp(key, "alert") == 0) field = "alert";   // dm|room|both
       else if (strcmp(key, "mode")  == 0) field = "alert";   // alias van 'alert'
-      else if (strcmp(key, "rooms") == 0) field = "rooms";   // "0,1"
+      else if (strcmp(key, "rooms") == 0) field = "rooms";    // "0,1"
+      else if (strcmp(key, "snodes") == 0) field = "snodes";  // "0,1" (sensor-nodes)
       if (field == NULL) { failed++; StrHelper::strncpy(last_bad, key, sizeof(last_bad)); continue; }
 
       char setting[24];
@@ -2241,95 +2251,74 @@ bool MonitorSensors::querySensors(uint8_t requester_permissions, CayenneLPP& tel
    * staat er toch, omdat "netvoeding" en "batterijvoeding" in de bewaking twee
    * aparte sensoren zijn die elk hun eigen waarschuwing kunnen krijgen, en
    * omdat een LPP_SWITCH 3 byte kost. */
-  if (requester_permissions & TELEM_PERM_BASE) {
-    /* Het masker van afgekapte vakjes hoort bij DEZE uitlezing en niet bij de
-     * vorige: wie een pingtijd uitzet en daarmee ruimte maakt, moet de melding
-     * zien verdwijnen. */
-    _telem_dropped = 0;
+  emitStateAndMonitors(requester_permissions, telemetry, -1);
+  return true;
+}
 
-    /* isMains() en niet _mains: een forcering hoort OOK in de telemetrie te
-     * staan. Een dashboard aan de andere kant moet hetzelfde zien als deze node,
-     * anders is de simulatie een test van de pagina in plaats van van het
-     * systeem -- en dan blijft juist de vraag onbeantwoord of dat dashboard er
-     * iets van meekrijgt. */
-    const bool mains_now = isMains();
+/* SUBSET-telemetrie voor een virtuele sensor-node. Zelfde node-eigen basis
+ * (batterij/GPS/omgeving via de basisklasse), maar de toestandsschakelaars en de
+ * monitorkanalen worden GEFILTERD op het sensornodes-masker van sensor-node
+ * `snode_idx`. Zo draagt elk pakket alleen de sensoren die aan die node hangen en
+ * blijft elke node binnen de één-pakket-CayenneLPP-limiet. _telem_base/_telem_dropped
+ * (voor de web-budgetweergave) worden hier NIET aangeraakt -- die horen bij de
+ * volledige telemetrie. */
+bool MonitorSensors::querySensorsForNode(int snode_idx, uint8_t requester_permissions, CayenneLPP& telemetry) {
+  EnvironmentSensorManager::querySensors(requester_permissions, telemetry);
+  emitStateAndMonitors(requester_permissions, telemetry, snode_idx);
+  return true;
+}
+
+/* Gedeelde kern; snode_filter < 0 = alle kanalen, >= 0 = alleen kanalen waarvan
+ * het sensornodes-masker bit `snode_filter` gezet heeft. */
+void MonitorSensors::emitStateAndMonitors(uint8_t requester_permissions, CayenneLPP& telemetry, int snode_filter) {
+  if (!(requester_permissions & TELEM_PERM_BASE)) return;
+
+  /* Het masker van afgekapte vakjes hoort bij de VOLLEDIGE uitlezing; bij een
+   * subset (een sensor-node) laten we het met rust. */
+  if (snode_filter < 0) _telem_dropped = 0;
+
+  const uint16_t node_bit = (snode_filter >= 0 && snode_filter < 16)
+                          ? (uint16_t)(1u << snode_filter) : 0;
+  /* Vaste bronnen tellen mee als het hun eigen snode-masker betreft (of altijd bij
+   * de volledige telemetrie). netvoeding/batterij delen MON_FA_MAINS; wifi hangt
+   * aan MON_FA_WIFI. */
+  const bool want_power = (snode_filter < 0) || (fixedSensorNodesMask(MON_FA_MAINS) & node_bit);
+  const bool want_wifi  = (snode_filter < 0) || (fixedSensorNodesMask(MON_FA_WIFI)  & node_bit);
+
+  const bool mains_now = isMains();
+  if (want_power) {
     telemetry.addSwitch(CH_MAINS,   mains_now ? 1 : 0);
     telemetry.addSwitch(CH_BATTERY, mains_now ? 0 : 1);
-    /* Zonder aangehangen WifiTask is er geen wifi, en dan is "niet online" het
-     * eerlijke antwoord. Het kanaal blijft altijd aanwezig, zodat een
-     * dashboard geen veld ziet komen en gaan. */
-    telemetry.addSwitch(CH_WIFI,    isWifiOnline() ? 1 : 0);
+  }
+  if (want_wifi) telemetry.addSwitch(CH_WIFI, isWifiOnline() ? 1 : 0);
 
-    /* De monitors. Op vakjesvolgorde en dus op de volgorde waarin ze zijn
-     * aangemaakt; de kanaalnummers zijn wat telt en die staan vast.
-     *
-     * Hier staat GEEN onderscheid tussen zelf gepingd en van buiten gemeld, en
-     * dat is de bedoeling: beide soorten leveren een schakelaar en, als ze op
-     * staan, een tijd in milliseconden. Een dashboard hoort niet te hoeven weten
-     * hoe wij aan onze uitslag komen. De verouderingsregel voor gemelde diensten
-     * werkt daarom via seeded (zie loopPushStale) -- dan valt zo'n vakje langs
-     * exact hetzelfde pad terug op "schakelaar 0, geen tijd" als een
-     * ping-monitor waarvan we nog niets weten.
-     *
-     * De pingtijd gaat alleen mee als de monitor up is. Een tijd bij een dode
-     * dienst is geen meting maar een oude waarde, en wie hem toch zou tekenen
-     * krijgt een grafiek die tijdens een storing gewoon doorloopt.
-     *
-     * De schakelaar gaat WEL altijd mee, ook als er nog nooit een uitslag was:
-     * LPP_SWITCH kent geen "onbekend", en een kanaal dat komt en gaat is voor
-     * een dashboard erger dan een kanaal dat even 0 staat. Kanaal 4 vertelt
-     * bovendien of we op dat moment konden meten.
-     *
-     * Het budget wordt nagerekend en niet aangenomen: de basisklasse kan er
-     * naar believen GPS en omgevingssensoren voor gezet hebben. Bij overloop
-     * kappen we af -- CayenneLPP zou zelf ook weigeren (LPP_ERROR_OVERFLOW),
-     * maar dan zou een monitor half in het pakket staan: schakelaar erin,
-     * pingtijd eruit. Zo blijft het per monitor alles of niets. */
-    for (int i = 0; i < MAX_MONITORS; i++) {
-      if (!monitorUsed(i)) continue;
+  for (int i = 0; i < MAX_MONITORS; i++) {
+    if (!monitorUsed(i)) continue;
+    /* Subset: alleen de monitors die aan deze sensor-node gekoppeld zijn. */
+    if (snode_filter >= 0 && !(_cfg.mons[i].sensornodes & node_bit)) continue;
 
-      /* monitorIsUp()/monitorSeeded() en niet _mon[i] rechtstreeks: dat is het
-       * ENIGE punt waar de forcering in de telemetrie komt, en het moet er zijn.
-       * Een simulatie die de pagina wel en het mesh niet bereikt, test de helft
-       * van de keten -- en juist de andere helft is waar het misgaat. */
-      const bool up = monitorSeeded(i) && monitorIsUp(i);
-      /* De pingtijd gaat alleen mee als de monitor OP is en als deze monitor hem
-       * mag meesturen (send_ms). Dat tweede is de knop waarmee 9 byte 3 byte
-       * wordt, en daarmee het verschil tussen zeventien en ruim vijftig monitors
-       * in hetzelfde pakket. */
-      const bool with_ms = up && _cfg.mons[i].send_ms;
-      const uint8_t need = TELEM_BYTES_SWITCH + (with_ms ? TELEM_BYTES_GENERIC : 0);
+    const bool up = monitorSeeded(i) && monitorIsUp(i);
+    const bool with_ms = up && _cfg.mons[i].send_ms;
+    const uint8_t need = TELEM_BYTES_SWITCH + (with_ms ? TELEM_BYTES_GENERIC : 0);
 
-      if ((int)telemetry.getSize() + need > TELEM_BUDGET) {
-        /* AFKAPPEN MAG, STIL AFKAPPEN NIET.
-         *
-         * Per monitor alles of niets -- een halve monitor (schakelaar erin,
-         * pingtijd eruit) zou een dashboard een tijd van nul laten tekenen. En
-         * geen 'break': de rest van de lus wordt doorlopen om te MARKEREN welke
-         * vakjes buiten het pakket vielen, zodat /status.json en de pagina kunnen
-         * zeggen WELKE dat waren. Een monitor die stil uit de telemetrie
-         * verdwijnt is de fout die dit project al twee keer gekost heeft.
-         *
-         * Doorlopen kan bovendien nog iets opleveren: een monitor die verderop
-         * staat en zijn pingtijd niet meestuurt, past soms nog wel in de 3 byte
-         * die er over zijn. Dat is geen truc maar de bedoeling van het budget. */
+    if ((int)telemetry.getSize() + need > TELEM_BUDGET) {
+      /* Afkappen mag, stil afkappen niet -- zie de volledige uitleg in de
+       * git-historie. Bij de volledige uitlezing markeren we WELKE vakjes buiten
+       * het pakket vielen (voor /status.json en de pagina); bij een subset niet. */
+      if (snode_filter < 0) {
         _telem_dropped |= ((uint32_t)1 << i);
         MESH_DEBUG_PRINTLN("MonitorSensors: kanaal %d past niet in de telemetrie (%d/%d byte gebruikt)",
                            (int)_cfg.mons[i].channel, (int)telemetry.getSize(),
                            (int)TELEM_BUDGET);
-        continue;
       }
+      continue;
+    }
 
-      telemetry.addSwitch(_cfg.mons[i].channel, up ? 1 : 0);
-      if (with_ms) {
-        /* multiplier van LPP_GENERIC_SENSOR is 1, dus dit zijn exacte hele
-         * milliseconden en geen afgeronde schaalwaarde. */
-        telemetry.addGenericSensor(_cfg.mons[i].channel, (float)_mon[i].last_ms);
-      }
+    telemetry.addSwitch(_cfg.mons[i].channel, up ? 1 : 0);
+    if (with_ms) {
+      telemetry.addGenericSensor(_cfg.mons[i].channel, (float)_mon[i].last_ms);
     }
   }
-
-  return true;
 }
 
 /* ===================== kanalen uitdelen =====================
@@ -2501,6 +2490,9 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
    * Reconfigureerbaar via mon.<ch>.alert / mon.<ch>.rooms. */
   e.alert_mode = MON_ALERT_DEFAULT;
   e.rooms_mask = MON_ROOMS_DEFAULT;
+  /* Nieuwe monitor verschijnt standaard op sensor-node 0 ("BE-HSS-DinX-Up").
+   * Reconfigureerbaar via mon.<ch>.snodes. */
+  e.sensornodes = MON_SNODES_DEFAULT;
 
   memset(&_mon[slot], 0, sizeof(_mon[slot]));
   _mon[slot].up = true;               /* nog niet 'seeded'; zie applyResult() */
@@ -3073,6 +3065,11 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
       markDirty();
       return true;
     }
+    if (strcmp(field, "snodes") == 0) {  /* lijst van sensor-node-indexen, bv "0,1" */
+      _cfg.mons[slot].sensornodes = parseRoomsMask(value);   // zelfde "0,1"/"none"-vorm
+      markDirty();
+      return true;
+    }
 
     return false;   /* mon.N.state is een uitlezing; onbekend veld idem */
   }
@@ -3091,6 +3088,9 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     }
     if (strcmp(field, "rooms") == 0) {
       return setFixedRoomsMask(fi, parseRoomsMask(value));
+    }
+    if (strcmp(field, "snodes") == 0) {
+      return setFixedSensorNodesMask(fi, parseRoomsMask(value));   // "0,1"/"none"
     }
     return false;
   }

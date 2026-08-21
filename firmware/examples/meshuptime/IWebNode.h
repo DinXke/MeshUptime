@@ -93,4 +93,24 @@ public:
                                           { (void)out; (void)out_len; return 0; }
   virtual bool webRoomsRestore(const char* json)
                                           { (void)json; return false; }
+
+  /* ---- VIRTUELE SENSOR-NODES (web-GUI) --------------------------------------
+   * Symmetrisch met de room-API. Alleen de room-server (RoomMesh) implementeert
+   * dit; SensorMesh laat de standaarden staan (webSNodeMax()==0 -> geen sensor-
+   * nodes). De join-URI gebruikt het sensor-contacttype (type=4, MeshCore
+   * docs/qr_codes.md). Backup/restore van de sensor-nodes loopt mee in
+   * webRoomsBackup()/webRoomsRestore(). */
+  virtual int  webSNodeMax()          { return 0; }   // 0 = geen sensor-nodes
+  virtual int  webSNodeActiveCount()  { return 0; }
+  virtual bool webSNodeActive(int idx)     { (void)idx; return false; }
+  virtual const char* webSNodeName(int idx){ (void)idx; return ""; }
+  virtual bool webSNodeStealth(int idx)    { (void)idx; return false; }
+  virtual bool webSNodePubHex(int idx, char* out, size_t out_len)
+                                          { (void)idx; (void)out; (void)out_len; return false; }
+  virtual bool webSNodeJoinUri(int idx, char* out, size_t out_len)
+                                          { (void)idx; (void)out; (void)out_len; return false; }
+  virtual int  webSNodeAdd(const char* name) { (void)name; return -1; }
+  virtual bool webSNodeEdit(int idx, const char* name, int stealth)
+                                          { (void)idx; (void)name; (void)stealth; return false; }
+  virtual bool webSNodeDel(int idx)        { (void)idx; return false; }
 };

@@ -107,6 +107,15 @@
  * ("Storingen"). uint16_t = tot 16 rooms; ruim boven MAX_ROOMS. */
 #define MON_ROOMS_DEFAULT  0x0001
 
+/* SENSOR-NODE-LIDMAATSCHAPSSET per sensor: een bitmasker van virtuele sensor-node-
+ * indexen (bit i = sensor-node i). Bepaalt op WELKE virtuele sensor-nodes deze
+ * sensor als TELEMETRIE-kanaal verschijnt -- los van rooms_mask (dat bepaalt in
+ * welke rooms de status-TEKST wordt gepost). Een sensor kan zo tegelijk in
+ * meerdere rooms EN meerdere sensor-nodes zitten, en sensoren kunnen over meerdere
+ * sensor-nodes verdeeld worden om voorbij de één-pakket-CayenneLPP-limiet te
+ * schalen. Standaard sensor-node 0 ("BE-HSS-DinX-Up"). uint16_t = tot 16 nodes. */
+#define MON_SNODES_DEFAULT  0x0001
+
 /* De VASTE alarmbronnen (geen ping-monitor). Elk heeft een eigen route+room-set
  * in MonitorCfg. Volgorde vastgelegd zodat de opslag-indexen stabiel blijven. */
 enum {
@@ -187,6 +196,11 @@ struct MonitorCfgEntry {
    * sensor-variant negeert deze velden -- die alarmeert altijd via DM. */
   uint8_t  alert_mode;     /* MON_ALERT_DM | MON_ALERT_ROOM */
   uint16_t rooms_mask;     /* bit i = room i */
+
+  /* SENSOR-NODE-set (room-variant): op welke virtuele sensor-nodes deze sensor als
+   * telemetrie-kanaal verschijnt. Bij het LEZEN optioneel (oude bestanden krijgen
+   * MON_SNODES_DEFAULT); bij het SCHRIJVEN altijd. Los van rooms_mask. */
+  uint16_t sensornodes;    /* bit i = sensor-node i */
 };
 
 /* Grenzen van de rustperiode voor een HERSTELMELDING. Hier en niet in
@@ -297,6 +311,8 @@ struct MonitorCfg {
    * per-monitor velden hierboven maar voor batterij/netvoeding/wifi/test. */
   uint8_t  fixed_alert_mode[MON_FA_COUNT];
   uint16_t fixed_rooms_mask[MON_FA_COUNT];
+  /* SENSOR-NODE-set voor de vaste bronnen, symmetrisch met fixed_rooms_mask. */
+  uint16_t fixed_sensornodes[MON_FA_COUNT];
 
   MonitorCfgEntry mons[MON_MAX_MONITORS];
 };
