@@ -759,14 +759,22 @@ bool RoomMesh::processAckForSlot(RoomSlot& slot, const uint8_t* data) {
 /*  Adverts (per room)                                                  */
 /* ------------------------------------------------------------------ */
 mesh::Packet* RoomMesh::createRoomAdvert(RoomSlot& slot) {
+  /* HET STANDAARD MESHCORE-ADVERTFORMAAT, en niet met de hand.
+   *
+   * Hier stond een handgemaakte opbouw: [ADV_TYPE_ROOM][name_len][naam...]. Die
+   * extra name_len-byte hoort NIET in het formaat -- AdvertDataBuilder zet een
+   * vlaggenbyte (type | ADV_NAME_MASK | evt. ADV_LATLON_MASK) en dan de naam als
+   * de RESTERENDE bytes, zonder lengteprefix. Door die extra byte lazen de
+   * MeshCore-app en MeshManager onze roomnaam verkeerd en toonden zij "(unnamed)".
+   *
+   * We gebruiken bewust NIET _cli.buildAdvertData(): die pakt _prefs.node_name,
+   * terwijl elke room hier zijn EIGEN naam heeft. Vandaar AdvertDataBuilder met
+   * slot.name (naam-only, net als simple_room_server). De inkomende parser
+   * (onAdvertRecv -> AdvertDataParser) verwachtte dit standaardformaat al; alleen
+   * onze UITGAANDE adverts waren fout. */
   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
-  uint8_t app_data_len = 0;
-  app_data[app_data_len++] = ADV_TYPE_ROOM;
-  int name_len = strlen(slot.name);
-  if (name_len > 20) name_len = 20;
-  app_data[app_data_len++] = (uint8_t)name_len;
-  memcpy(&app_data[app_data_len], slot.name, name_len);
-  app_data_len += name_len;
+  AdvertDataBuilder builder(ADV_TYPE_ROOM, slot.name);
+  uint8_t app_data_len = builder.encodeTo(app_data);
 
   self_id = slot.id;
   return createAdvert(slot.id, app_data, app_data_len);
