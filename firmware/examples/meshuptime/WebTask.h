@@ -225,6 +225,26 @@ private:
   void handleAclDel();
   void handleAclStrict();
 
+  /* ROOM-BEHEER (alleen zinvol op de room-server-variant; op de sensor-variant
+   * kent de node geen rooms en antwoorden deze routes met 'niet ondersteund').
+   *
+   * Net als bij de toegangslijst: EEN GET met de hele stand (/rooms.json, incl. de
+   * join-URI per room) en POSTs die iets veranderen. De backup draagt de
+   * VOLLEDIGE config incl. sleutels en staat daarom achter dezelfde auth; hij wordt
+   * niet gelogd. De QR wordt in de PAGINA getekend uit de join-URI (een kleine
+   * inline generator), zodat er geen QR-lib in de flash hoeft en geen externe
+   * asset geladen wordt. De join-URI zelf komt uit /rooms.json, zodat ook de
+   * MeshManager-server zijn eigen QR kan tekenen. */
+  void handleRoomsJson();
+  void handleRoomAdd();
+  void handleRoomEdit();
+  void handleRoomDel();
+  void handleRoomsBackup();
+  void handleRoomsRestore();
+  /* Gemeenschappelijke poort voor de room-routes: meshlaag gekoppeld EN deze node
+   * kent rooms. Verstuurt zelf het 503/501-antwoord en geeft dan false. */
+  bool roomsAvailable();
+
   /* Schrijft het monitoroverzicht in buf achter positie n en geeft de nieuwe
    * positie terug. Apart van handleStatus() omdat die anders één functie van
    * honderd regels wordt met twee onderwerpen erin. */
@@ -250,6 +270,12 @@ private:
   friend void web_route_sim();
   friend void web_route_simclear();
   friend void web_route_alerttest();
+  friend void web_route_roomsjson();
+  friend void web_route_roomadd();
+  friend void web_route_roomedit();
+  friend void web_route_roomdel();
+  friend void web_route_roomsbackup();
+  friend void web_route_roomsrestore();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

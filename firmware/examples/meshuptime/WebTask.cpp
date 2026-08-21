@@ -429,6 +429,12 @@ void web_route_logout()    { if (g_self) g_self->handleLogout(); }
 void web_route_sim()       { if (g_self) g_self->handleSim(); }
 void web_route_simclear()  { if (g_self) g_self->handleSimClear(); }
 void web_route_alerttest() { if (g_self) g_self->handleAlertTest(); }
+void web_route_roomsjson()    { if (g_self) g_self->handleRoomsJson(); }
+void web_route_roomadd()      { if (g_self) g_self->handleRoomAdd(); }
+void web_route_roomedit()     { if (g_self) g_self->handleRoomEdit(); }
+void web_route_roomdel()      { if (g_self) g_self->handleRoomDel(); }
+void web_route_roomsbackup()  { if (g_self) g_self->handleRoomsBackup(); }
+void web_route_roomsrestore() { if (g_self) g_self->handleRoomsRestore(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -889,6 +895,7 @@ letter-spacing:.13em;color:var(--muted)}
 <nav class="tabs">
 <button class="on" data-p="1">bewaking</button>
 <button data-p="2">toegang</button>
+<button id="tabrooms" data-p="4" hidden>rooms</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -1447,6 +1454,84 @@ niet in dat lijstje staan; zoeken op naam werkt wel.</p>
 </div></details>
 
 </section>
+
+<section id="p4" hidden>
+<h2>Rooms &mdash; de MeshCore room-servers op deze node</h2>
+<p class="why"><b>Wat dit is:</b> deze node draagt tot vier virtuele
+<b>room-servers</b> tegelijk, elk met een eigen sleutelpaar en naam. De
+MeshCore-app ziet ze als losse rooms. <b>Room&nbsp;0</b> is de hoofdidentiteit van
+deze node en kan niet verwijderd worden. Een room wordt joinbaar door hem als
+contact toe te voegen &mdash; scan de <b>QR</b> of plak de <b>join-link</b> (die
+draagt naam&nbsp;+&nbsp;publieke sleutel, <i>niet</i> het wachtwoord). Staat er een
+<b>gastwachtwoord</b>, dan is dat nog steeds nodig om te lezen/schrijven; een
+<b>stealth</b>-room adverteert niet en is alleen via QR/link te vinden.</p>
+<div class="card pad0"><table id="rl"></table></div>
+<div id="rmsg"></div>
+
+<!-- Deel-paneel: QR + kopieerbare join-link -->
+<div id="rshare" class="card" hidden>
+<div style="display:flex;justify-content:space-between;align-items:center">
+<h3 id="rshare-t" style="margin:0">Deel room</h3>
+<button type="button" class="sec" onclick="roomShareClose()">sluiten</button></div>
+<div style="text-align:center;margin:.7rem 0"><canvas id="rqr"></canvas></div>
+<label>Join-link<input id="rshare-uri" readonly spellcheck="false"></label>
+<div class="quick"><button type="button" id="rcopy">kopieer link</button></div>
+<p class="note">Scan met de MeshCore-app (Contact toevoegen &rarr; scannen) of plak
+de link. De link bevat de room-naam en de <b>publieke</b> sleutel &mdash; nooit een
+wachtwoord.</p></div>
+
+<!-- Bewerk-paneel -->
+<div id="redit" class="card" hidden>
+<h3 id="redit-t" style="margin:0 0 .4rem">Room bewerken</h3>
+<div class="row">
+<label>Naam<input id="re-name" maxlength="23" spellcheck="false"></label>
+<label>Beheerderswachtwoord<input id="re-pass" type="password" maxlength="15"
+autocomplete="new-password" placeholder="ongewijzigd"></label>
+<label>Gastwachtwoord<input id="re-guest" type="password" maxlength="15"
+autocomplete="new-password" placeholder="ongewijzigd"></label></div>
+<label class="cb" style="margin-top:.5rem"><input type="checkbox" id="re-stealth">
+stealth (niet adverteren)</label>
+<label class="cb"><input type="checkbox" id="re-guestclear"> gastwachtwoord
+<b>wissen</b> (room weer open volgens de leesregels)</label>
+<div class="quick"><button type="button" id="re-save">Opslaan</button>
+<button type="button" class="sec" onclick="roomEditClose()">annuleer</button></div>
+<p class="note">Lege velden laten <b>naam</b>, <b>beheerder</b> en <b>gast</b>
+ongewijzigd &mdash; de wachtwoorden worden nooit teruggelezen, dus ze staan hier
+leeg. Vul alleen in wat je wilt veranderen; vink <b>gastwachtwoord wissen</b> aan om
+het weg te halen. Een nieuwe naam gaat direct het advert in.</p></div>
+
+<h2>Room toevoegen</h2>
+<div class="card"><form id="radd">
+<label>Naam<input name="name" maxlength="23" required spellcheck="false"
+placeholder="bv. Telemetrie"></label>
+<button>Toevoegen</button>
+<div id="raddmsg"></div>
+<p class="note">Een nieuwe room krijgt een <b>eigen sleutelpaar</b> en neemt het
+huidige beheerderswachtwoord van deze node over. Daarna te delen via de
+<b>Deel</b>-knop.</p></form></div>
+
+<h2>Backup &amp; restore</h2>
+<div class="card">
+<p class="note">De backup is een JSON-bestand met de <b>volledige</b> room-config
+&mdash; namen, stealth, <b>wachtwoorden en sleutelparen</b>. Daarmee is elke room
+exact te herstellen (zelfde publieke sleutel, dus bestaande QR-codes en contacten
+blijven geldig). <b>Bewaar hem veilig</b>: wie hem heeft, heeft de room-identiteiten.
+Room&nbsp;0 (hoofdidentiteit) wordt bij restore standaard <b>niet</b> overschreven.</p>
+<div class="quick">
+<button type="button" id="rbackup">Backup downloaden</button>
+<label class="btn sec" style="cursor:pointer;line-height:1.4">Restore uploaden&hellip;<input
+type="file" id="rrestore" accept="application/json,.json" hidden></label></div>
+<label class="cb" style="margin-top:.6rem"><input type="checkbox" id="rov">
+bij restore <b>ook room&nbsp;0</b> (hoofdidentiteit) overschrijven</label>
+<div id="rrmsg"></div></div>
+</section>
+
+<!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
+     encoder-kern en geminifieerd. Client-side, geen externe asset, geen C-lib in de
+     flash. De matrix is byte-identiek geverifieerd t.o.v. de volledige lib. -->
+<script>
+var qrcode=function(){var r=function(r,t){var n=r,e=c[t],o=null,u=0,a=null,f=[],i={},g=function(r,t){o=function(r){for(var t=new Array(r),n=0;n<r;n+=1){t[n]=new Array(r);for(var e=0;e<r;e+=1)t[n][e]=null}return t}(u=4*n+17),h(0,0),h(u-7,0),h(0,u-7),s(),l(),d(r,t),n>=7&&v(r),null==a&&(a=p(n,e,f)),w(a,t)},h=function(r,t){for(var n=-1;n<=7;n+=1)if(!(r+n<=-1||u<=r+n))for(var e=-1;e<=7;e+=1)t+e<=-1||u<=t+e||(o[r+n][t+e]=0<=n&&n<=6&&(0==e||6==e)||0<=e&&e<=6&&(0==n||6==n)||2<=n&&n<=4&&2<=e&&e<=4)},l=function(){for(var r=8;r<u-8;r+=1)null==o[r][6]&&(o[r][6]=r%2==0);for(var t=8;t<u-8;t+=1)null==o[6][t]&&(o[6][t]=t%2==0)},s=function(){for(var r=A.getPatternPosition(n),t=0;t<r.length;t+=1)for(var e=0;e<r.length;e+=1){var u=r[t],a=r[e];if(null==o[u][a])for(var f=-2;f<=2;f+=1)for(var i=-2;i<=2;i+=1)o[u+f][a+i]=-2==f||2==f||-2==i||2==i||0==f&&0==i}},v=function(r){for(var t=A.getBCHTypeNumber(n),e=0;e<18;e+=1){var a=!r&&1==(t>>e&1);o[Math.floor(e/3)][e%3+u-8-3]=a}for(e=0;e<18;e+=1){a=!r&&1==(t>>e&1);o[e%3+u-8-3][Math.floor(e/3)]=a}},d=function(r,t){for(var n=e<<3|t,a=A.getBCHTypeInfo(n),f=0;f<15;f+=1){var i=!r&&1==(a>>f&1);f<6?o[f][8]=i:f<8?o[f+1][8]=i:o[u-15+f][8]=i}for(f=0;f<15;f+=1){i=!r&&1==(a>>f&1);f<8?o[8][u-f-1]=i:f<9?o[8][15-f-1+1]=i:o[8][15-f-1]=i}o[u-8][8]=!r},w=function(r,t){for(var n=-1,e=u-1,a=7,f=0,i=A.getMaskFunction(t),g=u-1;g>0;g-=2)for(6==g&&(g-=1);;){for(var c=0;c<2;c+=1)if(null==o[e][g-c]){var h=!1;f<r.length&&(h=1==(r[f]>>>a&1)),i(e,g-c)&&(h=!h),o[e][g-c]=h,-1==(a-=1)&&(f+=1,a=7)}if((e+=n)<0||u<=e){e-=n,n=-n;break}}},p=function(r,t,n){for(var e=B.getRSBlocks(r,t),o=C(),u=0;u<n.length;u+=1){var a=n[u];o.put(a.getMode(),4),o.put(a.getLength(),A.getLengthInBits(a.getMode(),r)),a.write(o)}var f=0;for(u=0;u<e.length;u+=1)f+=e[u].dataCount;if(o.getLengthInBits()>8*f)throw"code length overflow. ("+o.getLengthInBits()+">"+8*f+")";for(o.getLengthInBits()+4<=8*f&&o.put(0,4);o.getLengthInBits()%8!=0;)o.putBit(!1);for(;!(o.getLengthInBits()>=8*f||(o.put(236,8),o.getLengthInBits()>=8*f));)o.put(17,8);return function(r,t){for(var n=0,e=0,o=0,u=new Array(t.length),a=new Array(t.length),f=0;f<t.length;f+=1){var i=t[f].dataCount,g=t[f].totalCount-i;e=Math.max(e,i),o=Math.max(o,g),u[f]=new Array(i);for(var c=0;c<u[f].length;c+=1)u[f][c]=255&r.getBuffer()[c+n];n+=i;var h=A.getErrorCorrectPolynomial(g),l=y(u[f],h.getLength()-1).mod(h);for(a[f]=new Array(h.getLength()-1),c=0;c<a[f].length;c+=1){var s=c+l.getLength()-a[f].length;a[f][c]=s>=0?l.getAt(s):0}}var v=0;for(c=0;c<t.length;c+=1)v+=t[c].totalCount;var d=new Array(v),w=0;for(c=0;c<e;c+=1)for(f=0;f<t.length;f+=1)c<u[f].length&&(d[w]=u[f][c],w+=1);for(c=0;c<o;c+=1)for(f=0;f<t.length;f+=1)c<a[f].length&&(d[w]=a[f][c],w+=1);return d}(o,e)};i.addData=function(r,t){var n=null;switch(t=t||"Byte"){case"Numeric":n=D(r);break;case"Alphanumeric":n=M(r);break;case"Byte":n=m(r);break;case"Kanji":n=b(r);break;default:throw"mode:"+t}f.push(n),a=null},i.isDark=function(r,t){if(r<0||u<=r||t<0||u<=t)throw r+","+t;return o[r][t]},i.getModuleCount=function(){return u},i.make=function(){if(n<1){for(var r=1;r<40;r++){for(var t=B.getRSBlocks(r,e),o=C(),u=0;u<f.length;u++){var a=f[u];o.put(a.getMode(),4),o.put(a.getLength(),A.getLengthInBits(a.getMode(),r)),a.write(o)}var c=0;for(u=0;u<t.length;u++)c+=t[u].dataCount;if(o.getLengthInBits()<=8*c)break}n=r}g(!1,function(){for(var r=0,t=0,n=0;n<8;n+=1){g(!0,n);var e=A.getLostPoint(i);(0==n||r>e)&&(r=e,t=n)}return t}())};return i};r.stringToBytes=(r.stringToBytesFuncs={default:function(r){for(var t=[],n=0;n<r.length;n+=1){var e=r.charCodeAt(n);t.push(255&e)}return t}}).default;var t,n,e,o,u,a=1,f=2,i=4,g=8,c={L:1,M:0,Q:3,H:2},h=0,l=1,s=2,v=3,d=4,w=5,p=6,k=7,A=(t=[[],[6,18],[6,22],[6,26],[6,30],[6,34],[6,22,38],[6,24,42],[6,26,46],[6,28,50],[6,30,54],[6,32,58],[6,34,62],[6,26,46,66],[6,26,48,70],[6,26,50,74],[6,30,54,78],[6,30,56,82],[6,30,58,86],[6,34,62,90],[6,28,50,72,94],[6,26,50,74,98],[6,30,54,78,102],[6,28,54,80,106],[6,32,58,84,110],[6,30,58,86,114],[6,34,62,90,118],[6,26,50,74,98,122],[6,30,54,78,102,126],[6,26,52,78,104,130],[6,30,56,82,108,134],[6,34,60,86,112,138],[6,30,58,86,114,142],[6,34,62,90,118,146],[6,30,54,78,102,126,150],[6,24,50,76,102,128,154],[6,28,54,80,106,132,158],[6,32,58,84,110,136,162],[6,26,54,82,110,138,166],[6,30,58,86,114,142,170]],n=1335,e=7973,u=function(r){for(var t=0;0!=r;)t+=1,r>>>=1;return t},(o={}).getBCHTypeInfo=function(r){for(var t=r<<10;u(t)-u(n)>=0;)t^=n<<u(t)-u(n);return 21522^(r<<10|t)},o.getBCHTypeNumber=function(r){for(var t=r<<12;u(t)-u(e)>=0;)t^=e<<u(t)-u(e);return r<<12|t},o.getPatternPosition=function(r){return t[r-1]},o.getMaskFunction=function(r){switch(r){case h:return function(r,t){return(r+t)%2==0};case l:return function(r,t){return r%2==0};case s:return function(r,t){return t%3==0};case v:return function(r,t){return(r+t)%3==0};case d:return function(r,t){return(Math.floor(r/2)+Math.floor(t/3))%2==0};case w:return function(r,t){return r*t%2+r*t%3==0};case p:return function(r,t){return(r*t%2+r*t%3)%2==0};case k:return function(r,t){return(r*t%3+(r+t)%2)%2==0};default:throw"bad maskPattern:"+r}},o.getErrorCorrectPolynomial=function(r){for(var t=y([1],0),n=0;n<r;n+=1)t=t.multiply(y([1,L.gexp(n)],0));return t},o.getLengthInBits=function(r,t){if(1<=t&&t<10)switch(r){case a:return 10;case f:return 9;case i:case g:return 8;default:throw"mode:"+r}else if(t<27)switch(r){case a:return 12;case f:return 11;case i:return 16;case g:return 10;default:throw"mode:"+r}else{if(!(t<41))throw"type:"+t;switch(r){case a:return 14;case f:return 13;case i:return 16;case g:return 12;default:throw"mode:"+r}}},o.getLostPoint=function(r){for(var t=r.getModuleCount(),n=0,e=0;e<t;e+=1)for(var o=0;o<t;o+=1){for(var u=0,a=r.isDark(e,o),f=-1;f<=1;f+=1)if(!(e+f<0||t<=e+f))for(var i=-1;i<=1;i+=1)o+i<0||t<=o+i||0==f&&0==i||a==r.isDark(e+f,o+i)&&(u+=1);u>5&&(n+=3+u-5)}for(e=0;e<t-1;e+=1)for(o=0;o<t-1;o+=1){var g=0;r.isDark(e,o)&&(g+=1),r.isDark(e+1,o)&&(g+=1),r.isDark(e,o+1)&&(g+=1),r.isDark(e+1,o+1)&&(g+=1),0!=g&&4!=g||(n+=3)}for(e=0;e<t;e+=1)for(o=0;o<t-6;o+=1)r.isDark(e,o)&&!r.isDark(e,o+1)&&r.isDark(e,o+2)&&r.isDark(e,o+3)&&r.isDark(e,o+4)&&!r.isDark(e,o+5)&&r.isDark(e,o+6)&&(n+=40);for(o=0;o<t;o+=1)for(e=0;e<t-6;e+=1)r.isDark(e,o)&&!r.isDark(e+1,o)&&r.isDark(e+2,o)&&r.isDark(e+3,o)&&r.isDark(e+4,o)&&!r.isDark(e+5,o)&&r.isDark(e+6,o)&&(n+=40);var c=0;for(o=0;o<t;o+=1)for(e=0;e<t;e+=1)r.isDark(e,o)&&(c+=1);return n+=Math.abs(100*c/t/t-50)/5*10},o),L=function(){for(var r=new Array(256),t=new Array(256),n=0;n<8;n+=1)r[n]=1<<n;for(n=8;n<256;n+=1)r[n]=r[n-4]^r[n-5]^r[n-6]^r[n-8];for(n=0;n<255;n+=1)t[r[n]]=n;var e={glog:function(r){if(r<1)throw"glog("+r+")";return t[r]},gexp:function(t){for(;t<0;)t+=255;for(;t>=256;)t-=255;return r[t]}};return e}();function y(r,t){if(void 0===r.length)throw r.length+"/"+t;var n=function(){for(var n=0;n<r.length&&0==r[n];)n+=1;for(var e=new Array(r.length-n+t),o=0;o<r.length-n;o+=1)e[o]=r[o+n];return e}(),e={getAt:function(r){return n[r]},getLength:function(){return n.length},multiply:function(r){for(var t=new Array(e.getLength()+r.getLength()-1),n=0;n<e.getLength();n+=1)for(var o=0;o<r.getLength();o+=1)t[n+o]^=L.gexp(L.glog(e.getAt(n))+L.glog(r.getAt(o)));return y(t,0)},mod:function(r){if(e.getLength()-r.getLength()<0)return e;for(var t=L.glog(e.getAt(0))-L.glog(r.getAt(0)),n=new Array(e.getLength()),o=0;o<e.getLength();o+=1)n[o]=e.getAt(o);for(o=0;o<r.getLength();o+=1)n[o]^=L.gexp(L.glog(r.getAt(o))+t);return y(n,0).mod(r)}};return e}var B=function(){var r=[[1,26,19],[1,26,16],[1,26,13],[1,26,9],[1,44,34],[1,44,28],[1,44,22],[1,44,16],[1,70,55],[1,70,44],[2,35,17],[2,35,13],[1,100,80],[2,50,32],[2,50,24],[4,25,9],[1,134,108],[2,67,43],[2,33,15,2,34,16],[2,33,11,2,34,12],[2,86,68],[4,43,27],[4,43,19],[4,43,15],[2,98,78],[4,49,31],[2,32,14,4,33,15],[4,39,13,1,40,14],[2,121,97],[2,60,38,2,61,39],[4,40,18,2,41,19],[4,40,14,2,41,15],[2,146,116],[3,58,36,2,59,37],[4,36,16,4,37,17],[4,36,12,4,37,13],[2,86,68,2,87,69],[4,69,43,1,70,44],[6,43,19,2,44,20],[6,43,15,2,44,16],[4,101,81],[1,80,50,4,81,51],[4,50,22,4,51,23],[3,36,12,8,37,13],[2,116,92,2,117,93],[6,58,36,2,59,37],[4,46,20,6,47,21],[7,42,14,4,43,15],[4,133,107],[8,59,37,1,60,38],[8,44,20,4,45,21],[12,33,11,4,34,12],[3,145,115,1,146,116],[4,64,40,5,65,41],[11,36,16,5,37,17],[11,36,12,5,37,13],[5,109,87,1,110,88],[5,65,41,5,66,42],[5,54,24,7,55,25],[11,36,12,7,37,13],[5,122,98,1,123,99],[7,73,45,3,74,46],[15,43,19,2,44,20],[3,45,15,13,46,16],[1,135,107,5,136,108],[10,74,46,1,75,47],[1,50,22,15,51,23],[2,42,14,17,43,15],[5,150,120,1,151,121],[9,69,43,4,70,44],[17,50,22,1,51,23],[2,42,14,19,43,15],[3,141,113,4,142,114],[3,70,44,11,71,45],[17,47,21,4,48,22],[9,39,13,16,40,14],[3,135,107,5,136,108],[3,67,41,13,68,42],[15,54,24,5,55,25],[15,43,15,10,44,16],[4,144,116,4,145,117],[17,68,42],[17,50,22,6,51,23],[19,46,16,6,47,17],[2,139,111,7,140,112],[17,74,46],[7,54,24,16,55,25],[34,37,13],[4,151,121,5,152,122],[4,75,47,14,76,48],[11,54,24,14,55,25],[16,45,15,14,46,16],[6,147,117,4,148,118],[6,73,45,14,74,46],[11,54,24,16,55,25],[30,46,16,2,47,17],[8,132,106,4,133,107],[8,75,47,13,76,48],[7,54,24,22,55,25],[22,45,15,13,46,16],[10,142,114,2,143,115],[19,74,46,4,75,47],[28,50,22,6,51,23],[33,46,16,4,47,17],[8,152,122,4,153,123],[22,73,45,3,74,46],[8,53,23,26,54,24],[12,45,15,28,46,16],[3,147,117,10,148,118],[3,73,45,23,74,46],[4,54,24,31,55,25],[11,45,15,31,46,16],[7,146,116,7,147,117],[21,73,45,7,74,46],[1,53,23,37,54,24],[19,45,15,26,46,16],[5,145,115,10,146,116],[19,75,47,10,76,48],[15,54,24,25,55,25],[23,45,15,25,46,16],[13,145,115,3,146,116],[2,74,46,29,75,47],[42,54,24,1,55,25],[23,45,15,28,46,16],[17,145,115],[10,74,46,23,75,47],[10,54,24,35,55,25],[19,45,15,35,46,16],[17,145,115,1,146,116],[14,74,46,21,75,47],[29,54,24,19,55,25],[11,45,15,46,46,16],[13,145,115,6,146,116],[14,74,46,23,75,47],[44,54,24,7,55,25],[59,46,16,1,47,17],[12,151,121,7,152,122],[12,75,47,26,76,48],[39,54,24,14,55,25],[22,45,15,41,46,16],[6,151,121,14,152,122],[6,75,47,34,76,48],[46,54,24,10,55,25],[2,45,15,64,46,16],[17,152,122,4,153,123],[29,74,46,14,75,47],[49,54,24,10,55,25],[24,45,15,46,46,16],[4,152,122,18,153,123],[13,74,46,32,75,47],[48,54,24,14,55,25],[42,45,15,32,46,16],[20,147,117,4,148,118],[40,75,47,7,76,48],[43,54,24,22,55,25],[10,45,15,67,46,16],[19,148,118,6,149,119],[18,75,47,31,76,48],[34,54,24,34,55,25],[20,45,15,61,46,16]],t=function(r,t){var n={};return n.totalCount=r,n.dataCount=t,n},n={};return n.getRSBlocks=function(n,e){var o=function(t,n){switch(n){case c.L:return r[4*(t-1)+0];case c.M:return r[4*(t-1)+1];case c.Q:return r[4*(t-1)+2];case c.H:return r[4*(t-1)+3];default:return}}(n,e);if(void 0===o)throw"bad rs block @ typeNumber:"+n+"/errorCorrectionLevel:"+e;for(var u=o.length/3,a=[],f=0;f<u;f+=1)for(var i=o[3*f+0],g=o[3*f+1],h=o[3*f+2],l=0;l<i;l+=1)a.push(t(g,h));return a},n}(),C=function(){var r=[],t=0,n={getBuffer:function(){return r},getAt:function(t){var n=Math.floor(t/8);return 1==(r[n]>>>7-t%8&1)},put:function(r,t){for(var e=0;e<t;e+=1)n.putBit(1==(r>>>t-e-1&1))},getLengthInBits:function(){return t},putBit:function(n){var e=Math.floor(t/8);r.length<=e&&r.push(0),n&&(r[e]|=128>>>t%8),t+=1}};return n},D=function(r){var t=a,n=r,e={getMode:function(){return t},getLength:function(r){return n.length},write:function(r){for(var t=n,e=0;e+2<t.length;)r.put(o(t.substring(e,e+3)),10),e+=3;e<t.length&&(t.length-e==1?r.put(o(t.substring(e,e+1)),4):t.length-e==2&&r.put(o(t.substring(e,e+2)),7))}},o=function(r){for(var t=0,n=0;n<r.length;n+=1)t=10*t+u(r.charAt(n));return t},u=function(r){if("0"<=r&&r<="9")return r.charCodeAt(0)-"0".charCodeAt(0);throw"illegal char :"+r};return e},M=function(r){var t=f,n=r,e={getMode:function(){return t},getLength:function(r){return n.length},write:function(r){for(var t=n,e=0;e+1<t.length;)r.put(45*o(t.charAt(e))+o(t.charAt(e+1)),11),e+=2;e<t.length&&r.put(o(t.charAt(e)),6)}},o=function(r){if("0"<=r&&r<="9")return r.charCodeAt(0)-"0".charCodeAt(0);if("A"<=r&&r<="Z")return r.charCodeAt(0)-"A".charCodeAt(0)+10;switch(r){case" ":return 36;case"$":return 37;case"%":return 38;case"*":return 39;case"+":return 40;case"-":return 41;case".":return 42;case"/":return 43;case":":return 44;default:throw"illegal char :"+r}};return e},m=function(t){var n=i,e=r.stringToBytes(t),o={getMode:function(){return n},getLength:function(r){return e.length},write:function(r){for(var t=0;t<e.length;t+=1)r.put(e[t],8)}};return o},b=function(t){var n=g,e=r.stringToBytesFuncs.SJIS;if(!e)throw"sjis not supported.";!function(){var r=e("友");if(2!=r.length||38726!=(r[0]<<8|r[1]))throw"sjis not supported."}();var o=e(t),u={getMode:function(){return n},getLength:function(r){return~~(o.length/2)},write:function(r){for(var t=o,n=0;n+1<t.length;){var e=(255&t[n])<<8|255&t[n+1];if(33088<=e&&e<=40956)e-=33088;else{if(!(57408<=e&&e<=60351))throw"illegal char at "+(n+1)+"/"+e;e-=49472}e=192*(e>>>8&255)+(255&e),r.put(e,13),n+=2}if(n<t.length)throw"illegal char at "+(n+1)}};return u};return r}();"undefined"!=typeof window&&(window.qrcode=qrcode);
+</script>
 
 <script>
 /* ===================== sessie: 401 -> naar de login =======================
@@ -2143,8 +2228,9 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=3;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
-if(p=="3"){cfg()}}}
+for(var k=1;k<=4;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+if(p=="3"){cfg()}
+if(p=="4"){roomsLoad()}}}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -2620,9 +2706,143 @@ post3("acl","key="+encodeURIComponent(f["key"].value.trim())+
    tekst weggooit. Eén keer bij het laden -- het kanaalbudget staat op het eerste
    tabblad en moet er meteen staan -- en daarna bij het openen van het
    beheertabblad en na elke gelukte wijziging. */
+/* =============================== rooms ==================================
+   Alles praat met /rooms.json en de /room/* + /rooms/* endpoints. De QR wordt
+   client-side getekend uit de join-URI (qrcode-lib hierboven); niets verlaat deze
+   node. Op de sensor-variant geeft /rooms.json 501 -> tab blijft verborgen. */
+function rmsg(id,t,ok){var e=document.getElementById(id);if(!e)return;
+e.textContent=t||"";e.className=ok?"ok":"x";e.style.margin=t?".4rem 0":"0";
+if(t)setTimeout(function(){if(e.textContent==t)e.textContent=""},6000)}
+
+var RM=[];
+function roomsGet(){return fetch("rooms.json",{credentials:"include"})
+.then(function(r){if(r.status==401){location="/login";throw 0}
+if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
+
+/* Bij het laden: is dit een room-node? Zo ja, toon de tab. */
+function roomsProbe(){roomsGet().then(function(d){
+var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0)})
+.catch(function(){})}
+
+function roomsLoad(){roomsGet().then(function(d){
+var e=document.getElementById("rl");
+if(!d){e.innerHTML="<tr><td>Deze node kent geen rooms (sensor-variant).</td></tr>";return}
+RM=d.rooms||[];roomsRender(d)}).catch(function(){rmsg("rmsg","kon rooms niet laden",0)})}
+
+function roomsRender(d){var e=document.getElementById("rl");e.innerHTML="";
+var h=e.insertRow();["#","naam","stealth","gast","posts",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+d.rooms.forEach(function(rm){var r=e.insertRow();
+var c=r.insertCell();c.className="num";c.textContent=rm.idx;
+r.insertCell().textContent=rm.name;
+c=r.insertCell();c.textContent=rm.stealth?"aan":"–";if(rm.stealth)c.className="c-warn";
+c=r.insertCell();c.textContent=rm.guest?"ja":"nee";
+c=r.insertCell();c.className="num";c.textContent=rm.posts;
+c=r.insertCell();c.className="acts";
+var bs=document.createElement("button");bs.textContent="deel";bs.className="go";
+bs.onclick=function(){roomShare(rm)};c.appendChild(bs);
+var be=document.createElement("button");be.textContent="bewerk";
+be.onclick=function(){roomEdit(rm)};c.appendChild(be);
+if(rm.idx>0){var bd=document.createElement("button");bd.textContent="wis";
+bd.onclick=function(){roomDel(rm)};c.appendChild(bd)}})}
+
+/* ---- delen: QR + join-link ---- */
+function drawQR(uri){var qr=qrcode(0,"M");qr.addData(uri);qr.make();
+var n=qr.getModuleCount(),s=5,q=4,cv=document.getElementById("rqr");
+cv.width=cv.height=(n+q*2)*s;var g=cv.getContext("2d");
+g.fillStyle="#fff";g.fillRect(0,0,cv.width,cv.height);g.fillStyle="#000";
+for(var y=0;y<n;y+=1)for(var x=0;x<n;x+=1)if(qr.isDark(y,x))g.fillRect((x+q)*s,(y+q)*s,s,s)}
+function roomShare(rm){var p=document.getElementById("rshare");p.hidden=false;
+document.getElementById("rshare-t").textContent="Deel: "+rm.name;
+document.getElementById("rshare-uri").value=rm.uri||"";
+try{drawQR(rm.uri)}catch(e){rmsg("rmsg","QR tekenen mislukt",0)}
+p.scrollIntoView({block:"nearest"})}
+function roomShareClose(){document.getElementById("rshare").hidden=true}
+document.getElementById("rcopy").onclick=function(){
+var i=document.getElementById("rshare-uri");i.focus();i.select();
+if(navigator.clipboard&&navigator.clipboard.writeText){
+navigator.clipboard.writeText(i.value).then(function(){rmsg("rmsg","join-link gekopieerd",1)},
+function(){rmsg("rmsg","kopiëren niet gelukt — selecteer handmatig",0)})}
+else{try{document.execCommand("copy");rmsg("rmsg","join-link gekopieerd",1)}
+catch(e){rmsg("rmsg","kopiëren niet gelukt — selecteer handmatig",0)}}};
+
+/* ---- toevoegen ---- */
+document.getElementById("radd").onsubmit=function(ev){ev.preventDefault();
+var f=ev.target.elements,nm=f["name"].value.trim();if(!nm)return;
+fetch("room/add",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(nm)}).then(function(r){return r.json()})
+.then(function(j){if(j.ok){f["name"].value="";
+rmsg("raddmsg","room "+j.idx+" toegevoegd",1);roomsLoad()}
+else rmsg("raddmsg","toevoegen mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("raddmsg","toevoegen mislukt",0)})};
+
+/* ---- bewerken ---- */
+var REI=-1;
+function roomEdit(rm){REI=rm.idx;document.getElementById("redit").hidden=false;
+document.getElementById("redit-t").textContent="Bewerken: room "+rm.idx+" ("+rm.name+")";
+document.getElementById("re-name").value=rm.name;
+document.getElementById("re-pass").value="";
+document.getElementById("re-guest").value="";
+document.getElementById("re-guestclear").checked=false;
+document.getElementById("re-stealth").checked=!!rm.stealth;
+document.getElementById("redit").scrollIntoView({block:"nearest"})}
+function roomEditClose(){document.getElementById("redit").hidden=true;REI=-1}
+document.getElementById("re-save").onclick=function(){if(REI<0)return;
+var b="idx="+REI,nm=document.getElementById("re-name").value.trim(),
+pw=document.getElementById("re-pass").value,
+gv=document.getElementById("re-guest").value,
+gc=document.getElementById("re-guestclear").checked,
+st=document.getElementById("re-stealth").checked?1:0;
+if(nm)b+="&name="+encodeURIComponent(nm);
+if(pw)b+="&pass="+encodeURIComponent(pw);
+if(gc)b+="&guest=";else if(gv)b+="&guest="+encodeURIComponent(gv);
+b+="&stealth="+st;
+fetch("room/edit",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg("rmsg","room "+REI+" opgeslagen",1);roomEditClose();roomsLoad()}
+else rmsg("rmsg","opslaan mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("rmsg","opslaan mislukt",0)})};
+
+/* ---- verwijderen ---- */
+function roomDel(rm){if(rm.idx<=0)return;
+if(!confirm("Room "+rm.idx+" ('"+rm.name+"') verwijderen? De sleutel gaat verloren; "+
+"bestaande contacten en QR-codes worden ongeldig."))return;
+fetch("room/del",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"idx="+rm.idx})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){rmsg("rmsg","room "+rm.idx+" verwijderd",1);roomEditClose();roomShareClose();roomsLoad()}
+else rmsg("rmsg","verwijderen mislukt: "+(j.error||""),0)})
+.catch(function(){rmsg("rmsg","verwijderen mislukt",0)})}
+
+/* ---- backup / restore ---- */
+document.getElementById("rbackup").onclick=function(){
+fetch("rooms/backup",{credentials:"include"}).then(function(r){
+if(!r.ok)throw 0;return r.text()}).then(function(t){
+var bl=new Blob([t],{type:"application/json"}),u=URL.createObjectURL(bl),
+a=document.createElement("a");a.href=u;a.download="meshuptime-rooms-backup.json";
+document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);
+rmsg("rrmsg","backup gedownload — bewaar veilig, hij bevat de sleutels",1)})
+.catch(function(){rmsg("rrmsg","backup mislukt",0)})};
+document.getElementById("rrestore").onchange=function(ev){
+var f=ev.target.files[0];if(!f)return;var rd=new FileReader();
+rd.onload=function(){var txt=rd.result,ov=document.getElementById("rov").checked;
+if(ov)txt=txt.replace("{",'{"overwrite_main":"1",');
+if(!confirm("Rooms herstellen uit deze backup? Dit overschrijft de huidige "+
+"room-config"+(ov?" INCLUSIEF room 0 (hoofdidentiteit)":"")+".")){ev.target.value="";return}
+fetch("rooms/restore",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/json"},body:txt})
+.then(function(r){return r.json().catch(function(){return{ok:r.ok}})})
+.then(function(j){if(j.ok){rmsg("rrmsg","hersteld",1);roomsLoad()}
+else rmsg("rrmsg","restore mislukt: "+(j.error||"onbekend"),0)})
+.catch(function(){rmsg("rrmsg","restore mislukt",0)});ev.target.value=""};
+rd.readAsText(f)};
+
 u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
 cfg();
+roomsProbe();
 </script></body></html>)HTML";
 
 /* -------------------------------- opslag ---------------------------------- */
@@ -2771,6 +2991,18 @@ void WebTask::routes() {
   _server->on("/sim", HTTP_POST, web_route_sim);
   _server->on("/sim/clear", HTTP_POST, web_route_simclear);
   _server->on("/alert/test", HTTP_POST, web_route_alerttest);
+  /* Room-beheer. De leeskant (/rooms.json, /rooms/backup) is GET; alles wat een
+   * room aanmaakt, wijzigt, verwijdert of terugzet is POST -- om dezelfde reden als
+   * bij de monitors en de toegangslijst: een GET die een room wist of de config
+   * terugzet is een link die een browser of linkchecker kan volgen. /rooms/backup
+   * is een GET (het is een download en verandert niets) maar draagt sleutels, dus
+   * hij zit achter dezelfde auth. */
+  _server->on("/rooms.json", HTTP_GET, web_route_roomsjson);
+  _server->on("/room/add", HTTP_POST, web_route_roomadd);
+  _server->on("/room/edit", HTTP_POST, web_route_roomedit);
+  _server->on("/room/del", HTTP_POST, web_route_roomdel);
+  _server->on("/rooms/backup", HTTP_GET, web_route_roomsbackup);
+  _server->on("/rooms/restore", HTTP_POST, web_route_roomsrestore);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -3852,6 +4084,192 @@ void WebTask::handleAclStrict() {
     _server->send(200, "text/plain",
         "ok slot UIT; elke node op het mesh mag de sensoren uitlezen\n");
   }
+}
+
+/* ================================ room-beheer =============================
+ *
+ * Alle mutaties lopen via de IWebNode-room-API (webRoomAdd/Edit/Del/…), en die
+ * loopt in RoomMesh op zijn beurt via handleRoomCommand -- dezelfde keuring,
+ * dezelfde persistentie en dezelfde adverts als de CLI. WebTask bouwt hier dus
+ * GEEN room-logica na; het vertaalt alleen HTTP <-> die API. De join-URI wordt
+ * door de node opgebouwd (die kent de room-pubkey), niet hier.
+ *
+ * webRoomMax() == 0 betekent "deze node kent geen rooms" -- dat is de sensor-
+ * variant, die IWebNode's standaarden laat staan. Dan antwoorden we netjes met
+ * 501 i.p.v. te doen alsof er rooms zijn. */
+
+/* Kleine helper: een geheel-getal-argument uit het formulier. Geeft def terug als
+ * het ontbreekt of geen cijfer is. */
+static int getArgInt(WebServer& s, const char* name, int def) {
+  char buf[12];
+  if (!getArg(s, name, buf, sizeof(buf)) || buf[0] == 0) return def;
+  return atoi(buf);
+}
+
+/* true als deze node rooms kent EN de meshlaag gekoppeld is; anders is het
+ * antwoord al verstuurd (503/501). */
+bool WebTask::roomsAvailable() {
+  if (_acl == nullptr) {
+    _server->send(503, "text/plain", "meshlaag niet gekoppeld");
+    return false;
+  }
+  if (_acl->webRoomMax() <= 0) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"deze node kent geen rooms (sensor-variant)\"}");
+    return false;
+  }
+  return true;
+}
+
+/* GET /rooms.json -- de hele room-stand, incl. de join-URI per room. `guest` is
+ * een boolean (of er een gastwachtwoord gezet is) -- NOOIT het wachtwoord zelf. */
+void WebTask::handleRoomsJson() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  const int max = _acl->webRoomMax();
+  int n = snprintf(g_json, sizeof(g_json),
+      "{\"max\":%d,\"active\":%d,\"rooms\":[", max, _acl->webRoomActiveCount());
+
+  char esc[NB_JSON_NAME];
+  char pub[PUB_KEY_SIZE * 2 + 1];
+  char uri[200];
+  char euri[300];
+  bool first = true;
+  for (int i = 0; i < max; i++) {
+    if (!_acl->webRoomActive(i)) continue;
+    if ((size_t)n > sizeof(g_json) - 640) break;   // marge; kap niet halverwege af
+    jsonEscape(_acl->webRoomName(i), esc, sizeof(esc));
+    pub[0] = 0;  _acl->webRoomPubHex(i, pub, sizeof(pub));
+    uri[0] = 0;  _acl->webRoomJoinUri(i, uri, sizeof(uri));
+    jsonEscape(uri, euri, sizeof(euri));
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+        "%s{\"idx\":%d,\"name\":\"%s\",\"stealth\":%s,\"guest\":%s,\"posts\":%d,"
+        "\"pub\":\"%s\",\"uri\":\"%s\"}",
+        first ? "" : ",", i, esc,
+        _acl->webRoomStealth(i) ? "true" : "false",
+        _acl->webRoomHasGuest(i) ? "true" : "false",
+        _acl->webRoomPosts(i), pub, euri);
+    first = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /room/add  (name) -> {"ok":true,"idx":N,"uri":"..."} */
+void WebTask::handleRoomAdd() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  char name[24];
+  if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}");
+    return;
+  }
+  int idx = _acl->webRoomAdd(name);
+  if (idx < 0) {
+    _server->send(503, "application/json",
+        "{\"ok\":false,\"error\":\"geen vrije room-slot\"}");
+    return;
+  }
+  char uri[200] = {0};
+  _acl->webRoomJoinUri(idx, uri, sizeof(uri));
+  char euri[300]; jsonEscape(uri, euri, sizeof(euri));
+  char msg[360];
+  snprintf(msg, sizeof(msg), "{\"ok\":true,\"idx\":%d,\"uri\":\"%s\"}", idx, euri);
+  _server->send(200, "application/json", msg);
+}
+
+/* POST /room/edit  (idx, optioneel name,pass,guest,stealth=0/1) -> {"ok":true} */
+void WebTask::handleRoomEdit() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  int idx = getArgInt(*_server, "idx", -1);
+  if (idx < 0 || idx >= _acl->webRoomMax() || !_acl->webRoomActive(idx)) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige idx\"}");
+    return;
+  }
+
+  char name[24], pass[16], guest[16], st[4];
+  bool has_name  = getArg(*_server, "name",  name,  sizeof(name));
+  bool has_pass  = getArg(*_server, "pass",  pass,  sizeof(pass));
+  bool has_guest = getArg(*_server, "guest", guest, sizeof(guest));   // "" = wissen
+  bool has_st    = getArg(*_server, "stealth", st, sizeof(st));
+
+  /* name/pass alleen als niet-leeg (een lege naam of leeg beheerderswachtwoord is
+   * geen bedoeling); guest juist óók leeg toestaan, want dat wist het. */
+  const char* namep  = (has_name  && name[0])  ? name  : nullptr;
+  const char* passp  = (has_pass  && pass[0])  ? pass  : nullptr;
+  const char* guestp = has_guest ? guest : nullptr;
+  int stealth = has_st ? (st[0] == '1' ? 1 : 0) : -1;
+
+  if (!_acl->webRoomEdit(idx, namep, passp, guestp, stealth)) {
+    _server->send(503, "application/json", "{\"ok\":false,\"error\":\"bewerken mislukt\"}");
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /room/del  (idx) -> {"ok":true}. Room 0 mag niet weg. */
+void WebTask::handleRoomDel() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  int idx = getArgInt(*_server, "idx", -1);
+  if (idx <= 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"room 0 (hoofdidentiteit) kan niet weg\"}");
+    return;
+  }
+  if (!_acl->webRoomDel(idx)) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"ongeldige of inactieve room\"}");
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* GET /rooms/backup -- VOLLEDIGE room-config INCL. sleutels, als download.
+ * GEVOELIG: alleen achter auth (requireAuth). Wordt niet gelogd. */
+void WebTask::handleRoomsBackup() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  int len = _acl->webRoomsBackup(g_json, sizeof(g_json));
+  if (len <= 0) {
+    _server->send(503, "application/json",
+        "{\"ok\":false,\"error\":\"backup kon niet worden opgebouwd\"}");
+    return;
+  }
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->sendHeader("Content-Disposition",
+                      "attachment; filename=\"meshuptime-rooms-backup.json\"");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /rooms/restore  (JSON-body zoals de backup) -> {"ok":true}. Streng: alleen
+ * op de eigen backup-marker; room 0 blijft tenzij "overwrite_main":"1". */
+void WebTask::handleRoomsRestore() {
+  if (!requireAuth()) return;
+  if (!roomsAvailable()) return;
+
+  /* De ruwe body zit bij een niet-form POST in het argument "plain". We lezen hem
+   * in g_json (ruim) i.p.v. op de stapel: een backup kan ~1 kB zijn en de
+   * loop-taak deelt zijn stapel met de mesh. */
+  if (!getArg(*_server, "plain", g_json, sizeof(g_json)) || g_json[0] == 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"lege body -- stuur de backup-JSON\"}");
+    return;
+  }
+  if (!_acl->webRoomsRestore(g_json)) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"ongeldige backup (verkeerde marker of vorm)\"}");
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
 }
 
 /* ================================ nodebeheer ==============================

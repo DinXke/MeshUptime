@@ -246,6 +246,22 @@ public:
   const NeighbourList& getNeighbours() const override { return neighbours; }
   void        requestSensorReadNow() override { last_read_time = 0; }
 
+  /* ---- IWebNode: room-beheer (web-GUI). Zie IWebNode.h voor het contract. ---- */
+  int  webRoomMax() override         { return MAX_ROOMS; }
+  int  webRoomActiveCount() override { return _num_active_rooms; }
+  bool webRoomActive(int idx) override  { return isRoomActive(idx); }
+  const char* webRoomName(int idx) override { return getRoomName(idx); }
+  bool webRoomStealth(int idx) override { return (idx >= 0 && idx < MAX_ROOMS) ? rooms[idx].stealth : false; }
+  bool webRoomHasGuest(int idx) override { return (idx >= 0 && idx < MAX_ROOMS) ? (rooms[idx].guest_password[0] != 0) : false; }
+  int  webRoomPosts(int idx) override   { return (idx >= 0 && idx < MAX_ROOMS) ? (int)rooms[idx].num_posted : 0; }
+  bool webRoomPubHex(int idx, char* out, size_t out_len) override;
+  bool webRoomJoinUri(int idx, char* out, size_t out_len) override;
+  int  webRoomAdd(const char* name) override;
+  bool webRoomEdit(int idx, const char* name, const char* pass, const char* guest, int stealth) override;
+  bool webRoomDel(int idx) override;
+  int  webRoomsBackup(char* out, size_t out_len) override;
+  bool webRoomsRestore(const char* json) override;
+
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
    * informatief (alleen de `ver`-CLI leest dit); het protocol-versieveld is het

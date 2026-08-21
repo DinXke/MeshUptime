@@ -53,4 +53,44 @@ public:
   /* Buurtlijst en het naar-voren-trekken van een sensorleesronde. */
   virtual const NeighbourList& getNeighbours() const = 0;
   virtual void        requestSensorReadNow() = 0;
+
+  /* ---- ROOM-BEHEER (web-GUI) ----------------------------------------------
+   *
+   * ALLEEN de room-server (RoomMesh) heeft rooms; SensorMesh niet. Daarom staan
+   * deze methoden hier NIET als pure virtuals maar met een veilige standaard:
+   * webRoomMax()==0 betekent "deze node kent geen rooms", en dan antwoorden de
+   * /rooms*-endpoints in WebTask netjes met 'niet ondersteund'. Zo hoeft
+   * SensorMesh niets te leveren en blijft de sensor-env (de terugval) ongemoeid.
+   *
+   * De JOIN-URI en de pubkey-hex worden HIER (in de node) opgebouwd en niet in
+   * WebTask: alleen de node kent de room-identiteit (pubkey) en de room-naam. De
+   * mutaties lopen via dezelfde room-logica als de CLI (handleRoomCommand), zodat
+   * er geen tweede schrijfpad ontstaat. */
+  virtual int  webRoomMax()          { return 0; }   // 0 = geen rooms op deze node
+  virtual int  webRoomActiveCount()  { return 0; }
+  virtual bool webRoomActive(int idx)     { (void)idx; return false; }
+  virtual const char* webRoomName(int idx){ (void)idx; return ""; }
+  virtual bool webRoomStealth(int idx)    { (void)idx; return false; }
+  virtual bool webRoomHasGuest(int idx)   { (void)idx; return false; }  // NOOIT het ww zelf
+  virtual int  webRoomPosts(int idx)      { (void)idx; return 0; }
+  virtual bool webRoomPubHex(int idx, char* out, size_t out_len)
+                                          { (void)idx; (void)out; (void)out_len; return false; }
+  virtual bool webRoomJoinUri(int idx, char* out, size_t out_len)
+                                          { (void)idx; (void)out; (void)out_len; return false; }
+  /* Toevoegen: geeft de nieuwe idx terug, of -1 (vol / geweigerd). */
+  virtual int  webRoomAdd(const char* name) { (void)name; return -1; }
+  /* Bewerken: name/pass/guest == NULL laat het veld ONgewijzigd; guest=="" wist
+   * het gastwachtwoord; stealth <0 = ongewijzigd, 0/1 = uit/aan. */
+  virtual bool webRoomEdit(int idx, const char* name, const char* pass,
+                           const char* guest, int stealth)
+                                          { (void)idx; (void)name; (void)pass;
+                                            (void)guest; (void)stealth; return false; }
+  virtual bool webRoomDel(int idx)        { (void)idx; return false; }  // room 0 kan niet weg
+  /* Backup/restore van de VOLLEDIGE room-config INCL. sleutels. GEVOELIG: alleen
+   * achter auth aanroepen, niet loggen. webRoomsBackup geeft de lengte terug (0 =
+   * mislukt/te klein). */
+  virtual int  webRoomsBackup(char* out, size_t out_len)
+                                          { (void)out; (void)out_len; return 0; }
+  virtual bool webRoomsRestore(const char* json)
+                                          { (void)json; return false; }
 };

@@ -1168,6 +1168,244 @@ void RoomMesh::handleRoomCommand(char* args, char* reply) {
   strcpy(reply, "room list|add|del|stealth|set name|pass|guest");
 }
 
+/* ================================================================== */
+/*  IWebNode: room-beheer voor de web-GUI                              */
+/*                                                                     */
+/*  De MUTATIES lopen via handleRoomCommand -- dezelfde keuring, dezelfde  */
+/*  persistentie en dezelfde adverts als de CLI. De join-URI en de backup  */
+/*  worden HIER opgebouwd omdat alleen deze klasse de room-identiteiten    */
+/*  (pubkey + prv_key) kent.                                               */
+/* ================================================================== */
+
+/* URL-encode (RFC 3986 unreserved blijft; spatie -> '+'; rest -> %XX). Voor de
+ * naam in de join-URI, precies zoals de MeshCore-app hem verwacht. */
+static void roomUrlEncode(const char* in, char* out, size_t out_len) {
+  static const char hex[] = "0123456789ABCDEF";
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 4 < out_len; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
+      out[o++] = (char)c;
+    } else if (c == ' ') {
+      out[o++] = '+';
+    } else {
+      out[o++] = '%'; out[o++] = hex[c >> 4]; out[o++] = hex[c & 0x0f];
+    }
+  }
+  out[o] = 0;
+}
+
+/* JSON-escape van \ en " (en control-chars als \u00xx). Voor de backup. */
+static void roomJsonEscape(const char* in, char* out, size_t out_len) {
+  size_t o = 0;
+  for (size_t i = 0; in[i] && o + 7 < out_len; i++) {
+    unsigned char c = (unsigned char)in[i];
+    if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = (char)c; }
+    else if (c < 0x20)         { o += snprintf(out + o, out_len - o, "\\u%04x", c); }
+    else                       { out[o++] = (char)c; }
+  }
+  out[o] = 0;
+}
+
+/* Plat-JSON-veld eruit halen: zoekt "key":"value" en vult dest (met de-escape van
+ * \" en \\). Geeft true als het veld bestond. Geen JSON-lib -- zelfde aanpak als
+ * SIREN's restore, ruim genoeg voor onze eigen backup-vorm. */
+static bool roomExtractField(const char* json, const char* key, char* dest, size_t dest_len) {
+  char pat[32];
+  snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+  const char* p = strstr(json, pat);
+  dest[0] = 0;
+  if (!p) return false;
+  p += strlen(pat);
+  size_t o = 0;
+  while (*p && *p != '"' && o < dest_len - 1) {
+    if (*p == '\\' && (p[1] == '"' || p[1] == '\\')) { dest[o++] = p[1]; p += 2; }
+    else dest[o++] = *p++;
+  }
+  dest[o] = 0;
+  return true;
+}
+
+bool RoomMesh::webRoomPubHex(int idx, char* out, size_t out_len) {
+  if (idx < 0 || idx >= MAX_ROOMS || !rooms[idx].active) return false;
+  if (out_len < (size_t)(PUB_KEY_SIZE * 2 + 1)) return false;
+  mesh::Utils::toHex(out, rooms[idx].id.pub_key, PUB_KEY_SIZE);
+  return true;
+}
+
+bool RoomMesh::webRoomJoinUri(int idx, char* out, size_t out_len) {
+  if (idx < 0 || idx >= MAX_ROOMS || !rooms[idx].active) return false;
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, rooms[idx].id.pub_key, PUB_KEY_SIZE);
+  char enc[sizeof(rooms[idx].name) * 3 + 1];
+  roomUrlEncode(rooms[idx].name, enc, sizeof(enc));
+  /* type=3 = ADV_TYPE_ROOM (Room Server). Formaat uit MeshCore docs/qr_codes.md. */
+  int n = snprintf(out, out_len,
+                   "meshcore://contact/add?name=%s&public_key=%s&type=3", enc, hex);
+  return n > 0 && (size_t)n < out_len;
+}
+
+int RoomMesh::webRoomAdd(const char* name) {
+  if (!name || name[0] == 0) return -1;
+  char cmd[8 + sizeof(rooms[0].name) + 8];
+  char reply[96];
+  snprintf(cmd, sizeof(cmd), "add %s", name);
+  handleRoomCommand(cmd, reply);
+  /* add antwoordt "OK room <idx> '<naam>'"; idx eruit lezen zonder sscanf. */
+  if (strncmp(reply, "OK room ", 8) == 0) {
+    int idx = atoi(reply + 8);
+    if (idx > 0 && idx < MAX_ROOMS) return idx;
+  }
+  return -1;
+}
+
+bool RoomMesh::webRoomEdit(int idx, const char* name, const char* pass,
+                           const char* guest, int stealth) {
+  if (idx < 0 || idx >= MAX_ROOMS || !rooms[idx].active) return false;
+  char cmd[16 + 64];
+  char reply[96];
+  if (name && name[0]) {
+    snprintf(cmd, sizeof(cmd), "set name %d %s", idx, name);
+    handleRoomCommand(cmd, reply);
+  }
+  if (pass && pass[0]) {
+    snprintf(cmd, sizeof(cmd), "set pass %d %s", idx, pass);
+    handleRoomCommand(cmd, reply);
+  }
+  if (guest) {   // ook lege string: wist het gastwachtwoord
+    snprintf(cmd, sizeof(cmd), "set guest %d %s", idx, guest);
+    handleRoomCommand(cmd, reply);
+  }
+  if (stealth >= 0) {
+    snprintf(cmd, sizeof(cmd), "stealth %d %s", idx, stealth ? "on" : "off");
+    handleRoomCommand(cmd, reply);
+  }
+  return true;
+}
+
+bool RoomMesh::webRoomDel(int idx) {
+  if (idx <= 0 || idx >= MAX_ROOMS || !rooms[idx].active) return false;   // room 0 blijft
+  char cmd[16];
+  char reply[96];
+  snprintf(cmd, sizeof(cmd), "del %d", idx);
+  handleRoomCommand(cmd, reply);
+  return strncmp(reply, "OK", 2) == 0;
+}
+
+/* Backup: platte JSON met de VOLLEDIGE room-config INCL. identiteiten (prv+pub,
+ * 96 byte -> 192 hex). GEVOELIG. Geeft de geschreven lengte terug, of 0. */
+int RoomMesh::webRoomsBackup(char* out, size_t out_len) {
+  if (!out || out_len < 128) return 0;
+  int n = snprintf(out, out_len,
+      "{\"type\":\"meshuptime-rooms-backup\",\"version\":1,\"max\":%d", MAX_ROOMS);
+  char nesc[sizeof(rooms[0].name) * 6 + 1];
+  char pesc[sizeof(rooms[0].password) * 6 + 1];
+  char gesc[sizeof(rooms[0].guest_password) * 6 + 1];
+  uint8_t idbuf[PRV_KEY_SIZE + PUB_KEY_SIZE];
+  char    idhex[(PRV_KEY_SIZE + PUB_KEY_SIZE) * 2 + 1];
+  for (int i = 0; i < MAX_ROOMS; i++) {
+    if ((size_t)n > out_len - 512) return 0;   // te krap -> weiger i.p.v. afkappen
+    if (!rooms[i].active) {
+      n += snprintf(out + n, out_len - n, ",\"room%d_active\":\"0\"", i);
+      continue;
+    }
+    roomJsonEscape(rooms[i].name, nesc, sizeof(nesc));
+    roomJsonEscape(rooms[i].password, pesc, sizeof(pesc));
+    roomJsonEscape(rooms[i].guest_password, gesc, sizeof(gesc));
+    size_t idn = rooms[i].id.writeTo(idbuf, sizeof(idbuf));   // prv||pub = 96 byte
+    mesh::Utils::toHex(idhex, idbuf, idn);
+    n += snprintf(out + n, out_len - n,
+        ",\"room%d_active\":\"1\",\"room%d_name\":\"%s\",\"room%d_stealth\":\"%d\","
+        "\"room%d_guest\":\"%s\",\"room%d_pass\":\"%s\",\"room%d_id\":\"%s\"",
+        i, i, nesc, i, rooms[i].stealth ? 1 : 0, i, gesc, i, pesc, i, idhex);
+  }
+  n += snprintf(out + n, out_len - n, "}");
+  memset(idbuf, 0, sizeof(idbuf));   // sleutelmateriaal van de stapel vegen
+  return ((size_t)n < out_len) ? n : 0;
+}
+
+/* Restore: parse de platte backup-JSON en herstel de rooms INCL. identiteiten.
+ * Streng: alleen op de eigen backup-marker. Room 0 (hoofdidentiteit) wordt NIET
+ * overschreven tenzij "overwrite_main":"1" in de JSON staat. */
+bool RoomMesh::webRoomsRestore(const char* json) {
+  if (!json || !strstr(json, "\"meshuptime-rooms-backup\"")) return false;
+
+  char ovr[4] = {0};
+  roomExtractField(json, "overwrite_main", ovr, sizeof(ovr));
+  bool allow_main = (ovr[0] == '1');
+
+  for (int i = 0; i < MAX_ROOMS; i++) {
+    char key[20];
+    char active[4] = {0};
+    snprintf(key, sizeof(key), "room%d_active", i);
+    roomExtractField(json, key, active, sizeof(active));
+    bool want = (active[0] == '1');
+
+    if (!want) {
+      if (i > 0 && rooms[i].active) {
+        rooms[i].active = false;
+        _num_active_rooms--;
+        for (int k = 0; k < MAX_TOTAL_POSTS; k++)
+          if (_post_pool[k].room_idx == i) { memset(&_post_pool[k], 0, sizeof(PostInfo)); _post_pool[k].room_idx = 0xFF; }
+      }
+      continue;
+    }
+
+    if (!rooms[i].active) { rooms[i].active = true; _num_active_rooms++; }
+
+    char name[sizeof(rooms[0].name)]           = {0};
+    char pass[sizeof(rooms[0].password)]       = {0};
+    char guest[sizeof(rooms[0].guest_password)]= {0};
+    char st[4]      = {0};
+    char idhex[(PRV_KEY_SIZE + PUB_KEY_SIZE) * 2 + 1] = {0};
+
+    snprintf(key, sizeof(key), "room%d_name", i);
+    if (roomExtractField(json, key, name, sizeof(name)) && name[0]) {
+      StrHelper::strncpy(rooms[i].name, name, sizeof(rooms[i].name));
+      /* Room 0's naam is ook de node-naam (NodePrefs) -- gelijk houden, net als
+       * de CLI 'set name 0' doet, anders liegt 'ver'/de UI na een restore. */
+      if (i == 0) StrHelper::strncpy(_prefs.node_name, name, sizeof(_prefs.node_name));
+    }
+    snprintf(key, sizeof(key), "room%d_pass", i);
+    if (roomExtractField(json, key, pass, sizeof(pass)) && pass[0]) {
+      StrHelper::strncpy(rooms[i].password, pass, sizeof(rooms[i].password));
+      if (i == 0) StrHelper::strncpy(_prefs.password, pass, sizeof(_prefs.password));
+    }
+    snprintf(key, sizeof(key), "room%d_guest", i);
+    if (roomExtractField(json, key, guest, sizeof(guest)))
+      StrHelper::strncpy(rooms[i].guest_password, guest, sizeof(rooms[i].guest_password));
+    snprintf(key, sizeof(key), "room%d_stealth", i);
+    if (roomExtractField(json, key, st, sizeof(st)))
+      rooms[i].stealth = (st[0] == '1');
+
+    /* Identiteit (96 byte). Room 0 alleen met expliciete toestemming. */
+    snprintf(key, sizeof(key), "room%d_id", i);
+    bool have_id = roomExtractField(json, key, idhex, sizeof(idhex));
+    size_t want_hex = (PRV_KEY_SIZE + PUB_KEY_SIZE) * 2;
+    if (have_id && strlen(idhex) == want_hex && (i > 0 || allow_main)) {
+      uint8_t idbuf[PRV_KEY_SIZE + PUB_KEY_SIZE];
+      if (mesh::Utils::fromHex(idbuf, sizeof(idbuf), idhex)) {
+        rooms[i].id.readFrom(idbuf, sizeof(idbuf));
+        if (i == 0) saveIdentity(rooms[0].id);   // persisteert naar "_main"
+        else        saveRoomIdentity(i);
+      }
+      memset(idbuf, 0, sizeof(idbuf));
+    } else if (i > 0) {
+      /* Actieve room zonder (geldige) sleutel in de backup: zorg dat hij er een
+       * heeft, anders kan hij niet ondertekenen/adverteren. */
+      loadOrCreateRoomIdentity(i);
+    }
+    memset(idhex, 0, sizeof(idhex));
+  }
+
+  saveRoomConfig();
+  savePrefs();   // room 0's naam/wachtwoord kan naar NodePrefs zijn geschreven
+  updateAdvertTimer();
+  updateFloodAdvertTimer();
+  return true;
+}
+
 /* ------------------------------------------------------------------ */
 /*  ACL-helpers (IWebNode)                                              */
 /* ------------------------------------------------------------------ */
