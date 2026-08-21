@@ -156,4 +156,18 @@ public:
   virtual int  webBotSendTo(const char* pub_hex, const char* text) { (void)pub_hex; (void)text; return -1; }
   /* DM de HELE ontvangerslijst. Retour = aantal ontvangers aangeschreven, <0 fout. */
   virtual int  webBotPost(const char* text) { (void)text; return -1; }
+
+  /* ---- HASHTAG-/PUBLIEKE KANALEN (web-GUI) ----------------------------------
+   * De bot leest de ingeschakelde kanalen mee en antwoordt IN het kanaal op
+   * ping/test/path. Alleen de room-server implementeert dit. Het kanaal-SECRET
+   * wordt nooit teruggegeven (schrijf-alleen, zoals een wachtwoord). */
+  virtual int  webChannelMax()   { return 0; }
+  virtual int  webChannelCount() { return 0; }
+  virtual bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex)
+                                 { (void)i; (void)name; (void)name_len; (void)bits; (void)enabled; (void)hashhex; return false; }
+  /* Toevoegen/bijwerken op naam; secret_hex = 32 of 64 hex. 0 ok, <0 fout. */
+  virtual int  webChannelAdd(const char* name, const char* secret_hex, int enabled)
+                                 { (void)name; (void)secret_hex; (void)enabled; return -1; }
+  virtual int  webChannelDel(const char* name)          { (void)name; return -1; }
+  virtual int  webChannelToggle(const char* name, int enabled) { (void)name; (void)enabled; return -1; }
 };

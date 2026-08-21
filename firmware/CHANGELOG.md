@@ -7,6 +7,29 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.0 — hashtag-kanalen + grote contactenlijst (naamresolutie)
+
+- **Hashtag-/publieke kanalen**: de bot leest de ingeschakelde MeshCore
+  group-channels mee en antwoordt IN het kanaal op `ping` (Pong), `test`
+  (signaalrapport: SNR/RSSI/hops) en `path` (route met repeaternamen). Een kanaal
+  is een gedeeld secret (32 hex = 128-bit of 64 hex = 256-bit); de kanaal-hash =
+  eerste byte van `sha256(secret)` — exact het MeshCore-formaat. Beheer via de
+  web-GUI (bot-tab: toevoegen/aan-uit/wissen); persistent in `/channels.cfg`. Het
+  secret is schrijf-alleen (nooit teruggetoond). `searchChannelsByHash`/
+  `onGroupDataRecv` overrides; antwoord geflood via `createGroupDatagram`.
+- **Grote advert-/contactlijst** voor NAAMRESOLUTIE: de `NeighbourList` groeide van
+  12 naar **200** ingangen (pubkey + naam + adv-type + snr/hops/laatst-gehoord),
+  LRU op laatst-gehoord. ~13,6 kB RAM (de bewuste ruil). RAM-only: adverts komen
+  te vaak voor per-advert-flashschrijven; na een herstart stromen de namen binnen
+  minuten vanzelf weer binnen. Gebruikt voor ALLE naamresolutie: de `path`-
+  repeaternamen, de DM-afzendernaam en het `/contacts.json`-lijstje (weergave
+  gekapt op NB_JSON_MAX=64; de lijst zelf blijft groot voor resolutie).
+- **Kanaal-afzendernaam inline**: een group-bericht draagt de afzendernaam IN het
+  bericht (`"<naam>: <tekst>"`, zoals de MeshCore-app) — géén pubkey. De bot
+  gebruikt die naam direct; zo tonen we ook namen van afzenders wier advert we
+  nooit los hoorden. Resolutievolgorde: (a) naam uit het bericht (kanaal), (b) de
+  grote advert-/contactlijst (path/DM), (c) hex-pubkey-prefix als laatste terugval.
+
 ## v2.2.2 — NTP/tijdzone instelbaar + lokale tijd + path-repeaters
 
 - **NTP-server + tijdzone via de web-GUI** (paneel *Tijd*, `/time.cfg`, POST `/time`):

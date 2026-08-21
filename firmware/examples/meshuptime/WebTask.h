@@ -246,6 +246,7 @@ private:
    * kent rooms. Verstuurt zelf het 503/501-antwoord en geeft dan false. */
   bool roomsAvailable();
   bool botAvailable();
+  bool channelsAvailable();
 
   /* VIRTUELE SENSOR-NODES. Symmetrisch met /room/add|edit|del; de lijst zit in
    * /rooms.json (aparte "snodes"-array), backup/restore loopt mee met /rooms/*. */
@@ -284,6 +285,12 @@ private:
   void handleBotAdvert();
   void handleBotSendto();
   void handleBotPost();
+
+  /* Hashtag-/publieke kanalen: /channels.json (GET), /channel/add|del|toggle (POST). */
+  void handleChannelsJson();
+  void handleChannelAdd();
+  void handleChannelDel();
+  void handleChannelToggle();
 
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
@@ -338,6 +345,10 @@ private:
   friend void web_route_botadvert();
   friend void web_route_botsendto();
   friend void web_route_botpost();
+  friend void web_route_channelsjson();
+  friend void web_route_channeladd();
+  friend void web_route_channeldel();
+  friend void web_route_channeltoggle();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

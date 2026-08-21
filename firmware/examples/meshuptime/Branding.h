@@ -20,11 +20,14 @@
  *   v2.2.2 = NTP-server + tijdzone instelbaar (web-GUI), menselijke tijden lokaal
  *            (CET/CEST), protocol/RTC blijven UTC; bot-`path` toont de
  *            tussenliggende repeaters met naam.
+ *   v2.3.0 = hashtag-/publieke kanalen (de bot leest mee + antwoordt op
+ *            ping/test/path), grote advert-/contactlijst (naamresolutie overal),
+ *            kanaal-afzendernaam inline uit het bericht.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.2.2"
+  #define MESHUPTIME_VERSION   "v2.3.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

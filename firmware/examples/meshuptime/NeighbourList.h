@@ -11,26 +11,32 @@
  * nieuwe ingang "log eerst met het beheerderswachtwoord in". Deze lijst maakt
  * van dat probleem een keuzelijstje.
  *
- * NIET IN SPIFFS, EN DAT IS DE HELE REDEN DAT DEZE KLASSE ZO KLEIN IS. Wat hier
- * staat is een bewering over het HEDEN: "deze node was net te horen". Een
- * bewaarde versie zou na een herstart beweren dat een node in de buurt is die er
- * al een week niet meer is, en dat is erger dan een lege lijst -- een lege lijst
- * liegt niet. Daar komt bij dat elke schrijfactie flash kost en dat adverts met
- * tientallen per uur langskomen.
+ * TWEE DOELEN, en dat verklaart de GROOTTE (v2.3.0). (1) "Wie is er nu?" voor de
+ * toegangslijst-kiezer, en (2) NAAMRESOLUTIE pubkey->naam voor de bot-`path`
+ * (repeaternamen), de DM-afzendernaam en de kanaal-diagnose. De MeshCore-app toont
+ * overal meteen namen omdat zij een GROTE contactdatabase bijhoudt (naam uit elk
+ * gehoord advert); een kleine lijst liet ons terugvallen op de hex-pubkey. Daarom
+ * is de capaciteit nu fors: elke gehoorde node onthouden we met pubkey + naam.
+ *
+ * RAM I.P.V. FLASH, bewust. Adverts komen met tientallen per uur langs; per advert
+ * naar flash schrijven zou de flash verslijten (dat was de oorspronkelijke reden
+ * om NIET te bewaren). Een periodieke snapshot zou kunnen, maar de namen stromen
+ * na een herstart binnen enkele minuten vanzelf weer binnen zodra de adverts
+ * langskomen -- de kost (code + flash-slijtage) weegt niet op tegen die paar
+ * minuten. Zie het eindrapport; blijft een afweging die later kan kantelen.
  *
  * AFWIJKING VAN "RING", met opzet: een strikte FIFO-ring zou dezelfde node bij
- * elk advert opnieuw opnemen en na twaalf adverts van één drukke buur zou de
- * lijst twaalf keer diezelfde buur zijn. Hier wordt op publieke sleutel
- * SAMENGEVOEGD (naam, signaal en tijd worden bijgewerkt, de teller loopt op) en
- * bij een volle lijst valt de LANGST NIET GEHOORDE ingang eruit. Dat is wat een
- * ring hier moet doen: twaalf verschillende buren tonen, niet twaalf adverts.
+ * elk advert opnieuw opnemen. Hier wordt op publieke sleutel SAMENGEVOEGD (naam,
+ * signaal en tijd bijgewerkt, teller op) en bij een volle lijst valt de LANGST
+ * NIET GEHOORDE ingang eruit (LRU op laatst-gehoord). Zo tonen we verschillende
+ * nodes, niet dezelfde advert-storm.
  *
  * Statisch: één vast blok van MAX_NEIGHBOURS ingangen, geen new, geen malloc,
- * geen String. Kost ongeveer 12 x 68 = 816 byte RAM.
+ * geen String. Bij 200 x 68 byte ~= 13,6 kB RAM (de bewuste ruil voor namen).
  */
 
 #ifndef MAX_NEIGHBOURS
-  #define MAX_NEIGHBOURS  12
+  #define MAX_NEIGHBOURS  200
 #endif
 
 /* 24 en niet 32: een advert is hoogstens MAX_ADVERT_DATA_SIZE (32) byte en

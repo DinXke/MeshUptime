@@ -47,6 +47,7 @@
 /* Bot: identiteit via IdentityStore ("/bot_id"); de DM-ontvangerslijst als tekst. */
 #define BOT_ID_NAME      "/bot_id"
 #define BOT_RECIPS_PATH  "/bot_recips"
+#define CHANNELS_CFG_PATH "/channels.cfg"
 /* Eigenaar-seed: de lijst begint met deze pubkey op een verse node. */
 #define BOT_OWNER_SEED_HEX  "2cb0c5eb473757805eab00f9dd0594c229d6e50b2acec6b57403b6259c9e126f"
 
@@ -102,6 +103,7 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   memset(_bot_recips, 0, sizeof(_bot_recips));
   _active_is_bot = false;
   _bot_match_n = 0;
+  memset(_channels, 0, sizeof(_channels));
 
   memset(rooms, 0, sizeof(rooms));
   for (int i = 0; i < MAX_ROOMS; i++) {
@@ -226,6 +228,9 @@ void RoomMesh::begin(FILESYSTEM* fs) {
     if (mesh::Utils::fromHex(seed, PUB_KEY_SIZE, BOT_OWNER_SEED_HEX)) botRecipAdd(seed);
     saveBotRecips();
   }
+
+  /* Hashtag-/publieke kanalen die de bot meeleest (persistent, /channels.cfg). */
+  loadChannels();
 
   /* Alleen room 0's ACL wordt bewaard (in het bestaande contacts-bestand); de
    * ACL's van de extra rooms en de sensor-nodes leven in RAM en worden opnieuw
@@ -1824,6 +1829,266 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   mesh::Identity dest(sender_pub);
   mesh::Packet* rpkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, dest, secret, out, 5 + rlen);
   if (rpkt) sendFloodScoped(default_scope, rpkt, TXT_ACK_DELAY + SERVER_RESPONSE_DELAY, _prefs.path_hash_mode + 1);
+}
+
+/* ================================================================== */
+/*  Hashtag-/publieke kanalen: de bot leest mee en antwoordt          */
+/* ================================================================== */
+
+void RoomMesh::channelComputeHash(BotChannel& c) {
+  /* Het MeshCore group-channel-formaat: de kanaal-hash = eerste byte van
+   * sha256(secret, secret_len). 16-byte (128-bit) of 32-byte (256-bit) sleutel. */
+  mesh::Utils::sha256(&c.hash, 1, c.secret, c.secret_len);
+}
+
+int RoomMesh::channelFindByName(const char* name) const {
+  if (!name) return -1;
+  for (int i = 0; i < MAX_CHANNELS; i++)
+    if (_channels[i].used && strcasecmp(_channels[i].name, name) == 0) return i;
+  return -1;
+}
+
+int RoomMesh::channelCount() const {
+  int n = 0;
+  for (int i = 0; i < MAX_CHANNELS; i++) if (_channels[i].used) n++;
+  return n;
+}
+
+bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash) const {
+  int n = 0;
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (!_channels[i].used) continue;
+    if (n == idx) {
+      if (out_name) StrHelper::strncpy(out_name, _channels[i].name, 24);
+      if (out_bits) *out_bits = _channels[i].secret_len * 8;
+      if (out_enabled) *out_enabled = _channels[i].enabled;
+      if (out_hash) *out_hash = _channels[i].hash;
+      return true;
+    }
+    n++;
+  }
+  return false;
+}
+
+/* IWebNode-brug: naam + bits + enabled + hash-hex (nooit het secret). */
+bool RoomMesh::webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex) {
+  uint8_t h = 0;
+  char nm[24];
+  if (!channelGet(i, nm, bits, enabled, &h)) return false;
+  if (name && name_len) StrHelper::strncpy(name, nm, name_len);
+  if (hashhex) { mesh::Utils::toHex(hashhex, &h, 1); hashhex[2] = 0; }
+  return true;
+}
+
+/* Toevoegen/bijwerken op NAAM. secret_hex = 32 (128-bit) of 64 (256-bit) hextekens. */
+int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled) {
+  if (!name || name[0] == 0 || !secret_hex) return -2;
+  int hexlen = (int)strlen(secret_hex);
+  if (hexlen != 32 && hexlen != 64) return -2;         // 128- of 256-bit
+  uint8_t secret[PUB_KEY_SIZE];
+  memset(secret, 0, sizeof(secret));
+  if (!mesh::Utils::fromHex(secret, hexlen / 2, secret_hex)) return -2;
+
+  int idx = channelFindByName(name);                   // bijwerken?
+  if (idx < 0) {
+    for (int i = 0; i < MAX_CHANNELS; i++) if (!_channels[i].used) { idx = i; break; }
+    if (idx < 0) return -3;                             // vol
+  }
+  BotChannel& c = _channels[idx];
+  memset(&c, 0, sizeof(c));
+  c.used = true;
+  c.enabled = enabled;
+  StrHelper::strncpy(c.name, name, sizeof(c.name));
+  memcpy(c.secret, secret, PUB_KEY_SIZE);
+  c.secret_len = (uint8_t)(hexlen / 2);
+  channelComputeHash(c);
+  saveChannels();
+  return 0;
+}
+
+int RoomMesh::channelDel(const char* name) {
+  int idx = channelFindByName(name);
+  if (idx < 0) return -2;
+  memset(&_channels[idx], 0, sizeof(_channels[idx]));
+  saveChannels();
+  return 1;
+}
+
+int RoomMesh::channelSetEnabled(const char* name, bool en) {
+  int idx = channelFindByName(name);
+  if (idx < 0) return -2;
+  _channels[idx].enabled = en;
+  saveChannels();
+  return 1;
+}
+
+/* Persistentie: één regel per kanaal  ->  c <enabled> <secrethex> <naam>
+ * (naam als rest van de regel zodat spaties mogen; secret als hex). */
+void RoomMesh::saveChannels() {
+  if (_fs == NULL) return;
+  File f = _fs->open(CHANNELS_CFG_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUCHAN1\n");
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (!_channels[i].used) continue;
+    mesh::Utils::toHex(hex, _channels[i].secret, _channels[i].secret_len);
+    hex[_channels[i].secret_len * 2] = 0;
+    f.printf("c %d %s %s\n", _channels[i].enabled ? 1 : 0, hex, _channels[i].name);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadChannels() {
+  memset(_channels, 0, sizeof(_channels));
+  if (_fs == NULL || !_fs->exists(CHANNELS_CFG_PATH)) return;
+  File f = _fs->open(CHANNELS_CFG_PATH, "r");
+  if (!f) return;
+  char line[160];
+  bool first = true;
+  int ci = 0;
+  while (f.available() && ci < MAX_CHANNELS) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int ch = f.read();
+      if (ch < 0 || ch == '\n') break;
+      if (ch == '\r') continue;
+      line[len++] = (char)ch;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'c') continue;
+    // c <enabled> <secrethex> <naam>
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    int en = atoi(p);   while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    char* hex = p;      while (*p && *p != ' ') p++; if (*p) { *p = 0; p++; } while (*p == ' ') p++;
+    char* name = p;
+    int hexlen = (int)strlen(hex);
+    if ((hexlen != 32 && hexlen != 64) || name[0] == 0) continue;
+    BotChannel& c = _channels[ci];
+    memset(&c, 0, sizeof(c));
+    if (!mesh::Utils::fromHex(c.secret, hexlen / 2, hex)) continue;
+    c.secret_len = (uint8_t)(hexlen / 2);
+    c.enabled = en ? true : false;
+    c.used = true;
+    StrHelper::strncpy(c.name, name, sizeof(c.name));
+    channelComputeHash(c);
+    ci++;
+  }
+  f.close();
+}
+
+/* De basisklasse zoekt bij een inkomend group-pakket de kanalen met deze hash;
+ * wij leveren de INGESCHAKELDE kanalen die matchen, met hun secret zodat de
+ * basisklasse kan ontsleutelen. */
+int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
+  int n = 0;
+  for (int i = 0; i < MAX_CHANNELS && n < max_matches; i++) {
+    if (!_channels[i].used || !_channels[i].enabled) continue;
+    if (_channels[i].hash != hash[0]) continue;
+    channels[n].hash[0] = _channels[i].hash;
+    memcpy(channels[n].secret, _channels[i].secret, PUB_KEY_SIZE);
+    n++;
+  }
+  return n;
+}
+
+/* Een ontsleutelde group-tekst. Formaat: [ts:4][txt_type:1]["<afzender>: <bericht>"].
+ * We knippen de "<afzender>: "-prefix eraf, herkennen ping/test/path en antwoorden
+ * IN het kanaal (met de afzendernaam erbij). */
+void RoomMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel,
+                               uint8_t* data, size_t len) {
+  if (type != PAYLOAD_TYPE_GRP_TXT || len < 6) return;
+  if ((data[4] >> 2) != 0) return;         // alleen TXT_TYPE_PLAIN
+  data[len] = 0;
+  handleChannelText(packet, channel, (const char*)&data[5]);
+}
+
+void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel& channel, const char* text) {
+  /* "<afzender>: <bericht>" -> afzender + bericht scheiden op de EERSTE ": ". */
+  char sender[24]; sender[0] = 0;
+  const char* msg = text;
+  const char* sep = strstr(text, ": ");
+  if (sep) {
+    int sl = (int)(sep - text); if (sl > (int)sizeof(sender) - 1) sl = sizeof(sender) - 1;
+    memcpy(sender, text, sl); sender[sl] = 0;
+    msg = sep + 2;
+  }
+  while (*msg == ' ') msg++;
+
+  /* Niet op onszelf reageren (de bot post ook onder _bot_name). */
+  if (sender[0] && strcasecmp(sender, _bot_name) == 0) return;
+
+  /* Alleen op een KAAL commando reageren (ping/test/path), evt. met een leading '#'
+   * of '!' dat sommige clients toevoegen. Zo blijft het kanaal niet vollopen. */
+  const char* v = msg;
+  if (*v == '#' || *v == '!' || *v == '/') v++;
+  char verb[8]; int vi = 0;
+  while (v[vi] && v[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = v[vi]; vi++; }
+  verb[vi] = 0;
+
+  bool is_ping = !strcasecmp(verb, "ping");
+  bool is_test = !strcasecmp(verb, "test");
+  bool is_path = !strcasecmp(verb, "path");
+  if (!(is_ping || is_test || is_path)) return;   // geen bot-commando; negeren
+
+  uint32_t now_s = getRTCClock()->getCurrentTime();
+  char rxt[40]; fmtLocalHMS(now_s, rxt, sizeof(rxt));
+  float snr_db = ((float)packet->_snr) / 4.0f;
+  int rssi = (int)radio_driver.getLastRSSI();
+  int nhops = (int)packet->getPathHashCount();
+
+  static char reply[200];
+  const char* who = sender[0] ? sender : "?";
+
+  if (is_ping) {
+    snprintf(reply, sizeof(reply), "@%s Pong (%s)", who, rxt);
+  } else if (is_test) {
+    /* Signaalrapport: "ik hoor je" met SNR/RSSI/hops. */
+    snprintf(reply, sizeof(reply), "@%s gehoord \xE2\x9C\x93 SNR %.1f dB, RSSI %d dBm, %d hops (%s)",
+             who, snr_db, rssi, nhops, rxt);
+  } else {   // path: route met repeater-namen (zelfde als de DM-path)
+    uint8_t hsize = packet->getPathHashSize(); if (hsize == 0) hsize = 1;
+    char route[80]; int ro = 0; route[0] = 0;
+    for (int h = 0; h < nhops; h++) {
+      if (ro > 50) { ro += snprintf(route + ro, sizeof(route) - ro, "%s\xE2\x80\xA6", h ? " > " : ""); break; }
+      const uint8_t* hh = &packet->path[h * hsize];
+      const char* rn = NULL;
+      for (int k = 0; k < neighbours.getNumEntries(); k++) {
+        const NeighbourEntry* e = neighbours.getEntryByIdx(k);
+        if (e && memcmp(e->pub_key, hh, hsize) == 0 && e->name[0]) { rn = e->name; break; }
+      }
+      char hn[18];
+      if (rn) StrHelper::strncpy(hn, rn, sizeof(hn));
+      else { int nb = hsize > 4 ? 4 : hsize; char hx[9]; mesh::Utils::toHex(hx, hh, nb); hx[nb*2]=0; StrHelper::strncpy(hn, hx, sizeof(hn)); }
+      ro += snprintf(route + ro, sizeof(route) - ro, "%s[%s]", h ? " > " : "", hn);
+    }
+    if (nhops == 0)
+      snprintf(reply, sizeof(reply), "@%s direct | SNR %.1f dB | RSSI %d dBm | %s", who, snr_db, rssi, rxt);
+    else
+      snprintf(reply, sizeof(reply), "@%s via %s (%d hops) | SNR %.1f dB | RSSI %d dBm | %s",
+               who, route, nhops, snr_db, rssi, rxt);
+  }
+
+  sendChannelReply(channel, reply);
+}
+
+/* "<botnaam>: <reply>" bouwen en IN het kanaal versturen (geflood). */
+void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* reply) {
+  static uint8_t temp[MAX_PACKET_PAYLOAD];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &ts, 4);
+  temp[4] = 0;   // TXT_TYPE_PLAIN
+  int off = 5 + snprintf((char*)&temp[5], MAX_PACKET_PAYLOAD - 6, "%s: %s",
+                         _bot_name[0] ? _bot_name : "bot", reply);
+  if (off > MAX_PACKET_PAYLOAD - 1) off = MAX_PACKET_PAYLOAD - 1;
+  /* self_id op de hoofdidentiteit (group-pakketten worden niet met self_id
+   * ondertekend, maar houd de dispatch-toestand netjes). */
+  mesh::GroupChannel ch = channel;   // niet-const kopie voor de API
+  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
+  if (pkt) sendFloodScoped(default_scope, pkt, SERVER_RESPONSE_DELAY, _prefs.path_hash_mode + 1);
 }
 
 /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Enqueue als een

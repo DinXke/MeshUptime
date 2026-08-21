@@ -145,6 +145,13 @@
   #define BOT_NAME_DEFAULT   "BE-HSS-DinX-Bot"
 #endif
 
+/* HASHTAG-/PUBLIEKE KANALEN die de bot meeleest. Een MeshCore group-channel is een
+ * gedeeld geheim (16 of 32 byte); de kanaal-hash = eerste byte van sha256(secret).
+ * De bot antwoordt IN het kanaal op ping/test/path. Bescheiden aantal i.v.m. RAM. */
+#ifndef MAX_CHANNELS
+  #define MAX_CHANNELS  8
+#endif
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -254,6 +261,18 @@ struct AlertTask {
 struct BotRecip {
   uint8_t pub_key[PUB_KEY_SIZE];
   uint8_t level;               // 0 = vrije ingang; >=1 = actief
+};
+
+/* Eén hashtag-/publiek kanaal dat de bot meeleest. secret = het gedeelde
+ * kanaalgeheim (16 of 32 byte); hash = eerste byte van sha256(secret, secret_len)
+ * (het MeshCore group-channel-formaat). used=false is een vrije ingang. */
+struct BotChannel {
+  char    name[24];
+  uint8_t secret[PUB_KEY_SIZE];   // 16- of 32-byte sleutel (rest 0)
+  uint8_t secret_len;             // 16 of 32
+  uint8_t hash;                   // sha256(secret, secret_len)[0]
+  bool    used;
+  bool    enabled;                // meelezen/antwoorden aan/uit
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
@@ -380,6 +399,16 @@ public:
   int         webBotSendTo(const char* pub_hex, const char* text) override;
   int         webBotPost(const char* text) override { return botPost(text); }
 
+  /* ---- IWebNode: hashtag-/publieke kanalen ---- */
+  int  webChannelMax() override   { return channelMax(); }
+  int  webChannelCount() override { return channelCount(); }
+  bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex) override;
+  int  webChannelAdd(const char* name, const char* secret_hex, int enabled) override {
+    return channelAdd(name, secret_hex, enabled != 0);
+  }
+  int  webChannelDel(const char* name) override    { return channelDel(name); }
+  int  webChannelToggle(const char* name, int enabled) override { return channelSetEnabled(name, enabled != 0); }
+
   /* ---- Bot: publieke API (CLI + intern) ---- */
   bool botActive() const { return _bot_active; }
   int  botRecipCount() const;
@@ -388,6 +417,19 @@ public:
   int  botRecipDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet gevonden, -3 dubbelzinnig
   int  botSendTo(const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
   int  botPost(const char* text);                              // aantal aangeschreven, <0 fout
+
+  /* ---- Hashtag-/publieke kanalen: publieke API (CLI + web) ---- */
+  int  channelMax() const { return MAX_CHANNELS; }
+  int  channelCount() const;
+  /* Op index (over de GEBRUIKTE ingangen). out_name >= 24. Geeft naam, sleutellengte
+   * in bits (128/256), enabled en de kanaal-hash. Het SECRET wordt NOOIT
+   * teruggegeven (schrijf-alleen, zoals een wachtwoord). false = geen ingang. */
+  bool channelGet(int i, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash) const;
+  /* Toevoegen/bijwerken op NAAM. secret_hex = 32 of 64 hextekens (128/256-bit).
+   * 0 ok, -2 ongeldige naam/secret, -3 vol. */
+  int  channelAdd(const char* name, const char* secret_hex, bool enabled);
+  int  channelDel(const char* name);                 // 1 ok, -2 niet gevonden
+  int  channelSetEnabled(const char* name, bool en); // 1 ok, -2 niet gevonden
 
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
@@ -440,6 +482,9 @@ protected:
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onAckRecv(mesh::Packet* packet, uint32_t ack_crc) override;
+  /* Hashtag-/publieke kanalen: de bot leest mee en antwoordt op ping/test/path. */
+  int  searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
 
   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 
@@ -494,6 +539,9 @@ private:
    * getPeerSharedSecret/onPeerDataRecv lezen het. MEMBER, niet op de stapel. */
   uint8_t       _bot_match_pub[4][PUB_KEY_SIZE];
   int           _bot_match_n;
+
+  /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
+  BotChannel    _channels[MAX_CHANNELS];
 
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
@@ -569,6 +617,18 @@ private:
    * antwoordbuffer is static (niet op de loopTask-stapel). */
   void          handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
                             const uint8_t* secret, uint8_t* data, size_t len);
+
+  /* ---- kanalen: persistentie + diagnose-antwoord ---- */
+  void          loadChannels();
+  void          saveChannels();
+  int           channelFindByName(const char* name) const;   // -1 = niet gevonden
+  void          channelComputeHash(BotChannel& c);           // hash uit secret+len
+  /* Een binnengekomen kanaaltekst afhandelen (ping/test/path) en, indien herkend,
+   * IN het kanaal antwoorden. Antwoordbuffer static (niet op de loopTask-stapel). */
+  void          handleChannelText(mesh::Packet* packet, const mesh::GroupChannel& channel,
+                                  const char* text);
+  /* Bouwen + IN het kanaal versturen: "<botnaam>: <reply>". */
+  void          sendChannelReply(const mesh::GroupChannel& channel, const char* reply);
 
   /* ---- adverts + telemetrie voor sensor-nodes ---- */
   mesh::Packet* createSensorNodeAdvert(RoomSlot& slot);

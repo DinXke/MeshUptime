@@ -140,15 +140,23 @@ static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 360 + 130 + JSON_TAIL
  * af zodra er minder dan ACL_TAIL over is -- een half JSON-document maakt de
  * pagina stuk op een plek waar niemand de oorzaak zoekt.
  */
-static char g_acl[6144];
+/* WEERGAVE-plafond voor de buurt-/contactenlijst in JSON (zie de uitleg bij de
+ * tweede definitie verderop). De lijst zelf is groot (MAX_NEIGHBOURS=200, voor
+ * naamresolutie); /acl.json en /contacts.json tonen hoogstens NB_JSON_MAX. Hier
+ * VÓÓR g_acl gedefinieerd omdat de static_assert eronder hem gebruikt. */
+#ifndef NB_JSON_MAX
+  #define NB_JSON_MAX  64
+#endif
+
+static char g_acl[16384];
 #define ACL_TAIL  320       /* ruimte die altijd vrij blijft voor één regel + "]}" */
 
 /* De rekensom hierboven is geen decoratie. MAX_CLIENTS (20) en MAX_NEIGHBOURS
  * (12) zijn met een bouwvlag te verhogen -- platformio.local.ini zet nu al
  * MAX_CONTACTS=32 -- en dan moet g_acl mee. Dit dwingt dat af bij het compileren
  * in plaats van bij het eerste stil afgekapte antwoord op een node in het veld. */
-static_assert(80 + MAX_CLIENTS * 165 + MAX_NEIGHBOURS * 185 + ACL_TAIL <= sizeof(g_acl),
-              "g_acl te klein voor MAX_CLIENTS/MAX_NEIGHBOURS -- zie de rekensom hierboven");
+static_assert(80 + MAX_CLIENTS * 165 + NB_JSON_MAX * 185 + ACL_TAIL <= sizeof(g_acl),
+              "g_acl te klein voor MAX_CLIENTS/NB_JSON_MAX -- zie de rekensom hierboven");
 
 static char g_ssid_shown[33] = {0};   // alleen om te tonen; nooit het wachtwoord
 /* NTP-server + POSIX-TZ, één keer bij begin() uit /time.cfg gelezen en bij /time
@@ -459,6 +467,10 @@ void web_route_botrecip()     { if (g_self) g_self->handleBotRecip(); }
 void web_route_botadvert()    { if (g_self) g_self->handleBotAdvert(); }
 void web_route_botsendto()    { if (g_self) g_self->handleBotSendto(); }
 void web_route_botpost()      { if (g_self) g_self->handleBotPost(); }
+void web_route_channelsjson() { if (g_self) g_self->handleChannelsJson(); }
+void web_route_channeladd()   { if (g_self) g_self->handleChannelAdd(); }
+void web_route_channeldel()   { if (g_self) g_self->handleChannelDel(); }
+void web_route_channeltoggle(){ if (g_self) g_self->handleChannelToggle(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -1762,6 +1774,20 @@ mag op een prefix (&ge;12 hex).</p>
 <div id="botsendmsg"></div>
 <p class="note">Eén DM (<b>stuur DM</b>) of naar iedereen op de lijst
 (<b>post naar allen</b>). Beide zijn beheer-acties.</p></div>
+
+<h2>Hashtag-kanalen &mdash; meeluisteren en antwoorden</h2>
+<div class="card pad0"><table id="chl"></table></div>
+<div class="frow" style="margin-top:.4rem">
+<input id="ch-name" placeholder="kanaalnaam (bv. Public)" maxlength="23" spellcheck="false" style="width:10rem">
+<input id="ch-secret" placeholder="secret (32 of 64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="ch-add">toevoegen</button></div>
+<div id="chmsg"></div>
+<p class="note">De bot leest de <b>ingeschakelde</b> kanalen mee en antwoordt IN het
+kanaal op <code>ping</code>, <code>test</code> (signaalrapport) en <code>path</code>
+(route met repeater-namen). Een kanaal is een gedeeld <b>secret</b> (32 hex = 128-bit,
+of 64 hex = 256-bit), net als in de MeshCore-app (bv. de publieke <i>Public</i>-sleutel).
+Het secret wordt hier niet teruggetoond &mdash; schrijf-alleen, zoals een wachtwoord.
+Zet een kanaal op <b>uit</b> om te stoppen met meelezen zonder het te wissen.</p>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -3296,7 +3322,8 @@ var kp=document.getElementById("bot-pub");kp.textContent=d.pub.slice(0,8)+"…"+
 kp.title=d.pub+"  (klik om te kopiëren)";kp.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(d.pub)};
 document.getElementById("bot-uri").value=d.uri||"";
 try{drawQRon("bqr",d.uri)}catch(e){}
-botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)})}
+botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)});
+channelsLoad()}
 function botRender(list,max){var e=document.getElementById("botrl");e.innerHTML="";
 var h=e.insertRow();["ontvanger","",""].forEach(function(t){
 var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
@@ -3352,6 +3379,47 @@ headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"msg="+encodeU
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("bot-post-msg").value="";bmsg("botsendmsg","gepost naar "+j.sent+" ontvanger(s)",1)}
 else bmsg("botsendmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botsendmsg","mislukt",0)})};
+
+/* ---- hashtag-kanalen: lijst + toevoegen/aan-uit/wissen ---- */
+function channelsLoad(){fetch("channels.json",{credentials:"include"})
+.then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})
+.then(function(d){if(!d)return;channelsRender(d.channels||[])})
+.catch(function(){bmsg("chmsg","kon kanalen niet laden",0)})}
+function channelsRender(list){var e=document.getElementById("chl");if(!e)return;e.innerHTML="";
+var h=e.insertRow();["kanaal","sleutel","aan",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+list.forEach(function(c){var r=e.insertRow();
+r.insertCell().textContent=c.n;
+var sc=r.insertCell();sc.className="num";sc.textContent=c.bits+"-bit #"+c.h;
+var ac=r.insertCell();var cb=document.createElement("input");cb.type="checkbox";cb.checked=!!c.en;
+cb.onchange=function(){channelToggle(c.n,cb.checked)};ac.appendChild(cb);
+var dc=r.insertCell();dc.className="acts";var b=document.createElement("button");b.textContent="wis";
+b.onclick=function(){channelDel(c.n)};dc.appendChild(b)});
+if(!list.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=4;
+c.textContent="(geen kanalen — voeg er een toe, bv. Public)";c.style.color="var(--muted)"}}
+function channelToggle(name,en){fetch("channel/toggle",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(name)+"&enabled="+(en?1:0)})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("chmsg",j.ok?("kanaal "+name+(en?" aan":" uit")):"mislukt: "+(j.error||""),j.ok?1:0);channelsLoad()})
+.catch(function(){bmsg("chmsg","mislukt",0)})}
+function channelDel(name){if(!confirm("Kanaal '"+name+"' verwijderen?"))return;
+fetch("channel/del",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"name="+encodeURIComponent(name)})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("chmsg",j.ok?"kanaal weg":"mislukt: "+(j.error||""),j.ok?1:0);channelsLoad()})
+.catch(function(){bmsg("chmsg","mislukt",0)})}
+document.getElementById("ch-add").onclick=function(){
+var name=document.getElementById("ch-name").value.trim(),
+sec=document.getElementById("ch-secret").value.trim();
+if(!name||!sec){bmsg("chmsg","naam en secret nodig",0);return}
+fetch("channel/add",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(name)+"&secret="+encodeURIComponent(sec)+"&enabled=1"})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){document.getElementById("ch-name").value="";document.getElementById("ch-secret").value="";
+bmsg("chmsg","kanaal toegevoegd",1);channelsLoad()}
+else bmsg("chmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("chmsg","mislukt",0)})};
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
    Dezelfde rm/sn-maskers als per-sensor, maar PER room/sensor-node getoond.
@@ -3665,6 +3733,10 @@ void WebTask::routes() {
   _server->on("/bot/advert", HTTP_POST, web_route_botadvert);
   _server->on("/bot/sendto", HTTP_POST, web_route_botsendto);
   _server->on("/bot/post", HTTP_POST, web_route_botpost);
+  _server->on("/channels.json", HTTP_GET, web_route_channelsjson);
+  _server->on("/channel/add", HTTP_POST, web_route_channeladd);
+  _server->on("/channel/del", HTTP_POST, web_route_channeldel);
+  _server->on("/channel/toggle", HTTP_POST, web_route_channeltoggle);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -4548,6 +4620,14 @@ void WebTask::handleAlertTest() {
  * niet na te rekenen is: jsonEscape() kan een teken tot zes tekens maken. */
 #define NB_JSON_NAME  48
 
+/* WEERGAVE-plafond voor de buurt-/contactenlijst in JSON. De lijst zelf is groot
+ * (MAX_NEIGHBOURS=200, voor NAAMRESOLUTIE), maar /acl.json en /contacts.json tonen
+ * hoogstens de eerste NB_JSON_MAX ingangen -- genoeg voor de kiezer, en het houdt
+ * g_acl/g_json klein (een JSON van 200 contacten is onbruikbaar in de pagina). */
+#ifndef NB_JSON_MAX
+  #define NB_JSON_MAX  64
+#endif
+
 /* Een publieke sleutel uit een tekstveld. Geeft het aantal BYTES terug, of 0 bij
  * afkeuring.
  *
@@ -4632,7 +4712,7 @@ void WebTask::handleAclJson() {
   n += snprintf(g_acl + n, sizeof(g_acl) - n, "],\"nb\":[");
   first = true;
 
-  for (int i = 0; i < nb.getNumEntries(); i++) {
+  for (int i = 0; i < nb.getNumEntries() && i < NB_JSON_MAX; i++) {
     const NeighbourEntry* e = nb.getEntryByIdx(i);
     if ((size_t)n > sizeof(g_acl) - ACL_TAIL) break;
 
@@ -5233,9 +5313,10 @@ void WebTask::handleContactsJson() {
   char key[PUB_KEY_SIZE * 2 + 1];
   char esc[NB_JSON_NAME];
 
-  int n = snprintf(g_json, sizeof(g_json), "{\"max\":%d,\"contacts\":[", MAX_NEIGHBOURS);
+  int n = snprintf(g_json, sizeof(g_json), "{\"max\":%d,\"shown\":%d,\"contacts\":[",
+                   MAX_NEIGHBOURS, NB_JSON_MAX);
   bool first = true;
-  for (int i = 0; i < nb.getNumEntries(); i++) {
+  for (int i = 0; i < nb.getNumEntries() && i < NB_JSON_MAX; i++) {
     const NeighbourEntry* e = nb.getEntryByIdx(i);
     if ((size_t)n > sizeof(g_json) - 160) break;
     mesh::Utils::toHex(key, e->pub_key, PUB_KEY_SIZE);
@@ -5363,6 +5444,88 @@ void WebTask::handleBotPost() {
     return;
   }
   _server->send(400, "application/json", "{\"ok\":false,\"error\":\"wachtrij vol of geen ontvangers\"}");
+}
+
+/* ================================================================== */
+/*  Hashtag-/publieke kanalen (web)                                    */
+/* ================================================================== */
+
+bool WebTask::channelsAvailable() {
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return false; }
+  if (_acl->webChannelMax() <= 0) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"deze node kent geen kanalen (sensor-variant)\"}");
+    return false;
+  }
+  return true;
+}
+
+/* GET /channels.json -- de kanalenlijst (naam, sleutellengte, aan/uit, hash).
+ * Het SECRET komt hier NOOIT in voor (schrijf-alleen). */
+void WebTask::handleChannelsJson() {
+  if (!requireAuth()) return;
+  if (!channelsAvailable()) return;
+
+  int n = snprintf(g_json, sizeof(g_json), "{\"max\":%d,\"channels\":[", _acl->webChannelMax());
+  int cnt = _acl->webChannelCount();
+  char nm[24], nesc[24 * 6 + 1], hh[4];
+  for (int i = 0; i < cnt; i++) {
+    if ((size_t)n > sizeof(g_json) - 120) break;
+    int bits = 0; bool en = false;
+    if (!_acl->webChannelGet(i, nm, sizeof(nm), &bits, &en, hh)) continue;
+    jsonEscape(nm, nesc, sizeof(nesc));
+    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"n\":\"%s\",\"bits\":%d,\"en\":%s,\"h\":\"%s\"}",
+                  i == 0 ? "" : ",", nesc, bits, en ? "true" : "false", hh);
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /channel/add  (name, secret [32/64 hex], enabled=0|1) */
+void WebTask::handleChannelAdd() {
+  if (!requireAuth()) return;
+  if (!channelsAvailable()) return;
+  char name[24], secret[80], en[4];
+  if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}"); return;
+  }
+  if (!getArg(*_server, "secret", secret, sizeof(secret)) || secret[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"secret ontbreekt (32 of 64 hex)\"}"); return;
+  }
+  bool enabled = !(getArg(*_server, "enabled", en, sizeof(en)) && en[0] == '0');   // standaard aan
+  int r = _acl->webChannelAdd(name, secret, enabled ? 1 : 0);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  _server->send(400, "application/json",
+      r == -3 ? "{\"ok\":false,\"error\":\"kanalenlijst vol\"}"
+              : "{\"ok\":false,\"error\":\"secret moet 32 of 64 hextekens zijn\"}");
+}
+
+/* POST /channel/del  (name) */
+void WebTask::handleChannelDel() {
+  if (!requireAuth()) return;
+  if (!channelsAvailable()) return;
+  char name[24];
+  if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}"); return;
+  }
+  int r = _acl->webChannelDel(name);
+  _server->send(r == 1 ? 200 : 400, "application/json",
+                r == 1 ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"niet gevonden\"}");
+}
+
+/* POST /channel/toggle  (name, enabled=0|1) */
+void WebTask::handleChannelToggle() {
+  if (!requireAuth()) return;
+  if (!channelsAvailable()) return;
+  char name[24], en[4];
+  if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}"); return;
+  }
+  bool enabled = getArg(*_server, "enabled", en, sizeof(en)) && en[0] == '1';
+  int r = _acl->webChannelToggle(name, enabled ? 1 : 0);
+  _server->send(r == 1 ? 200 : 400, "application/json",
+                r == 1 ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"niet gevonden\"}");
 }
 
 /* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
