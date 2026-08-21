@@ -435,6 +435,7 @@ void web_route_roomedit()     { if (g_self) g_self->handleRoomEdit(); }
 void web_route_roomdel()      { if (g_self) g_self->handleRoomDel(); }
 void web_route_roomsbackup()  { if (g_self) g_self->handleRoomsBackup(); }
 void web_route_roomsrestore() { if (g_self) g_self->handleRoomsRestore(); }
+void web_route_monalarm()     { if (g_self) g_self->handleMonAlarm(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -2796,7 +2797,7 @@ gc=document.getElementById("re-guestclear").checked,
 st=document.getElementById("re-stealth").checked?1:0;
 if(nm)b+="&name="+encodeURIComponent(nm);
 if(pw)b+="&pass="+encodeURIComponent(pw);
-if(gc)b+="&guest=";else if(gv)b+="&guest="+encodeURIComponent(gv);
+if(gc)b+="&guest_clear=1";else if(gv)b+="&guest="+encodeURIComponent(gv);
 b+="&stealth="+st;
 fetch("room/edit",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
@@ -3003,6 +3004,9 @@ void WebTask::routes() {
   _server->on("/room/del", HTTP_POST, web_route_roomdel);
   _server->on("/rooms/backup", HTTP_GET, web_route_roomsbackup);
   _server->on("/rooms/restore", HTTP_POST, web_route_roomsrestore);
+  /* Per-sensor alarmroute (am) + room-set (rm). POST-only: hij zet de bewaking van
+   * een kanaal op een andere bezorgweg, dus geen GET-link die een browser volgt. */
+  _server->on("/mon/alarm", HTTP_POST, web_route_monalarm);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -4193,17 +4197,20 @@ void WebTask::handleRoomEdit() {
     return;
   }
 
-  char name[24], pass[16], guest[16], st[4];
+  char name[24], pass[16], guest[16], st[4], gc[4];
   bool has_name  = getArg(*_server, "name",  name,  sizeof(name));
   bool has_pass  = getArg(*_server, "pass",  pass,  sizeof(pass));
-  bool has_guest = getArg(*_server, "guest", guest, sizeof(guest));   // "" = wissen
+  bool has_guest = getArg(*_server, "guest", guest, sizeof(guest));
   bool has_st    = getArg(*_server, "stealth", st, sizeof(st));
+  bool clear_guest = getArg(*_server, "guest_clear", gc, sizeof(gc)) && gc[0] == '1';
 
-  /* name/pass alleen als niet-leeg (een lege naam of leeg beheerderswachtwoord is
-   * geen bedoeling); guest juist óók leeg toestaan, want dat wist het. */
+  /* CONTRACT: lege/ontbrekende velden = ONGEWIJZIGD (zo stuurt de MeshManager-
+   * server ze). Dat geldt ook voor 'guest' -- een lege waarde wist het gast-
+   * wachtwoord dus NIET (dat zou de server per ongeluk doen). Wissen is een
+   * expliciete handeling: 'guest_clear=1' (de "wis gast"-knop in de eigen GUI). */
   const char* namep  = (has_name  && name[0])  ? name  : nullptr;
   const char* passp  = (has_pass  && pass[0])  ? pass  : nullptr;
-  const char* guestp = has_guest ? guest : nullptr;
+  const char* guestp = clear_guest ? "" : ((has_guest && guest[0]) ? guest : nullptr);
   int stealth = has_st ? (st[0] == '1' ? 1 : 0) : -1;
 
   if (!_acl->webRoomEdit(idx, namep, passp, guestp, stealth)) {
@@ -4270,6 +4277,119 @@ void WebTask::handleRoomsRestore() {
     return;
   }
   _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
+ *
+ * DE IDENTIFICATIE. De MeshManager-server nam `idx` = de POSITIE in de mon[]-array
+ * van /status.json. Die array begint met VIER vaste cellen (kanaal 1 'spanning',
+ * netvoeding, batterij, wifi) die GEEN am/rm dragen; de reguliere monitors -- de
+ * enige met am/rm -- staan er dus vanaf positie MON_FIXED_PREFIX (4) achter, in
+ * slotvolgorde en alleen de gebruikte. We rekenen `idx` terug naar het kanaal via
+ * exact diezelfde volgorde als appendMonitors.
+ *
+ * Positie is BROOS: hij verschuift als er een monitor bij/af gaat, en de eerste
+ * vier zijn vaste bronnen zonder am/rm. Daarom accepteren we OOK het stabiele veld
+ * `ch` (dat al in elke mon[]-cel staat als "ch"); geef je `ch` mee, dan wint dat.
+ * Zie het eindrapport voor de aanbeveling aan de serverkant.
+ *
+ * GEEN tweede schrijfpad: we sturen 'sensor set mon.<ch>.alert' en '.rooms' langs
+ * dezelfde CLI als de rest, en verifiëren daarna via de getters (definitief, geen
+ * broze tekstuitslag-parsing). */
+void WebTask::handleMonAlarm() {
+  if (!requireAuth()) return;
+  if (_mon == nullptr) {
+    _server->send(503, "application/json",
+        "{\"ok\":false,\"error\":\"sensorlaag niet gekoppeld\"}");
+    return;
+  }
+  if (_acl == nullptr) {
+    _server->send(503, "application/json", "{\"ok\":false,\"error\":\"meshlaag niet gekoppeld\"}");
+    return;
+  }
+
+  const int am = getArgInt(*_server, "am", 0);
+  const int rm = getArgInt(*_server, "rm", -1);
+  if (am < 1 || am > 3) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"am: 1=dm, 2=room, 3=both\"}");
+    return;
+  }
+  if (rm < 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"rm ontbreekt (room-bitmasker, 0 = geen room)\"}");
+    return;
+  }
+
+  /* mon[] = [MON_FIXED_PREFIX vaste cellen] + [gebruikte reguliere monitors]. */
+  const int MON_FIXED_PREFIX = 4;
+  int slot = -1;
+  char chbuf[8];
+  if (getArg(*_server, "ch", chbuf, sizeof(chbuf)) && chbuf[0]) {
+    int ch = atoi(chbuf);
+    for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
+      if (_mon->monitorUsed(i) && (int)_mon->monitorChannel(i) == ch) { slot = i; break; }
+    }
+    if (slot < 0) {
+      _server->send(404, "application/json",
+          "{\"ok\":false,\"error\":\"geen (gebruikt) kanaal met dat ch\"}");
+      return;
+    }
+  } else {
+    int idx = getArgInt(*_server, "idx", -1);
+    int rel = idx - MON_FIXED_PREFIX;
+    if (idx < 0 || rel < 0) {
+      _server->send(400, "application/json",
+          "{\"ok\":false,\"error\":\"idx wijst op een vast kanaal (0-3) of ontbreekt; "
+          "reguliere monitors beginnen op positie 4 -- of stuur 'ch'\"}");
+      return;
+    }
+    int seen = 0;
+    for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
+      if (!_mon->monitorUsed(i)) continue;
+      if (seen == rel) { slot = i; break; }
+      seen++;
+    }
+    if (slot < 0) {
+      _server->send(404, "application/json",
+          "{\"ok\":false,\"error\":\"geen monitor op die mon[]-positie\"}");
+      return;
+    }
+  }
+
+  const int ch = (int)_mon->monitorChannel(slot);
+
+  /* rm-bitmasker -> komma-lijst van room-indexen ("0,2"), of "none" voor 0. */
+  char rooms[48];
+  int ro = 0;
+  for (int b = 0; b < 16; b++) {
+    if (rm & (1 << b)) {
+      if (ro) rooms[ro++] = ',';
+      ro += snprintf(rooms + ro, sizeof(rooms) - ro, "%d", b);
+    }
+  }
+  if (ro == 0) strcpy(rooms, "none"); else rooms[ro] = 0;
+
+  /* am gaat als getal direct door (parseAlertMode accepteert 1/2/3). */
+  snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.alert %d", ch, am);
+  _acl->handleCommandWeb(0, g_cmd, g_reply);
+  snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.rooms %s", ch, rooms);
+  _acl->handleCommandWeb(0, g_cmd, g_reply);
+
+  /* Definitieve controle via de getters -- niet de CLI-tekst parsen. */
+  bool ok = ((int)_mon->monitorAlertMode(slot) == am) &&
+            ((int)_mon->monitorRoomsMask(slot) == rm);
+  if (!ok) {
+    char msg[160];
+    snprintf(msg, sizeof(msg),
+        "{\"ok\":false,\"error\":\"node nam am/rm niet over (am=%u rm=%u)\",\"ch\":%d}",
+        (unsigned)_mon->monitorAlertMode(slot), (unsigned)_mon->monitorRoomsMask(slot), ch);
+    _server->send(500, "application/json", msg);
+    return;
+  }
+  char msg[64];
+  snprintf(msg, sizeof(msg), "{\"ok\":true,\"ch\":%d,\"am\":%d,\"rm\":%d}", ch, am, rm);
+  _server->send(200, "application/json", msg);
 }
 
 /* ================================ nodebeheer ==============================

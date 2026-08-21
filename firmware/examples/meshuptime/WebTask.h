@@ -245,6 +245,12 @@ private:
    * kent rooms. Verstuurt zelf het 503/501-antwoord en geeft dan false. */
   bool roomsAvailable();
 
+  /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
+   * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
+   * Loopt via de bestaande CLI ('sensor set mon.<ch>.alert/rooms') zodat er geen
+   * tweede schrijfpad ontstaat, en verifieert daarna via de getters. */
+  void handleMonAlarm();
+
   /* Schrijft het monitoroverzicht in buf achter positie n en geeft de nieuwe
    * positie terug. Apart van handleStatus() omdat die anders één functie van
    * honderd regels wordt met twee onderwerpen erin. */
@@ -276,6 +282,7 @@ private:
   friend void web_route_roomdel();
   friend void web_route_roomsbackup();
   friend void web_route_roomsrestore();
+  friend void web_route_monalarm();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).
