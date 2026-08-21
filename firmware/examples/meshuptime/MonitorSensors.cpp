@@ -783,6 +783,56 @@ bool MonitorSensors::setFixedSensorNodesMask(int idx, uint16_t mask) {
   return true;
 }
 
+/* ---- mute / snooze / checknow ---- */
+int MonitorSensors::findByNameOrChannel(const char* s) const {
+  if (!s || !*s) return -1;
+  bool digits = true;
+  for (const char* p = s; *p; p++) if (*p < '0' || *p > '9') { digits = false; break; }
+  return digits ? findByChannel((uint8_t)atoi(s)) : findByName(s);
+}
+bool MonitorSensors::setMute(const char* s, unsigned long secs) {
+  int slot = findByNameOrChannel(s);
+  if (slot < 0) return false;
+  _mute_until[slot] = secs ? (millis() + secs * 1000UL) : 0;
+  return true;
+}
+bool MonitorSensors::clearMute(const char* s) {
+  int slot = findByNameOrChannel(s);
+  if (slot < 0) return false;
+  _mute_until[slot] = 0;
+  return true;
+}
+void MonitorSensors::setSnooze(unsigned long secs) {
+  _snooze_until = secs ? (millis() + secs * 1000UL) : 0;
+}
+bool MonitorSensors::isSnoozed() const {
+  return _snooze_until != 0 && (long)(millis() - _snooze_until) < 0;
+}
+unsigned long MonitorSensors::snoozeSecsLeft() const {
+  return isSnoozed() ? (_snooze_until - millis()) / 1000UL : 0;
+}
+bool MonitorSensors::isMuted(int slot) const {
+  if (isSnoozed()) return true;
+  if (slot < 0 || slot >= MAX_MONITORS) return false;
+  return _mute_until[slot] != 0 && (long)(millis() - _mute_until[slot]) < 0;
+}
+unsigned long MonitorSensors::muteSecsLeft(int slot) const {
+  if (slot < 0 || slot >= MAX_MONITORS) return 0;
+  if (_mute_until[slot] == 0 || (long)(millis() - _mute_until[slot]) >= 0) return 0;
+  return (_mute_until[slot] - millis()) / 1000UL;
+}
+bool MonitorSensors::checkNow(const char* s) {
+  if (!s || !*s) {
+    unsigned long now = millis();
+    for (int i = 0; i < MAX_MONITORS; i++) if (monitorUsed(i)) _mon[i].next_check = now;
+    return true;
+  }
+  int slot = findByNameOrChannel(s);
+  if (slot < 0 || !monitorUsed(slot)) return false;
+  _mon[slot].next_check = millis();
+  return true;
+}
+
 /* DEZE TWEE ZIJN HET HELE SIMULATIEPAD voor de monitors.
  *
  * Staat er een forcering op dit vakje, dan geven zij de geforceerde stand; de
@@ -2050,13 +2100,24 @@ const char* MonitorSensors::adhocResultText() const {
     }
   }
   if (_adhoc.done > 0) {
-    n += snprintf(buf + n, sizeof(buf) - n, " | %u/%u ok",
-                  (unsigned)_adhoc.ok, (unsigned)_adhoc.done);
+    unsigned loss = (unsigned)((100u * (_adhoc.done - _adhoc.ok)) / _adhoc.done);
+    n += snprintf(buf + n, sizeof(buf) - n, " | %u/%u ok (%u%% verlies)",
+                  (unsigned)_adhoc.ok, (unsigned)_adhoc.done, loss);
     if (_adhoc.ok > 0) {
       uint32_t avg = _adhoc.sum_ms / _adhoc.ok;
+      /* Jitter = gemiddelde absolute afwijking tussen opeenvolgende geldige RTT's. */
+      uint32_t jsum = 0; unsigned jcnt = 0; uint32_t prev = 0xFFFFFFFFUL;
+      for (uint8_t i = 0; i < _adhoc.done && i < ADHOC_MAX_PINGS; i++) {
+        uint32_t v = _adhoc.results[i];
+        if (v == 0xFFFFFFFFUL) continue;
+        if (prev != 0xFFFFFFFFUL) { jsum += (v > prev) ? (v - prev) : (prev - v); jcnt++; }
+        prev = v;
+      }
       n += snprintf(buf + n, sizeof(buf) - n, ", min/gem/max %lu/%lu/%lu ms",
                     (unsigned long)_adhoc.min_ms, (unsigned long)avg,
                     (unsigned long)_adhoc.max_ms);
+      if (jcnt > 0) n += snprintf(buf + n, sizeof(buf) - n, ", jitter %lu ms",
+                                  (unsigned long)(jsum / jcnt));
     }
   }
   /* De ouderdom van de uitslag, zoals de alerts hun duur meegeven: als de

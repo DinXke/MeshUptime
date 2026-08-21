@@ -589,6 +589,23 @@ int DmCommands::renderReply(const ClientInfo& from, int room_idx, const char* li
       }
       return (int)strlen(out);
     }
+    /* Node-/netwerk-/bedien-commando's (neighbors/wifi/sys/dns/mute/...). */
+    {
+      uint8_t role = from.permissions & PERM_ACL_ROLE_MASK;
+      int nl = _data->dmNodeCommand(p, role, out, out_len);
+      if (nl > 0) {
+        /* Een deferred net-taak vanuit een room? Oorsprong onthouden (zoals ping),
+         * zodat de uitslag in DEZE room terugkomt en niet als DM. */
+        if (_data->dmAdhocState() != 0 && !_data->dmAdhocReady()) {
+          _ping_wait = true;
+          _ping_from_room = true;
+          _ping_room_idx = room_idx;
+          char* dm = strstr(out, " als aparte DM");
+          if (dm) memmove(dm, dm + 14, strlen(dm + 14) + 1);
+        }
+        return nl;
+      }
+    }
     /* Geen herkend commando: gewone room-post, geen vraag -> niets terug. */
     return 0;
   }
@@ -694,6 +711,34 @@ bool DmCommands::handleDm(const ClientInfo& from, uint32_t timestamp, const uint
        * antwoord. Gekopieerd, want de ClientInfo kan tegen die tijd weg zijn. */
       if (_data->dmAdhocState() != 0 && !_data->dmAdhocReady()) {
         _ping_wait = true;
+        _ping_from_room = false;   // DM-oorsprong -> DM-pad
+        _ping_id = from.id;
+        memcpy(_ping_secret, from.shared_secret, PUB_KEY_SIZE);
+        if (from.out_path_len != OUT_PATH_UNKNOWN && from.out_path_len <= MAX_PATH_SIZE) {
+          memcpy(_ping_path, from.out_path, from.out_path_len);
+          _ping_path_len = from.out_path_len;
+        } else {
+          _ping_path_len = OUT_PATH_UNKNOWN;
+        }
+      }
+      splitReply();
+      if (_num_chunks == 0) { reset(); return true; }
+      _next_action = millis() + DM_FIRST_SEND_MS;
+      return true;
+    }
+  }
+
+  /* Node-/netwerk-/bedien-commando's over DM (neighbors/wifi/sys/dns/mute/...). */
+  {
+    char nbuf[DM_TEXT_BUF_LEN];
+    uint8_t role = from.permissions & PERM_ACL_ROLE_MASK;
+    int nl = _data->dmNodeCommand(p, role, nbuf, sizeof(nbuf));
+    if (nl > 0) {
+      startReply(from);
+      appendText(nbuf);
+      if (_data->dmAdhocState() != 0 && !_data->dmAdhocReady()) {
+        _ping_wait = true;
+        _ping_from_room = false;   // DM-oorsprong
         _ping_id = from.id;
         memcpy(_ping_secret, from.shared_secret, PUB_KEY_SIZE);
         if (from.out_path_len != OUT_PATH_UNKNOWN && from.out_path_len <= MAX_PATH_SIZE) {

@@ -310,6 +310,21 @@ public:
    * zijn (via hun sensornodes-masker). Zo kunnen sensoren over meerdere sensor-
    * nodes verdeeld worden, elk binnen de één-pakket-CayenneLPP-limiet. */
   bool        querySensorsForNode(int snode_idx, uint8_t requester_permissions, CayenneLPP& telemetry);
+
+  /* ---- MUTE / SNOOZE (alerts tijdelijk dempen) + CHECKNOW ----
+   * Een gemute sensor of een globaal gesnoozede node genereert geen dm/room/both
+   * tot de tijd om is. main_room checkt isMuted(slot) vóór het alarm-dispatch.
+   * Alle tijden in millis(); RAM-only (na herstart weer actief). */
+  int         findByNameOrChannel(const char* s) const;              // slot, of -1
+  bool        setMute(const char* name_or_ch, unsigned long secs);   // secs 0 = wissen
+  bool        clearMute(const char* name_or_ch);
+  void        setSnooze(unsigned long secs);                          // 0 = wissen
+  bool        isSnoozed() const;
+  unsigned long snoozeSecsLeft() const;
+  bool        isMuted(int slot) const;         // slot-mute OF globale snooze
+  unsigned long muteSecsLeft(int slot) const;  // resterend voor DEZE slot (0 = niet gemute)
+  bool        checkNow(const char* name_or_ch);   // forceer meting; leeg/NULL = alle
+
   bool        monitorIsUp(int slot) const;
   bool        monitorSeeded(int slot) const;             /* al ooit een uitslag? */
   uint32_t    monitorPingMs(int slot) const;
@@ -1065,6 +1080,11 @@ private:
     bool          stale;         /* melding te oud; toestand onbekend */
   };
   MonState _mon[MAX_MONITORS];
+
+  /* MUTE/SNOOZE-toestand (RAM-only). _mute_until[slot] en _snooze_until in millis();
+   * 0 = niet actief. Zie de mute/snooze-methoden. */
+  unsigned long _mute_until[MAX_MONITORS] = {0};
+  unsigned long _snooze_until = 0;
 
   /* ---------------- de ping-machine ----------------
    *

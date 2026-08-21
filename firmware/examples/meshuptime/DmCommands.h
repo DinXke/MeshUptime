@@ -73,6 +73,16 @@ public:
   virtual const char* dmAdhocResult() { return ""; }
   virtual void        dmAdhocClear() {}
   virtual const char* dmHelpExtra() { return nullptr; }
+
+  /* NODE-/NETWERK-/BEDIEN-COMMANDO'S (batch). Schrijft het antwoord in 'out' en
+   * geeft de lengte terug, of 0 als de regel geen node-commando is (dan valt
+   * DmCommands door naar list/get/status/help/mon). `role` = de ACL-rol van de
+   * afzender (PERM_ACL_*): read=1, readwrite=2, admin=3 -- de implementatie
+   * handhaaft per commando het vereiste niveau. Sync commando's leveren meteen
+   * tekst; een deferred commando (bv. ad-hoc net-taak) start iets en zet de adhoc-
+   * state, waarna DmCommands de uitslag via dezelfde weg als ping bezorgt. */
+  virtual int         dmNodeCommand(const char* line, uint8_t role, char* out, size_t out_len)
+                        { (void)line; (void)role; (void)out; (void)out_len; return 0; }
 };
 
 /* ================== DE MAAT VAN EEN BERICHT ==================
