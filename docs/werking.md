@@ -16,9 +16,45 @@ van upstream tag `companion-v1.17.0` (dezelfde commit als `repeater-v1.17.0` en
 `room-server-v1.17.0`), met een eigen `SensorManager`, een wifi-taak en een
 webserver erbij.
 
-De node kondigt zich aan als **`ADV_TYPE_SENSOR`** (`SensorMesh.cpp:297`) en
-antwoordt op node-discovery met `CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_SENSOR`.
-Dat is het eerlijke type: dit apparaat biedt sensoren aan.
+### Twee varianten, één bord
+
+Er zijn **twee bouwvarianten** van dezelfde firmware, met dezelfde modules op
+hetzelfde bord:
+
+- **Sensor-variant** (`env:meshuptime`, `main.cpp` / `SensorMesh`). De
+  oorspronkelijke node: één identiteit, kondigt zich aan als **`ADV_TYPE_SENSOR`**
+  (`SensorMesh.cpp:297`) en antwoordt op node-discovery met
+  `CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_SENSOR`. Dat is het eerlijke type: dit
+  apparaat biedt sensoren aan. Blijft de terugvalweg.
+- **Room-server-variant** (`env:meshuptime_room`, build-flag
+  `ROOM_SERVER_VARIANT`, `main_room.cpp` / `RoomMesh`). **Het huidige
+  hoofdproduct.** Eén toestel draagt nu meerdere identiteiten tegelijk — rooms,
+  virtuele sensor-nodes en een bot — elk met een eigen sleutelpaar en een eigen
+  advert-type. De rest van dit bestand beschrijft, tenzij anders vermeld, de
+  room-variant; de sensor-basis (voeding, wifi, kanalen, monitors) zit in béide en
+  wordt hieronder als gedeelde kern beschreven.
+
+`SensorMesh.cpp` blijft in beide envs meegecompileerd omdat de `WebTask` er
+type-mede aan gekoppeld is; alleen `main_room.cpp` en `RoomMesh.cpp` schakelen
+tussen de envs (zie [bouwen.md](bouwen.md)).
+
+### De identiteiten van de room-server
+
+De room-variant is bewust géén enkele node met één sleutel maar een verzameling
+virtuele identiteiten, elk met een eigen advert-type zodat de MeshCore-app ze in
+het juiste vakje toont:
+
+| identiteit | advert-type | join-URI-type | aantal | wat de app toont |
+|---|---|---|---|---|
+| room | `ADV_TYPE_ROOM` | 3 | `MAX_ROOMS=4` | een Room-server |
+| sensor-node | `ADV_TYPE_SENSOR` | 4 | `MAX_SENSOR_NODES=4` | een sensor met telemetrie |
+| bot | `ADV_TYPE_CHAT` | 1 | 1 | een gewoon chat-contact |
+
+Room 0 hergebruikt de bestaande hoofdidentiteit (de sleutel uit
+`/identity/_main.id` blijft behouden). Waarom aparte identiteiten: de app toont
+telemetrie **alleen** voor sensor-type contacten en chatberichten voor chat-type
+contacten. Eén node die zowel room, sensor als notifier wil zijn, moet die petten
+dus letterlijk als aparte contacten dragen.
 
 Doorsturen zit in de basis en staat standaard uit
 (`SensorMesh::allowPacketForward`: `disable_fwd`, plus `flood_max` op een
@@ -148,36 +184,222 @@ Het aantal herverbindingen, het aantal harde resets en de laatste reden van
 wegvallen staan in de webinterface. "Geen wifi" zonder reden kost iemand een
 avond zoeken.
 
+## De room-server
+
+Alles hierboven — kanalen, monitors, voeding, wifi — is de gedeelde sensor-kern.
+Hieronder staat wat de room-variant (`RoomMesh`) er bovenop legt.
+
+### Rooms
+
+Eén toestel bedient tot **vier** room-identiteiten (`MAX_ROOMS=4`), elk een
+volwaardige MeshCore Room: eigen sleutelpaar, eigen naam, een **admin-** én een
+**gastwachtwoord**, en een eigen toegangslijst (`ClientACL`). Room 0 hergebruikt de
+hoofdidentiteit; de andere krijgen een vers sleutelpaar bij aanmaken.
+
+De posts delen één pool (`MAX_TOTAL_POSTS=48`) met een quotum per room, zodat één
+drukke room de andere niet leeghongert. In de MeshCore-app verschijnt elke room als
+een aparte Room-server waar je met wachtwoord op inlogt; de gast-rol mag meelezen
+maar niet beheren.
+
+### Virtuele sensor-nodes
+
+Naast de rooms draagt de node tot **vier** sensor-node-identiteiten
+(`MAX_SENSOR_NODES=4`), elk van het sensor-type (`ADV_TYPE_SENSOR`) met een eigen
+sleutelpaar. De reden is puur de app: die toont telemetrie alleen voor sensor-type
+contacten, niet voor rooms. Wie zijn metingen in de app wil zien, koppelt ze aan
+een sensor-node.
+
+Elke sensor draagt maar één CayenneLPP-pakket, en dat pakket is begrensd (zie *Het
+bytebudget* hierboven). Met meerdere sensor-nodes kun je de monitors **spreiden**:
+node A draagt kanaal 1–6, node B draagt 7–12 — subset-telemetrie per node, zodat je
+voorbij de één-pakket-limiet komt. Elke sensor(-monitor) heeft daarom twee maskers:
+
+- **rooms-masker** — aan welke rooms de sensor zijn up/down-alerts stuurt;
+- **sensornodes-masker** — via welke sensor-node(s) de telemetriewaarde uitgaat.
+
+Beide maskers mogen leeg zijn (nergens gekoppeld) of meerdere bits zetten. Een
+sensor kan dus tegelijk in twee rooms alarmeren en via twee sensor-nodes telemetrie
+voeden.
+
+### Per-sleutel-ACL: wachtwoordloze toegang
+
+Naast de wachtwoord-login is er een **per-sleutel-ACL** (`MAX_ACL_GRANTS=16`,
+bewaard in `/acl_grants`): een lijst grants die elk een **pubkey** aan één van drie
+niveaus binden — `read`, `readwrite` of `admin`.
+
+De toegang wordt verleend **zonder wachtwoord**, en dat is geen gat: het antwoord
+wordt versleuteld met het ECDH-geheim dat uit die pubkey afgeleid is. Alleen de
+houder van de bijbehorende privésleutel kan het lezen, dus het bezit van de sleutel
+ís de authenticatie. Deze grants zijn **persistent** en staan los van de vluchtige
+login-sessies: een reboot wist de sessies maar niet de grants.
+
+### Kanaalbeheer-panel
+
+Het koppelen gebeurt node-centrisch, in één panel: per sensor kun je de rooms- en
+sensornodes-maskers zetten (koppelen/ontkoppelen). Vanuit hetzelfde panel gaat ook
+het **handmatig advert**: per room, per sensor-node of voor de bot een advert
+uitsturen, als **flood** (het hele mesh) of **zero-hop** (alleen directe buren).
+Handig om een verse identiteit bekend te maken zonder op de volgende automatische
+advert te wachten.
+
+### De room/DM-commandoset
+
+In een room of in een DM aan een room reageert de node op een uitgebreide
+commandoset, **gestuurd door het rechtenniveau** van de afzender:
+
+| niveau | commando's |
+|---|---|
+| read | `dns`, `ping <host> [n]`, `port <host> <poort>`, `http <url>`, `scan`, `traceroute <host>`, `neighbors`/`nb`, `wifi`, `sys`/`health`, `history <s>` |
+| readwrite | `checknow`, `mute`/`unmute`, `snooze`, `test` |
+| admin | `sendto <pubkey> <msg>`, `reboot`, `ntp`/`sync` |
+
+`ping` geeft niet alleen bereikbaarheid maar ook **verlies%** en **jitter**.
+Uitgestelde uitslagen (ping en de netwerk-diagnoses) komen terug **naar de
+oorsprong** — dezelfde room of DM waar het commando vandaan kwam — via het algemene
+oorsprong-routing-mechanisme (de v2.1.0 "ping-fix", nu voor alle trage taken).
+
+### De async netwerk-taak-engine
+
+De diagnoses `port`, `scan`, `http` en `traceroute` zouden blokkeren als je ze
+naïef uitvoert, en blokkeren is hier verboden: de LoRa-radio wordt uit dezelfde
+`loop()` bediend en heeft de strengste tijdseisen. Daarom een **coöperatieve,
+niet-blokkerende taak-engine**: één taak tegelijk, in kleine stappen vanuit
+`loop()`, met het resultaat terug naar de oorsprong.
+
+- **`port <host> <poort>`** — een non-blocking TCP-connect: lukt de verbinding, dan
+  is de poort open.
+- **`scan`** — een asynchrone WiFi-scan van de omgeving.
+- **`http <url>`** — haalt de **statuscode** en de **responstijd** op.
+- **`traceroute <host>`** — meet de **hop-afstand** eerlijk: met `esp_ping` wordt de
+  TTL opgevoerd tot de bestemming antwoordt; die TTL is dan het aantal hops.
+  Begrensd op **30 hops**, ~1,2 s per TTL. **De tussenliggende hop-IP's zijn op dit
+  lwIP/esp_ping-platform niet beschikbaar** — je krijgt de afstand, niet de route.
+  Dat staat er met opzet eerlijk bij; het is geen bug maar een platformgrens.
+
+### SNMP als monitor-soort
+
+Naast *ping* en *gemeld* is er een derde monitor-soort: **SNMP**. De node doet zelf,
+op het poll-interval, een **niet-blokkerende SNMP-GET** (BER/ASN.1-codering, v2c
+over UDP:161). Het is geen nieuw verzendpad — de gepollde waarde stroomt door
+**precies dezelfde** telemetrie- en alert-pijplijn als elke andere monitor:
+CayenneLPP (generiek kanaal) → sensor-nodes → mesh → MeshManager voor de waarde;
+up/down → rooms/DM voor de alerts. Alleen de **bron** is nieuw.
+
+Een SNMP-monitor draagt: naam, doel-IP (poort :161 vast), de **v2c community**, een
+OID, een **interpretatie** (`numeric` / `rate` / `status`) met een `snmparg` (de
+vergelijkwaarde bij status of de referentie bij rate), een interval en de gewone
+am/rm/sn-maskers (alarm-, rooms- en sensornodes-maskers).
+
+De community-string is een geheim en wordt zo behandeld: **geobfusceerd** bewaard
+(XOR + hex in `/monitors.cfg`) en **nooit** gelogd, geëxporteerd of in een UI
+getoond. Beheer kan via de web-GUI (SNMP-formulier + `POST /monitor/snmp`), via de
+CLI en via room/DM (`mon.<kanaal>.type` / `.community` / `.oid` / `.interp` /
+`.snmparg`).
+
+### De bot: een virtueel chat/notifier-contact
+
+De per-sensor `dm`- en `both`-alerts kwamen vroeger van de room-identiteit, en dat
+paste slecht: in de app zag je een Room je een DM sturen. Daarom een aparte
+**bot-identiteit**, `BE-HSS-DinX-Bot`: een eigen persistent sleutelpaar
+(`/bot_id`), adverteert als **`ADV_TYPE_CHAT`**, en verschijnt dus als een gewoon
+chat-contact.
+
+De bot stuurt **schone DM's** — voor flash-meldingen én voor de per-sensor
+`dm`/`both`-alerts, herbedraad van de room naar de bot, met **herhaal-tot-ACK** per
+ontvanger. Zijn ontvangerslijst is persistent (`/bot_recips`, 16 volledige
+pubkeys) en wordt op een verse node geseed met de eigenaar. De bot rekent zijn
+gedeelde geheim **zelf** uit de ontvanger-pubkey (`calcSharedSecret` +
+`createDatagram`), dus hij hangt niet aan een room-sessie.
+
+Bediening:
+
+- **CLI**: `bot list | add <pubkey> | del <prefix> | post <msg> |
+  sendto <pubkey> <msg> | advert [flood] | uri`.
+- **Room/DM**: het admin-commando `sendto <pubkey> <msg>`.
+- **Web-GUI**: het bot-tab (join/QR, ontvangerbeheer, `sendto`/`post`).
+
+### Ontdekte contacten en de kiezer
+
+`GET /contacts.json` geeft de **buurtlijst met volledige pubkey** plus naam,
+snr/hops, laatst-gehoord en teller. De web-GUI gebruikt die lijst als **kiezer**
+op twee plekken: bij de bot-ontvangers en bij de per-slot ACL-grants. Zo kies je
+uit gehoorde nodes in plaats van een sleutel van 64 hextekens met de hand te
+plakken. Er gaan **alleen publieke sleutels** over deze weg — nooit een geheim.
+
+### Join-URI's en QR
+
+Elke identiteit is te delen met een MeshCore join-URI, in de web-GUI client-side
+als QR getekend (geen externe assets):
+
+    meshcore://contact/add?name=<naam>&public_key=<64hex>&type=N
+
+met `type` **1** = chat (de bot), **2** = repeater, **3** = room-server (rooms),
+**4** = sensor (sensor-nodes). Een kanaal delen gaat met
+`meshcore://channel/add?name=<naam>&secret=<32hex>`.
+
 ## De webinterface
 
 Één pagina uit PROGMEM, één webserver, geen framework, geen CDN, geen externe
 stylesheet, geen extern lettertype: een node zonder internet moet zijn eigen
 beheerpagina kunnen tonen. Donker als standaard, licht via
-`prefers-color-scheme`, systeemlettertypen met mono voor de getallen. Drie
-tabbladen — bewaking, toegang, node — met inklapbare secties.
+`prefers-color-scheme`, systeemlettertypen met mono voor de getallen. De
+sensor-variant heeft drie tabbladen — bewaking, toegang, node; de room-variant
+voegt de tabbladen **rooms**, **sensor-nodes** en **bot** toe. Op de sensor-variant
+blijven die tabbladen verborgen en geven de bijbehorende endpoints `501`. Alle
+secties zijn inklapbaar.
 
 Kleur is semantisch en niet decoratief. Daarvoor bestaat het veld `sev`: "aan"
 op kanaal 2 (netvoeding) is goed, "aan" op kanaal 3 (batterijvoeding) is juist
 een waarschuwing. Een pagina die de kleur uit het woord raadt, verft die twee
 hetzelfde en dan liegt de kleur.
 
-Alles zit achter HTTP Basic-auth. Gebruikersnaam en wachtwoord komen uit
-bouwvlaggen (`WEB_USER` / `WEB_PASS`) en die staan nog op hun voorbeeldwaarde —
-zie [openstaand.md](openstaand.md).
+Alles zit achter een login met een **sessiecookie**: `POST /login` zet de cookie,
+`POST /logout` wist hem, en de webgegevens zijn zelf te zetten via `/web/cred`
+(en te resetten via `/web/cred/reset`). Ook de gevoelige endpoints — waaronder de
+room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 
 ### De routes
 
-| route | methode | wat het doet |
-|---|---|---|
-| `/` | GET | de pagina |
-| `/status.json` | GET | de hele stand: voeding, wifi, monitors, heap, uptime |
-| `/cfg.json` | GET | de hele stand van `NodePrefs` in één verzoek |
-| `/acl.json` | GET | toegangslijst, stand van het slot, buurtlijst |
-| `/wifi` | POST | netwerkinstellingen |
-| `/hook` | GET + POST | uitslag van buiten aanleveren |
-| `/monitor`, `/monitor/del` | POST | monitor aanmaken, verwijderen |
-| `/acl`, `/acl/del`, `/acl/strict` | POST | toegang beheren |
-| `/cli` | POST | de enige schrijfweg voor nodebeheer |
+`GET`:
+
+| route | wat het doet |
+|---|---|
+| `/` | de pagina |
+| `/login` | het loginformulier |
+| `/status.json` | de hele stand: voeding, wifi, monitors, heap, uptime |
+| `/cfg.json` | de hele stand van `NodePrefs` in één verzoek |
+| `/acl.json` | toegangslijst, stand van het slot, ontdekte buren |
+| `/rooms.json` | de rooms + sensor-nodes met hun koppelingen |
+| `/contacts.json` | buurtlijst met volledige pubkey (kiezer voor bot/ACL) |
+| `/bot.json` | de bot: identiteit, join/QR, ontvangerslijst |
+| `/rooms/backup` | volledige room-config incl. sleutels (achter auth) |
+| `/hook` | uitslag van buiten aanleveren (mag ook GET, zie onder) |
+
+`POST`:
+
+| route(s) | wat het doet |
+|---|---|
+| `/login`, `/logout` | sessie openen/sluiten |
+| `/wifi` | netwerkinstellingen |
+| `/hook` | uitslag van buiten aanleveren |
+| `/monitor`, `/monitor/del` | ping/gemelde monitor aanmaken, verwijderen |
+| `/monitor/snmp` | SNMP-monitor aanmaken |
+| `/mon/alarm` | de alarm-route/maskers van een monitor zetten |
+| `/acl`, `/acl/del`, `/acl/strict` | per-sleutel-ACL en het slot beheren |
+| `/cli` | de schrijfweg voor nodebeheer (console) |
+| `/web/cred`, `/web/cred/reset` | de webgegevens zetten/resetten |
+| `/sim`, `/sim/clear` | een toestand simuleren / wissen (test) |
+| `/alert/test` | een testwaarschuwing afvuren |
+| `/room/add`, `/room/edit`, `/room/del` | rooms beheren |
+| `/rooms/restore` | room-config terugzetten (achter auth) |
+| `/snode/add`, `/snode/edit`, `/snode/del` | sensor-nodes beheren |
+| `/room/acl`, `/snode/acl` | de ACL van een room / sensor-node zetten |
+| `/room/advert`, `/snode/advert` | handmatig advert per room / sensor-node |
+| `/bot/recipient` | een bot-ontvanger toevoegen/verwijderen |
+| `/bot/advert`, `/bot/sendto`, `/bot/post` | bot adverteren / DM sturen / posten |
+
+Op de sensor-variant bestaan de room-, snode- en bot-endpoints niet als functie:
+ze geven **`501`** en de bijbehorende GUI-tabbladen blijven verborgen.
 
 **Niets dat verandert gaat via GET**, en dat is geen formaliteit. Een GET die
 een monitor wist, wordt door elke browser, elke prefetch en elke linkchecker
@@ -255,6 +477,12 @@ seriële console, een veld erbij maakt oude bestanden niet onleesbaar, en er is
 geen uitlijning of endianness om je aan te vergissen.
 
 ## De DM-opdrachten
+
+Dit zijn de basis-DM-opdrachten van de sensor-kern. De room-variant legt daar de
+veel grotere, rechten-gestuurde **room/DM-commandoset** bovenop (zie *De
+room-server* → *De room/DM-commandoset*): `ping`/`port`/`http`/`scan`/`traceroute`,
+`checknow`/`mute`/`snooze`, `sendto`/`reboot`/`ntp` enzovoort. De vier hieronder
+blijven de kern.
 
 Vier opdrachten, in een gewoon tekstbericht over het mesh:
 
@@ -398,13 +626,15 @@ mesh.
 
 MeshUptime is een **zelfstandig PlatformIO-project**; MeshCore is een gepinde
 git-submodule onder `firmware/vendor/MeshCore`. De volledige uitleg — beide
-bouwwegen, de tag-matrix in de CI en waarom de patch via een pre-build hook loopt
-— staat in [bouwen.md](bouwen.md).
+bouwwegen, beide envs, de tag-matrix in de CI en waarom de patch via een pre-build
+hook loopt — staat in [bouwen.md](bouwen.md).
 
     git submodule update --init firmware/vendor/MeshCore
     cd firmware
-    python -m platformio run -e meshuptime
-    python -m platformio run -e meshuptime -t upload --upload-port COM4
+    python -m platformio run -e meshuptime_room
+    python -m platformio run -e meshuptime_room -t upload --upload-port COM4
+
+Vervang `meshuptime_room` door `meshuptime` voor de sensor-variant (terugvalweg).
 
 De WiFi-gegevens staan **niet** in deze repo (plaatshouders in
 `firmware/platformio.ini`; zie [../firmware/wifi.ini.voorbeeld](../firmware/wifi.ini.voorbeeld)).

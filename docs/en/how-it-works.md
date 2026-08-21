@@ -15,9 +15,43 @@ upstream tag `companion-v1.17.0` (the same commit as `repeater-v1.17.0` and
 `room-server-v1.17.0`), with a custom `SensorManager`, a WiFi task and a web
 server added.
 
-The node advertises as **`ADV_TYPE_SENSOR`** (`SensorMesh.cpp:297`) and answers
-node discovery with `CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_SENSOR`. That is the
-honest type: this device offers sensors.
+### Two variants, one board
+
+There are **two build variants** of the same firmware, with the same modules on the
+same board:
+
+- **Sensor variant** (`env:meshuptime`, `main.cpp` / `SensorMesh`). The original
+  node: one identity, advertises as **`ADV_TYPE_SENSOR`** (`SensorMesh.cpp:297`) and
+  answers node discovery with `CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_SENSOR`. That
+  is the honest type: this device offers sensors. Stays the rollback path.
+- **Room-server variant** (`env:meshuptime_room`, build flag `ROOM_SERVER_VARIANT`,
+  `main_room.cpp` / `RoomMesh`). **The current primary product.** One device now
+  carries several identities at once — rooms, virtual sensor-nodes and a bot — each
+  with its own keypair and its own advert type. Unless stated otherwise, the rest of
+  this file describes the room variant; the sensor base (power, WiFi, channels,
+  monitors) is in *both* and is described below as the shared core.
+
+`SensorMesh.cpp` stays compiled into both envs because the `WebTask` is coupled to
+it by type; only `main_room.cpp` and `RoomMesh.cpp` switch between the envs (see
+[building.md](building.md)).
+
+### The room-server's identities
+
+The room variant is deliberately not a single node with one key but a collection of
+virtual identities, each with its own advert type so the MeshCore app shows it in
+the right box:
+
+| identity | advert type | join-URI type | count | what the app shows |
+|---|---|---|---|---|
+| room | `ADV_TYPE_ROOM` | 3 | `MAX_ROOMS=4` | a room server |
+| sensor-node | `ADV_TYPE_SENSOR` | 4 | `MAX_SENSOR_NODES=4` | a sensor with telemetry |
+| bot | `ADV_TYPE_CHAT` | 1 | 1 | an ordinary chat contact |
+
+Room 0 reuses the existing main identity (the key in `/identity/_main.id` is
+preserved). Why separate identities: the app shows telemetry **only** for
+sensor-type contacts and chat messages for chat-type contacts. A node that wants to
+be room, sensor and notifier at once must therefore wear those hats as literally
+separate contacts.
 
 Packet forwarding is in the base and is off by default
 (`SensorMesh::allowPacketForward` checks `disable_fwd`, plus `flood_max` on a
@@ -144,36 +178,217 @@ connecting, online, retrying, own AP) and runs on:
 The reconnect count, the hard-reset count and the last disconnect reason are shown
 in the web interface. "No WiFi" without a reason costs somebody an evening.
 
+## The room-server
+
+Everything above — channels, monitors, power, WiFi — is the shared sensor core.
+What follows is what the room variant (`RoomMesh`) adds on top.
+
+### Rooms
+
+One device serves up to **four** room identities (`MAX_ROOMS=4`), each a full
+MeshCore Room: its own keypair, its own name, an **admin** *and* a **guest**
+password, and its own access list (`ClientACL`). Room 0 reuses the main identity;
+the others get a fresh keypair when created.
+
+The posts share one pool (`MAX_TOTAL_POSTS=48`) with a per-room quota, so one busy
+room cannot starve the others. In the MeshCore app each room appears as a separate
+room server you log into with a password; the guest role may read along but not
+administer.
+
+### Virtual sensor-nodes
+
+Alongside the rooms the node carries up to **four** sensor-node identities
+(`MAX_SENSOR_NODES=4`), each of the sensor type (`ADV_TYPE_SENSOR`) with its own
+keypair. The reason is purely the app: it shows telemetry only for sensor-type
+contacts, not for rooms. Whoever wants to see their measurements in the app couples
+them to a sensor-node.
+
+Each sensor carries only one CayenneLPP packet, and that packet is bounded (see *The
+byte budget* above). With multiple sensor-nodes you can **spread** the monitors:
+node A carries channels 1–6, node B carries 7–12 — subset-telemetry per node, so you
+get past the one-packet limit. Every sensor(-monitor) therefore has two masks:
+
+- **rooms mask** — which rooms the sensor sends its up/down alerts to;
+- **sensornodes mask** — which sensor-node(s) carry the telemetry value out.
+
+Both masks may be empty (coupled nowhere) or set several bits. A sensor can thus
+alarm in two rooms and feed telemetry through two sensor-nodes at the same time.
+
+### Per-key ACL: passwordless access
+
+Beside the password login there is a **per-key ACL** (`MAX_ACL_GRANTS=16`, stored in
+`/acl_grants`): a list of grants that each bind a **pubkey** to one of three levels —
+`read`, `readwrite` or `admin`.
+
+Access is granted **without a password**, and that is not a hole: the reply is
+encrypted with the ECDH secret derived from that pubkey. Only the holder of the
+matching private key can read it, so possession of the key *is* the authentication.
+These grants are **persistent** and separate from the volatile login sessions: a
+reboot clears the sessions but not the grants.
+
+### Channel-management panel
+
+Coupling is done node-centrically, in one panel: per sensor you set the rooms and
+sensornodes masks (couple/uncouple). From the same panel comes the **manual
+advert**: send an advert for a room, a sensor-node or the bot, as **flood** (the
+whole mesh) or **zero-hop** (direct neighbours only). Handy to make a fresh identity
+known without waiting for the next automatic advert.
+
+### The room/DM command set
+
+In a room, or in a DM to a room, the node answers an extended command set, **gated
+by the sender's permission level**:
+
+| level | commands |
+|---|---|
+| read | `dns`, `ping <host> [n]`, `port <host> <port>`, `http <url>`, `scan`, `traceroute <host>`, `neighbors`/`nb`, `wifi`, `sys`/`health`, `history <s>` |
+| readwrite | `checknow`, `mute`/`unmute`, `snooze`, `test` |
+| admin | `sendto <pubkey> <msg>`, `reboot`, `ntp`/`sync` |
+
+`ping` reports not just reachability but **loss%** and **jitter**. Deferred results
+(ping and the network diagnostics) come back **to the origin** — the same room or DM
+the command came from — via the general origin-routing mechanism (the v2.1.0
+"ping fix", now for all slow tasks).
+
+### The async network-task engine
+
+The diagnostics `port`, `scan`, `http` and `traceroute` would block if run naively,
+and blocking is forbidden here: the LoRa radio is serviced from the same `loop()`
+and has the tightest timing requirements. Hence a **cooperative, non-blocking task
+engine**: one task at a time, in small steps from `loop()`, with the result routed
+back to the origin.
+
+- **`port <host> <port>`** — a non-blocking TCP connect: if the connection
+  succeeds, the port is open.
+- **`scan`** — an asynchronous WiFi scan of the surroundings.
+- **`http <url>`** — fetches the **status code** and the **response time**.
+- **`traceroute <host>`** — measures the **hop distance** honestly: with `esp_ping`
+  the TTL is raised until the destination replies; that TTL is then the hop count.
+  Bounded at **30 hops**, ~1.2 s per TTL. **The intermediate hop IPs are not
+  available on this lwIP/esp_ping platform** — you get the distance, not the route.
+  That is stated honestly on purpose; it is a platform limit, not a bug.
+
+### SNMP as a monitor kind
+
+Beside *ping* and *pushed* there is a third monitor kind: **SNMP**. The node itself,
+on the poll interval, does a **non-blocking SNMP-GET** (BER/ASN.1 encoding, v2c over
+UDP:161). It is not a new send path — the polled value flows through **exactly the
+same** telemetry and alert pipeline as any other monitor: CayenneLPP (generic
+channel) → sensor-nodes → mesh → MeshManager for the value; up/down → rooms/DM for
+the alerts. Only the **source** is new.
+
+An SNMP monitor carries: name, target IP (port :161 fixed), the **v2c community**,
+an OID, an **interpretation** (`numeric` / `rate` / `status`) with an `snmparg` (the
+compare value for status or the reference for rate), an interval, and the usual
+am/rm/sn masks (alarm, rooms and sensornodes masks).
+
+The community string is a secret and is treated as one: stored **obfuscated** (XOR +
+hex in `/monitors.cfg`) and **never** logged, exported or shown in a UI. Management
+is via the web GUI (SNMP form + `POST /monitor/snmp`), the CLI, and room/DM
+(`mon.<channel>.type` / `.community` / `.oid` / `.interp` / `.snmparg`).
+
+### The bot: a virtual chat/notifier contact
+
+The per-sensor `dm` and `both` alerts used to come from the room identity, and that
+fitted badly: in the app you saw a Room send you a DM. Hence a separate **bot
+identity**, `BE-HSS-DinX-Bot`: its own persistent keypair (`/bot_id`), advertises as
+**`ADV_TYPE_CHAT`**, and so appears as an ordinary chat contact.
+
+The bot sends **clean DMs** — for flash notifications *and* for the per-sensor
+`dm`/`both` alerts, rewired from the room to the bot, with **repeat-until-ACK** per
+recipient. Its recipient list is persistent (`/bot_recips`, 16 full pubkeys) and is
+seeded with the owner on a fresh node. The bot computes its shared secret **itself**
+from the recipient pubkey (`calcSharedSecret` + `createDatagram`), so it does not
+hang off a room session.
+
+Control:
+
+- **CLI**: `bot list | add <pubkey> | del <prefix> | post <msg> |
+  sendto <pubkey> <msg> | advert [flood] | uri`.
+- **Room/DM**: the admin command `sendto <pubkey> <msg>`.
+- **Web GUI**: the bot tab (join/QR, recipient management, `sendto`/`post`).
+
+### Discovered contacts and the picker
+
+`GET /contacts.json` returns the **neighbour list with full pubkey** plus name,
+snr/hops, last-heard and count. The web GUI uses that list as a **picker** in two
+places: the bot recipients and the per-slot ACL grants. So you choose from heard
+nodes instead of pasting a 64-hex key by hand. Only **public keys** travel this way
+— never a secret.
+
+### Join URIs and QR
+
+Each identity can be shared with a MeshCore join URI, drawn client-side as a QR in
+the web GUI (no external assets):
+
+    meshcore://contact/add?name=<name>&public_key=<64hex>&type=N
+
+with `type` **1** = chat (the bot), **2** = repeater, **3** = room server (rooms),
+**4** = sensor (sensor-nodes). Sharing a channel uses
+`meshcore://channel/add?name=<name>&secret=<32hex>`.
+
 ## The web interface
 
 One page from PROGMEM, one web server, no framework, no CDN, no external
 stylesheet, no external font: a node without internet must be able to serve its
 own admin page. Dark by default, light through `prefers-color-scheme`, system font
-stacks with mono for the figures. Three tabs — monitoring, access, node — with
-collapsible sections.
+stacks with mono for the figures. The sensor variant has three tabs — monitoring,
+access, node; the room variant adds the **rooms**, **sensor-nodes** and **bot**
+tabs. On the sensor variant those tabs stay hidden and the corresponding endpoints
+return `501`. All sections are collapsible.
 
 Colour is semantic, not decorative, which is what the `sev` field is for: "on" on
 channel 2 (mains) is good, "on" on channel 3 (battery) is a warning. A page that
 guesses the colour from the word paints those two the same, and then the colour
 lies.
 
-Everything sits behind HTTP Basic auth. Username and password come from build
-flags (`WEB_USER` / `WEB_PASS`) and are still at their example values — see
-[open-issues.md](open-issues.md).
+Everything sits behind a login with a **session cookie**: `POST /login` sets the
+cookie, `POST /logout` clears it, and the web credentials themselves are settable via
+`/web/cred` (and resettable via `/web/cred/reset`). The sensitive endpoints too —
+including the room backup/restore that carry keys — sit behind the same auth.
 
 ### The routes
 
-| route | method | what it does |
-|---|---|---|
-| `/` | GET | the page |
-| `/status.json` | GET | everything: power, WiFi, monitors, heap, uptime |
-| `/cfg.json` | GET | the whole of `NodePrefs` in one request |
-| `/acl.json` | GET | access list, lock state, neighbour list |
-| `/wifi` | POST | network settings |
-| `/hook` | GET + POST | supply a verdict from outside |
-| `/monitor`, `/monitor/del` | POST | create, delete a monitor |
-| `/acl`, `/acl/del`, `/acl/strict` | POST | manage access |
-| `/cli` | POST | the only write path for node administration |
+`GET`:
+
+| route | what it does |
+|---|---|
+| `/` | the page |
+| `/login` | the login form |
+| `/status.json` | everything: power, WiFi, monitors, heap, uptime |
+| `/cfg.json` | the whole of `NodePrefs` in one request |
+| `/acl.json` | access list, lock state, discovered neighbours |
+| `/rooms.json` | the rooms + sensor-nodes with their couplings |
+| `/contacts.json` | neighbour list with full pubkey (picker for bot/ACL) |
+| `/bot.json` | the bot: identity, join/QR, recipient list |
+| `/rooms/backup` | full room config incl. keys (behind auth) |
+| `/hook` | supply a verdict from outside (may also be GET, see below) |
+
+`POST`:
+
+| route(s) | what it does |
+|---|---|
+| `/login`, `/logout` | open/close a session |
+| `/wifi` | network settings |
+| `/hook` | supply a verdict from outside |
+| `/monitor`, `/monitor/del` | create, delete a ping/pushed monitor |
+| `/monitor/snmp` | create an SNMP monitor |
+| `/mon/alarm` | set a monitor's alert route/masks |
+| `/acl`, `/acl/del`, `/acl/strict` | manage the per-key ACL and the lock |
+| `/cli` | the write path for node administration (console) |
+| `/web/cred`, `/web/cred/reset` | set/reset the web credentials |
+| `/sim`, `/sim/clear` | simulate / clear a state (testing) |
+| `/alert/test` | fire a test alert |
+| `/room/add`, `/room/edit`, `/room/del` | manage rooms |
+| `/rooms/restore` | restore room config (behind auth) |
+| `/snode/add`, `/snode/edit`, `/snode/del` | manage sensor-nodes |
+| `/room/acl`, `/snode/acl` | set the ACL of a room / sensor-node |
+| `/room/advert`, `/snode/advert` | manual advert per room / sensor-node |
+| `/bot/recipient` | add/remove a bot recipient |
+| `/bot/advert`, `/bot/sendto`, `/bot/post` | bot advert / DM / post |
+
+On the sensor variant the room, snode and bot endpoints do not exist as a function:
+they return **`501`** and the corresponding GUI tabs stay hidden.
 
 **Nothing that changes anything goes over GET**, and that is not a formality. A
 GET that deletes a monitor is followed by every browser, every prefetch and every
@@ -250,6 +465,12 @@ the serial console, an extra field does not make older files unreadable, and the
 is no alignment or endianness to get wrong.
 
 ## The DM commands
+
+These are the basic DM commands of the sensor core. The room variant layers the far
+larger, permission-gated **room/DM command set** on top (see *The room-server* →
+*The room/DM command set*): `ping`/`port`/`http`/`scan`/`traceroute`,
+`checknow`/`mute`/`snooze`, `sendto`/`reboot`/`ntp` and so on. The four below stay
+the core.
 
 Four commands, in an ordinary text message over the mesh:
 

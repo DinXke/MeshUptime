@@ -9,6 +9,38 @@ transition so flashing does not break.
 
 ---
 
+## The two envs
+
+Separate from the two build ways, there are **two PlatformIO envs**, both for the
+same board with the same modules:
+
+| env | variant | main / mesh class | build flag |
+|---|---|---|---|
+| `meshuptime_room` | room-server (**primary**) | `main_room.cpp` / `RoomMesh` | `ROOM_SERVER_VARIANT=1` |
+| `meshuptime` | sensor (rollback) | `main.cpp` / `SensorMesh` | — |
+
+`meshuptime_room` **extends** `meshuptime` (`extends = env:meshuptime`) and only
+adds the `ROOM_SERVER_VARIANT` build flag on top. The difference is in the
+`build_src_filter`: the sensor env excludes `main_room.cpp` and `RoomMesh.cpp`, the
+room env re-enables them and excludes `main.cpp`. `SensorMesh.cpp` stays in **both**
+envs (the `WebTask` is coupled to it by type). Defaults for the room env —
+`MAX_ROOMS=4`, `MAX_TOTAL_POSTS=48` — live in `RoomMesh.h` and can be overridden in
+`env:meshuptime_room` if the RAM budget allows.
+
+Last known build sizes (`Heltec_lora32_v3`, no PSRAM, 327,680 B RAM / 3,342,336 B
+flash):
+
+| env | RAM | flash |
+|---|---|---|
+| `meshuptime_room` | 40.5% (132,728) | 45.2% (1,509,589) |
+| `meshuptime` | 33.9% (111,072) | 44.6% (1,491,325) |
+
+The room env is larger because of the extra panels (rooms, sensor-nodes, bot, SNMP)
+and the async network engine. If the figures differ sharply, something did not carry
+over.
+
+---
+
 ## Way 1 — the standalone project (preferred)
 
 One source: this repo. No copy steps, no two-tree sync.
@@ -18,15 +50,18 @@ git clone https://github.com/DinXke/MeshUptime.git
 cd MeshUptime
 git submodule update --init firmware/vendor/MeshCore
 cd firmware
-python -m platformio run -e meshuptime
+python -m platformio run -e meshuptime_room
 ```
 
 Flash (writes the program partition only, not SPIFFS — identity and settings
 survive):
 
 ```sh
-python -m platformio run -e meshuptime -t upload --upload-port COM4
+python -m platformio run -e meshuptime_room -t upload --upload-port COM4
 ```
+
+Replace `meshuptime_room` with `meshuptime` for the sensor variant (rollback); all
+other steps are the same.
 
 Under the hood:
 
@@ -91,7 +126,7 @@ This stays working as long as the flashing workflow still uses it. In short:
 3. `firmware/examples/meshuptime/*` into the checkout's `examples/meshuptime/`.
 4. A `platformio.local.ini` (with your real WiFi) — MeshCore reads it via
    `extra_configs`. `firmware/platformio.ci.ini` is the placeholder mirror of it.
-5. `pio run -e meshuptime` inside the checkout.
+5. `pio run -e meshuptime` (or `-e meshuptime_room`) inside the checkout.
 
 Downside — and the reason way 1 is preferred: this is the two-tree sync that gave
 broken builds when several people/agents worked at once. Once flashing runs on
@@ -109,6 +144,7 @@ way 1, this copy (and `platformio.ci.ini`) can go.
   as a warning and in the summary, without turning the required build red. That
   turns an upgrade into a tick beforehand instead of a surprise.
 
-Last known figures on a fresh checkout (must match; if they differ, something did
-not carry over): **RAM 32.0%** (104,904 of 327,680 bytes), **flash 41.4%**
-(1,385,037 of 3,342,336 bytes).
+The expected build sizes per env are above in *The two envs*; if they differ
+sharply on a fresh checkout, something did not carry over. (An older, sensor-only
+baseline was RAM 32.0% / flash 41.4% — from before the room-server code; purely for
+historical comparison.)
