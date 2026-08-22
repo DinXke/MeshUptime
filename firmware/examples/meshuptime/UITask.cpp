@@ -48,8 +48,11 @@ int UITask::collectAlerts(char lines[][22], int max_lines) {
   int n = 0;
   float v = (float)board.getBattMilliVolts() / 1000.0f;
   if (v < 3.6f && n < max_lines) { snprintf(lines[n++], 22, "accu laag %.2fV", v); }
-  if (!sensors.isMains() && n < max_lines) { snprintf(lines[n++], 22, "netvoeding weg"); }
-  if (!sensors.isWifiOnline() && n < max_lines) { snprintf(lines[n++], 22, "wifi weg"); }
+  /* fixedIsDown() (gedebounced) i.p.v. de rauwe isMains()/isWifiOnline(): het
+   * STORING-scherm en het alarmpad tonen zo DEZELFDE stabiele toestand -- geen
+   * "storing weg" op het scherm terwijl er net een "terug" de deur uit ging. */
+  if (sensors.fixedIsDown(MonitorSensors::FIXED_POWER) && n < max_lines) { snprintf(lines[n++], 22, "netvoeding weg"); }
+  if (sensors.fixedIsDown(MonitorSensors::FIXED_WIFI) && n < max_lines) { snprintf(lines[n++], 22, "wifi weg"); }
   for (int i = 0; i < MonitorSensors::MAX_MONITORS && n < max_lines; i++) {
     if (sensors.monitorUsed(i) && sensors.monitorSeeded(i) &&
         !sensors.monitorsPaused() && !sensors.monitorIsUp(i)) {

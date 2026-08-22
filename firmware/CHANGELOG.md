@@ -7,6 +7,34 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.4 — spook-recovery weg (symmetrisch gedebouncete storingstoestand)
+
+Fysiek gemeld: USB uittrekken gaf terecht "storing netvoeding weg" op de OLED, maar
+tegelijk een SPOOK-alert "netvoeding terug na 0s" (re-plug gaf wél de juiste duur).
+
+OORZAAK: in v2.3.3 was de DOWN-kant gedebouncet (`fixedAlertDown` telde de
+onderbrekingsklok) maar de UP/recovery-kant NIET: `fixedRawTick` zette
+`_fixed_raw_down_since` op 0 zodra de rauwe toestand één keer "op" las, waarna
+`main_room::edge` meteen een recovery vuurde met een bijna-0 geregistreerde duur.
+Een korte afwijking (de settle door de mains.hi/lo-band bij uittrekken/insteken)
+volstond zo voor een spurieuze "terug na 0s".
+
+FIX (root): de vaste kanalen draaien nu op een SYMMETRISCH GEDEBOUNCETE
+toestandsmachine (`_fixed_state_down` + `_fixed_change_since`): de rauwe meting moet
+de debounce-drempel lang AANEENGESLOTEN afwijken voordat de toestand kantelt --
+identiek voor down en up. Gevolgen:
+1. Geen recovery meer met een duur onder de drempel: een recovery vergt dat de
+   toestand eerst ECHT neer stond (>= debounce) en daarna stabiel terug is (>=
+   debounce), dus "terug na ~0s" kan niet meer.
+2. De recovery is nu symmetrisch gedebounced, net als de down-kant.
+3. Bovenop de bestaande hysterese van `samplePower()` (mains.hi/lo-band +
+   SAMPLES_TO_SWITCH + SETTLE) laat deze extra laag een flap tijdens het settelen de
+   alarmtoestand niet meer kantelen.
+4. De OLED (STORING-scherm) leest nu dezelfde gedebouncete toestand (`fixedIsDown`)
+   als het alarmpad (`fixedAlertDown`), zodat scherm en alarm elkaar nooit
+   tegenspreken. De herstelmelding toont de echte onderbrekingsduur
+   (`_fixed_last_down_ms`).
+
 ## v2.3.3 — wifi/netvoeding-alerts: geen mislabel + debounce
 
 Twee fixes tegen de vloed van "wifi simulatie"-alerts die de gebruiker meldde.

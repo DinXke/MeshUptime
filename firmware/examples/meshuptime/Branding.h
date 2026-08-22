@@ -30,11 +30,14 @@
  *   v2.3.3 = wifi/netvoeding-alerts: SIMULATIE-merkteken alleen bij een echte
  *            forcering (geen mislabel), + debounce/opstart-genade tegen de vloed
  *            van alerts bij korte blips en de eigen reboot.
+ *   v2.3.4 = spook-recovery ("netvoeding terug na 0s") weg: symmetrisch
+ *            gedebouncete storingstoestand voor vaste kanalen, OLED + alarm delen
+ *            die toestand.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.3"
+  #define MESHUPTIME_VERSION   "v2.3.4"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

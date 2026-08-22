@@ -401,7 +401,10 @@ bool MonitorSensors::begin() {
   memset(_fixed_rec_until, 0, sizeof(_fixed_rec_until));
   memset(_fixed_rec_alerting, 0, sizeof(_fixed_rec_alerting));
   memset(_fixed_rep, 0, sizeof(_fixed_rep));
-  memset(_fixed_raw_down_since, 0, sizeof(_fixed_raw_down_since));
+  memset(_fixed_state_down, 0, sizeof(_fixed_state_down));
+  memset(_fixed_state_init, 0, sizeof(_fixed_state_init));
+  memset(_fixed_change_since, 0, sizeof(_fixed_change_since));
+  memset(_fixed_down_start, 0, sizeof(_fixed_down_start));
   memset(_fixed_last_down_ms, 0, sizeof(_fixed_last_down_ms));
   _boot_ms = millis();   /* start van de opstart-genadeperiode (debounce) */
 
@@ -1574,15 +1577,41 @@ void MonitorSensors::loopRecovery() {
   fixedRawTick(FIXED_WIFI, !isWifiOnline());
 }
 
-/* Bijhouden van de rauwe onderbrekingsklok van een vast kanaal. */
-void MonitorSensors::fixedRawTick(int which, bool down_now) {
+/* SYMMETRISCH GEDEBOUNCETE toestandsmachine voor een vast kanaal. De rauwe meting
+ * (raw_down, al ontruist door samplePower()/de wifi-laag) moet DE DEBOUNCE-DREMPEL
+ * lang aaneengesloten afwijken van de stabiele toestand voordat die kantelt. Zo
+ * kantelt een korte blip -- de settle door de mains.hi/lo-band bij uit-/insteken,
+ * of de eigen reboot -- de toestand NIET, en kan er dus geen spook-"terug na 0s"
+ * ontstaan: een recovery vergt dat _fixed_state_down eerst ECHT neer stond (>= de
+ * drempel) en daarna stabiel terug is (ook >= de drempel). De down- en up-kant zijn
+ * daarmee identiek gedebounced. */
+void MonitorSensors::fixedRawTick(int which, bool raw_down) {
   if (which < 0 || which >= FIXED_ALERT_COUNT) return;
   const unsigned long now = millis();
-  if (down_now) {
-    if (_fixed_raw_down_since[which] == 0) _fixed_raw_down_since[which] = now ? now : 1;
-  } else if (_fixed_raw_down_since[which] != 0) {
-    _fixed_last_down_ms[which] = now - _fixed_raw_down_since[which];
-    _fixed_raw_down_since[which] = 0;
+
+  /* Eerste meting: de toestand op de rauwe waarde zetten zonder een flank (geen
+   * spurieuze down/recovery voor de begintoestand). */
+  if (!_fixed_state_init[which]) {
+    _fixed_state_init[which] = true;
+    _fixed_state_down[which] = raw_down;
+    _fixed_change_since[which] = 0;
+    if (raw_down) _fixed_down_start[which] = now;
+    return;
+  }
+
+  if (raw_down == _fixed_state_down[which]) {   // rauw klopt met de stabiele toestand
+    _fixed_change_since[which] = 0;             // een pending kanteling vervalt
+    return;
+  }
+
+  /* Rauw wijkt af: pas kantelen als het lang genoeg AANEENGESLOTEN afwijkt. */
+  if (_fixed_change_since[which] == 0) _fixed_change_since[which] = now ? now : 1;
+  const unsigned long thr = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
+  if ((unsigned long)(now - _fixed_change_since[which]) >= thr) {
+    _fixed_state_down[which] = raw_down;
+    _fixed_change_since[which] = 0;
+    if (raw_down) _fixed_down_start[which] = now;                 // begin onderbreking
+    else          _fixed_last_down_ms[which] = now - _fixed_down_start[which];  // duur
   }
 }
 
@@ -1591,17 +1620,20 @@ bool MonitorSensors::fixedIsSim(int which) const {
   return _sim[idx].mode != SIM_OFF;
 }
 
+/* De gedebouncete storingstoestand, voor de OLED (geen opstart-genade -- het scherm
+ * mag de waarheid tonen; het alarm zwijgt alleen tijdens de genadeperiode). */
+bool MonitorSensors::fixedIsDown(int which) const {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
+  return _fixed_state_down[which];
+}
+
 bool MonitorSensors::fixedAlertDown(int which) const {
   if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
   /* Opstart-genadeperiode: vlak na boot niets melden -- de node moet eerst een
    * stabiele meting hebben (wifi/DHCP komt niet meteen). Zo vuurt een herstart
-   * geen "wifi weg"/"wifi terug"-paar. */
+   * geen "wifi weg"/"wifi terug"-paar. Daarna telt de gedebouncete toestand. */
   if ((unsigned long)(millis() - _boot_ms) < FIXED_BOOT_GRACE_MS) return false;
-  if (_fixed_raw_down_since[which] == 0) return false;   // nu op
-  /* Debounce: pas "neer" voor het alarm als het lang genoeg aaneengesloten neer is.
-   * fixed_debounce_s == 0 -> geen debounce (meteen). */
-  const unsigned long thr = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
-  return (unsigned long)(millis() - _fixed_raw_down_since[which]) >= thr;
+  return _fixed_state_down[which];
 }
 
 /* De voorwaarde die main.cpp aan de TWEEDE Trigger per vakje hangt.

@@ -849,6 +849,10 @@ public:
    * genadeperiode voorbij is -- zo alarmeert een korte blip of de eigen reboot
    * niet. which = FIXED_POWER / FIXED_WIFI. */
   bool        fixedAlertDown(int which) const;
+  /* De GEDEBOUNCETE storingstoestand van een vast kanaal (zonder de opstart-
+   * genadeperiode), voor de OLED -- zodat scherm en alarm dezelfde stabiele
+   * toestand tonen en elkaar nooit tegenspreken. */
+  bool        fixedIsDown(int which) const;
   /* Wordt de storing op dit vaste kanaal NU gesimuleerd (forcering actief)? Bepaalt
    * of de alerttekst het SIMULATIE-merkteken draagt. */
   bool        fixedIsSim(int which) const;
@@ -1260,12 +1264,23 @@ private:
   bool          _fixed_rec_alerting[FIXED_ALERT_COUNT];
   AlertRepeat   _fixed_rep[FIXED_ALERT_COUNT];    /* herhalen tot bevestiging */
 
-  /* DEBOUNCE op de vaste kanalen (wifi/netvoeding). _fixed_raw_down_since = millis
-   * waarop de RAUWE onderbreking begon (0 = nu op); _fixed_last_down_ms = de duur
-   * van de zojuist geeindigde onderbreking (voor de "terug na Xs"-tekst). _boot_ms
-   * = starttijd, voor de opstart-genadeperiode. Zo alarmeert een korte blip (bv. de
-   * eigen reboot) niet. Zie fixedAlertDown(). */
-  unsigned long _fixed_raw_down_since[FIXED_ALERT_COUNT];
+  /* SYMMETRISCH GEDEBOUNCETE toestandsmachine voor de vaste kanalen (wifi/
+   * netvoeding). Eén stabiele toestand die ZOWEL het alarmpad (fixedAlertDown) als
+   * de OLED (fixedIsDown) lezen, zodat ze elkaar nooit tegenspreken.
+   *  _fixed_state_down  = de stabiele toestand (true = neer).
+   *  _fixed_change_since = millis waarop de RAUWE toestand begon af te wijken van
+   *                        _fixed_state_down (0 = klopt); pas na de debounce-drempel
+   *                        aaneengesloten afwijken kantelt de toestand. Zo kantelt
+   *                        een korte blip (uittrekken/insteken-settle, of de eigen
+   *                        reboot) de toestand NIET -- geen spook-"terug na 0s".
+   *  _fixed_down_start  = millis waarop _fixed_state_down neer ging (voor de duur).
+   *  _fixed_last_down_ms = duur van de laatste ECHTE onderbreking (>= debounce).
+   *  _fixed_state_init  = is de toestand al op de eerste rauwe meting gezet?
+   *  _boot_ms           = starttijd, voor de opstart-genadeperiode. */
+  bool          _fixed_state_down[FIXED_ALERT_COUNT];
+  bool          _fixed_state_init[FIXED_ALERT_COUNT];
+  unsigned long _fixed_change_since[FIXED_ALERT_COUNT];
+  unsigned long _fixed_down_start[FIXED_ALERT_COUNT];
   unsigned long _fixed_last_down_ms[FIXED_ALERT_COUNT];
   unsigned long _boot_ms;
 
