@@ -1203,7 +1203,9 @@ void SensorMesh::loop() {
   }
 
   uint32_t curr = getRTCClock()->getCurrentTime();
-  if (curr >= last_read_time + SENSOR_READ_INTERVAL_SECS) {
+  // v2.3.6: cadans LIVE uit _cfg (sensors.readIntervalSecs()); de -D
+  // SENSOR_READ_INTERVAL_SECS blijft enkel de default-seed (zie MonitorStore.h).
+  if (curr >= last_read_time + sensors.readIntervalSecs()) {
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     // query other sensors -- target specific

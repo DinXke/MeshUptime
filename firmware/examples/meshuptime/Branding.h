@@ -38,11 +38,18 @@
  *            genoeg onderbreking (nooit "na 0s", ook bij sim/alert.debounce=0).
  *            Debounce vereenvoudigd tot korte settle (5 s std; reboot-vloed doet
  *            de opstart-genade), boot-grace-desync tussen OLED en alarm weg.
+ *   v2.3.6 = reactietijd van de netvoeding/wifi-alert RUNTIME-INSTELBAAR (web-GUI
+ *            "Reactietijd" + CLI/DM + persistent) i.p.v. hardgecodeerd: de vroeger
+ *            vaste consts SAMPLE_INTERVAL_MS/SAMPLES_TO_SWITCH/SETTLE_MS +
+ *            SENSOR_READ_INTERVAL_SECS stapelden op tot ~60 s. Nieuwe snelle
+ *            defaults (power.sample 2 s, power.confirm 2, power.settle 8 s,
+ *            read.interval 3 s, alert.debounce 2 s) -> alert in ~6-10 s. Live
+ *            gelezen, in status.json ("timing") voor de MeshManager-server.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.5"
+  #define MESHUPTIME_VERSION   "v2.3.6"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

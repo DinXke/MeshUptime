@@ -436,7 +436,7 @@ bool MonitorSensors::begin() {
    * loop()-ronde op zijn beginwaarde, en die zou kunnen liegen. */
   _state_since = millis();
   samplePower();
-  _next_sample = millis() + SAMPLE_INTERVAL_MS;
+  _next_sample = millis() + sampleIntervalMs();
 
   return ok;
 }
@@ -448,7 +448,9 @@ void MonitorSensors::loop() {
    * een vaste tik, geen wachten en geen I/O. */
   unsigned long now = millis();
   if ((long)(now - _next_sample) >= 0) {
-    _next_sample = now + SAMPLE_INTERVAL_MS;
+    /* LIVE gelezen (v2.3.6): power.sample kan tijdens het draaien gewijzigd zijn,
+     * en dan hoort de volgende tik meteen de nieuwe waarde te gebruiken. */
+    _next_sample = now + sampleIntervalMs();
     samplePower();
   }
 
@@ -518,13 +520,14 @@ void MonitorSensors::samplePower() {
   }
 
   /* Insteltijd. Ook na het opstarten, want _state_since wordt in begin() gezet:
-   * de eerste minuut na een reset zit de node in dezelfde transient. */
-  if ((unsigned long)(millis() - _state_since) < SETTLE_MS) {
+   * de eerste seconden na een reset zit de node in dezelfde transient. LIVE
+   * gelezen (v2.3.6): power.settle in seconden -> ms. 0 = geen settle. */
+  if ((unsigned long)(millis() - _state_since) < (unsigned long)_cfg.power_settle_s * 1000UL) {
     _agree = 0;
     return;
   }
 
-  if (++_agree >= SAMPLES_TO_SWITCH) {
+  if (++_agree >= _cfg.power_confirm) {
     _mains = wants_mains;
     _agree = 0;
     _state_since = millis();
@@ -3457,10 +3460,12 @@ bool MonitorSensors::delMonitor(const char* name) {
  */
 
 #define MON_FIELDS_PER_MONITOR  5     /* name, host, int, state, ms */
-#define MON_NUM_GLOBAL_SETTINGS 13    /* mains.hi/lo/state + mon.count/add/del
+#define MON_NUM_GLOBAL_SETTINGS 17    /* mains.hi/lo/state + mon.count/add/del
                                        + alert.recover/alert.rhold/alert.repeat
                                        + push.url/push.token/push.hb
-                                       + alert.debounce */
+                                       + alert.debounce
+                                       + power.sample/power.confirm/power.settle
+                                       + read.interval  (v2.3.6 reactietijd) */
 
 /* Vaste buffers, één per instelling: getSettingValue() is const en mag niets
  * alloceren, en met een buffer per instelling kan een aanroeper meerdere
@@ -3512,6 +3517,12 @@ const char* MonitorSensors::getSettingName(int i) const {
     case 10: return "push.token";   // Bearer-token voor de server
     case 11: return "push.hb";      // s: beloofd heartbeat-interval
     case 12: return "alert.debounce"; // s: debounce vaste kanalen (0 = uit)
+    /* v2.3.6 REACTIETIJD -- zelfde weg als elke andere instelling (CLI/DM/web door
+     * één zeef, één opslag). LIVE gelezen in samplePower()/loop()/de leesronde. */
+    case 13: return "power.sample";   // s: samplePower-tik (1..60)
+    case 14: return "power.confirm";  // n: bevestigende metingen (1..10)
+    case 15: return "power.settle";   // s: rust na overgang/reboot (0..300)
+    case 16: return "read.interval";  // s: onSensorDataRead-cadans (1..60)
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -3581,6 +3592,24 @@ const char* MonitorSensors::getSettingValue(int i) const {
     case 12:
       snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
                (unsigned)_cfg.fixed_debounce_s);
+      return s_setting_buf[2];
+    /* v2.3.6 reactietijd. Elke aanroeper leest er één, dus buffer [2] mag hier
+     * hergebruikt worden (zie de noot bij s_mon_val_buf). */
+    case 13:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.power_sample_s);
+      return s_setting_buf[2];
+    case 14:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.power_confirm);
+      return s_setting_buf[2];
+    case 15:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.power_settle_s);
+      return s_setting_buf[2];
+    case 16:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.read_interval_s);
       return s_setting_buf[2];
   }
 
@@ -3721,6 +3750,49 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     if (end == value || *end != 0) return false;
     if (v < MON_FDEB_MIN || v > MON_FDEB_MAX) return false;
     _cfg.fixed_debounce_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+
+  /* v2.3.6 REACTIETIJD. Alle vier gaan door dezelfde keuring en dezelfde opslag,
+   * en worden LIVE gelezen -- een wijziging werkt dus meteen zonder herstart. */
+  if (strcmp(name, "power.sample") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_PSAMPLE_MIN || v > MON_PSAMPLE_MAX) return false;
+    _cfg.power_sample_s = (uint16_t)v;
+    /* De volgende tik meteen naar voren i.p.v. de oude (mogelijk 10 s) af te
+     * wachten, zodat het sneller-zetten ook echt sneller aanvoelt. */
+    _next_sample = millis();
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "power.confirm") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_PCONFIRM_MIN || v > MON_PCONFIRM_MAX) return false;
+    _cfg.power_confirm = (uint8_t)v;
+    _agree = 0;   /* de lopende teller is met de oude drempel opgebouwd */
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "power.settle") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_PSETTLE_MIN || v > MON_PSETTLE_MAX) return false;
+    _cfg.power_settle_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "read.interval") == 0) {
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_READ_MIN || v > MON_READ_MAX) return false;
+    _cfg.read_interval_s = (uint16_t)v;
     markDirty();
     return true;
   }

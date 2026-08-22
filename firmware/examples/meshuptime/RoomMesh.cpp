@@ -1460,8 +1460,10 @@ void RoomMesh::loop() {
   }
 
   // periodieke sensorleesronde -> app-hook (posts + alarmen)
+  // v2.3.6: cadans LIVE uit _cfg (sensors.readIntervalSecs()) i.p.v. de compile-time
+  // -D SENSOR_READ_INTERVAL_SECS; die blijft enkel de default-seed (zie MonitorStore.h).
   uint32_t curr = getRTCClock()->getCurrentTime();
-  if (curr >= last_read_time + SENSOR_READ_INTERVAL_SECS) {
+  if (curr >= last_read_time + sensors.readIntervalSecs()) {
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     sensors.querySensors(0xFF, telemetry);

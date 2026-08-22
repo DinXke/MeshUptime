@@ -65,6 +65,12 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
   /* Korte settle vaste kanalen (wifi/netvoeding): standaard 5 s tegen de spanning-
    * settle bij uittrekken (de reboot-vloed dempt de opstart-genade, niet dit). */
   cfg.fixed_debounce_s = MON_FDEB_DEFAULT;
+  /* Reactietijd-parameters (v2.3.6): snelle defaults -> netvoeding/wifi-alert in
+   * ~6-10 s. Waren hardgecodeerd in MonitorSensors.h. */
+  cfg.power_sample_s   = MON_PSAMPLE_DEFAULT;
+  cfg.power_confirm    = MON_PCONFIRM_DEFAULT;
+  cfg.power_settle_s   = MON_PSETTLE_DEFAULT;
+  cfg.read_interval_s  = MON_READ_DEFAULT;
   /* Herhalen tot bevestiging standaard aan (300 s). Zie MonitorCfg: dit is de
    * gevraagde standaard en dus een gedragsverandering bij het bijwerken; op 0
    * zetten geeft het oude "één melding en klaar". */
@@ -203,6 +209,24 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       int v = atoi(parts[1]);
       staged.fixed_debounce_s = (v >= MON_FDEB_MIN && v <= MON_FDEB_MAX)
                               ? (uint16_t)v : MON_FDEB_DEFAULT;
+    } else if (strcmp(parts[0], "psample") == 0) {
+      /* Reactietijd (v2.3.6); buiten de grenzen -> de standaard. Een oud bestand
+       * zonder deze regels houdt gewoon de snelle defaults uit setDefaults(). */
+      int v = atoi(parts[1]);
+      staged.power_sample_s = (v >= MON_PSAMPLE_MIN && v <= MON_PSAMPLE_MAX)
+                            ? (uint16_t)v : MON_PSAMPLE_DEFAULT;
+    } else if (strcmp(parts[0], "pconfirm") == 0) {
+      int v = atoi(parts[1]);
+      staged.power_confirm = (v >= MON_PCONFIRM_MIN && v <= MON_PCONFIRM_MAX)
+                           ? (uint8_t)v : MON_PCONFIRM_DEFAULT;
+    } else if (strcmp(parts[0], "psettle") == 0) {
+      int v = atoi(parts[1]);
+      staged.power_settle_s = (v >= MON_PSETTLE_MIN && v <= MON_PSETTLE_MAX)
+                            ? (uint16_t)v : MON_PSETTLE_DEFAULT;
+    } else if (strcmp(parts[0], "read") == 0) {
+      int v = atoi(parts[1]);
+      staged.read_interval_s = (v >= MON_READ_MIN && v <= MON_READ_MAX)
+                             ? (uint16_t)v : MON_READ_DEFAULT;
     } else if (strcmp(parts[0], "purl") == 0) {
       /* Geen keuring op de inhoud hier: die zit in setSettingValue(), en wat in
        * dit bestand staat is door diezelfde zeef geschreven. Alleen de lengte
@@ -357,6 +381,13 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "rec %u\nrhold %u\narepeat %u\nfdeb %u\n",
                  (unsigned)(cfg.recover_alerts ? 1 : 0), (unsigned)cfg.rhold_s,
                  (unsigned)cfg.repeat_s, (unsigned)cfg.fixed_debounce_s);
+  f.write((const uint8_t*)line, len);
+
+  /* Reactietijd-parameters (v2.3.6). Elk op een eigen sleutel zodat een oud
+   * bestand zonder een ervan de (snelle) standaard uit setDefaults() houdt. */
+  len = snprintf(line, sizeof(line), "psample %u\npconfirm %u\npsettle %u\nread %u\n",
+                 (unsigned)cfg.power_sample_s, (unsigned)cfg.power_confirm,
+                 (unsigned)cfg.power_settle_s, (unsigned)cfg.read_interval_s);
   f.write((const uint8_t*)line, len);
 
   /* De push-instellingen. url en token alleen als ze er ZIJN: een lege regel

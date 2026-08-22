@@ -1141,6 +1141,54 @@ RAM en met opzet niet in de opslag: een node die na een stroomstoring in
 testmodus opstart, zwijgt over een echte storing.</p>
 </div>
 
+<h2>Reactietijd &mdash; hoe snel een netvoeding/wifi-alert komt</h2>
+<p class="why"><b>Waarom dit er is:</b> een netvoeding- of wifi-alert duurde vroeger
+~1&nbsp;minuut, omdat de detectie met opzet traag was en hardgecodeerd. Deze marges
+zijn nu instelbaar. <b>De afweging:</b> sneller reageren = een kleinere marge tegen
+een <i>valse</i> flap (een korte spanning-dip of blip die geen echte
+stroomonderbreking is). De hi/lo-drempels bij &quot;Instellingen&quot; blijven de
+eigenlijke ontruising; dit zijn alleen de reactietijd-marges. Met de standaarden
+hieronder komt een alert in ~6&ndash;10&nbsp;s.</p>
+<div class="card">
+<div class="row">
+<label>Meet-tik voeding (s)<input id="tim-samp" type="number" min="1" max="60"
+value="2"><span class="cur" id="tim-sampcur">nu: &ndash;</span></label>
+<label>Bevestigende metingen<input id="tim-conf" type="number" min="1" max="10"
+value="2"><span class="cur" id="tim-confcur">nu: &ndash;</span></label>
+<label>Rust na overgang (s)<input id="tim-set" type="number" min="0" max="300"
+value="8"><span class="cur" id="tim-setcur">nu: &ndash;</span></label>
+</div>
+<div class="row" style="margin-top:.6rem">
+<label>Leesronde / alert-eval (s)<input id="tim-read" type="number" min="1" max="60"
+value="3"><span class="cur" id="tim-readcur">nu: &ndash;</span></label>
+<label>Settle vaste kanalen (s)<input id="tim-deb" type="number" min="0" max="3600"
+value="2"><span class="cur" id="tim-debcur">nu: &ndash;</span></label>
+</div>
+<div class="quick"><button id="tim-go">reactietijd opslaan</button></div>
+<div id="tim-msg"></div>
+<p class="note"><b>Meet-tik voeding &mdash; <code>power.sample</code> (1&ndash;60&nbsp;s).</b>
+Hoe vaak de node de accuspanning meet. Sneller meten = sneller merken dat de stekker
+eruit is, maar elke meting valt binnen dezelfde ruis, dus te snel zonder genoeg
+bevestigingen laat een dip harder doorwerken. Standaard 2&nbsp;s (was 10&nbsp;s).</p>
+<p class="note"><b>Bevestigende metingen &mdash; <code>power.confirm</code> (1&ndash;10).</b>
+Zoveel metingen aan de andere kant achter elkaar voordat de toestand kantelt. Hoger =
+zekerder maar trager (reactietijd &asymp; meet-tik &times; dit getal). Standaard 2
+(was 3).</p>
+<p class="note"><b>Rust na overgang &mdash; <code>power.settle</code> (0&ndash;300&nbsp;s).</b>
+Na een overgang &eacute;n vlak na een reboot mag de voedingstoestand deze tijd niet
+wisselen &mdash; dempt de spanning-transient bij het uittrekken/opstarten. Dit was met
+60&nbsp;s de grootste boosdoener vlak na een herstart. Standaard 8&nbsp;s. 0 = geen
+rust.</p>
+<p class="note"><b>Leesronde / alert-eval &mdash; <code>read.interval</code> (1&ndash;60&nbsp;s).</b>
+Hoe vaak de node de sensoren leest en de waarschuwingen beoordeelt. Ook een snel
+gedetecteerde onderbreking wacht tot de volgende leesronde voordat het bericht de deur
+uit gaat. Standaard 3&nbsp;s.</p>
+<p class="note"><b>Settle vaste kanalen &mdash; <code>alert.debounce</code> (0&ndash;3600&nbsp;s).</b>
+Extra korte settle op de vaste kanalen (wifi/netvoeding) bovenop de meet-bevestiging
+hierboven; laag mag dus. Standaard 2&nbsp;s (was 5&nbsp;s). De harde grendel tegen een
+spook-&quot;terug&quot; blijft altijd gelden, ook op 0.</p>
+</div>
+
 <h2>Monitor toevoegen</h2>
 <div class="card"><form id="a">
 <div class="row">
@@ -1305,7 +1353,10 @@ regel. Wat er niet in een formulier staat, typ je hier.<br>
 <code>mon.&lt;kan&gt;.name</code> <code>mon.&lt;kan&gt;.host</code>
 <code>mon.&lt;kan&gt;.int</code> <code>mon.&lt;kan&gt;.state</code>
 <code>mon.&lt;kan&gt;.ms</code>
-<code>alert.recover</code> <code>alert.rhold</code> <code>alert.repeat</code>. En
+<code>alert.recover</code> <code>alert.rhold</code> <code>alert.repeat</code>
+<code>alert.debounce</code>, en de reactietijd
+<code>power.sample</code> <code>power.confirm</code> <code>power.settle</code>
+<code>read.interval</code>. En
 <code>sensor list</code> voor de hele lijst.<br>
 <b>Ad-hoc ping:</b> <code>ping &lt;adres&gt; [n]</code> pingt een vrij op te
 geven adres (n keer, standaard 3, hoogstens 5). Niet-blokkerend: de console
@@ -2500,7 +2551,7 @@ return r.json().then(function(d){lock(d);acltab(d);nbtab(d)})})}
 
 var MONS=[];   // laatste status.json-monitors, voor het kanaalbeheer-panel
 function u2(){return fetch("status.json").then(function(r){return r.json()})
-.then(function(d){MONS=d.mon||[];tiles(d);simban(d);pingres(d);table(d);tbud(d);deliv(d);recui(d);
+.then(function(d){MONS=d.mon||[];tiles(d);simban(d);pingres(d);table(d);tbud(d);deliv(d);recui(d);timui(d);
 var s=document.getElementById("ssid");if(!s.value){s.value=d.ssid}
 document.getElementById("sub").textContent=d.ssid?"bewaking · "+d.ssid:"bewaking"})
 /* EEN MISLUKTE VERVERSING MOET ZICH MELDEN. Zonder deze tak bleef de pagina
@@ -3025,6 +3076,53 @@ nb.innerHTML='<div class="t"><b>'+
 (rep.maxed?"De gestopte meldingen blijven op de pagina als storing zichtbaar; "+
 "alleen het herhalen hield op.":"")+"</div>"}
 else{nb.className="";nb.innerHTML=""}}}
+
+/* v2.3.6 REACTIETIJD. Zelfde weg als de alarminstellingen: alles over de CLI
+   ('sensor set ...'), één zeef en één opslag, en ALLEEN wat veranderd is. WASTIM
+   houdt de laatst ontvangen stand bij, zodat wie iets typt zijn waarde houdt tot
+   hij opslaat. */
+var WASTIM={samp:null,conf:null,set:null,read:null,deb:null};
+function tmsg(t,ok){var m=document.getElementById("tim-msg");
+m.textContent=t;m.className=ok?"ok":"bad"}
+document.getElementById("tim-go").onclick=function(){
+var sp=parseInt(document.getElementById("tim-samp").value,10);
+var cf=parseInt(document.getElementById("tim-conf").value,10);
+var st=parseInt(document.getElementById("tim-set").value,10);
+var rd=parseInt(document.getElementById("tim-read").value,10);
+var db=parseInt(document.getElementById("tim-deb").value,10);
+if(!(sp>=1&&sp<=60)){tmsg("meet-tik: 1 t/m 60 s",0);return}
+if(!(cf>=1&&cf<=10)){tmsg("bevestigingen: 1 t/m 10",0);return}
+if(!(st>=0&&st<=300)){tmsg("rust: 0 t/m 300 s",0);return}
+if(!(rd>=1&&rd<=60)){tmsg("leesronde: 1 t/m 60 s",0);return}
+if(!(db>=0&&db<=3600)){tmsg("settle: 0 t/m 3600 s",0);return}
+var cmds=[];
+if(WASTIM.samp===null||sp!=WASTIM.samp){cmds.push("sensor set power.sample "+sp)}
+if(WASTIM.conf===null||cf!=WASTIM.conf){cmds.push("sensor set power.confirm "+cf)}
+if(WASTIM.set===null||st!=WASTIM.set){cmds.push("sensor set power.settle "+st)}
+if(WASTIM.read===null||rd!=WASTIM.read){cmds.push("sensor set read.interval "+rd)}
+if(WASTIM.deb===null||db!=WASTIM.deb){cmds.push("sensor set alert.debounce "+db)}
+if(!cmds.length){tmsg("niets veranderd",1);return}
+tmsg("bezig...",1);
+cliSeq(cmds,function(good,bad,last){
+if(bad){tmsg(bad+" van de "+(good+bad)+" geweigerd: "+last.trim(),0)}
+else{tmsg("opgeslagen -- werkt meteen (alert nu ~6-10 s)",1)}
+u2()})};
+
+/* De velden bijwerken uit status.json, maar niet terwijl iemand erin bezig is --
+   dezelfde regel als recui(). */
+function timui(d){
+var t=d.timing;if(!t){return}
+function fld(id,k,val,unit){
+var f=document.getElementById(id);
+if(f&&(WASTIM[k]===null||f.value==""+WASTIM[k])){f.value=val}
+WASTIM[k]=val;
+var c=document.getElementById(id+"cur");
+if(c){c.textContent="nu: "+val+(unit||"")}}
+fld("tim-samp","samp",t.psample," s");
+fld("tim-conf","conf",t.pconfirm,"");
+fld("tim-set","set",t.psettle," s");
+fld("tim-read","read",t.read," s");
+fld("tim-deb","deb",t.deb," s")}
 
 document.getElementById("ka").onsubmit=function(ev){ev.preventDefault();
 var f=ev.target.elements;
@@ -3948,11 +4046,34 @@ void WebTask::handleStatus() {
         (unsigned)countAlertRecipients());
   }
 
+  /* v2.3.6 REACTIETIJD -- de runtime-instelbare detectie-marges + hun grenzen.
+   * Zo kan de MeshManager-server ze tonen (met sliders die de grenzen kennen) en
+   * later ook zetten via "sensor set power.sample|power.confirm|power.settle|
+   * read.interval". CONTRACT: velden psample/pconfirm/psettle/read/deb (huidige
+   * waarden) + *_min/*_max per veld. */
+  char timblk[360];
+  timblk[0] = 0;
+  if (_mon != nullptr) {
+    snprintf(timblk, sizeof(timblk),
+        "\"timing\":{\"psample\":%u,\"pconfirm\":%u,\"psettle\":%u,\"read\":%u,\"deb\":%u,"
+        "\"psample_min\":%u,\"psample_max\":%u,\"pconfirm_min\":%u,\"pconfirm_max\":%u,"
+        "\"psettle_min\":%u,\"psettle_max\":%u,\"read_min\":%u,\"read_max\":%u,"
+        "\"deb_min\":%u,\"deb_max\":%u},",
+        (unsigned)_mon->powerSampleSecs(), (unsigned)_mon->powerConfirm(),
+        (unsigned)_mon->powerSettleSecs(), (unsigned)_mon->readIntervalSecs(),
+        (unsigned)_mon->fixedDebounceSecs(),
+        (unsigned)MON_PSAMPLE_MIN, (unsigned)MON_PSAMPLE_MAX,
+        (unsigned)MON_PCONFIRM_MIN, (unsigned)MON_PCONFIRM_MAX,
+        (unsigned)MON_PSETTLE_MIN, (unsigned)MON_PSETTLE_MAX,
+        (unsigned)MON_READ_MIN, (unsigned)MON_READ_MAX,
+        (unsigned)MON_FDEB_MIN, (unsigned)MON_FDEB_MAX);
+  }
+
   int n = snprintf(g_json, sizeof(g_json),
       "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"rssi\":%d,"
       "\"reason\":%u,\"reconnects\":%lu,\"resets\":%lu,\"uptime\":%lu,"
       "\"heap\":%lu,\"largest\":%lu,\"ssid\":\"%s\","
-      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s%s\"mon\":[",
+      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s%s%s\"mon\":[",
       _fw, wifiStateName(_wifi),
       ip[0], ip[1], ip[2], ip[3],
       (int)WiFi.RSSI(),
@@ -3970,7 +4091,7 @@ void WebTask::handleStatus() {
       _mon != nullptr ? (_mon->isMains() ? 1 : 0) : -1,
       _mon != nullptr ? _mon->lastVolts() : 0.0f,
       _mon != nullptr && _mon->monitorsPaused() ? 1 : 0,
-      budblk, adhocblk, simblk);
+      budblk, adhocblk, simblk, timblk);
 
   if (n < 0 || (size_t)n >= sizeof(g_json)) {   /* kan niet; vangnet */
     _server->send(500, "text/plain", "antwoord te groot");

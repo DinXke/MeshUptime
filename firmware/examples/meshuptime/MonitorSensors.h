@@ -493,6 +493,21 @@ public:
   bool     recoverEnabled() const { return _cfg.recover_alerts != 0; }
   uint16_t recoverHoldSecs() const { return _cfg.rhold_s; }
 
+  /* REACTIETIJD-parameters (v2.3.6). Voor de pagina/status.json en voor de
+   * leesronde-cadans (RoomMesh/SensorMesh lezen readIntervalSecs() LIVE i.p.v. de
+   * oude compile-time -D). Zetten gaat via "sensor set power.sample|power.confirm|
+   * power.settle|read.interval" -- over de CLI, net als elke andere instelling,
+   * zodat er geen tweede schrijfpad ontstaat. */
+  uint16_t powerSampleSecs()  const { return _cfg.power_sample_s; }
+  uint8_t  powerConfirm()     const { return _cfg.power_confirm; }
+  uint16_t powerSettleSecs()  const { return _cfg.power_settle_s; }
+  uint16_t fixedDebounceSecs() const { return _cfg.fixed_debounce_s; }
+  uint16_t readIntervalSecs() const {
+    /* Vangnet: een 0 uit een corrupt bestand zou de leesronde elke ronde laten
+     * vuren. Nooit onder MON_READ_MIN. */
+    return _cfg.read_interval_s >= MON_READ_MIN ? _cfg.read_interval_s : MON_READ_DEFAULT;
+  }
+
   /* ==================== HERHALEN TOT EEN MENS BEVESTIGT ====================
    *
    * WAAROM, EN WAT HET NIET IS
@@ -997,9 +1012,13 @@ private:
    *  - 60 s insteltijd na een overgang; in de eerste minuut na uittrekken is
    *    een transient van ~50 mV gemeten (4,052 -> 4,087 -> 4,034)
    */
-  static const uint8_t  SAMPLES_TO_SWITCH  = 3;
-  static const uint32_t SAMPLE_INTERVAL_MS = 10000;   // 10 s: 3 metingen = 30 s reactietijd
-  static const uint32_t SETTLE_MS          = 60000;   // insteltijd na een overgang
+  /* v2.3.6: deze drie waren hardgecodeerd (SAMPLES_TO_SWITCH=3,
+   * SAMPLE_INTERVAL_MS=10000, SETTLE_MS=60000) en stapelden op tot ~60 s
+   * reactietijd. Ze staan nu RUNTIME-INSTELBAAR in _cfg (power.confirm /
+   * power.sample / power.settle, zie MonitorStore.h) en worden LIVE gelezen in
+   * samplePower()/loop() -- niet één keer bij boot gecachet -- zodat een wijziging
+   * via GUI/CLI meteen werkt. De hi/lo-hysterese hieronder blijft de eigenlijke
+   * ontruising. */
 
   /* ---------------- afspraken van de ping-bewaking ---------------- */
 
@@ -1067,6 +1086,15 @@ private:
   unsigned long _state_since = 0;
 
   void samplePower();
+
+  /* De samplePower-tik in ms, LIVE uit _cfg (v2.3.6). Nooit onder 1 s, ook niet
+   * bij een 0 uit een corrupt bestand: een tik van 0 zou loop() elke ronde laten
+   * meten en de radio verdringen. */
+  unsigned long sampleIntervalMs() const {
+    uint16_t s = _cfg.power_sample_s;
+    if (s < MON_PSAMPLE_MIN) s = MON_PSAMPLE_DEFAULT;
+    return (unsigned long)s * 1000UL;
+  }
 
   /* Gemeten toestand per vakje. Staat NIET in MonitorCfg: na een herstart is
    * hij ongeldig en moet er opnieuw gemeten worden. */

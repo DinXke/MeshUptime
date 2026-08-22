@@ -7,6 +7,44 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.6 — reactietijd netvoeding/wifi-alert runtime-instelbaar
+
+De netvoeding-/wifi-alert duurde ~1 minuut. Oorzaak was een bewust trage detectie
+die HARDGECODEERD in de firmware stond en waarvan de marges opstapelden:
+
+- `SAMPLE_INTERVAL_MS = 10000` (spanning meten elke 10 s),
+- `SAMPLES_TO_SWITCH = 3` (3 bevestigende metingen → ~30 s om `_mains` te wisselen),
+- `SETTLE_MS = 60000` (na een reset/overgang mocht `_mains` 60 s niet wisselen —
+  domineerde vlak na een reboot),
+- de leesronde-cadans `SENSOR_READ_INTERVAL_SECS` (compile-time `-D`), plus de losse
+  `alert.debounce` (5 s). Samen ~60 s.
+
+**FIX.** Deze vier reactietijd-parameters zijn nu RUNTIME-INSTELBAAR (web-GUI + CLI +
+DM), persistent in `/monitors.cfg`, en worden LIVE gelezen in `samplePower()`/`loop()`/
+de leesronde — een wijziging werkt dus meteen zonder herstart. De hi/lo-hysterese
+(`mains.hi`/`mains.lo`) blijft ongewijzigd de eigenlijke ontruising.
+
+Nieuwe instellingen (CLI/DM `sensor set <sleutel> <waarde>`; ook in de web-GUI-sectie
+**Reactietijd** met per-veld "?"-help):
+
+| sleutel | vervangt | default (was) | bereik |
+|---|---|---|---|
+| `power.sample` | `SAMPLE_INTERVAL_MS` | 2 s (10 s) | 1–60 |
+| `power.confirm` | `SAMPLES_TO_SWITCH` | 2 (3) | 1–10 |
+| `power.settle` | `SETTLE_MS` | 8 s (60 s) | 0–300 |
+| `read.interval` | `SENSOR_READ_INTERVAL_SECS` | 3 s | 1–60 |
+| `alert.debounce` | (bestond al, `fdeb`) | 2 s (5 s) | 0–3600 |
+
+De `-D SENSOR_READ_INTERVAL_SECS` blijft enkel de default-seed voor `read.interval`
+(`MON_READ_DEFAULT`), nu op 3. De waarden staan in `status.json` onder `"timing"`
+(huidige waarde + `*_min`/`*_max` per veld) zodat de MeshManager-server ze kan tonen
+en later zetten. Netto met de defaults: netvoeding/wifi-alert in ~6–10 s.
+
+Geldt voor BEIDE envs: de leesronde-cadans is ook in de sensor-variant
+(`env:meshuptime`) runtime-instelbaar. Persistentie: een `/monitors.cfg` van een
+oudere versie zonder de nieuwe regels (`psample`/`pconfirm`/`psettle`/`read`) houdt
+gewoon de nieuwe snelle defaults.
+
 ## v2.3.5 — spook-recovery ECHT weg (harde grendel) + debounce vereenvoudigd
 
 Fysiek getest bleek de spook-"netvoeding terug na 0s" ná v2.3.4 nog steeds te komen,

@@ -248,7 +248,45 @@ struct MonitorCfgEntry {
  * gelden -- die staat los van deze duur). */
 #define MON_FDEB_MIN          0
 #define MON_FDEB_MAX       3600
-#define MON_FDEB_DEFAULT      5
+/* v2.3.6: standaard omlaag van 5 naar 2 s. De samplePower-bevestiging (power.confirm
+ * metingen op power.sample-tik) ontruist al; deze settle is daar bovenop, dus laag
+ * mag. Netto met de nieuwe defaults: netvoeding/wifi-alert in ~6-10 s i.p.v. ~60 s. */
+#define MON_FDEB_DEFAULT      2
+
+/* ---- REACTIETIJD-parameters van de VOEDINGSDETECTIE (v2.3.6, runtime-instelbaar) ----
+ *
+ * Waren hardgecodeerde consts in MonitorSensors.h (SAMPLE_INTERVAL_MS=10000,
+ * SAMPLES_TO_SWITCH=3, SETTLE_MS=60000) en stapelden op tot ~60 s reactietijd. Nu
+ * instelbaar via de web-GUI/CLI/DM ("sensor set power.sample|power.confirm|
+ * power.settle") en persistent in /monitors.cfg. LIVE gelezen in samplePower()/loop(),
+ * dus een wijziging werkt meteen. De hi/lo-hysterese (mains_hi/mains_lo) blijft de
+ * eigenlijke ontruising; dit zijn enkel de reactietijd-marges.
+ *
+ * power.sample : tik (s) waarop samplePower() een ADC-meting doet. Sneller = kleinere
+ *                marge tegen een valse flap.
+ * power.confirm: aantal opeenvolgende metingen aan de andere kant vóór _mains kantelt.
+ * power.settle : rustperiode (s) na een overgang EN na een reboot waarin _mains niet
+ *                mag wisselen (dempt de spanning-transient bij uittrekken/opstarten). */
+#define MON_PSAMPLE_MIN       1
+#define MON_PSAMPLE_MAX      60
+#define MON_PSAMPLE_DEFAULT   2
+#define MON_PCONFIRM_MIN      1
+#define MON_PCONFIRM_MAX     10
+#define MON_PCONFIRM_DEFAULT  2
+#define MON_PSETTLE_MIN       0
+#define MON_PSETTLE_MAX     300
+#define MON_PSETTLE_DEFAULT   8
+
+/* ---- LEESRONDE-cadans (v2.3.6, runtime-instelbaar) ----
+ * Hoe vaak de app-hook onSensorDataRead() (de alert-eval) draait. Was de compile-time
+ * -D SENSOR_READ_INTERVAL_SECS; die blijft ENKEL de default-seed (zie hieronder). Nu
+ * instelbaar met "sensor set read.interval" en persistent. */
+#ifndef SENSOR_READ_INTERVAL_SECS
+  #define SENSOR_READ_INTERVAL_SECS 3
+#endif
+#define MON_READ_MIN          1
+#define MON_READ_MAX         60
+#define MON_READ_DEFAULT      SENSOR_READ_INTERVAL_SECS
 
 /* Grenzen van de herhaalperiode (repeat_s). 0 is toegestaan en betekent uit.
  * De ondergrens is 60 s en niet lager: elke herhaling is een DM-keten naar alle
@@ -321,6 +359,14 @@ struct MonitorCfg {
    * de opstart-genade (~60 s), niet dit. 0 = geen settle (de harde grendel tegen de
    * spook-"terug" blijft dan gelden). */
   uint16_t fixed_debounce_s;  /* MON_FDEB_MIN..MAX */
+
+  /* REACTIETIJD-parameters (v2.3.6). Zie de MON_PSAMPLE_-, MON_PCONFIRM_-,
+   * MON_PSETTLE_- en MON_READ_-grenzen hierboven. LIVE gelezen (niet bij boot
+   * gecachet), zodat een wijziging via GUI/CLI meteen werkt. */
+  uint16_t power_sample_s;    /* MON_PSAMPLE_MIN..MAX  (samplePower-tik) */
+  uint8_t  power_confirm;     /* MON_PCONFIRM_MIN..MAX (bevestigende metingen) */
+  uint16_t power_settle_s;    /* MON_PSETTLE_MIN..MAX  (rust na overgang/reboot) */
+  uint16_t read_interval_s;   /* MON_READ_MIN..MAX     (onSensorDataRead-cadans) */
 
   /* Bitmasker van kanalen die OOIT zijn uitgedeeld, bit 0 = kanaal 5.
    * Dit hoort bij de blijvende gegevens en niet bij het geheugen: zonder dit
