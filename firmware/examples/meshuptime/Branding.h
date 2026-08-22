@@ -45,11 +45,22 @@
  *            defaults (power.sample 2 s, power.confirm 2, power.settle 8 s,
  *            read.interval 3 s, alert.debounce 2 s) -> alert in ~6-10 s. Live
  *            gelezen, in status.json ("timing") voor de MeshManager-server.
+ *   v2.3.7 = ALLE alert-types onder ÉÉN gegrendelde kantelaar (main_room::
+ *            edgeLatched). De ping-monitors EN de batterij (crit/laag) draaiden nog
+ *            op de kale edge() en hadden exact de bugs die de vaste kanalen vóór
+ *            v2.3.5 hadden: een pauze (wifi weg) las als "weer bereikbaar", een flap
+ *            gaf een spook-"terug", de duur klopte niet (down_since 0 -> "na
+ *            <uptime>", vandaar de 2u21) en een echte storing kon als SIMULATIE
+ *            gelabeld worden. Nu voor iedereen dezelfde grendels: freeze bij niet-
+ *            meetbaar/gemute, herstel alleen na een echt GEMELDE storing (announced)
+ *            + plausibele duur, sim-merk alleen bij een echte forcering, en een
+ *            gedeelde symmetrische debounce (debounceStep) -- de batterij kreeg
+ *            Schmitt-hysterese (3,40/3,50 V crit, 3,60/3,70 V laag) tegen geflikker.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.6"
+  #define MESHUPTIME_VERSION   "v2.3.7"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

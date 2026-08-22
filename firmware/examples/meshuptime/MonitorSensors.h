@@ -859,10 +859,10 @@ public:
   const char* fixedAlertText(int which) const;
 
   /* GEDEBOUNCET "neer" voor een vast kanaal (wifi/netvoeding), voor de room-
-   * variant (main_room::fixedEdge). Geeft DE STABIELE, gesettlede toestand --
+   * variant (main_room::edgeLatched). Geeft DE STABIELE, gesettlede toestand --
    * IDENTIEK aan fixedIsDown(), ZONDER opstart-genade. De genade zit niet meer
    * hier (dat gaf een desync met de OLED: scherm 'neer', alarm 'niet neer'),
-   * maar in fixedEdge, dat tijdens de genade de dispatch onderdrukt en de
+   * maar in edgeLatched, dat tijdens de genade de dispatch onderdrukt en de
    * baseline stil bijhoudt. which = FIXED_POWER / FIXED_WIFI. */
   bool        fixedAlertDown(int which) const;
   /* De GEDEBOUNCETE storingstoestand van een vast kanaal, voor de OLED -- exact
@@ -882,6 +882,44 @@ public:
   /* Wordt de storing op dit vaste kanaal NU gesimuleerd (forcering actief)? Bepaalt
    * of de alerttekst het SIMULATIE-merkteken draagt. */
   bool        fixedIsSim(int which) const;
+
+  /* ============ v2.3.7: gedeelde, gegrendelde edge voor ALLE alert-types ============
+   *
+   * De room-variant bracht monitors, batterij-drempels en de vaste kanalen onder
+   * ÉÉN gegrendelde kantelaar (main_room::edgeLatched). Vóór v2.3.7 draaiden de
+   * monitors en de batterij nog op de KALE edge(), met exact de bugs die de vaste
+   * kanalen vóór v2.3.5 hadden: een pauze werd als "weer bereikbaar" gelezen, de
+   * duur klopte niet (down_since bleef 0 -> "na <uptime>"), en een echte storing kon
+   * als SIMULATIE gelabeld worden. Deze klasse levert de "waarheid" die de
+   * kantelaar leest -- meetbaarheid, gedebouncete toestand, plausibele hersteltijd --
+   * zodat de grendels op één plek zitten en elk nieuw alert-type ze erft.
+   *
+   * ---- ping-monitors (room-pad) ---- */
+  /* Meetbaar? Alleen dan mag de kantelaar een flank verwerken. Een niet-meetbare
+   * monitor (bewaking gepauzeerd, of nog geen enkele uitslag) BEVRIEST de kantelaar:
+   * een pauze/onbekend is NOOIT "herstel". Een forcering is wél meetbaar (er IS een
+   * mening), ook zonder wifi. */
+  bool monitorMeasurable(int slot) const;
+  /* Boekhouding voor de room-edge: leg bij een GEMELDE storing het beginmoment
+   * (down_since) en of het een forcering/stille melder was (was_sim/was_stale) vast,
+   * en wis dat bij herstel/reset. recoverAlertText() leest deze voor de duur en het
+   * SIMULATIE-merkteken; zo draagt een echte storing NOOIT het merkteken en klopt de
+   * "na X"-duur. Zet down_sent NIET (dat is het sensor-variant-pad). */
+  void monitorNoteDown(int slot);
+  void monitorNoteClear(int slot);
+  /* Plausibele onbereikbaarheidsduur (>= FIXED_MIN_RECOVER_MS): de harde grendel
+   * tegen een spook-"weer bereikbaar na 0s", ook bij een debounce van 0. */
+  bool monitorRecoveryOk(int slot) const;
+
+  /* ---- batterij: gedebouncete drempel-edges (crit/laag) met Schmitt-hysterese ----
+   * Zelfde symmetrische debounce-kern (debounceStep) én dezelfde grendels als de
+   * vaste kanalen, zodat de batterij niet meer rond 3,4/3,6 V flikkert. */
+  enum BattAlert : uint8_t { BATT_CRIT = 0, BATT_LOW = 1, BATT_COUNT = 2 };
+  /* Voed de debounce met de laatste klemspanning (in onSensorDataRead). */
+  void battTick(float volts);
+  bool battAlertDown(int which) const;   /* gedebouncete "onder de drempel" */
+  bool battRecoveryOk(int which) const;  /* duur >= min (zelfde grendel als vast) */
+  bool battInBootGrace() const { return fixedInBootGrace(); }
 
   /* ---------------- het testbericht ----------------
    *
@@ -1322,6 +1360,31 @@ private:
   unsigned long _fixed_down_start[FIXED_ALERT_COUNT];
   unsigned long _fixed_last_down_ms[FIXED_ALERT_COUNT];
   unsigned long _boot_ms;
+
+  /* v2.3.7: gedebouncete batterij-drempels (crit/laag), zelfde velden en dezelfde
+   * debounce-kern (debounceStep) als de vaste kanalen -- alleen de rauwe ingang
+   * verschilt (een Schmitt-drempel op de spanning i.p.v. de mains-hi/lo-band). */
+  bool          _batt_state_down[BATT_COUNT];
+  bool          _batt_state_init[BATT_COUNT];
+  unsigned long _batt_change_since[BATT_COUNT];
+  unsigned long _batt_down_start[BATT_COUNT];
+  unsigned long _batt_last_down_ms[BATT_COUNT];
+  /* Schmitt-banden (Volt). Eenmaal 'onder de drempel' pas weer 'op peil' boven de
+   * HI-band -- zo geeft een spanning die rond de drempel bengelt geen geflikker,
+   * net als de mains-hysterese. */
+  static constexpr float BATT_CRIT_LO = 3.40f;
+  static constexpr float BATT_CRIT_HI = 3.50f;
+  static constexpr float BATT_LOW_LO  = 3.60f;
+  static constexpr float BATT_LOW_HI  = 3.70f;
+
+  /* De gedeelde symmetrische debounce-kern (v2.3.7). Werkt op losse referenties,
+   * net als trackRecovery, zodat de vaste kanalen (fixedRawTick) én de batterij-
+   * drempels (battTick) IDENTIEK debouncen zonder hun opslag te delen. Retour: een
+   * van DB_NONE/DB_INIT/DB_FLIP, zodat de aanroeper zijn eigen diag kan loggen. */
+  enum { DB_NONE = 0, DB_INIT = 1, DB_FLIP = 2 };
+  static uint8_t debounceStep(bool& state, bool& init, unsigned long& change_since,
+                              unsigned long& down_start, unsigned long& last_down_ms,
+                              bool raw_down, unsigned long thr_ms);
 
   /* De kern van "herhalen tot bevestiging", gedeeld door de monitors en de vaste
    * kanalen. Geeft terug wat er aan alertIf() gevoerd moet worden en beheert de

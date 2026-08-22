@@ -1,6 +1,14 @@
 #include "RoomMesh.h"
 #include "TimeFmt.h"
 
+/* === KANAAL-COMMANDO-DIAGNOSE (v2.3.7) ======================================
+ * ALTIJD-AAN seriële logging (MESH_DEBUG staat uit), prefix "[chan]" -- net als
+ * [fixdiag]/[fixedge]. Zo is via COM4 te zien of een gemist kanaal-commando een
+ * PARSE-probleem is (verkeerd geknipt/getrimd), een ONLEESBAAR pakket (verkeerde
+ * sleutel door een 1-byte kanaal-hash-botsing) of gewoon RF-verlies (de LoRa-laag
+ * mag pakketten missen -- dat is inherent, geen bug: dan verschijnt hier NIETS). */
+#define CHAN_DIAG(...) do { Serial.printf("[chan] " __VA_ARGS__); Serial.println(); } while (0)
+
 /* ============================================================================
  * RoomMesh -- implementatie. Zie RoomMesh.h voor het waarom.
  *
@@ -2053,32 +2061,80 @@ void RoomMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::G
   handleChannelText(packet, channel, (const char*)&data[5]);
 }
 
+/* Whitespace = spatie, TAB, CR of LF (de trimset voor kanaal-commando's). */
+static inline bool chanIsWs(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
+
 void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel& channel, const char* text) {
-  /* "<afzender>: <bericht>" -> afzender + bericht scheiden op de EERSTE ": ". */
+  if (!text) return;
+  CHAN_DIAG("rx ruw=\"%s\" len=%u", text, (unsigned)strlen(text));
+
+  /* MISLUKTE DECODE herkennen (task #4). De kanaal-hash is 1 byte (eerste byte van
+   * sha256(secret)); botsen twee gejoynde kanalen daarop, dan ontsleutelt een
+   * bericht met de VERKEERDE sleutel tot gorgel. Herken dat aan controltekens
+   * (buiten \t\r\n) en log het -- zo is een hash-botsing te onderscheiden van een
+   * parse-probleem of RF-verlies. */
+  int nonprint = 0, total = 0;
+  for (const char* p = text; *p; p++, total++) {
+    unsigned char c = (unsigned char)*p;
+    if (c != '\t' && c != '\r' && c != '\n' && c < 0x20) nonprint++;
+  }
+  if (nonprint > 0) {
+    CHAN_DIAG("ONLEESBAAR (%d/%d controltekens) -> waarschijnlijk verkeerde sleutel "
+              "(1-byte kanaal-hash-botsing?) of corrupt pakket; genegeerd", nonprint, total);
+    return;
+  }
+
+  /* "<afzender>: <bericht>" scheiden -- TOLERANT (task #2):
+   *  - probeer eerst ": ", dan een kale ":";
+   *  - geen herkenbare, plausibele naam-prefix -> de HELE tekst is het bericht,
+   *    zodat een kaal "ping" (zonder naam) ook werkt.
+   * Een ':' zonder plausibel naam-prefix (te lang, of het prefix bevat al
+   * whitespace/':' -- denk aan een URL) telt NIET als scheider. */
   char sender[24]; sender[0] = 0;
   const char* msg = text;
   const char* sep = strstr(text, ": ");
+  int seplen = 2;
+  if (!sep) { sep = strchr(text, ':'); seplen = 1; }
   if (sep) {
-    int sl = (int)(sep - text); if (sl > (int)sizeof(sender) - 1) sl = sizeof(sender) - 1;
-    memcpy(sender, text, sl); sender[sl] = 0;
-    msg = sep + 2;
+    int sl = (int)(sep - text);
+    bool plausible = (sl > 0 && sl <= (int)sizeof(sender) - 1);
+    for (int i = 0; plausible && i < sl; i++)
+      if (chanIsWs(text[i]) || text[i] == ':') plausible = false;   // naam bevat geen ws/':'
+    if (plausible) {
+      memcpy(sender, text, sl); sender[sl] = 0;
+      msg = sep + seplen;
+    }
   }
-  while (*msg == ' ') msg++;
+  /* Leading whitespace van het bericht af. */
+  while (*msg && chanIsWs(*msg)) msg++;
 
   /* Niet op onszelf reageren (de bot post ook onder _bot_name). */
-  if (sender[0] && strcasecmp(sender, _bot_name) == 0) return;
+  if (sender[0] && strcasecmp(sender, _bot_name) == 0) {
+    CHAN_DIAG("van onszelf (%s) -> genegeerd", sender);
+    return;
+  }
 
-  /* Alleen op een KAAL commando reageren (ping/test/path), evt. met een leading '#'
-   * of '!' dat sommige clients toevoegen. Zo blijft het kanaal niet vollopen. */
+  /* Alleen op een KAAL commando reageren (ping/test/path), evt. met een leading '#',
+   * '!' of '/' dat sommige clients toevoegen. Verb = tot de eerste whitespace, dan
+   * trailing leestekens eraf (bv. "ping!"/"ping."). Zo blijft het kanaal niet
+   * vollopen en breekt een trailing CR/LF de match niet meer. */
   const char* v = msg;
   if (*v == '#' || *v == '!' || *v == '/') v++;
-  char verb[8]; int vi = 0;
-  while (v[vi] && v[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = v[vi]; vi++; }
+  char verb[12]; int vi = 0;
+  while (v[vi] && !chanIsWs(v[vi]) && vi < (int)sizeof(verb) - 1) { verb[vi] = v[vi]; vi++; }
   verb[vi] = 0;
+  while (vi > 0) {   // trailing leestekens (niet-alfanumeriek) wegknippen
+    char c = verb[vi - 1];
+    bool alnum = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    if (alnum) break;
+    verb[--vi] = 0;
+  }
 
   bool is_ping = !strcasecmp(verb, "ping");
   bool is_test = !strcasecmp(verb, "test");
   bool is_path = !strcasecmp(verb, "path");
+  CHAN_DIAG("geparsed afzender=\"%s\" verb=\"%s\" -> %s", sender, verb,
+            (is_ping || is_test || is_path) ? "MATCH" : "geen bot-commando (genegeerd)");
   if (!(is_ping || is_test || is_path)) return;   // geen bot-commando; negeren
 
   uint32_t now_s = getRTCClock()->getCurrentTime();

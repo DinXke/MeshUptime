@@ -7,6 +7,64 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.7 — alle alert-types onder één gegrendelde kantelaar
+
+De grendels die de vaste kanalen (netvoeding/wifi) in v2.3.5 kregen, golden nog NIET
+voor de ping-monitors en de batterij-alerts. Die draaiden in `main_room::onSensorDataRead`
+op de **kale `edge()`** en vertoonden daardoor exact dezelfde fouten die de vaste kanalen
+vóór v2.3.5 hadden — fysiek gemeld op de monitors mon.5/mon.6/mon.9:
+
+> "UDM_Pro weer bereikbaar na 2u21 — dit is een SIMULATIE, geen echte storing", verscheen
+> terwijl de monitor juist WEGVIEL.
+
+Drie symptomen in één melding, met drie oorzaken:
+
+1. **Vals herstel op het verkeerde moment.** `monitorsPaused()` (bv. onze wifi valt weg → we
+   meten ons eigen netwerk niet meer) maakte de storingsconditie `false`. De kale `edge()`
+   las dat als een overgang neer→op en vuurde "weer bereikbaar" — terwijl de dienst NIET
+   terug was. Een pauze werd als herstel gelezen.
+2. **Echte storing als SIMULATIE gelabeld.** `recoverAlertText()` merkt met `was_sim`; dat
+   veld werd in het room-pad nooit netjes gezet/gewist en lekte naar echte events. Bovendien
+   werden `monitorAlertText()` en `recoverAlertText()` (beide dezelfde statische buffer)
+   in v2.3.6 als twee argumenten aan `edge()` gegeven — de tweede overschreef de eerste, dus
+   de storingsmelding kon de herstel-/sim-tekst dragen.
+3. **Rare duur (2u21).** In het room-pad wordt `monitorAlert()` niet aangeroepen, dus
+   `down_since` bleef 0 → `recoverAlertText()` rekende `millis()/1000` = de **uptime** (≈2u21).
+
+**FIX — unificatie.** De kale `edge()` én de losse `fixedEdge()` zijn vervangen door ÉÉN
+getemplate-de, gegrendelde `main_room::edgeLatched()` die ALLE alert-types gebruiken
+(batterij crit/laag, netvoeding, wifi, elke ping-monitor). Dezelfde grendels voor iedereen,
+zodat een toekomstig alert-type ze automatisch erft:
+
+- **Freeze bij niet-meetbaar/gemute/gesnoozed** — geen dispatch én de baseline niet
+  bijwerken (een openstaande overgang blijft bewaard en vuurt alsnog bij hervatten). Een
+  pauze is nooit "herstel". Voor monitors: `monitorMeasurable()` = geseed én niet gepauzeerd
+  (of een forcering actief).
+- **Herstel alleen na een echt GEMELDE storing** (`announced`-vlag per alert) **+ plausibele
+  duur** (`recovery_ok`, ≥ `FIXED_MIN_RECOVER_MS`, nooit 0 s/sub-seconde — ook niet met
+  `alert.debounce == 0` of bij een sim).
+- **SIMULATIE-merk alleen bij een echte forcering.** `monitorNoteDown()/monitorNoteClear()`
+  zetten/wissen `was_sim`/`was_stale` op de huidige stand; een echte storing draagt nooit
+  het merkteken, een sim-lek naar een latere echte storing kan niet meer.
+- **Sane duur.** `monitorNoteDown()` legt het echte beginmoment vast (`down_since`), dus de
+  "na X"-duur is de onbereikbaarheidsduur, niet de uptime.
+- **Lazy teksten.** De helper haalt in de vurende tak precies één tekst op — geen aliasing
+  meer van de gedeelde `s_alert_buf`.
+
+**Batterij: Schmitt-hysterese + debounce.** De batterij-alerts (`< 3,4 V` crit, `< 3,6 V`
+laag) waren kale drempelvergelijkingen die rond de drempel konden flikkeren. Ze lopen nu
+door dezelfde **gedeelde symmetrische debounce** (`MonitorSensors::debounceStep`, uitgefactord
+uit `fixedRawTick`) met een Schmitt-band: crit aan < 3,40 V / weer op peil > 3,50 V; laag aan
+< 3,60 V / > 3,70 V. Settle-drempel = `alert.debounce` (consistent met de reactietijd), plus
+de opstart-genade (`fixedInBootGrace`) zodat de reboot-dip geen batterij-alarm geeft.
+
+**Testalarm** (room-commando `test`) blijft een bewust stateless one-shot: geen edge,
+geen herstel, geen duur, geen sim — geen van de bugs (a)–(f) is van toepassing.
+
+Alleen de room-variant; de sensor-variant (`env:meshuptime`, `main.cpp`) gebruikt nog het
+bestaande `monitorAlert()/recoverAlert()`-pad en is ongewijzigd. Debug-logging blijft:
+`[fixedge]` (per edge-beslissing) en `[fixdiag]` (debounce-flips, nu ook batterij).
+
 ## v2.3.6 — reactietijd netvoeding/wifi-alert runtime-instelbaar
 
 De netvoeding-/wifi-alert duurde ~1 minuut. Oorzaak was een bewust trage detectie

@@ -413,6 +413,11 @@ bool MonitorSensors::begin() {
   memset(_fixed_change_since, 0, sizeof(_fixed_change_since));
   memset(_fixed_down_start, 0, sizeof(_fixed_down_start));
   memset(_fixed_last_down_ms, 0, sizeof(_fixed_last_down_ms));
+  memset(_batt_state_down, 0, sizeof(_batt_state_down));
+  memset(_batt_state_init, 0, sizeof(_batt_state_init));
+  memset(_batt_change_since, 0, sizeof(_batt_change_since));
+  memset(_batt_down_start, 0, sizeof(_batt_down_start));
+  memset(_batt_last_down_ms, 0, sizeof(_batt_last_down_ms));
   _boot_ms = millis();   /* start van de opstart-genadeperiode (debounce) */
 
   /* Geen ad-hoc ping na een start. Vluchtig, dus alleen RAM. */
@@ -1574,7 +1579,7 @@ void MonitorSensors::loopRecovery() {
   /* De twee vaste kanalen op de RAUWE isMains()/isWifiOnline(). Dit voedt de
    * herstel-boekhouding van de SENSOR-variant (fixedRecoverAlert, alleen via
    * simulaties). In de ROOM-variant bestaat fixedRecoverAlert niet -- daar loopt
-   * het herstel volledig via main_room::fixedEdge op de GEDEBOUNCETE toestand --
+   * het herstel volledig via main_room::edgeLatched op de GEDEBOUNCETE toestand --
    * en zou deze rauwe klok los daarvan een venster kunnen openen. Daarom in de
    * room-variant WEGGELATEN: geen tweede, ongedebouncet herstelpad. */
 #ifndef ROOM_SERVER_VARIANT
@@ -1601,40 +1606,129 @@ void MonitorSensors::loopRecovery() {
  * ontstaan: een recovery vergt dat _fixed_state_down eerst ECHT neer stond (>= de
  * drempel) en daarna stabiel terug is (ook >= de drempel). De down- en up-kant zijn
  * daarmee identiek gedebounced. */
-void MonitorSensors::fixedRawTick(int which, bool raw_down) {
-  if (which < 0 || which >= FIXED_ALERT_COUNT) return;
+/* De gedeelde symmetrische debounce-kern (v2.3.7). Voorheen zat deze logica alleen
+ * in fixedRawTick; nu delen de vaste kanalen en de batterij-drempels haar letterlijk.
+ * De rauwe meting (raw_down) moet thr_ms lang AANEENGESLOTEN afwijken van de stabiele
+ * toestand voordat die kantelt. Zo kantelt een korte blip de toestand NIET en kan er
+ * geen spook-"terug na 0s" ontstaan: een recovery vergt dat de toestand eerst ECHT
+ * neer stond (>= drempel) en daarna stabiel terug is. De down- en up-kant zijn
+ * daarmee identiek gedebounced. */
+uint8_t MonitorSensors::debounceStep(bool& state, bool& init, unsigned long& change_since,
+                                     unsigned long& down_start, unsigned long& last_down_ms,
+                                     bool raw_down, unsigned long thr_ms) {
   const unsigned long now = millis();
 
   /* Eerste meting: de toestand op de rauwe waarde zetten zonder een flank (geen
    * spurieuze down/recovery voor de begintoestand). */
-  if (!_fixed_state_init[which]) {
-    _fixed_state_init[which] = true;
-    _fixed_state_down[which] = raw_down;
-    _fixed_change_since[which] = 0;
-    if (raw_down) _fixed_down_start[which] = now;
-    FIXDIAG("rawtick ch=%d INIT state=%s down_start=%lu grace=%d",
-            which, raw_down ? "DOWN" : "up", _fixed_down_start[which],
-            (int)fixedInBootGrace());
-    return;
+  if (!init) {
+    init = true;
+    state = raw_down;
+    change_since = 0;
+    if (raw_down) down_start = now;
+    return DB_INIT;
   }
 
-  if (raw_down == _fixed_state_down[which]) {   // rauw klopt met de stabiele toestand
-    _fixed_change_since[which] = 0;             // een pending kanteling vervalt
-    return;
+  if (raw_down == state) {       // rauw klopt met de stabiele toestand
+    change_since = 0;            // een pending kanteling vervalt
+    return DB_NONE;
   }
 
   /* Rauw wijkt af: pas kantelen als het lang genoeg AANEENGESLOTEN afwijkt. */
-  if (_fixed_change_since[which] == 0) _fixed_change_since[which] = now ? now : 1;
+  if (change_since == 0) change_since = now ? now : 1;
+  if ((unsigned long)(now - change_since) >= thr_ms) {
+    state = raw_down;
+    change_since = 0;
+    if (raw_down) down_start = now;                 // begin onderbreking
+    else          last_down_ms = now - down_start;  // duur van de laatste onderbreking
+    return DB_FLIP;
+  }
+  return DB_NONE;
+}
+
+void MonitorSensors::fixedRawTick(int which, bool raw_down) {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return;
   const unsigned long thr = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
-  if ((unsigned long)(now - _fixed_change_since[which]) >= thr) {
-    _fixed_state_down[which] = raw_down;
-    _fixed_change_since[which] = 0;
-    if (raw_down) _fixed_down_start[which] = now;                 // begin onderbreking
-    else          _fixed_last_down_ms[which] = now - _fixed_down_start[which];  // duur
+  uint8_t r = debounceStep(_fixed_state_down[which], _fixed_state_init[which],
+                           _fixed_change_since[which], _fixed_down_start[which],
+                           _fixed_last_down_ms[which], raw_down, thr);
+  if (r == DB_INIT)
+    FIXDIAG("rawtick ch=%d INIT state=%s down_start=%lu grace=%d",
+            which, raw_down ? "DOWN" : "up", _fixed_down_start[which],
+            (int)fixedInBootGrace());
+  else if (r == DB_FLIP)
     FIXDIAG("rawtick ch=%d FLIP -> state=%s down_start=%lu last_down_ms=%lu thr=%lu grace=%d",
             which, raw_down ? "DOWN" : "up", _fixed_down_start[which],
             _fixed_last_down_ms[which], thr, (int)fixedInBootGrace());
-  }
+}
+
+/* v2.3.7: de batterij-drempels (crit/laag) door DEZELFDE debounce-kern. De rauwe
+ * ingang is een Schmitt-drempel: eenmaal 'onder', pas weer 'op peil' boven de
+ * HI-band -- geen geflikker rond 3,4/3,6 V. De settle-drempel deelt de vaste
+ * fixed_debounce_s, zodat de reactietijd consistent is met de rest. */
+void MonitorSensors::battTick(float v) {
+  const unsigned long thr = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
+  const bool crit_raw = _batt_state_down[BATT_CRIT] ? (v < BATT_CRIT_HI) : (v < BATT_CRIT_LO);
+  const bool low_raw  = _batt_state_down[BATT_LOW]  ? (v < BATT_LOW_HI)  : (v < BATT_LOW_LO);
+  uint8_t rc = debounceStep(_batt_state_down[BATT_CRIT], _batt_state_init[BATT_CRIT],
+                            _batt_change_since[BATT_CRIT], _batt_down_start[BATT_CRIT],
+                            _batt_last_down_ms[BATT_CRIT], crit_raw, thr);
+  uint8_t rl = debounceStep(_batt_state_down[BATT_LOW], _batt_state_init[BATT_LOW],
+                            _batt_change_since[BATT_LOW], _batt_down_start[BATT_LOW],
+                            _batt_last_down_ms[BATT_LOW], low_raw, thr);
+  if (rc == DB_FLIP || rl == DB_FLIP)
+    FIXDIAG("batt v=%.2f crit=%d low=%d grace=%d", v,
+            (int)_batt_state_down[BATT_CRIT], (int)_batt_state_down[BATT_LOW],
+            (int)fixedInBootGrace());
+}
+
+bool MonitorSensors::battAlertDown(int which) const {
+  if (which < 0 || which >= BATT_COUNT) return false;
+  return _batt_state_down[which];
+}
+
+bool MonitorSensors::battRecoveryOk(int which) const {
+  if (which < 0 || which >= BATT_COUNT) return false;
+  unsigned long floor_ms = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
+  if (floor_ms < FIXED_MIN_RECOVER_MS) floor_ms = FIXED_MIN_RECOVER_MS;
+  return _batt_last_down_ms[which] >= floor_ms;
+}
+
+/* ---- ping-monitor room-edge: meetbaarheid, duur-boekhouding, herstel-grendel ---- */
+bool MonitorSensors::monitorMeasurable(int slot) const {
+  if (!monitorUsed(slot)) return false;
+  /* Een forcering is meetbaar (er IS een mening), ook zonder wifi. Anders: alleen
+   * als er een echte uitslag is (seeded) én de bewaking niet gepauzeerd is. Een
+   * gepauzeerde/onbekende monitor bevriest de kantelaar -- nooit "herstel". */
+  if (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF) return true;
+  return _mon[slot].seeded && !monitorsPaused();
+}
+
+void MonitorSensors::monitorNoteDown(int slot) {
+  if (slot < 0 || slot >= MAX_MONITORS) return;
+  MonState& m = _mon[slot];
+  /* Wordt precies op de neer-flank aangeroepen (één keer per onderbreking), dus
+   * ONVOORWAARDELIJK: een oude down_since van een vorige, onderdrukt-herstelde
+   * storing zou anders de duur van de volgende opblazen. */
+  m.down_since = millis();   /* beginmoment van de gemelde storing */
+  /* was_sim/was_stale op de HUIDIGE stand: zo draagt een echte storing (sim uit)
+   * nooit het merkteken, en lekt een oude sim-vlag niet naar een latere storing. */
+  m.was_sim   = (_sim[SIM_MON_FIRST + slot].mode != SIM_OFF);
+  m.was_stale = m.stale;
+}
+
+void MonitorSensors::monitorNoteClear(int slot) {
+  if (slot < 0 || slot >= MAX_MONITORS) return;
+  MonState& m = _mon[slot];
+  m.down_since = 0;
+  m.was_sim    = false;
+  m.was_stale  = false;
+}
+
+bool MonitorSensors::monitorRecoveryOk(int slot) const {
+  if (slot < 0 || slot >= MAX_MONITORS) return false;
+  const MonState& m = _mon[slot];
+  if (m.down_since == 0) return false;   /* niets gemeld -> geen herstel */
+  return (unsigned long)(millis() - m.down_since) >= FIXED_MIN_RECOVER_MS;
 }
 
 bool MonitorSensors::fixedIsSim(int which) const {
@@ -1654,12 +1748,12 @@ bool MonitorSensors::fixedAlertDown(int which) const {
   /* GEEN opstart-genade meer HIER. Vroeger loog deze functie tijdens de eerste
    * ~60 s 'niet neer', terwijl fixedIsDown()/de OLED al 'neer' toonde -- die
    * desync kon de kantelaar in main_room uit de pas laten lopen. De genade zit nu
-   * in main_room::fixedEdge (dispatch onderdrukken tijdens de genade), zodat
+   * in main_room::edgeLatched (dispatch onderdrukken tijdens de genade), zodat
    * scherm en alarm ALTIJD dezelfde stabiele toestand lezen. */
   return _fixed_state_down[which];
 }
 
-/* Opstart-genadeperiode actief? main_room::fixedEdge onderdrukt zolang dit waar is
+/* Opstart-genadeperiode actief? main_room::edgeLatched onderdrukt zolang dit waar is
  * elke vaste-kanaal-dispatch (en houdt de baseline stil bij), zodat de reboot-
  * vloed geen alarm geeft en er na de genade geen kunstmatige flank ontstaat. */
 bool MonitorSensors::fixedInBootGrace() const {

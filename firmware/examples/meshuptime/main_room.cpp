@@ -148,127 +148,146 @@ public:
 protected:
   /* Kantelstanden voor de alarm-OVERGANGdetectie. Anti-spam: we posten/DM'en
    * ALLEEN op de overgang up->down / down->up, niet elke leesronde. */
+  /* KANTELSTANDEN. Voor ELK alert-type twee vlaggen, en sinds v2.3.7 voor
+   * ALLEMAAL hetzelfde paar (de monitors en de batterij hadden vroeger alleen een
+   * baseline en dat gaf een spook-"terug" op een pauze/flap):
+   *  st_*_down       = baseline: de laatst waargenomen GEDEBOUNCETE toestand.
+   *  st_*_announced  = hebben wij voor de LOPENDE onderbreking echt een "weg"
+   *                    gemeld? De harde grendel: zonder gemelde "weg" nooit "terug". */
   bool st_batt_crit = false, st_batt_low = false;
+  bool st_batt_crit_ann = false, st_batt_low_ann = false;
   bool st_mon_down[MonitorSensors::MAX_MONITORS];
-  /* Vaste kanalen (netvoeding/wifi): twee toestanden per kanaal.
-   *  st_*_down       = de baseline: de laatst waargenomen GEDEBOUNCETE toestand,
-   *                    voor de flankdetectie.
-   *  st_*_announced  = hebben wij voor de LOPENDE onderbreking daadwerkelijk een
-   *                    "weg"-melding de deur uit gedaan? De harde grendel: zonder
-   *                    een gemelde "weg" mag er nooit een "terug" komen. */
+  bool st_mon_ann[MonitorSensors::MAX_MONITORS];
   bool st_mains_down = false, st_wifi_down = false;
   bool st_mains_announced = false, st_wifi_announced = false;
 
-  /* Per-sensor route (dm/room/both) + room-set komen uit de MonitorSensors-config
-   * (mon.<ch>.alert/rooms en fa.<idx>.mode/rooms), instelbaar via web/serieel/room
-   * en bewaard. Op een OVERGANG verdeelt dispatchAlert() volgens die keuze. */
-  void edge(bool down_now, bool& was_down, bool high_pri, uint8_t mode, uint16_t rooms,
-            const char* down_text, const char* up_text, bool muted = false) {
-    /* GEMUTE/GESNOOZED: de kantelaar BEVRIEZEN -- geen alarm EN was_down niet
-     * bijwerken. Zo blijft een openstaande overgang bewaard en vuurt hij alsnog
-     * zodra de mute voorbij is (als de sensor dan nog neer staat). */
-    if (muted) return;
-    if (down_now && !was_down) {
-      was_down = true;
-      dispatchAlert(mode, rooms, high_pri, down_text);
-    } else if (!down_now && was_down) {
-      was_down = false;
-      dispatchAlert(mode, rooms, high_pri, up_text);
-    }
-  }
-
-  /* KANTELAAR VOOR DE VASTE KANALEN (netvoeding/wifi). Losse variant van edge()
-   * met DRIE extra grendels tegen de spook-melding "netvoeding/wifi terug na 0s":
+  /* ============ v2.3.7: ÉÉN gegrendelde kantelaar voor ALLE alert-types ============
    *
-   *  1. GRENDEL OP DE HERSTELMELDING (de eigenlijke bug): een "terug" komt ALLEEN
-   *     als wij voor deze onderbreking echt een "weg" gemeld hebben (announced) EN
-   *     de onderbreking echt lang genoeg duurde (fixedRecoveryOk -- >= de settle-
-   *     drempel, nooit sub-seconde). Een 0s/flap-"onderbreking" geeft dus nooit
-   *     een herstel, ook niet bij een sim of met alert.debounce == 0.
+   * Vervangt de kale edge() (monitors + batterij) én de losse fixedEdge() (vaste
+   * kanalen). Vóór v2.3.7 draaiden monitors en batterij op de kale edge() en hadden
+   * ze exact de bugs die de vaste kanalen vóór v2.3.5 hadden:
+   *   - een pauze/niet-meetbare toestand werd als "weer bereikbaar" gelezen;
+   *   - "terug" kwam ook na een flap (geen announced-grendel, geen duur-grendel);
+   *   - de duur klopte niet (down_since bleef 0 -> "na <uptime>", vandaar de 2u21);
+   *   - een echte storing kon als SIMULATIE gelabeld worden (was_sim-lek).
+   *
+   * De grendels, nu voor iedereen gelijk:
+   *  1. FREEZE: niet-meetbaar (pauze/onbekend) OF gemute/gesnoozed -> GEEN dispatch
+   *     en de baseline NIET bijwerken. Een openstaande overgang blijft zo bewaard en
+   *     vuurt alsnog zodra het weer meetbaar/actief is. Een pauze is NOOIT "herstel".
    *  2. OPSTART-GENADE ZONDER DESYNC: tijdens de genade GEEN dispatch, maar de
-   *     baseline (was_down) wel stil bijwerken. Zo maakt het einde van de genade
-   *     geen kunstmatige "weg"-flank voor een node die al op batterij startte, en
-   *     spreken OLED (fixedIsDown) en alarm (fixedAlertDown) elkaar nooit tegen --
-   *     beide lezen nu dezelfde stabiele toestand.
-   *  3. Snooze bevriest de kantelaar (als edge()).
+   *     baseline wel stil bijwerken (geen kunstmatige flank bij het einde).
+   *  3. HERSTEL-GRENDEL: "terug" ALLEEN als wij voor deze onderbreking echt een "weg"
+   *     meldden (announced) EN de onderbreking plausibel lang was (recovery_ok --
+   *     nooit 0s/sub-seconde, ook niet met debounce == 0 of bij een sim).
+   *  4. SIM-MERK: zit in de tekst-callbacks zelf (alleen bij een echte forcering).
    *
-   * down_now == fixedAlertDown() == de GEDEBOUNCETE, gesettlede toestand.
-   *
-   * De alerttekst wordt PAS in de vurende tak opgehaald, niet als argument: zowel
-   * fixedAlertText() als fixedRecoverAlertText() geven dezelfde statische buffer
-   * (s_alert_buf) terug, dus twee tegelijk als argument zou de ene de andere laten
-   * overschrijven. */
-  void fixedEdge(int which, bool& was_down, bool& announced,
-                 uint8_t mode, uint16_t rooms) {
-    if (sensors.isSnoozed()) return;                 // bevriezen als edge(muted)
-
-    const bool down_now = sensors.fixedAlertDown(which);
-    if (down_now == was_down) return;                // geen flank
-
-    const bool grace = sensors.fixedInBootGrace();
-    was_down = down_now;                             // baseline volgt de echte toestand
-
-    if (down_now) {
-      /* Naar 'neer'. Tijdens de genade NIET melden (reboot-vloed) en dus ook niet
-       * als "gemeld" boeken -- zo kan er straks geen "terug" voor volgen. */
-      if (grace) {
-        announced = false;
-        FIXEDGE_DIAG("ch=%d DOWN in boot-grace -> onderdrukt (niet gemeld)", which);
-        return;
-      }
+   * De teksten komen via callbacks (lazy): monitorAlertText()/recoverAlertText() en
+   * fixedAlertText()/fixedRecoverAlertText() delen allemaal ÉÉN statische buffer, dus
+   * ze vooraf allebei berekenen zou de ene de andere laten overschrijven -- de
+   * vurende tak haalt er precies één op. Herstel gaat ALTIJD als LOW_PRI (ook als de
+   * storing HIGH_PRI was): een gemiste "het werkt weer" is minder erg dan een gemiste
+   * "het is stuk". */
+  struct EdgeIn {
+    bool     down_now;      // gedebouncete/gesettlede storingstoestand
+    bool     measurable;    // false -> bevriezen (niet te meten)
+    bool     frozen;        // gemute/gesnoozed -> bevriezen
+    bool     grace;         // opstart-genade -> onderdruk dispatch, baseline wel bij
+    bool     recovery_ok;   // onderbreking plausibel lang
+    uint8_t  mode;
+    uint16_t rooms;
+    bool     high_pri;      // ernst van de STORING (herstel is altijd LOW_PRI)
+  };
+  template <typename DownText, typename UpText>
+  void edgeLatched(bool& was_down, bool& announced, const EdgeIn& in,
+                   DownText down_text, UpText up_text, const char* tag) {
+    if (in.frozen || !in.measurable) {
+      FIXEDGE_DIAG("%s BEVROREN (frozen=%d meetbaar=%d) -> geen dispatch",
+                   tag, (int)in.frozen, (int)in.measurable);
+      return;
+    }
+    if (in.down_now == was_down) return;             // geen flank
+    const bool grace = in.grace;
+    was_down = in.down_now;                          // baseline volgt de echte toestand
+    if (in.down_now) {
+      if (grace) { announced = false; FIXEDGE_DIAG("%s DOWN in boot-grace -> onderdrukt", tag); return; }
       announced = true;
-      dispatchAlert(mode, rooms, false, sensors.fixedAlertText(which));
-      FIXEDGE_DIAG("ch=%d DOWN gemeld", which);
+      dispatchAlert(in.mode, in.rooms, in.high_pri, down_text());
+      FIXEDGE_DIAG("%s DOWN gemeld", tag);
     } else {
-      /* Naar 'op'. De harde grendel: alleen een "terug" als wij echt een "weg"
-       * meldden EN de onderbreking echt lang genoeg was. */
       const bool was_ann = announced;
       announced = false;
-      const bool dur_ok = sensors.fixedRecoveryOk(which);
-      if (grace) {
-        FIXEDGE_DIAG("ch=%d UP in boot-grace -> geen herstel", which);
-        return;
-      }
-      if (was_ann && dur_ok) {
-        dispatchAlert(mode, rooms, false, sensors.fixedRecoverAlertText(which));
-        FIXEDGE_DIAG("ch=%d HERSTEL gemeld (announced=1 dur_ok=1)", which);
+      if (grace) { FIXEDGE_DIAG("%s UP in boot-grace -> geen herstel", tag); return; }
+      if (was_ann && in.recovery_ok) {
+        dispatchAlert(in.mode, in.rooms, false, up_text());   // herstel = LOW_PRI
+        FIXEDGE_DIAG("%s HERSTEL gemeld (announced=1 dur_ok=1)", tag);
       } else {
-        FIXEDGE_DIAG("ch=%d herstel ONDERDRUKT (announced=%d dur_ok=%d) -- geen spook-terug",
-                     which, (int)was_ann, (int)dur_ok);
+        FIXEDGE_DIAG("%s herstel ONDERDRUKT (announced=%d dur_ok=%d) -- geen spook-terug",
+                     tag, (int)was_ann, (int)in.recovery_ok);
       }
     }
   }
 
   void onSensorDataRead() override {
-    float v = (float)board.getBattMilliVolts() / 1000.0f;
+    const float v = (float)board.getBattMilliVolts() / 1000.0f;
+    const bool  snoozed = sensors.isSnoozed();
+
+    /* Batterij (crit/laag): sinds v2.3.7 gedebouncete Schmitt-drempels i.p.v. een
+     * kale vergelijking rond 3,4/3,6 V -- geen geflikker, en dezelfde grendels als
+     * de rest. battTick() voedt de debounce met de laatste meting. */
+    sensors.battTick(v);
 
     char t1[48];
-    snprintf(t1, sizeof(t1), "Batterij kritisch (%.2fV)!", v);
-    edge(v < 3.4f, st_batt_crit, true,
-         sensors.fixedAlertMode(MON_FA_BATT_CRIT), sensors.fixedRoomsMask(MON_FA_BATT_CRIT),
-         t1, "Batterij hersteld", sensors.isSnoozed());
-    char t2[48];
-    snprintf(t2, sizeof(t2), "Batterij laag (%.2fV)", v);
-    edge(v < 3.6f, st_batt_low, false,
-         sensors.fixedAlertMode(MON_FA_BATT_LOW), sensors.fixedRoomsMask(MON_FA_BATT_LOW),
-         t2, "Batterij weer op peil", sensors.isSnoozed());
+    EdgeIn bc = { sensors.battAlertDown(MonitorSensors::BATT_CRIT), true, snoozed,
+                  sensors.battInBootGrace(), sensors.battRecoveryOk(MonitorSensors::BATT_CRIT),
+                  sensors.fixedAlertMode(MON_FA_BATT_CRIT), sensors.fixedRoomsMask(MON_FA_BATT_CRIT), true };
+    edgeLatched(st_batt_crit, st_batt_crit_ann, bc,
+      [&]() -> const char* { snprintf(t1, sizeof(t1), "Batterij kritisch (%.2fV)!", v); return t1; },
+      []()  -> const char* { return "Batterij hersteld"; }, "batt.crit");
 
+    char t2[48];
+    EdgeIn bl = { sensors.battAlertDown(MonitorSensors::BATT_LOW), true, snoozed,
+                  sensors.battInBootGrace(), sensors.battRecoveryOk(MonitorSensors::BATT_LOW),
+                  sensors.fixedAlertMode(MON_FA_BATT_LOW), sensors.fixedRoomsMask(MON_FA_BATT_LOW), false };
+    edgeLatched(st_batt_low, st_batt_low_ann, bl,
+      [&]() -> const char* { snprintf(t2, sizeof(t2), "Batterij laag (%.2fV)", v); return t2; },
+      []()  -> const char* { return "Batterij weer op peil"; }, "batt.low");
+
+    /* Ping-monitors: dezelfde gegrendelde kantelaar. measurable=false (bewaking
+     * gepauzeerd, of nog geen uitslag) BEVRIEST -- dat was de bug van vóór v2.3.7:
+     * een pauze (wifi weg) las als "weer bereikbaar". De duur komt nu uit
+     * monitorNoteDown/recoverAlertText (echte onbereikbaarheid), niet uit de uptime. */
     for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) {
-      bool down = sensors.monitorUsed(i) && sensors.monitorSeeded(i) &&
-                  !sensors.monitorsPaused() && !sensors.monitorIsUp(i);
-      edge(down, st_mon_down[i], false,
-           sensors.monitorAlertMode(i), sensors.monitorRoomsMask(i),
-           sensors.monitorAlertText(i), sensors.recoverAlertText(i),
-           sensors.isMuted(i));
+      if (!sensors.monitorUsed(i)) {
+        st_mon_down[i] = false; st_mon_ann[i] = false; sensors.monitorNoteClear(i);
+        continue;
+      }
+      const int slot = i;
+      EdgeIn mi = { !sensors.monitorIsUp(i), sensors.monitorMeasurable(i), sensors.isMuted(i),
+                    false, sensors.monitorRecoveryOk(i),
+                    sensors.monitorAlertMode(i), sensors.monitorRoomsMask(i), false };
+      edgeLatched(st_mon_down[i], st_mon_ann[i], mi,
+        [slot]() -> const char* { sensors.monitorNoteDown(slot); return sensors.monitorAlertText(slot); },
+        [slot]() -> const char* { const char* s = sensors.recoverAlertText(slot); sensors.monitorNoteClear(slot); return s; },
+        "mon");
     }
 
-    /* De vaste kanalen via fixedEdge(): gedebouncete/gesettlede toestand, opstart-
-     * genade ZONDER OLED-desync, en de HARDE GRENDEL tegen de spook-"terug na 0s"
-     * (herstel enkel na een echt gemelde, lang-genoeg onderbreking). Zie fixedEdge. */
-    fixedEdge(MonitorSensors::FIXED_POWER, st_mains_down, st_mains_announced,
-              sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS));
-    fixedEdge(MonitorSensors::FIXED_WIFI, st_wifi_down, st_wifi_announced,
-              sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI));
+    /* De vaste kanalen (netvoeding/wifi): ongewijzigd gedrag (v2.3.5), nu via
+     * dezelfde helper -- gedebouncete toestand, opstart-genade zonder OLED-desync,
+     * harde herstel-grendel. */
+    EdgeIn fp = { sensors.fixedAlertDown(MonitorSensors::FIXED_POWER), true, snoozed,
+                  sensors.fixedInBootGrace(), sensors.fixedRecoveryOk(MonitorSensors::FIXED_POWER),
+                  sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS), false };
+    edgeLatched(st_mains_down, st_mains_announced, fp,
+      []() -> const char* { return sensors.fixedAlertText(MonitorSensors::FIXED_POWER); },
+      []() -> const char* { return sensors.fixedRecoverAlertText(MonitorSensors::FIXED_POWER); }, "mains");
+
+    EdgeIn fw = { sensors.fixedAlertDown(MonitorSensors::FIXED_WIFI), true, snoozed,
+                  sensors.fixedInBootGrace(), sensors.fixedRecoveryOk(MonitorSensors::FIXED_WIFI),
+                  sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI), false };
+    edgeLatched(st_wifi_down, st_wifi_announced, fw,
+      []() -> const char* { return sensors.fixedAlertText(MonitorSensors::FIXED_WIFI); },
+      []() -> const char* { return sensors.fixedRecoverAlertText(MonitorSensors::FIXED_WIFI); }, "wifi");
   }
 
   /* Een room-post herkennen als commando en de antwoordtekst opbouwen. RoomMesh
@@ -280,7 +299,7 @@ protected:
 
 public:
   void beginApp() {
-    for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) st_mon_down[i] = false;
+    for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) { st_mon_down[i] = false; st_mon_ann[i] = false; }
   }
 };
 
