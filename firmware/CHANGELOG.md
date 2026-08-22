@@ -7,6 +7,25 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.3 — wifi/netvoeding-alerts: geen mislabel + debounce
+
+Twee fixes tegen de vloed van "wifi simulatie"-alerts die de gebruiker meldde.
+
+- **Mislabeling weg**: `fixedAlertText`/`fixedRecoverAlertText` zetten het
+  SIMULATIE-merkteken (`TEST ` + " -- dit is een SIMULATIE, geen echte storing")
+  nu ALLEEN wanneer de storing echt geforceerd is (`fixedIsSim()`: de sim-modus van
+  dat vaste kanaal staat aan). Een ECHTE wifi-/netvoedingsonderbreking — de
+  room-variant vuurt op de gemeten `isWifiOnline()`/`isMains()` — krijgt een normale
+  tekst ("wifi weg, monitors bevroren" / "netvoeding weg …") zonder simulatie-staart.
+- **Debounce + opstart-genade**: nieuwe `fixedAlertDown()` (gebruikt door
+  `main_room::edge`) meldt een vast kanaal pas "neer" als de onderbreking langer dan
+  de drempel aanhoudt (instelbaar `alert.debounce`, standaard 45 s; 0 = uit) EN de
+  opstart-genadeperiode (60 s na boot) voorbij is. Zo alarmeert een korte blip of de
+  eigen reboot/herverbinding niet meer, en vuurt er dus ook geen spookherstel
+  ("wifi net terug") puur omdat de node opstartte. De debounce-drempel is persistent
+  (`fdeb` in /monitors.cfg) en te zetten via CLI/web (`alert.debounce`). De
+  herstelmelding toont nu de echte onderbrekingsduur (`_fixed_last_down_ms`).
+
 ## v2.3.2 — naam "Public" -> vaste publieke sleutel
 
 - **Speciale naam "Public"**: een kanaal toevoegen met de naam `Public` (case-

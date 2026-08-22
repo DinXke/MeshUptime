@@ -27,11 +27,14 @@
  *            (sha256[:16], hashtag-kanaal, zoals de MeshCore-app).
  *   v2.3.2 = naam "Public" (met/zonder #) zonder secret -> de VASTE publieke
  *            sleutel (het echte publieke kanaal), zoals de app.
+ *   v2.3.3 = wifi/netvoeding-alerts: SIMULATIE-merkteken alleen bij een echte
+ *            forcering (geen mislabel), + debounce/opstart-genade tegen de vloed
+ *            van alerts bij korte blips en de eigen reboot.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.2"
+  #define MESHUPTIME_VERSION   "v2.3.3"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

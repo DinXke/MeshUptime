@@ -843,6 +843,16 @@ public:
   bool        fixedAlert(int which);
   const char* fixedAlertText(int which) const;
 
+  /* GEDEBOUNCET "neer" voor een vast kanaal (wifi/netvoeding), voor de room-
+   * variant (main_room::edge). true pas als de onderbreking langer dan de
+   * debounce-drempel (alert.debounce, standaard 45 s) aanhoudt EN de opstart-
+   * genadeperiode voorbij is -- zo alarmeert een korte blip of de eigen reboot
+   * niet. which = FIXED_POWER / FIXED_WIFI. */
+  bool        fixedAlertDown(int which) const;
+  /* Wordt de storing op dit vaste kanaal NU gesimuleerd (forcering actief)? Bepaalt
+   * of de alerttekst het SIMULATIE-merkteken draagt. */
+  bool        fixedIsSim(int which) const;
+
   /* ---------------- het testbericht ----------------
    *
    * Los van alle sensoren: één kort bericht naar de ontvangers met
@@ -1250,6 +1260,15 @@ private:
   bool          _fixed_rec_alerting[FIXED_ALERT_COUNT];
   AlertRepeat   _fixed_rep[FIXED_ALERT_COUNT];    /* herhalen tot bevestiging */
 
+  /* DEBOUNCE op de vaste kanalen (wifi/netvoeding). _fixed_raw_down_since = millis
+   * waarop de RAUWE onderbreking begon (0 = nu op); _fixed_last_down_ms = de duur
+   * van de zojuist geeindigde onderbreking (voor de "terug na Xs"-tekst). _boot_ms
+   * = starttijd, voor de opstart-genadeperiode. Zo alarmeert een korte blip (bv. de
+   * eigen reboot) niet. Zie fixedAlertDown(). */
+  unsigned long _fixed_raw_down_since[FIXED_ALERT_COUNT];
+  unsigned long _fixed_last_down_ms[FIXED_ALERT_COUNT];
+  unsigned long _boot_ms;
+
   /* De kern van "herhalen tot bevestiging", gedeeld door de monitors en de vaste
    * kanalen. Geeft terug wat er aan alertIf() gevoerd moet worden en beheert de
    * eerste melding, het her-armen per periode (de puls-laag), de menselijke
@@ -1271,6 +1290,10 @@ private:
    * de monitors en de vaste kanalen, want de regel is voor beide dezelfde. */
   void trackRecovery(bool up_now, bool& down_sent, unsigned long& down_since,
                      unsigned long& up_since, unsigned long& rec_until);
+  /* Debounce-klok van een vast kanaal bijwerken (wifi/netvoeding). */
+  void fixedRawTick(int which, bool down_now);
+  /* Opstart-genadeperiode: geen vaste-kanaal-alarm de eerste ~60 s na boot. */
+  static const uint32_t FIXED_BOOT_GRACE_MS = 60000;
   /* "Wij hebben deze storing gemeld", plus het moment. Wordt op vier plaatsen
    * gezet en bepaalt de duur in het herstelbericht. */
   static void noteDownSent(bool& down_sent, unsigned long& down_since);

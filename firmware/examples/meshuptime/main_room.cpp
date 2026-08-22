@@ -187,11 +187,14 @@ protected:
            sensors.isMuted(i));
     }
 
-    edge(!sensors.isMains(), st_mains_down, false,
+    /* fixedAlertDown() i.p.v. de rauwe !isMains()/!isWifiOnline(): gedebouncet +
+     * opstart-genadeperiode, zodat een korte blip of de eigen reboot geen
+     * wifi-/netvoeding-alarm afvuurt (en dus ook geen spookherstel erna). */
+    edge(sensors.fixedAlertDown(MonitorSensors::FIXED_POWER), st_mains_down, false,
          sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS),
          sensors.fixedAlertText(MonitorSensors::FIXED_POWER),
          sensors.fixedRecoverAlertText(MonitorSensors::FIXED_POWER), sensors.isSnoozed());
-    edge(!sensors.isWifiOnline(), st_wifi_down, false,
+    edge(sensors.fixedAlertDown(MonitorSensors::FIXED_WIFI), st_wifi_down, false,
          sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI),
          sensors.fixedAlertText(MonitorSensors::FIXED_WIFI),
          sensors.fixedRecoverAlertText(MonitorSensors::FIXED_WIFI), sensors.isSnoozed());

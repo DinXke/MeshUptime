@@ -62,6 +62,8 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
    * standaard hoort de stand te zijn die het minste stilte oplevert. */
   cfg.recover_alerts = 1;
   cfg.rhold_s = MON_RHOLD_DEFAULT;
+  /* Debounce vaste kanalen (wifi/netvoeding): standaard 45 s tegen korte blips. */
+  cfg.fixed_debounce_s = MON_FDEB_DEFAULT;
   /* Herhalen tot bevestiging standaard aan (300 s). Zie MonitorCfg: dit is de
    * gevraagde standaard en dus een gedragsverandering bij het bijwerken; op 0
    * zetten geeft het oude "één melding en klaar". */
@@ -195,6 +197,11 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       int v = atoi(parts[1]);
       staged.repeat_s = (v == 0 || (v >= MON_AREPEAT_MIN && v <= MON_AREPEAT_MAX))
                       ? (uint16_t)v : MON_AREPEAT_DEFAULT;
+    } else if (strcmp(parts[0], "fdeb") == 0) {
+      /* Debounce vaste kanalen; buiten de grenzen -> de standaard. */
+      int v = atoi(parts[1]);
+      staged.fixed_debounce_s = (v >= MON_FDEB_MIN && v <= MON_FDEB_MAX)
+                              ? (uint16_t)v : MON_FDEB_DEFAULT;
     } else if (strcmp(parts[0], "purl") == 0) {
       /* Geen keuring op de inhoud hier: die zit in setSettingValue(), en wat in
        * dit bestand staat is door diezelfde zeef geschreven. Alleen de lengte
@@ -346,9 +353,9 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
    * nooit geschreven, dus een gewijzigde herstelmelding overleefde geen herstart.
    * Alle drie staan er nu, elk op een eigen sleutel zodat een oud bestand zonder
    * een ervan gewoon de standaard houdt. */
-  len = snprintf(line, sizeof(line), "rec %u\nrhold %u\narepeat %u\n",
+  len = snprintf(line, sizeof(line), "rec %u\nrhold %u\narepeat %u\nfdeb %u\n",
                  (unsigned)(cfg.recover_alerts ? 1 : 0), (unsigned)cfg.rhold_s,
-                 (unsigned)cfg.repeat_s);
+                 (unsigned)cfg.repeat_s, (unsigned)cfg.fixed_debounce_s);
   f.write((const uint8_t*)line, len);
 
   /* De push-instellingen. url en token alleen als ze er ZIJN: een lege regel

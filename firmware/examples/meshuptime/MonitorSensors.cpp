@@ -401,6 +401,9 @@ bool MonitorSensors::begin() {
   memset(_fixed_rec_until, 0, sizeof(_fixed_rec_until));
   memset(_fixed_rec_alerting, 0, sizeof(_fixed_rec_alerting));
   memset(_fixed_rep, 0, sizeof(_fixed_rep));
+  memset(_fixed_raw_down_since, 0, sizeof(_fixed_raw_down_since));
+  memset(_fixed_last_down_ms, 0, sizeof(_fixed_last_down_ms));
+  _boot_ms = millis();   /* start van de opstart-genadeperiode (debounce) */
 
   /* Geen ad-hoc ping na een start. Vluchtig, dus alleen RAM. */
   memset(&_adhoc, 0, sizeof(_adhoc));
@@ -1563,6 +1566,42 @@ void MonitorSensors::loopRecovery() {
   trackRecovery(isWifiOnline(), _fixed_down_sent[FIXED_WIFI],
                 _fixed_down_since[FIXED_WIFI], _fixed_up_since[FIXED_WIFI],
                 _fixed_rec_until[FIXED_WIFI]);
+
+  /* Debounce-boekhouding voor de vaste kanalen: onthoud sinds wanneer de RAUWE
+   * onderbreking loopt (voor fixedAlertDown) en de duur van de zojuist geeindigde
+   * onderbreking (voor de "terug na Xs"-herstelmelding in de room-variant). */
+  fixedRawTick(FIXED_POWER, !isMains());
+  fixedRawTick(FIXED_WIFI, !isWifiOnline());
+}
+
+/* Bijhouden van de rauwe onderbrekingsklok van een vast kanaal. */
+void MonitorSensors::fixedRawTick(int which, bool down_now) {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return;
+  const unsigned long now = millis();
+  if (down_now) {
+    if (_fixed_raw_down_since[which] == 0) _fixed_raw_down_since[which] = now ? now : 1;
+  } else if (_fixed_raw_down_since[which] != 0) {
+    _fixed_last_down_ms[which] = now - _fixed_raw_down_since[which];
+    _fixed_raw_down_since[which] = 0;
+  }
+}
+
+bool MonitorSensors::fixedIsSim(int which) const {
+  const uint8_t idx = (which == FIXED_POWER) ? SIM_POWER : SIM_WIFI;
+  return _sim[idx].mode != SIM_OFF;
+}
+
+bool MonitorSensors::fixedAlertDown(int which) const {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
+  /* Opstart-genadeperiode: vlak na boot niets melden -- de node moet eerst een
+   * stabiele meting hebben (wifi/DHCP komt niet meteen). Zo vuurt een herstart
+   * geen "wifi weg"/"wifi terug"-paar. */
+  if ((unsigned long)(millis() - _boot_ms) < FIXED_BOOT_GRACE_MS) return false;
+  if (_fixed_raw_down_since[which] == 0) return false;   // nu op
+  /* Debounce: pas "neer" voor het alarm als het lang genoeg aaneengesloten neer is.
+   * fixed_debounce_s == 0 -> geen debounce (meteen). */
+  const unsigned long thr = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
+  return (unsigned long)(millis() - _fixed_raw_down_since[which]) >= thr;
 }
 
 /* De voorwaarde die main.cpp aan de TWEEDE Trigger per vakje hangt.
@@ -1672,14 +1711,22 @@ const char* MonitorSensors::recoverAlertText(int slot) const {
 const char* MonitorSensors::fixedRecoverAlertText(int which) const {
   if (which < 0 || which >= FIXED_ALERT_COUNT) { s_alert_buf[0] = 0; return s_alert_buf; }
 
-  const unsigned long secs = (millis() - _fixed_down_since[which]) / 1000;
-  /* De storing op een vast kanaal kan bij deze opzet alleen een simulatie zijn
-   * (zie fixedAlert), dus het merkteken staat er altijd. Zou fixedAlert() ooit
-   * ook op de gemeten toestand gaan vuren, dan hoort hier dezelfde was_sim-vlag
-   * te komen als bij de monitors. */
+  /* De duur van de zojuist geeindigde onderbreking. De room-variant vuurt op de
+   * ECHTE toestand (main_room::edge) en zet _fixed_down_since niet; daar geeft de
+   * debounce-boekhouding (_fixed_last_down_ms) de juiste duur. De sensor-variant
+   * (fixedAlert, alleen simulaties) zet _fixed_down_since wel -- val daarop terug. */
+  unsigned long ms = _fixed_last_down_ms[which];
+  if (ms == 0 && _fixed_down_since[which] != 0) ms = millis() - _fixed_down_since[which];
+  const unsigned long secs = ms / 1000;
+
+  /* SIMULATIE-merkteken ALLEEN als de storing daadwerkelijk geforceerd is/was --
+   * niet bij een echte wifi-/netvoedingsonderbreking (dat was de mislabel-bug). */
+  const bool sim = fixedIsSim(which);
+  const char* mark = sim ? SIM_MARK : "";
+  const char* tail = sim ? SIM_TAIL : "";
   snprintf(s_alert_buf, sizeof(s_alert_buf), "%s%s terug na %s%s",
-           SIM_MARK, which == FIXED_POWER ? "netvoeding" : "wifi",
-           durText(secs), SIM_TAIL);
+           mark, which == FIXED_POWER ? "netvoeding" : "wifi",
+           durText(secs), tail);
   return s_alert_buf;
 }
 
@@ -1866,16 +1913,23 @@ bool MonitorSensors::fixedAlert(int which) {
 const char* MonitorSensors::fixedAlertText(int which) const {
   const char* rp = (which >= 0 && which < FIXED_ALERT_COUNT)
                  ? repeatSuffix(_fixed_rep[which].repeats) : "";
+  /* SIMULATIE-merkteken ALLEEN wanneer de storing echt geforceerd is. Een ECHTE
+   * wifi-/netvoedingsonderbreking (de room-variant vuurt op de gemeten toestand)
+   * krijgt een NORMALE tekst zonder de simulatie-staart -- dat was de mislabel-bug
+   * ("wifi simulatie" bij een echte storing). */
+  const bool sim = (which >= 0 && which < FIXED_ALERT_COUNT) ? fixedIsSim(which) : false;
+  const char* mark = sim ? SIM_MARK : "";
+  const char* tail = sim ? SIM_TAIL : "";
   if (which == FIXED_POWER) {
     snprintf(s_alert_buf, sizeof(s_alert_buf),
              "%snetvoeding weg, node op batterij (%.3fV)%s%s",
-             SIM_MARK, _last_volts, rp, SIM_TAIL);
+             mark, _last_volts, rp, tail);
   } else if (which == FIXED_WIFI) {
     /* Erbij dat de monitors bevriezen: dat is het GEVOLG dat de ontvanger moet
      * kennen. Zonder onze wifi meten wij niets over de diensten, en dan is het
      * uitblijven van verdere waarschuwingen geen goed nieuws. */
     snprintf(s_alert_buf, sizeof(s_alert_buf),
-             "%swifi weg, monitors bevroren%s%s", SIM_MARK, rp, SIM_TAIL);
+             "%swifi weg, monitors bevroren%s%s", mark, rp, tail);
   } else {
     s_alert_buf[0] = 0;
   }
@@ -3332,9 +3386,10 @@ bool MonitorSensors::delMonitor(const char* name) {
  */
 
 #define MON_FIELDS_PER_MONITOR  5     /* name, host, int, state, ms */
-#define MON_NUM_GLOBAL_SETTINGS 12    /* mains.hi/lo/state + mon.count/add/del
+#define MON_NUM_GLOBAL_SETTINGS 13    /* mains.hi/lo/state + mon.count/add/del
                                        + alert.recover/alert.rhold/alert.repeat
-                                       + push.url/push.token/push.hb */
+                                       + push.url/push.token/push.hb
+                                       + alert.debounce */
 
 /* Vaste buffers, één per instelling: getSettingValue() is const en mag niets
  * alloceren, en met een buffer per instelling kan een aanroeper meerdere
@@ -3385,6 +3440,7 @@ const char* MonitorSensors::getSettingName(int i) const {
     case 9:  return "push.url";     // leeg = push uit; alleen http://
     case 10: return "push.token";   // Bearer-token voor de server
     case 11: return "push.hb";      // s: beloofd heartbeat-interval
+    case 12: return "alert.debounce"; // s: debounce vaste kanalen (0 = uit)
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -3451,6 +3507,10 @@ const char* MonitorSensors::getSettingValue(int i) const {
       snprintf(s_setting_buf[3], sizeof(s_setting_buf[3]), "%u",
                (unsigned)_cfg.push_hb_s);
       return s_setting_buf[3];
+    case 12:
+      snprintf(s_setting_buf[2], sizeof(s_setting_buf[2]), "%u",
+               (unsigned)_cfg.fixed_debounce_s);
+      return s_setting_buf[2];
   }
 
   const int k     = idx - MON_NUM_GLOBAL_SETTINGS;
@@ -3580,6 +3640,16 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     if (end == value || *end != 0) return false;
     if (v != 0 && (v < MON_AREPEAT_MIN || v > MON_AREPEAT_MAX)) return false;
     _cfg.repeat_s = (uint16_t)v;
+    markDirty();
+    return true;
+  }
+  if (strcmp(name, "alert.debounce") == 0) {
+    /* Debounce vaste kanalen (wifi/netvoeding), in seconden. 0 = geen debounce. */
+    char* end = NULL;
+    long v = strtol(value, &end, 10);
+    if (end == value || *end != 0) return false;
+    if (v < MON_FDEB_MIN || v > MON_FDEB_MAX) return false;
+    _cfg.fixed_debounce_s = (uint16_t)v;
     markDirty();
     return true;
   }

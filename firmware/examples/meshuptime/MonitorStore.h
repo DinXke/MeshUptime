@@ -237,6 +237,14 @@ struct MonitorCfgEntry {
 #define MON_RHOLD_MAX      3600
 #define MON_RHOLD_DEFAULT   120
 
+/* DEBOUNCE op de vaste kanalen (wifi/netvoeding): een onderbreking moet zo lang
+ * aaneengesloten duren voordat er gealarmeerd wordt. Standaard 45 s -- lang genoeg
+ * om de eigen reboot/herverbinding (een paar seconden wifi-uitval) te negeren,
+ * kort genoeg om een echte storing snel te melden. 0 = geen debounce. */
+#define MON_FDEB_MIN          0
+#define MON_FDEB_MAX       3600
+#define MON_FDEB_DEFAULT     45
+
 /* Grenzen van de herhaalperiode (repeat_s). 0 is toegestaan en betekent uit.
  * De ondergrens is 60 s en niet lager: elke herhaling is een DM-keten naar alle
  * ontvangers, dus zendtijd op een band die met anderen gedeeld wordt, en de
@@ -301,6 +309,11 @@ struct MonitorCfg {
    * dus herhalen waar hij dat eerst niet deed. Dat is met opzet de gevraagde
    * standaard; wie het oude gedrag wil, zet alert.repeat op 0. */
   uint16_t repeat_s;         /* 0 = uit, anders MON_AREPEAT_MIN..MAX */
+
+  /* Debounce-drempel (s) voor de vaste kanalen wifi/netvoeding: zo lang moet een
+   * onderbreking aaneengesloten duren voordat er gealarmeerd wordt. Standaard 45 s;
+   * 0 = geen debounce. Stopt de vloed van wifi-alerts bij korte blips/reboots. */
+  uint16_t fixed_debounce_s;  /* MON_FDEB_MIN..MAX */
 
   /* Bitmasker van kanalen die OOIT zijn uitgedeeld, bit 0 = kanaal 5.
    * Dit hoort bij de blijvende gegevens en niet bij het geheugen: zonder dit
