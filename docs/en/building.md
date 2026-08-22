@@ -32,12 +32,13 @@ flash):
 
 | env | RAM | flash |
 |---|---|---|
-| `meshuptime_room` | 40.5% (132,728) | 45.2% (1,509,589) |
-| `meshuptime` | 33.9% (111,072) | 44.6% (1,491,325) |
+| `meshuptime_room` | ~54% | ~46% |
+| `meshuptime` | ~47% | ~45% |
 
-The room env is larger because of the extra panels (rooms, sensor-nodes, bot, SNMP)
-and the async network engine. If the figures differ sharply, something did not carry
-over.
+The room env is larger because of the extra panels (rooms, sensor-nodes, bot, SNMP,
+channels, time), the async network engine and the big advert/contact list (200
+entries, ~13.6 kB RAM, RAM-only). If the figures differ sharply, something did not
+carry over.
 
 ---
 

@@ -184,6 +184,23 @@ Het aantal herverbindingen, het aantal harde resets en de laatste reden van
 wegvallen staan in de webinterface. "Geen wifi" zonder reden kost iemand een
 avond zoeken.
 
+## Tijd: NTP, tijdzone en lokale weergave
+
+Sinds v2.2.2 zijn de **NTP-server** en de **tijdzone** instelbaar via de web-GUI
+(paneel *Tijd*, bewaard in `/time.cfg`, `POST /time`). Standaard is de NTP-server
+`pool.ntp.org` (een LAN-tijdserver mag ook) en de tijdzone Europe/Brussels als
+POSIX-TZ-string `CET-1CEST,M3.5.0/2,M10.5.0/3` — dus DST-bewust. Opslaan past de TZ
+meteen toe en vraagt een her-sync aan. De sync is robuust: al bij WiFi-connect én
+periodiek, elke 6 uur.
+
+**Menselijke tijden lokaal, protocol en RTC in UTC.** Alle voor mensen bedoelde
+tijden worden getoond in de **lokale** tijd mét de zone-afkorting (bv.
+`Received at: 00:35:11 CEST`), via `localtime_r`/`strftime %Z` op de ingestelde TZ.
+De RTC en **alle** MeshCore-protocoltijdstempels blijven UTC — de mesh rekent in
+UTC. Vóór de eerste geslaagde sync toont de node `niet gesynct` in plaats van een
+garbage-tijd (`TimeFmt.h`, `TIME_FLOOR`). `/cfg.json` legt dit bloot via
+`ntp`, `tz`, `tlocal` (de lokale datum/tijd), `tsync`, `tsyncmsg` en `tsyncage`.
+
 ## De room-server
 
 Alles hierboven — kanalen, monitors, voeding, wifi — is de gedeelde sensor-kern.
@@ -258,6 +275,11 @@ Uitgestelde uitslagen (ping en de netwerk-diagnoses) komen terug **naar de
 oorsprong** — dezelfde room of DM waar het commando vandaan kwam — via het algemene
 oorsprong-routing-mechanisme (de v2.1.0 "ping-fix", nu voor alle trage taken).
 
+Daarnaast zijn er de **subsysteem-commando's** die de identiteiten en kanalen
+beheren, ook over serieel en (voor een beheerder) over een DM: `room …`,
+`sensornode …`, `bot list|add|del|post|sendto|advert|uri` en
+`channel list|add|del|on|off`.
+
 ### De async netwerk-taak-engine
 
 De diagnoses `port`, `scan`, `http` en `traceroute` zouden blokkeren als je ze
@@ -311,6 +333,27 @@ pubkeys) en wordt op een verse node geseed met de eigenaar. De bot rekent zijn
 gedeelde geheim **zelf** uit de ontvanger-pubkey (`calcSharedSecret` +
 `createDatagram`), dus hij hangt niet aan een room-sessie.
 
+**Tweerichtings sinds v2.2.1.** De bot was eerst alleen-zenden: een inkomende DM
+aan de bot viel door naar de identiteit van `rooms[0]` en werd met de **verkeerde
+sleutel** ontsleuteld (en dus stil verworpen) — dat was de bug. `onRecvPacket`
+matcht nu ook de bot-identiteit `_bot_id`. Een chat-DM draagt alleen een 1-byte
+src-hash en géén pubkey, dus de afzender-pubkey wordt opgezocht in de buurtlijst
+(gehoorde adverts) en de ontvangerslijst, en het gedeelde geheim wordt daaruit
+berekend. Zo kan de bot ontsleutelen en terugantwoorden zonder wachtwoord-login.
+
+De bot heeft een kleine, eigen commandoset over DM (GÉÉN monitoring-console):
+
+| commando | antwoord |
+|---|---|
+| `ping` | `Pong (HH:MM:SS <zone>)` — de lokale tijd met zone-afkorting |
+| `test` | signaalrapport: SNR / RSSI / hops van het inkomende pakket |
+| `path` | de afzender + de tussenliggende repeaters bij **naam** + SNR/RSSI + de ontvangst­tijd (`Received at:` lokaal) |
+| `help` | somt de bot-commando's op; onbekende tekst → korte hint |
+
+Het antwoord is een schone DM vanaf de bot, met een ACK op het inkomende bericht.
+De velden komen uit het inkomende pakket (pad/hops, SNR×4→dB, RSSI, tijd); de
+antwoordbuffers staan `static` en niet op de loopTask-stapel.
+
 Bediening:
 
 - **CLI**: `bot list | add <pubkey> | del <prefix> | post <msg> |
@@ -318,13 +361,69 @@ Bediening:
 - **Room/DM**: het admin-commando `sendto <pubkey> <msg>`.
 - **Web-GUI**: het bot-tab (join/QR, ontvangerbeheer, `sendto`/`post`).
 
+### Hashtag- en publieke kanalen
+
+Sinds v2.3.0 leest de bot ook de ingeschakelde MeshCore **group-channels** mee en
+antwoordt IN het kanaal op `ping` (Pong), `test` (signaalrapport) en `path` (route
+met repeaternamen) — dezelfde stijl als de DM-responder, maar met de naam van de
+afzender ervoor. Het antwoord is een geflood group-bericht `"<botnaam>: <antwoord>"`
+(`createGroupDatagram`); het meelezen loopt via de overrides
+`searchChannelsByHash`/`onGroupDataRecv`.
+
+Een kanaal is in MeshCore niets meer dan een **gedeeld secret** (16 byte = 128-bit
+of 32 byte = 256-bit); de **kanaal-hash** is de eerste byte van `sha256(secret)`.
+De node volgt exact dat formaat. Beheer via de web-GUI (bot-tab:
+toevoegen/aan-uit/wissen), persistent in `/channels.cfg`; endpoints
+`GET /channels.json` en `POST /channel/add|del|toggle`; CLI
+`channel list|add <naam> [secrethex]|del <naam>|on <naam>|off <naam>`.
+
+Er zijn **drie soorten sleutel**, zoals de GUI/CLI/`/channel/add`-respons ook
+melden:
+
+- **eigen sleutel** — een expliciete 32- of 64-hex secret. Wint altijd, wordt nooit
+  teruggetoond.
+- **sleutel afgeleid uit naam** (v2.3.1) — voeg een kanaal toe met een naam maar
+  **zonder** secret en de node maakt een **hashtag-kanaal**: de sleutel is de eerste
+  16 byte van `sha256(naam)`, EXACT zoals de MeshCore-app (`#test` →
+  `9cd8fcf22a47333b591d96a2b848b73f`). Zelfde naam = zelfde kanaal als de app. Een
+  afgeleide sleutel is niet geheim: wie de naam kent, leidt hem af.
+- **publiek kanaal (vaste sleutel)** (v2.3.2) — de naam `Public` (case-insensitief,
+  met of zonder `#`) zonder secret gebruikt de vaste, welbekende publieke sleutel
+  `8b3387e9c5cdea6ac9e5edbaa115cd72` i.p.v. `sha256("public")`, zodat de node op het
+  ECHTE publieke kanaal uitkomt, net als de app. De `pub`-vlag in `/channels.json`
+  (`is_public`) wordt afgeleid door het secret met de publieke sleutel te
+  vergelijken, niet apart bewaard.
+
+### Naamresolutie en de grote contactenlijst
+
+Om in `path`, in een DM en in `/contacts.json` echte node-**namen** te tonen groeide
+de buurtlijst (`NeighbourList`) in v2.3.0 van 12 naar **200** ingangen: pubkey, naam,
+advert-type, snr/hops en laatst-gehoord, LRU op laatst-gehoord. Dat kost ~13,6 kB RAM
+— de bewuste ruil — en de lijst blijft **RAM-only**: adverts komen te vaak voor een
+per-advert-flashschrijf, en na een herstart stromen de namen binnen minuten vanzelf
+weer binnen.
+
+De **resolutievolgorde** is een gevolg van wat een bericht draagt:
+
+1. **inline naam uit het bericht** — een group-bericht draagt de afzendernaam IN de
+   tekst (`"<naam>: <tekst>"`, zoals de app) maar géén pubkey; die naam gebruiken we
+   direct.
+2. **de grote advert-/contactlijst**, op pubkey — voor `path` en DM's, die wél een
+   pubkey dragen maar géén naam.
+3. **hex-pubkey-prefix** als laatste terugval, als de naam nergens bekend is.
+
+Kort: een kanaalbericht heeft de naam (geen pubkey), een DM heeft de pubkey (geen
+naam) — vandaar de twee verschillende wegen naar hetzelfde antwoord.
+
 ### Ontdekte contacten en de kiezer
 
 `GET /contacts.json` geeft de **buurtlijst met volledige pubkey** plus naam,
-snr/hops, laatst-gehoord en teller. De web-GUI gebruikt die lijst als **kiezer**
-op twee plekken: bij de bot-ontvangers en bij de per-slot ACL-grants. Zo kies je
-uit gehoorde nodes in plaats van een sleutel van 64 hextekens met de hand te
-plakken. Er gaan **alleen publieke sleutels** over deze weg — nooit een geheim.
+snr/hops, laatst-gehoord en teller. De weergave is gekapt op `NB_JSON_MAX=64`
+ingangen; de lijst zelf blijft 200 groot voor de resolutie hierboven. De web-GUI
+gebruikt die lijst als **kiezer** op twee plekken: bij de bot-ontvangers en bij de
+per-slot ACL-grants. Zo kies je uit gehoorde nodes in plaats van een sleutel van 64
+hextekens met de hand te plakken. Er gaan **alleen publieke sleutels** over deze weg
+— nooit een geheim.
 
 ### Join-URI's en QR
 
@@ -335,7 +434,9 @@ als QR getekend (geen externe assets):
 
 met `type` **1** = chat (de bot), **2** = repeater, **3** = room-server (rooms),
 **4** = sensor (sensor-nodes). Een kanaal delen gaat met
-`meshcore://channel/add?name=<naam>&secret=<32hex>`.
+`meshcore://channel/add?name=<naam>&secret=<32hex>`; voor een hashtag-kanaal wordt de
+sleutel uit de naam afgeleid en voor `Public` is het de vaste publieke sleutel (zie
+*Hashtag- en publieke kanalen*).
 
 ## De webinterface
 
@@ -367,11 +468,12 @@ room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 | `/` | de pagina |
 | `/login` | het loginformulier |
 | `/status.json` | de hele stand: voeding, wifi, monitors, heap, uptime |
-| `/cfg.json` | de hele stand van `NodePrefs` in één verzoek |
+| `/cfg.json` | de hele stand van `NodePrefs` in één verzoek (incl. `ntp`/`tz`/`tlocal`/`tsync`/`tsyncmsg`/`tsyncage`) |
 | `/acl.json` | toegangslijst, stand van het slot, ontdekte buren |
 | `/rooms.json` | de rooms + sensor-nodes met hun koppelingen |
 | `/contacts.json` | buurtlijst met volledige pubkey (kiezer voor bot/ACL) |
 | `/bot.json` | de bot: identiteit, join/QR, ontvangerslijst |
+| `/channels.json` | de kanalen: naam, kanaal-hash, aan/uit, `pub`-vlag (secret nooit) |
 | `/rooms/backup` | volledige room-config incl. sleutels (achter auth) |
 | `/hook` | uitslag van buiten aanleveren (mag ook GET, zie onder) |
 
@@ -381,6 +483,7 @@ room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 |---|---|
 | `/login`, `/logout` | sessie openen/sluiten |
 | `/wifi` | netwerkinstellingen |
+| `/time` | NTP-server + tijdzone zetten (`/time.cfg`) |
 | `/hook` | uitslag van buiten aanleveren |
 | `/monitor`, `/monitor/del` | ping/gemelde monitor aanmaken, verwijderen |
 | `/monitor/snmp` | SNMP-monitor aanmaken |
@@ -397,9 +500,10 @@ room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 | `/room/advert`, `/snode/advert` | handmatig advert per room / sensor-node |
 | `/bot/recipient` | een bot-ontvanger toevoegen/verwijderen |
 | `/bot/advert`, `/bot/sendto`, `/bot/post` | bot adverteren / DM sturen / posten |
+| `/channel/add`, `/channel/del`, `/channel/toggle` | kanaal toevoegen / wissen / aan-uit |
 
-Op de sensor-variant bestaan de room-, snode- en bot-endpoints niet als functie:
-ze geven **`501`** en de bijbehorende GUI-tabbladen blijven verborgen.
+Op de sensor-variant bestaan de room-, snode-, bot- en kanaal-endpoints niet als
+functie: ze geven **`501`** en de bijbehorende GUI-tabbladen blijven verborgen.
 
 **Niets dat verandert gaat via GET**, en dat is geen formaliteit. Een GET die
 een monitor wist, wordt door elke browser, elke prefetch en elke linkchecker
@@ -574,11 +678,13 @@ past.
 **De buurtlijst.** Adverts worden opgevangen in `onAdvertRecv()`, de bestaande
 virtuele haak, dus zonder patch in `src/`. Die plek omdat hij ná de
 ed25519-controle draait: de sleutel is dan bewijsbaar van de afzender, en dat is
-de voorwaarde om hem als keuzelijst voor de ACL te gebruiken. De lijst houdt
-twaalf ingangen, voegt samen op sleutel (een echte ring zou na twaalf adverts van
-één drukke buur twaalf keer diezelfde buur tonen) en staat **niet** in SPIFFS: hij
-beschrijft wat er nú in de lucht is, en een bewaarde versie zou beweren dat een
-node in de buurt is die er al een week niet meer is.
+de voorwaarde om hem als keuzelijst voor de ACL te gebruiken. De lijst hield eerst
+twaalf ingangen; sinds v2.3.0 zijn dat er **200** (voor de naamresolutie, zie *De
+room-server* → *Naamresolutie*), LRU op laatst-gehoord. Hij voegt samen op sleutel
+(een echte ring zou na 200 adverts van één drukke buur diezelfde buur telkens weer
+tonen) en staat **niet** in SPIFFS: hij beschrijft wat er nú in de lucht is, en een
+bewaarde versie zou beweren dat een node in de buurt is die er al een week niet meer
+is.
 
 Bij een buur staat **SNR en niet RSSI**, met het aantal hops erbij. `mesh::Packet`
 bewaart alleen `_snr`; RSSI bestaat alleen live in de radio, en flood-pakketten

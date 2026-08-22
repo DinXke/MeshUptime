@@ -8,9 +8,13 @@ als er iets omvalt.
 Begonnen als één sensor-node, uitgegroeid tot een **multiroom room-server**: één
 toestel bedient meerdere rooms, virtuele sensor-nodes en een chat-bot tegelijk, en
 doet zelf zijn netwerk-diagnoses (ping, port, http, traceroute) en SNMP-metingen.
-De huidige versie is **MeshUptime v2.2.0** (eigen versionering, los van de
+De bot is intussen een **tweerichtings** mesh-diagnose-responder — hij antwoordt op
+`ping`/`test`/`path` zowel per DM als in **hashtag-/publieke kanalen** — de node
+synct zijn klok over **NTP** en toont menselijke tijden in de lokale tijdzone, en
+een **grote contactenlijst** lost overal node-namen op.
+De huidige versie is **MeshUptime v2.3.2** (eigen versionering, los van de
 MeshCore-bibliotheek v1.17.0); de branding toont beide:
-`MeshUptime v2.2.0 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
+`MeshUptime v2.3.2 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
 **[firmware/CHANGELOG.md](firmware/CHANGELOG.md)**.
 
 Er zijn **twee PlatformIO-envs**:
@@ -45,13 +49,14 @@ de kern en niet een aanvulling, en zit er een wifi-waakhond in.
 | Basis | `examples/simple_sensor` van MeshCore tag `companion-v1.17.0` |
 | Rol (sensor-env) | `ADV_TYPE_SENSOR` |
 | Rol (room-env) | rooms (`ADV_TYPE_ROOM`), sensor-nodes (`ADV_TYPE_SENSOR`), bot (`ADV_TYPE_CHAT`) |
-| RAM, room-env | 40,5% (132.728 van 327.680) |
-| Flash, room-env | 45,2% (1.509.589 van 3.342.336) |
-| RAM, sensor-env | 33,9% (111.072 van 327.680) |
-| Flash, sensor-env | 44,6% (1.491.325 van 3.342.336) |
+| RAM, room-env | ~54% (van 327.680) |
+| Flash, room-env | ~46% (van 3.342.336) |
+| RAM, sensor-env | ~47% (van 327.680) |
+| Flash, sensor-env | ~45% (van 3.342.336) |
 
 De room-env is groter: hij draagt de extra panelen (rooms, sensor-nodes, bot,
-SNMP) en de async netwerk-engine. De sensor-env is de kale terugvalweg. De oudere,
+SNMP, kanalen, tijd), de async netwerk-engine en de grote advert-/contactlijst
+(~13,6 kB RAM, RAM-only). De sensor-env is de kale terugvalweg. De oudere,
 kleinere cijfers van de eerste sensor-only bouw staan in
 [docs/metingen.md](docs/metingen.md) als historisch ijkpunt.
 
@@ -61,7 +66,7 @@ een herstart overleven, `/hook` voor een bestaande Uptime Kuma, telemetrie die
 door een tweede node opgevraagd en gelezen wordt, de webinterface met
 bewaking/toegang/nodebeheer, en de CLI over serieel.
 
-**Room-server-variant (v2.0.0 → v2.2.0), het huidige hoofdproduct:**
+**Room-server-variant (v2.0.0 → v2.3.2), het huidige hoofdproduct:**
 
 - **Multiroom** (`RoomMesh`): tot vier room-identiteiten (`MAX_ROOMS=4`), elk met
   eigen sleutelpaar, naam, admin- en gastwachtwoord en toegangslijst; gedeelde
@@ -95,6 +100,26 @@ bewaking/toegang/nodebeheer, en de CLI over serieel.
   dat schone DM's stuurt — voor flash-meldingen én voor de per-sensor `dm`/`both`-
   alerts, met herhaal-tot-ACK per ontvanger. Persistente ontvangerslijst
   (`/bot_recips`), CLI en room/DM-`sendto`.
+- **Tweerichtings-bot** (v2.2.1): de bot ontvangt nu ook DM's en antwoordt op een
+  kleine eigen commandoset — `ping`, `test` (SNR/RSSI/hops), `path` (route met
+  repeaternamen) en `help` — als schone DM met ACK. De afzender-pubkey wordt uit de
+  buurtlijst/ontvangerslijst opgelost en het gedeelde geheim eruit berekend.
+- **NTP + tijdzone** (v2.2.2): NTP-server en tijdzone instelbaar via de web-GUI
+  (paneel *Tijd*, `/time.cfg`, `POST /time`; standaard Europe/Brussels, DST-bewust).
+  Menselijke tijden worden LOKAAL getoond mét zone-afkorting (bv. `00:35:11 CEST`);
+  de RTC en alle MeshCore-protocoltijdstempels blijven UTC. Her-sync bij
+  WiFi-connect en elke 6 u.
+- **Hashtag- en publieke kanalen** (v2.3.0 → v2.3.2): de bot leest ingeschakelde
+  MeshCore group-channels mee en antwoordt IN het kanaal op `ping`/`test`/`path`.
+  Kanaalbeheer in de web-GUI (bot-tab: toevoegen/aan-uit/wissen), persistent in
+  `/channels.cfg`, endpoints `/channels.json` + `/channel/add|del|toggle`, en CLI
+  `channel list|add|del|on|off`. Toevoegen op naam zonder secret leidt de sleutel af
+  (`sha256(naam)[:16]`, zoals de app); de naam `Public` gebruikt de vaste publieke
+  sleutel `8b3387e9c5cdea6ac9e5edbaa115cd72`; een eigen 32/64-hex secret wint altijd.
+- **Grote contactenlijst + naamresolutie** (v2.3.0): de buurtlijst groeide van 12
+  naar **200** ingangen (RAM-only, ~13,6 kB) en lost overal node-namen op — de
+  `path`-repeaters, de DM-afzender en `/contacts.json`. Kanaalberichten dragen de
+  afzendernaam inline (géén pubkey); DM's dragen de pubkey (géén naam).
 - **Ontdekte contacten**: `/contacts.json` (buurtlijst met volledige pubkey) voedt
   een kiezer in de web-GUI voor zowel de bot-ontvangers als de per-slot ACL-grants.
 
@@ -168,12 +193,14 @@ aangebracht; met de hand hoeft dat alleen nog in de losse bouwkopie.
 ## Documentatie
 
 - **[firmware/CHANGELOG.md](firmware/CHANGELOG.md)** — de feature-geschiedenis per
-  versie (v2.0.0 / v2.1.0 / v2.2.0); de gezaghebbende samenvatting.
+  versie (v2.0.0 t/m v2.3.2); de gezaghebbende samenvatting.
 - **[docs/openstaand.md](docs/openstaand.md)** — wat niet werkt, en welke
   verdenkingen al onderzocht en weerlegd zijn. Het belangrijkste bestand.
 - [docs/werking.md](docs/werking.md) — hoe het werkt: rollen, kanaalindeling,
-  rooms, sensor-nodes, per-sleutel-ACL, de async netwerk-engine, SNMP, de bot,
-  webinterface, CLI, room/DM-opdrachten, toegangsbeheer, waarschuwingen
+  rooms, sensor-nodes, per-sleutel-ACL, de async netwerk-engine, SNMP, de bot
+  (tweerichtings, DM + kanalen), NTP/tijdzone, hashtag-/publieke kanalen,
+  naamresolutie, webinterface, CLI, room/DM-opdrachten, toegangsbeheer,
+  waarschuwingen
 - [docs/metingen.md](docs/metingen.md) — de metingen met hun getallen en datum
 - [docs/beslissingen.md](docs/beslissingen.md) — de keuzes met de reden, ook de
   keuzes die later zijn omgedraaid

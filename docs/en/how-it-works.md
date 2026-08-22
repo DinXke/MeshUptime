@@ -178,6 +178,23 @@ connecting, online, retrying, own AP) and runs on:
 The reconnect count, the hard-reset count and the last disconnect reason are shown
 in the web interface. "No WiFi" without a reason costs somebody an evening.
 
+## Time: NTP, timezone and local display
+
+Since v2.2.2 the **NTP server** and the **timezone** are settable via the web GUI
+(the *Time* panel, stored in `/time.cfg`, `POST /time`). The default NTP server is
+`pool.ntp.org` (a LAN time server is allowed too) and the default timezone is
+Europe/Brussels as the POSIX TZ string `CET-1CEST,M3.5.0/2,M10.5.0/3` — so DST-aware.
+Saving applies the TZ at once and requests a re-sync. The sync is robust: on
+WiFi-connect *and* periodically, every 6 hours.
+
+**Human times local, protocol and RTC in UTC.** All human-facing times are shown in
+**local** time with the zone abbreviation (e.g. `Received at: 00:35:11 CEST`), via
+`localtime_r`/`strftime %Z` on the configured TZ. The RTC and **all** MeshCore
+protocol timestamps stay UTC — the mesh reckons in UTC. Before the first successful
+sync the node shows `niet gesynct` ("not synced") instead of a garbage time
+(`TimeFmt.h`, `TIME_FLOOR`). `/cfg.json` exposes this via `ntp`, `tz`, `tlocal` (the
+local date/time), `tsync`, `tsyncmsg` and `tsyncage`.
+
 ## The room-server
 
 Everything above — channels, monitors, power, WiFi — is the shared sensor core.
@@ -250,6 +267,10 @@ by the sender's permission level**:
 the command came from — via the general origin-routing mechanism (the v2.1.0
 "ping fix", now for all slow tasks).
 
+Alongside these there are the **subsystem commands** that manage the identities and
+channels, over serial and (for an admin) over a DM too: `room …`, `sensornode …`,
+`bot list|add|del|post|sendto|advert|uri` and `channel list|add|del|on|off`.
+
 ### The async network-task engine
 
 The diagnostics `port`, `scan`, `http` and `traceroute` would block if run naively,
@@ -301,6 +322,27 @@ seeded with the owner on a fresh node. The bot computes its shared secret **itse
 from the recipient pubkey (`calcSharedSecret` + `createDatagram`), so it does not
 hang off a room session.
 
+**Two-way since v2.2.1.** The bot used to be send-only: an incoming DM to the bot
+fell through to the identity of `rooms[0]` and was decrypted with the **wrong key**
+(and so silently dropped) — that was the bug. `onRecvPacket` now also matches the bot
+identity `_bot_id`. A chat DM carries only a 1-byte src-hash and **no** pubkey, so the
+sender pubkey is resolved from the neighbour list (heard adverts) and the recipient
+list, and the shared secret is computed from it. That lets the bot decrypt and reply
+without a password login.
+
+The bot has a small command set of its own over DM (**not** the monitoring console):
+
+| command | reply |
+|---|---|
+| `ping` | `Pong (HH:MM:SS <zone>)` — the local time with zone abbreviation |
+| `test` | signal report: SNR / RSSI / hops of the incoming packet |
+| `path` | the sender + the intermediate repeaters by **name** + SNR/RSSI + the received-at time (`Received at:` local) |
+| `help` | lists the bot commands; unknown text → a short hint |
+
+The reply is a clean DM from the bot, with an ACK on the incoming message. The fields
+come from the incoming packet (path/hops, SNR×4→dB, RSSI, time); the reply buffers are
+`static`, not on the loopTask stack.
+
 Control:
 
 - **CLI**: `bot list | add <pubkey> | del <prefix> | post <msg> |
@@ -308,13 +350,65 @@ Control:
 - **Room/DM**: the admin command `sendto <pubkey> <msg>`.
 - **Web GUI**: the bot tab (join/QR, recipient management, `sendto`/`post`).
 
+### Hashtag and public channels
+
+Since v2.3.0 the bot also reads the enabled MeshCore **group channels** and answers
+IN the channel to `ping` (Pong), `test` (signal report) and `path` (route with
+repeater names) — the same style as the DM responder, but prefixed with the sender's
+name. The reply is a flooded group message `"<botname>: <reply>"`
+(`createGroupDatagram`); reading along runs via the `searchChannelsByHash` /
+`onGroupDataRecv` overrides.
+
+A channel in MeshCore is nothing more than a **shared secret** (16 bytes = 128-bit or
+32 bytes = 256-bit); the **channel hash** is the first byte of `sha256(secret)`. The
+node follows exactly that format. Management via the web GUI (bot tab:
+add/toggle/delete), persistent in `/channels.cfg`; endpoints `GET /channels.json` and
+`POST /channel/add|del|toggle`; CLI
+`channel list|add <name> [secrethex]|del <name>|on <name>|off <name>`.
+
+There are **three kinds of key**, as the GUI/CLI/`/channel/add` response also report:
+
+- **own key** — an explicit 32- or 64-hex secret. Always wins, is never shown back.
+- **key derived from the name** (v2.3.1) — add a channel with a name but **no**
+  secret and the node makes a **hashtag channel**: the key is the first 16 bytes of
+  `sha256(name)`, EXACTLY like the MeshCore app (`#test` →
+  `9cd8fcf22a47333b591d96a2b848b73f`). Same name = same channel as the app. A derived
+  key is not secret: whoever knows the name derives it.
+- **public channel (fixed key)** (v2.3.2) — the name `Public` (case-insensitive, with
+  or without `#`) with no secret uses the fixed, well-known public key
+  `8b3387e9c5cdea6ac9e5edbaa115cd72` instead of `sha256("public")`, so the node lands
+  on the REAL public channel, like the app. The `pub` flag in `/channels.json`
+  (`is_public`) is derived by comparing the secret with the public key, not stored
+  separately.
+
+### Name resolution and the big contact list
+
+To show real node **names** in `path`, in a DM and in `/contacts.json`, the neighbour
+list (`NeighbourList`) grew in v2.3.0 from 12 to **200** entries: pubkey, name,
+advert type, snr/hops and last-heard, LRU by last-heard. That costs ~13.6 kB RAM —
+the deliberate trade — and the list stays **RAM-only**: adverts arrive too often for
+a per-advert flash write, and after a reboot the names stream back in on their own
+within minutes.
+
+The **resolution order** follows from what a message carries:
+
+1. **inline name from the message** — a group message carries the sender name IN the
+   text (`"<name>: <text>"`, like the app) but no pubkey; we use that name directly.
+2. **the big advert/contact list**, keyed by pubkey — for `path` and DMs, which *do*
+   carry a pubkey but no name.
+3. **hex pubkey prefix** as a last fallback, if the name is not known anywhere.
+
+In short: a channel message has the name (no pubkey), a DM has the pubkey (no name) —
+hence the two different paths to the same answer.
+
 ### Discovered contacts and the picker
 
 `GET /contacts.json` returns the **neighbour list with full pubkey** plus name,
-snr/hops, last-heard and count. The web GUI uses that list as a **picker** in two
-places: the bot recipients and the per-slot ACL grants. So you choose from heard
-nodes instead of pasting a 64-hex key by hand. Only **public keys** travel this way
-— never a secret.
+snr/hops, last-heard and count. The display is capped at `NB_JSON_MAX=64` entries;
+the list itself stays 200 for the resolution above. The web GUI uses that list as a
+**picker** in two places: the bot recipients and the per-slot ACL grants. So you
+choose from heard nodes instead of pasting a 64-hex key by hand. Only **public keys**
+travel this way — never a secret.
 
 ### Join URIs and QR
 
@@ -325,7 +419,9 @@ the web GUI (no external assets):
 
 with `type` **1** = chat (the bot), **2** = repeater, **3** = room server (rooms),
 **4** = sensor (sensor-nodes). Sharing a channel uses
-`meshcore://channel/add?name=<name>&secret=<32hex>`.
+`meshcore://channel/add?name=<name>&secret=<32hex>`; for a hashtag channel the key is
+derived from the name, and for `Public` it is the fixed public key (see *Hashtag and
+public channels*).
 
 ## The web interface
 
@@ -356,11 +452,12 @@ including the room backup/restore that carry keys — sit behind the same auth.
 | `/` | the page |
 | `/login` | the login form |
 | `/status.json` | everything: power, WiFi, monitors, heap, uptime |
-| `/cfg.json` | the whole of `NodePrefs` in one request |
+| `/cfg.json` | the whole of `NodePrefs` in one request (incl. `ntp`/`tz`/`tlocal`/`tsync`/`tsyncmsg`/`tsyncage`) |
 | `/acl.json` | access list, lock state, discovered neighbours |
 | `/rooms.json` | the rooms + sensor-nodes with their couplings |
 | `/contacts.json` | neighbour list with full pubkey (picker for bot/ACL) |
 | `/bot.json` | the bot: identity, join/QR, recipient list |
+| `/channels.json` | the channels: name, channel hash, on/off, `pub` flag (secret never) |
 | `/rooms/backup` | full room config incl. keys (behind auth) |
 | `/hook` | supply a verdict from outside (may also be GET, see below) |
 
@@ -370,6 +467,7 @@ including the room backup/restore that carry keys — sit behind the same auth.
 |---|---|
 | `/login`, `/logout` | open/close a session |
 | `/wifi` | network settings |
+| `/time` | set NTP server + timezone (`/time.cfg`) |
 | `/hook` | supply a verdict from outside |
 | `/monitor`, `/monitor/del` | create, delete a ping/pushed monitor |
 | `/monitor/snmp` | create an SNMP monitor |
@@ -386,9 +484,10 @@ including the room backup/restore that carry keys — sit behind the same auth.
 | `/room/advert`, `/snode/advert` | manual advert per room / sensor-node |
 | `/bot/recipient` | add/remove a bot recipient |
 | `/bot/advert`, `/bot/sendto`, `/bot/post` | bot advert / DM / post |
+| `/channel/add`, `/channel/del`, `/channel/toggle` | add / delete / toggle a channel |
 
-On the sensor variant the room, snode and bot endpoints do not exist as a function:
-they return **`501`** and the corresponding GUI tabs stay hidden.
+On the sensor variant the room, snode, bot and channel endpoints do not exist as a
+function: they return **`501`** and the corresponding GUI tabs stay hidden.
 
 **Nothing that changes anything goes over GET**, and that is not a formality. A
 GET that deletes a monitor is followed by every browser, every prefetch and every
@@ -558,10 +657,12 @@ mesh — and is refused as soon as the prefix matches more than one entry.
 **The neighbour list.** Adverts are caught in `onAdvertRecv()`, the existing
 virtual hook, so with no patch in `src/`. That spot because it runs *after* the
 ed25519 check: the key is then provably the sender's, which is the precondition for
-using it as a pick list for the ACL. The list holds twelve entries, merges on key
-(a true ring would show the same busy neighbour twelve times after twelve
-adverts), and is **not** in SPIFFS: it describes what is on the air *now*, and a
-saved copy would claim a node is nearby that has been gone for a week.
+using it as a pick list for the ACL. The list held twelve entries at first; since
+v2.3.0 it holds **200** (for name resolution, see *The room-server* → *Name
+resolution*), LRU by last-heard. It merges on key (a true ring would show the same
+busy neighbour again and again after 200 adverts) and is **not** in SPIFFS: it
+describes what is on the air *now*, and a saved copy would claim a node is nearby
+that has been gone for a week.
 
 A neighbour is listed with **SNR and not RSSI**, plus the hop count.
 `mesh::Packet` keeps only `_snr`; RSSI exists only live in the radio, and flood

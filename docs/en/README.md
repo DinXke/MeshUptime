@@ -7,10 +7,13 @@ something falls over.
 
 It began as a single sensor node and grew into a **multiroom room-server**: one
 device serves several rooms, virtual sensor-nodes and a chat bot at once, and runs
-its own network diagnostics (ping, port, http, traceroute) and SNMP polls. The
-current version is **MeshUptime v2.2.0** (own versioning, separate from the MeshCore
-library v1.17.0); the branding shows both:
-`MeshUptime v2.2.0 (by DinX) - MeshCore v1.17.0`. The feature history is in
+its own network diagnostics (ping, port, http, traceroute) and SNMP polls. The bot
+is now a **two-way** mesh-diagnostics responder — it answers `ping`/`test`/`path`
+both by DM and inside **hashtag/public channels** — the node syncs its clock over
+**NTP** and shows human-facing times in the local timezone, and a **big contact
+list** resolves node names everywhere. The current version is **MeshUptime v2.3.2**
+(own versioning, separate from the MeshCore library v1.17.0); the branding shows
+both: `MeshUptime v2.3.2 (by DinX) - MeshCore v1.17.0`. The feature history is in
 [`firmware/CHANGELOG.md`](../../firmware/CHANGELOG.md).
 
 There are **two PlatformIO envs**:
@@ -27,7 +30,7 @@ first, so if the two ever disagree, the Dutch page is the newer one.
 | page | what is in it |
 |---|---|
 | **[open-issues.md](open-issues.md)** | **what does not work, and which suspicions have already been investigated and ruled out. Start here.** |
-| [how-it-works.md](how-it-works.md) | roles, channel map, web interface, CLI, DM commands, access control, alerts |
+| [how-it-works.md](how-it-works.md) | roles, channel map, the two-way bot (DM + channels), NTP/timezone, hashtag/public channels, name resolution, web interface, CLI, DM commands, access control, alerts |
 | [measurements.md](measurements.md) | every number with its date: power thresholds, WiFi behaviour on battery, heap per build, the byte budget |
 | [decisions.md](decisions.md) | the choices with their reasons, explicitly including the ones that were later reversed |
 | [building.md](building.md) | the two build ways, MeshCore as a pinned submodule dependency, the patch hook, and the CI tag matrix |
@@ -45,23 +48,27 @@ Recent builds:
 
 | env | RAM | flash |
 |---|---|---|
-| `meshuptime_room` (primary) | 40,5% (132.728 of 327.680) | 45,2% (1.509.589 of 3.342.336) |
-| `meshuptime` (rollback) | 33,9% (111.072 of 327.680) | 44,6% (1.491.325 of 3.342.336) |
+| `meshuptime_room` (primary) | ~54% (of 327.680) | ~46% (of 3.342.336) |
+| `meshuptime` (rollback) | ~47% (of 327.680) | ~45% (of 3.342.336) |
 
 The room env is larger — it carries the extra panels (rooms, sensor-nodes, bot,
-SNMP) and the async network engine. The older, smaller sensor-only figures are kept
-in [measurements.md](measurements.md) as a historical baseline.
+SNMP, channels, time), the async network engine and the big advert/contact list
+(~13.6 kB RAM, RAM-only). The older, smaller sensor-only figures are kept in
+[measurements.md](measurements.md) as a historical baseline.
 
 Confirmed on the device (in the sensor base): the power sensors with their
 calibrated thresholds, the WiFi sensor and its watchdog, ping monitors that survive
 a reboot, `/hook` for an existing Uptime Kuma, telemetry actually polled and read by
 a second node, the web interface, and the serial CLI.
 
-The room-server variant (v2.0.0 → v2.2.0) is the primary product: multiroom
+The room-server variant (v2.0.0 → v2.3.2) is the primary product: multiroom
 (`MAX_ROOMS=4`), virtual sensor-nodes (`MAX_SENSOR_NODES=4`), passwordless per-key
 ACL grants (`MAX_ACL_GRANTS=16`), a room/DM command set, the async network-task
 engine (`port`/`scan`/`http`/`traceroute`), a node-side SNMP monitor kind, and a
-chat bot for clean DM alerts. Full detail in [how-it-works.md](how-it-works.md).
+chat bot for clean DM alerts that is also a two-way `ping`/`test`/`path` responder
+over DM and in hashtag/public channels. NTP-synced local time (timezone-aware,
+protocol/RTC stay UTC) and a 200-entry contact list resolve node names everywhere.
+Full detail in [how-it-works.md](how-it-works.md).
 
 Built but never actually fired: the mesh alerts. Biggest open problem: a
 MeshManager repeater cannot poll these sensors — the round stalls on

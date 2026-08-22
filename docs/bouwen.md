@@ -33,11 +33,13 @@ Laatst bekende bouwgroottes (`Heltec_lora32_v3`, geen PSRAM, 327.680 B RAM /
 
 | env | RAM | flash |
 |---|---|---|
-| `meshuptime_room` | 40,5 % (132.728) | 45,2 % (1.509.589) |
-| `meshuptime` | 33,9 % (111.072) | 44,6 % (1.491.325) |
+| `meshuptime_room` | ~54 % | ~46 % |
+| `meshuptime` | ~47 % | ~45 % |
 
-De room-env is groter door de extra panelen (rooms, sensor-nodes, bot, SNMP) en de
-async netwerk-engine. Wijken de cijfers sterk af, dan is er iets niet meegekomen.
+De room-env is groter door de extra panelen (rooms, sensor-nodes, bot, SNMP,
+kanalen, tijd), de async netwerk-engine en de grote advert-/contactlijst (200
+ingangen, ~13,6 kB RAM, RAM-only). Wijken de cijfers sterk af, dan is er iets niet
+meegekomen.
 
 ---
 
