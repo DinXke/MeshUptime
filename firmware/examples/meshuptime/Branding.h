@@ -33,11 +33,16 @@
  *   v2.3.4 = spook-recovery ("netvoeding terug na 0s") weg: symmetrisch
  *            gedebouncete storingstoestand voor vaste kanalen, OLED + alarm delen
  *            die toestand.
+ *   v2.3.5 = spook-recovery ECHT weg (bug bleef in v2.3.4): harde grendel --
+ *            een vaste-kanaal-"terug" komt alleen na een echt GEMELDE, lang-
+ *            genoeg onderbreking (nooit "na 0s", ook bij sim/alert.debounce=0).
+ *            Debounce vereenvoudigd tot korte settle (5 s std; reboot-vloed doet
+ *            de opstart-genade), boot-grace-desync tussen OLED en alarm weg.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.4"
+  #define MESHUPTIME_VERSION   "v2.3.5"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

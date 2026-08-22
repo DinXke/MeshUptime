@@ -62,7 +62,8 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
    * standaard hoort de stand te zijn die het minste stilte oplevert. */
   cfg.recover_alerts = 1;
   cfg.rhold_s = MON_RHOLD_DEFAULT;
-  /* Debounce vaste kanalen (wifi/netvoeding): standaard 45 s tegen korte blips. */
+  /* Korte settle vaste kanalen (wifi/netvoeding): standaard 5 s tegen de spanning-
+   * settle bij uittrekken (de reboot-vloed dempt de opstart-genade, niet dit). */
   cfg.fixed_debounce_s = MON_FDEB_DEFAULT;
   /* Herhalen tot bevestiging standaard aan (300 s). Zie MonitorCfg: dit is de
    * gevraagde standaard en dus een gedragsverandering bij het bijwerken; op 0

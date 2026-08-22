@@ -34,6 +34,12 @@
  * antwoord nog verstuurd kan worden. loop() voert hem uit. */
 static unsigned long g_reboot_at = 0;
 
+/* === TIJDELIJKE DIAGNOSE (v2.3.5) ===========================================
+ * ALTIJD-AAN seriële logging (MESH_DEBUG staat uit) zodat de coordinator bij het
+ * uittrekken/insteken/sim live ziet WAT fixedEdge beslist. Prefix "[fixedge]"
+ * voor grepbaar filteren op COM4. Mag na de veldverificatie weer weg. */
+#define FIXEDGE_DIAG(...) do { Serial.printf("[fixedge] " __VA_ARGS__); Serial.println(); } while (0)
+
 #ifdef WIFI_SSID
   #include "WifiTask.h"
   #include "WebTask.h"
@@ -144,7 +150,14 @@ protected:
    * ALLEEN op de overgang up->down / down->up, niet elke leesronde. */
   bool st_batt_crit = false, st_batt_low = false;
   bool st_mon_down[MonitorSensors::MAX_MONITORS];
+  /* Vaste kanalen (netvoeding/wifi): twee toestanden per kanaal.
+   *  st_*_down       = de baseline: de laatst waargenomen GEDEBOUNCETE toestand,
+   *                    voor de flankdetectie.
+   *  st_*_announced  = hebben wij voor de LOPENDE onderbreking daadwerkelijk een
+   *                    "weg"-melding de deur uit gedaan? De harde grendel: zonder
+   *                    een gemelde "weg" mag er nooit een "terug" komen. */
   bool st_mains_down = false, st_wifi_down = false;
+  bool st_mains_announced = false, st_wifi_announced = false;
 
   /* Per-sensor route (dm/room/both) + room-set komen uit de MonitorSensors-config
    * (mon.<ch>.alert/rooms en fa.<idx>.mode/rooms), instelbaar via web/serieel/room
@@ -161,6 +174,68 @@ protected:
     } else if (!down_now && was_down) {
       was_down = false;
       dispatchAlert(mode, rooms, high_pri, up_text);
+    }
+  }
+
+  /* KANTELAAR VOOR DE VASTE KANALEN (netvoeding/wifi). Losse variant van edge()
+   * met DRIE extra grendels tegen de spook-melding "netvoeding/wifi terug na 0s":
+   *
+   *  1. GRENDEL OP DE HERSTELMELDING (de eigenlijke bug): een "terug" komt ALLEEN
+   *     als wij voor deze onderbreking echt een "weg" gemeld hebben (announced) EN
+   *     de onderbreking echt lang genoeg duurde (fixedRecoveryOk -- >= de settle-
+   *     drempel, nooit sub-seconde). Een 0s/flap-"onderbreking" geeft dus nooit
+   *     een herstel, ook niet bij een sim of met alert.debounce == 0.
+   *  2. OPSTART-GENADE ZONDER DESYNC: tijdens de genade GEEN dispatch, maar de
+   *     baseline (was_down) wel stil bijwerken. Zo maakt het einde van de genade
+   *     geen kunstmatige "weg"-flank voor een node die al op batterij startte, en
+   *     spreken OLED (fixedIsDown) en alarm (fixedAlertDown) elkaar nooit tegen --
+   *     beide lezen nu dezelfde stabiele toestand.
+   *  3. Snooze bevriest de kantelaar (als edge()).
+   *
+   * down_now == fixedAlertDown() == de GEDEBOUNCETE, gesettlede toestand.
+   *
+   * De alerttekst wordt PAS in de vurende tak opgehaald, niet als argument: zowel
+   * fixedAlertText() als fixedRecoverAlertText() geven dezelfde statische buffer
+   * (s_alert_buf) terug, dus twee tegelijk als argument zou de ene de andere laten
+   * overschrijven. */
+  void fixedEdge(int which, bool& was_down, bool& announced,
+                 uint8_t mode, uint16_t rooms) {
+    if (sensors.isSnoozed()) return;                 // bevriezen als edge(muted)
+
+    const bool down_now = sensors.fixedAlertDown(which);
+    if (down_now == was_down) return;                // geen flank
+
+    const bool grace = sensors.fixedInBootGrace();
+    was_down = down_now;                             // baseline volgt de echte toestand
+
+    if (down_now) {
+      /* Naar 'neer'. Tijdens de genade NIET melden (reboot-vloed) en dus ook niet
+       * als "gemeld" boeken -- zo kan er straks geen "terug" voor volgen. */
+      if (grace) {
+        announced = false;
+        FIXEDGE_DIAG("ch=%d DOWN in boot-grace -> onderdrukt (niet gemeld)", which);
+        return;
+      }
+      announced = true;
+      dispatchAlert(mode, rooms, false, sensors.fixedAlertText(which));
+      FIXEDGE_DIAG("ch=%d DOWN gemeld", which);
+    } else {
+      /* Naar 'op'. De harde grendel: alleen een "terug" als wij echt een "weg"
+       * meldden EN de onderbreking echt lang genoeg was. */
+      const bool was_ann = announced;
+      announced = false;
+      const bool dur_ok = sensors.fixedRecoveryOk(which);
+      if (grace) {
+        FIXEDGE_DIAG("ch=%d UP in boot-grace -> geen herstel", which);
+        return;
+      }
+      if (was_ann && dur_ok) {
+        dispatchAlert(mode, rooms, false, sensors.fixedRecoverAlertText(which));
+        FIXEDGE_DIAG("ch=%d HERSTEL gemeld (announced=1 dur_ok=1)", which);
+      } else {
+        FIXEDGE_DIAG("ch=%d herstel ONDERDRUKT (announced=%d dur_ok=%d) -- geen spook-terug",
+                     which, (int)was_ann, (int)dur_ok);
+      }
     }
   }
 
@@ -187,17 +262,13 @@ protected:
            sensors.isMuted(i));
     }
 
-    /* fixedAlertDown() i.p.v. de rauwe !isMains()/!isWifiOnline(): gedebouncet +
-     * opstart-genadeperiode, zodat een korte blip of de eigen reboot geen
-     * wifi-/netvoeding-alarm afvuurt (en dus ook geen spookherstel erna). */
-    edge(sensors.fixedAlertDown(MonitorSensors::FIXED_POWER), st_mains_down, false,
-         sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS),
-         sensors.fixedAlertText(MonitorSensors::FIXED_POWER),
-         sensors.fixedRecoverAlertText(MonitorSensors::FIXED_POWER), sensors.isSnoozed());
-    edge(sensors.fixedAlertDown(MonitorSensors::FIXED_WIFI), st_wifi_down, false,
-         sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI),
-         sensors.fixedAlertText(MonitorSensors::FIXED_WIFI),
-         sensors.fixedRecoverAlertText(MonitorSensors::FIXED_WIFI), sensors.isSnoozed());
+    /* De vaste kanalen via fixedEdge(): gedebouncete/gesettlede toestand, opstart-
+     * genade ZONDER OLED-desync, en de HARDE GRENDEL tegen de spook-"terug na 0s"
+     * (herstel enkel na een echt gemelde, lang-genoeg onderbreking). Zie fixedEdge. */
+    fixedEdge(MonitorSensors::FIXED_POWER, st_mains_down, st_mains_announced,
+              sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS));
+    fixedEdge(MonitorSensors::FIXED_WIFI, st_wifi_down, st_wifi_announced,
+              sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI));
   }
 
   /* Een room-post herkennen als commando en de antwoordtekst opbouwen. RoomMesh

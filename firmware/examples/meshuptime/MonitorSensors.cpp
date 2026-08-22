@@ -35,6 +35,13 @@
 #define MAINS_THRESHOLD_MIN   1.0f
 #define MAINS_THRESHOLD_MAX  12.0f
 
+/* === TIJDELIJKE DIAGNOSE (v2.3.5) ===========================================
+ * ALTIJD-AAN seriële logging (MESH_DEBUG staat op dit bord uit) zodat de
+ * coordinator bij het uittrekken/insteken/sim live kan zien WAT er kantelt en
+ * vuurt. Prefix "[fixdiag]" voor makkelijk grepbaar filteren op COM4. Mag na de
+ * veldverificatie weer weg. */
+#define FIXDIAG(...) do { Serial.printf("[fixdiag] " __VA_ARGS__); Serial.println(); } while (0)
+
 /* MON_INTERVAL_MIN/MAX/DEFAULT staan in MonitorStore.h: het inleesfilter en het
  * instellingenfilter moeten dezelfde grenzen aanhouden. */
 
@@ -1561,14 +1568,20 @@ void MonitorSensors::loopRecovery() {
                   _mon[i].up_since, _mon[i].rec_until);
   }
 
-  /* De twee vaste kanalen. isMains()/isWifiOnline() en dus mét forcering, om
-   * dezelfde reden. */
+  /* De twee vaste kanalen op de RAUWE isMains()/isWifiOnline(). Dit voedt de
+   * herstel-boekhouding van de SENSOR-variant (fixedRecoverAlert, alleen via
+   * simulaties). In de ROOM-variant bestaat fixedRecoverAlert niet -- daar loopt
+   * het herstel volledig via main_room::fixedEdge op de GEDEBOUNCETE toestand --
+   * en zou deze rauwe klok los daarvan een venster kunnen openen. Daarom in de
+   * room-variant WEGGELATEN: geen tweede, ongedebouncet herstelpad. */
+#ifndef ROOM_SERVER_VARIANT
   trackRecovery(isMains(), _fixed_down_sent[FIXED_POWER],
                 _fixed_down_since[FIXED_POWER], _fixed_up_since[FIXED_POWER],
                 _fixed_rec_until[FIXED_POWER]);
   trackRecovery(isWifiOnline(), _fixed_down_sent[FIXED_WIFI],
                 _fixed_down_since[FIXED_WIFI], _fixed_up_since[FIXED_WIFI],
                 _fixed_rec_until[FIXED_WIFI]);
+#endif
 
   /* Debounce-boekhouding voor de vaste kanalen: onthoud sinds wanneer de RAUWE
    * onderbreking loopt (voor fixedAlertDown) en de duur van de zojuist geeindigde
@@ -1596,6 +1609,9 @@ void MonitorSensors::fixedRawTick(int which, bool raw_down) {
     _fixed_state_down[which] = raw_down;
     _fixed_change_since[which] = 0;
     if (raw_down) _fixed_down_start[which] = now;
+    FIXDIAG("rawtick ch=%d INIT state=%s down_start=%lu grace=%d",
+            which, raw_down ? "DOWN" : "up", _fixed_down_start[which],
+            (int)fixedInBootGrace());
     return;
   }
 
@@ -1612,6 +1628,9 @@ void MonitorSensors::fixedRawTick(int which, bool raw_down) {
     _fixed_change_since[which] = 0;
     if (raw_down) _fixed_down_start[which] = now;                 // begin onderbreking
     else          _fixed_last_down_ms[which] = now - _fixed_down_start[which];  // duur
+    FIXDIAG("rawtick ch=%d FLIP -> state=%s down_start=%lu last_down_ms=%lu thr=%lu grace=%d",
+            which, raw_down ? "DOWN" : "up", _fixed_down_start[which],
+            _fixed_last_down_ms[which], thr, (int)fixedInBootGrace());
   }
 }
 
@@ -1629,11 +1648,31 @@ bool MonitorSensors::fixedIsDown(int which) const {
 
 bool MonitorSensors::fixedAlertDown(int which) const {
   if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
-  /* Opstart-genadeperiode: vlak na boot niets melden -- de node moet eerst een
-   * stabiele meting hebben (wifi/DHCP komt niet meteen). Zo vuurt een herstart
-   * geen "wifi weg"/"wifi terug"-paar. Daarna telt de gedebouncete toestand. */
-  if ((unsigned long)(millis() - _boot_ms) < FIXED_BOOT_GRACE_MS) return false;
+  /* GEEN opstart-genade meer HIER. Vroeger loog deze functie tijdens de eerste
+   * ~60 s 'niet neer', terwijl fixedIsDown()/de OLED al 'neer' toonde -- die
+   * desync kon de kantelaar in main_room uit de pas laten lopen. De genade zit nu
+   * in main_room::fixedEdge (dispatch onderdrukken tijdens de genade), zodat
+   * scherm en alarm ALTIJD dezelfde stabiele toestand lezen. */
   return _fixed_state_down[which];
+}
+
+/* Opstart-genadeperiode actief? main_room::fixedEdge onderdrukt zolang dit waar is
+ * elke vaste-kanaal-dispatch (en houdt de baseline stil bij), zodat de reboot-
+ * vloed geen alarm geeft en er na de genade geen kunstmatige flank ontstaat. */
+bool MonitorSensors::fixedInBootGrace() const {
+  return (unsigned long)(millis() - _boot_ms) < FIXED_BOOT_GRACE_MS;
+}
+
+/* HARDE GRENDEL tegen de spook-"terug na 0s". Een herstelmelding mag alleen als de
+ * zojuist geeindigde onderbreking ECHT was: haar gemeten duur (_fixed_last_down_ms,
+ * gezet door fixedRawTick op de stabiele up-kanteling) moet minstens de settle-
+ * drempel halen EN nooit onder FIXED_MIN_RECOVER_MS liggen. Zo geeft een sub-
+ * seconde flap nooit een herstel, ook niet met alert.debounce == 0. */
+bool MonitorSensors::fixedRecoveryOk(int which) const {
+  if (which < 0 || which >= FIXED_ALERT_COUNT) return false;
+  unsigned long floor_ms = (unsigned long)_cfg.fixed_debounce_s * 1000UL;
+  if (floor_ms < FIXED_MIN_RECOVER_MS) floor_ms = FIXED_MIN_RECOVER_MS;
+  return _fixed_last_down_ms[which] >= floor_ms;
 }
 
 /* De voorwaarde die main.cpp aan de TWEEDE Trigger per vakje hangt.

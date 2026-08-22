@@ -844,15 +844,26 @@ public:
   const char* fixedAlertText(int which) const;
 
   /* GEDEBOUNCET "neer" voor een vast kanaal (wifi/netvoeding), voor de room-
-   * variant (main_room::edge). true pas als de onderbreking langer dan de
-   * debounce-drempel (alert.debounce, standaard 45 s) aanhoudt EN de opstart-
-   * genadeperiode voorbij is -- zo alarmeert een korte blip of de eigen reboot
-   * niet. which = FIXED_POWER / FIXED_WIFI. */
+   * variant (main_room::fixedEdge). Geeft DE STABIELE, gesettlede toestand --
+   * IDENTIEK aan fixedIsDown(), ZONDER opstart-genade. De genade zit niet meer
+   * hier (dat gaf een desync met de OLED: scherm 'neer', alarm 'niet neer'),
+   * maar in fixedEdge, dat tijdens de genade de dispatch onderdrukt en de
+   * baseline stil bijhoudt. which = FIXED_POWER / FIXED_WIFI. */
   bool        fixedAlertDown(int which) const;
-  /* De GEDEBOUNCETE storingstoestand van een vast kanaal (zonder de opstart-
-   * genadeperiode), voor de OLED -- zodat scherm en alarm dezelfde stabiele
-   * toestand tonen en elkaar nooit tegenspreken. */
+  /* De GEDEBOUNCETE storingstoestand van een vast kanaal, voor de OLED -- exact
+   * dezelfde bron als fixedAlertDown(), zodat scherm en alarm elkaar nooit
+   * tegenspreken. */
   bool        fixedIsDown(int which) const;
+  /* Zit de node nog in de opstart-genadeperiode (< ~60 s na boot)? De room-
+   * variant onderdrukt tijdens die periode elke vaste-kanaal-dispatch, zodat de
+   * reboot-vloed geen alarm geeft. Los van de settle-smoothing (alert.debounce). */
+  bool        fixedInBootGrace() const;
+  /* HARDE GRENDEL tegen een spook-"terug na 0s": een herstelmelding mag alleen als
+   * de zojuist geeindigde onderbreking ECHT was -- minstens de settle-drempel EN
+   * nooit korter dan FIXED_MIN_RECOVER_MS. Staat los van de duur-configuratie: ook
+   * met alert.debounce == 0 (settle uit) kan een sub-seconde flap nooit een herstel
+   * geven. which = FIXED_POWER / FIXED_WIFI. */
+  bool        fixedRecoveryOk(int which) const;
   /* Wordt de storing op dit vaste kanaal NU gesimuleerd (forcering actief)? Bepaalt
    * of de alerttekst het SIMULATIE-merkteken draagt. */
   bool        fixedIsSim(int which) const;
@@ -1307,8 +1318,14 @@ private:
                      unsigned long& up_since, unsigned long& rec_until);
   /* Debounce-klok van een vast kanaal bijwerken (wifi/netvoeding). */
   void fixedRawTick(int which, bool down_now);
-  /* Opstart-genadeperiode: geen vaste-kanaal-alarm de eerste ~60 s na boot. */
+  /* Opstart-genadeperiode: geen vaste-kanaal-alarm de eerste ~60 s na boot. Dit
+   * (en NIET de settle-smoothing) is wat de reboot-vloed onderdrukt. */
   static const uint32_t FIXED_BOOT_GRACE_MS = 60000;
+  /* Ondergrens voor de duur van een ECHTE onderbreking voordat er een herstel-
+   * melding mag komen. De grendel tegen de spook-"terug na 0s"; staat los van
+   * alert.debounce zodat een sub-seconde flap nooit een herstel geeft, ook als de
+   * settle-smoothing uit staat (alert.debounce == 0). */
+  static const uint32_t FIXED_MIN_RECOVER_MS = 1000;
   /* "Wij hebben deze storing gemeld", plus het moment. Wordt op vier plaatsen
    * gezet en bepaalt de duur in het herstelbericht. */
   static void noteDownSent(bool& down_sent, unsigned long& down_since);

@@ -7,6 +7,57 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.5 — spook-recovery ECHT weg (harde grendel) + debounce vereenvoudigd
+
+Fysiek getest bleek de spook-"netvoeding terug na 0s" ná v2.3.4 nog steeds te komen,
+en — nieuwe aanwijzing van de gebruiker — OOK bij een geforceerde down via `/sim`.
+Dat wees de vinger van de rauwe spanning-flap naar de RECOVERY-DISPATCH zelf.
+
+OORZAAK. De symmetrische debounce van v2.3.4 was het ENIGE dat een spurieuze "terug"
+tegenhield, en dat is ontoereikend:
+- `alert.debounce` mag 0 zijn ("0 = uit"). Dan kantelt `fixedRawTick` de toestand
+  bij elke rauwe wisseling meteen; een settle-flap bij uittrekken gaf zo binnen een
+  paar 250 ms-tikken down→up, met een geregistreerde duur < 1 s → `durText(0)` =
+  "0s". De 45 s-default hielp alleen zolang niemand de debounce lager zette.
+- Er was GEEN onafhankelijke voorwaarde dat er überhaupt een "weg" gemeld was: zodra
+  `main_room::edge` een down-kant zag, kon de bijbehorende up-kant een "terug" vuren,
+  ook als de "down" nooit de deur uit ging (bv. onderdrukt door de opstart-genade) of
+  sub-seconde was. Een sim die snel toggelt reproduceerde net zo goed.
+- De opstart-genade zat IN `fixedAlertDown` (gaf tijdens de eerste ~60 s "niet neer"),
+  terwijl de OLED (`fixedIsDown`) al "neer" toonde. Die desync kon de kantelaar uit
+  de pas met de echte toestand laten lopen.
+
+FIX (root, niet symptoom). De grendel staat nu LOS van de debounceduur:
+1. **Harde grendel op de herstelmelding** (`main_room::fixedEdge`): een vaste-kanaal-
+   "terug" komt ALLEEN als (i) wij voor die onderbreking echt een "weg" gedispatcht
+   hebben (`st_*_announced`) EN (ii) de gemeten onderbreking minstens de settle-drempel
+   duurde en nooit onder `FIXED_MIN_RECOVER_MS` (1 s) — `fixedRecoveryOk()`. Een
+   0s/sub-seconde/flap-"onderbreking" geeft dus nooit meer een herstel, ook bij `/sim`
+   of met `alert.debounce == 0`.
+2. **Boot-grace zonder desync**: de opstart-genade zit niet meer in `fixedAlertDown`
+   (die geeft nu exact dezelfde stabiele toestand als `fixedIsDown`/OLED). `fixedEdge`
+   onderdrukt tijdens de genade de dispatch én houdt de baseline stil bij — zo maakt
+   het einde van de genade geen kunstmatige "weg"-flank en spreken scherm en alarm
+   elkaar nooit tegen.
+3. **Debounce vereenvoudigd tot een KORTE settle** (`MON_FDEB_DEFAULT` 45 → 5 s). De
+   reboot-vloed wordt door de opstart-genade (~60 s) gedempt, niet door de debounce;
+   die hoeft dus alleen nog de spanning-settle bij uittrekken te ontruisen (accu zakt
+   dwars door de mains.hi/lo-band). In steady-state meldt de node vrijwel direct.
+4. **Geen tweede, ongedebouncet herstelpad** in de room-variant: het rauwe
+   `trackRecovery(isMains()/isWifiOnline())` in `loopRecovery()` staat nu onder
+   `#ifndef ROOM_SERVER_VARIANT` (het voedt enkel de sim-recovery van de sensor-variant).
+5. **Aliasing-hazard weg**: `fixedEdge` haalt de alerttekst pas op in de vurende tak;
+   `fixedAlertText()`/`fixedRecoverAlertText()` delen één statische buffer, dus beide
+   tegelijk als argument doorgeven (zoals de oude `edge()`-aanroep) kon de ene tekst de
+   andere laten overschrijven.
+
+DIAGNOSE-LOGGING (tijdelijk, blijft in v2.3.5): altijd-aan seriële logging op COM4
+`[fixdiag]` (elke `fixedRawTick`-kanteling: kanaal, rauw, nieuwe toestand,
+`down_start`, `last_down_ms`, drempel, boot-grace) en `[fixedge]` (elke down/herstel-
+beslissing: kanaal, gemeld/onderdrukt, `announced`, `dur_ok`). MESH_DEBUG staat op dit
+bord uit, vandaar directe `Serial.printf`. Zo kan de coordinator live verifiëren wat er
+vuurt bij uittrekken, insteken en `/sim`.
+
 ## v2.3.4 — spook-recovery weg (symmetrisch gedebouncete storingstoestand)
 
 Fysiek gemeld: USB uittrekken gaf terecht "storing netvoeding weg" op de OLED, maar
