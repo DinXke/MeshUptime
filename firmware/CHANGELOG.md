@@ -7,6 +7,21 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.1 — kanaal op naam (sleutel afgeleid), zoals de app
+
+- **Kanaal toevoegen ZONDER secret** (web-GUI, `/channel/add`, CLI `channel add`):
+  laat het secret leeg en de node maakt een **hashtag-kanaal** — de sleutel wordt
+  DETERMINISTISCH uit de naam afgeleid als de eerste 16 byte van `sha256(naam)`,
+  EXACT zoals de MeshCore-app (`docs/companion_protocol.md`: `#test` ->
+  `9cd8fcf22a47333b591d96a2b848b73f`). Zelfde naam = zelfde kanaal als de app, dus
+  de node komt in precies hetzelfde kanaal. Een expliciete 32/64-hex sleutel blijft
+  toegestaan (bv. de publieke `Public`-sleutel `8b3387e9c5cdea6ac9e5edbaa115cd72`).
+  Bevinding uit de gevendorde code: publiek kanaal = vaste sleutel, hashtag =
+  sha256(naam)[:16], privé = random — alleen de hashtag-afleiding is "op naam".
+- De GUI/CLI/`/channel/add`-respons melden of de sleutel is **afgeleid** dan wel
+  **eigen**, met de kanaal-hash; een afgeleide sleutel is niet geheim (wie de naam
+  kent leidt hem af), een eigen secret wordt nooit teruggetoond.
+
 ## v2.3.0 — hashtag-kanalen + grote contactenlijst (naamresolutie)
 
 - **Hashtag-/publieke kanalen**: de bot leest de ingeschakelde MeshCore

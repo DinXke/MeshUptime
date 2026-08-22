@@ -273,6 +273,7 @@ struct BotChannel {
   uint8_t hash;                   // sha256(secret, secret_len)[0]
   bool    used;
   bool    enabled;                // meelezen/antwoorden aan/uit
+  bool    derived;                // true = sleutel uit de naam afgeleid (hashtag)
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
@@ -402,7 +403,7 @@ public:
   /* ---- IWebNode: hashtag-/publieke kanalen ---- */
   int  webChannelMax() override   { return channelMax(); }
   int  webChannelCount() override { return channelCount(); }
-  bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex) override;
+  bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived) override;
   int  webChannelAdd(const char* name, const char* secret_hex, int enabled) override {
     return channelAdd(name, secret_hex, enabled != 0);
   }
@@ -422,11 +423,12 @@ public:
   int  channelMax() const { return MAX_CHANNELS; }
   int  channelCount() const;
   /* Op index (over de GEBRUIKTE ingangen). out_name >= 24. Geeft naam, sleutellengte
-   * in bits (128/256), enabled en de kanaal-hash. Het SECRET wordt NOOIT
-   * teruggegeven (schrijf-alleen, zoals een wachtwoord). false = geen ingang. */
-  bool channelGet(int i, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash) const;
-  /* Toevoegen/bijwerken op NAAM. secret_hex = 32 of 64 hextekens (128/256-bit).
-   * 0 ok, -2 ongeldige naam/secret, -3 vol. */
+   * in bits (128/256), enabled, de kanaal-hash en of de sleutel uit de naam is
+   * afgeleid. Het SECRET wordt NOOIT teruggegeven (schrijf-alleen). false = geen. */
+  bool channelGet(int i, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived) const;
+  /* Toevoegen/bijwerken op NAAM. secret_hex leeg/NULL -> HASHTAG-kanaal: sleutel =
+   * eerste 16 byte van sha256(naam), exact zoals de MeshCore-app. Anders 32 of 64
+   * hextekens (128/256-bit expliciet). 0 ok, -2 ongeldige naam/secret, -3 vol. */
   int  channelAdd(const char* name, const char* secret_hex, bool enabled);
   int  channelDel(const char* name);                 // 1 ok, -2 niet gevonden
   int  channelSetEnabled(const char* name, bool en); // 1 ok, -2 niet gevonden
@@ -612,6 +614,7 @@ private:
   void          sendBotAdvertisement(int delay_millis, bool flood);
   int           botRecipFindFree() const;
   void          handleBotCommand(char* args, char* reply);
+  void          handleChannelCommand(char* args, char* reply);   // CLI: channel ...
   /* Inkomende DM op de bot-identiteit: het kleine mesh-diagnose-commandoset
    * (ping/path/help). Antwoordt als schone DM VANAF de bot naar de afzender. De
    * antwoordbuffer is static (niet op de loopTask-stapel). */

@@ -23,11 +23,13 @@
  *   v2.3.0 = hashtag-/publieke kanalen (de bot leest mee + antwoordt op
  *            ping/test/path), grote advert-/contactlijst (naamresolutie overal),
  *            kanaal-afzendernaam inline uit het bericht.
+ *   v2.3.1 = kanaal toevoegen op NAAM zonder secret: sleutel afgeleid uit de naam
+ *            (sha256[:16], hashtag-kanaal, zoals de MeshCore-app).
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.0"
+  #define MESHUPTIME_VERSION   "v2.3.1"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

@@ -163,9 +163,10 @@ public:
    * wordt nooit teruggegeven (schrijf-alleen, zoals een wachtwoord). */
   virtual int  webChannelMax()   { return 0; }
   virtual int  webChannelCount() { return 0; }
-  virtual bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex)
-                                 { (void)i; (void)name; (void)name_len; (void)bits; (void)enabled; (void)hashhex; return false; }
-  /* Toevoegen/bijwerken op naam; secret_hex = 32 of 64 hex. 0 ok, <0 fout. */
+  virtual bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived)
+                                 { (void)i; (void)name; (void)name_len; (void)bits; (void)enabled; (void)hashhex; (void)derived; return false; }
+  /* Toevoegen/bijwerken op naam; secret_hex leeg -> hashtag (sleutel uit naam),
+   * anders 32 of 64 hex. 0 ok, <0 fout. */
   virtual int  webChannelAdd(const char* name, const char* secret_hex, int enabled)
                                  { (void)name; (void)secret_hex; (void)enabled; return -1; }
   virtual int  webChannelDel(const char* name)          { (void)name; return -1; }

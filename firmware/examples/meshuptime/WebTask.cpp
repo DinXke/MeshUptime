@@ -1778,16 +1778,20 @@ mag op een prefix (&ge;12 hex).</p>
 <h2>Hashtag-kanalen &mdash; meeluisteren en antwoorden</h2>
 <div class="card pad0"><table id="chl"></table></div>
 <div class="frow" style="margin-top:.4rem">
-<input id="ch-name" placeholder="kanaalnaam (bv. Public)" maxlength="23" spellcheck="false" style="width:10rem">
-<input id="ch-secret" placeholder="secret (32 of 64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<input id="ch-name" placeholder="kanaalnaam (bv. #test of Public)" maxlength="23" spellcheck="false" style="width:11rem">
+<input id="ch-secret" placeholder="secret leeg = afgeleid uit naam (of 32/64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
 <button type="button" id="ch-add">toevoegen</button></div>
 <div id="chmsg"></div>
 <p class="note">De bot leest de <b>ingeschakelde</b> kanalen mee en antwoordt IN het
 kanaal op <code>ping</code>, <code>test</code> (signaalrapport) en <code>path</code>
-(route met repeater-namen). Een kanaal is een gedeeld <b>secret</b> (32 hex = 128-bit,
-of 64 hex = 256-bit), net als in de MeshCore-app (bv. de publieke <i>Public</i>-sleutel).
-Het secret wordt hier niet teruggetoond &mdash; schrijf-alleen, zoals een wachtwoord.
-Zet een kanaal op <b>uit</b> om te stoppen met meelezen zonder het te wissen.</p>
+(route met repeater-namen). <b>Secret leeg laten</b> = een <b>hashtag-kanaal</b>: de
+sleutel wordt dan uit de naam afgeleid (eerste 16 byte van <code>sha256(naam)</code>),
+exact zoals de MeshCore-app &mdash; zelfde naam is zelfde kanaal. Geef je wél een
+secret op (32 hex = 128-bit of 64 hex = 256-bit), dan gebruikt de node die (bv. de
+publieke <i>Public</i>-sleutel <code>8b3387e9c5cdea6ac9e5edbaa115cd72</code>). Een
+afgeleide sleutel is <b>niet geheim</b> (wie de naam kent leidt hem af); een eigen
+secret wordt hier niet teruggetoond. Zet een kanaal op <b>uit</b> om te stoppen met
+meelezen zonder het te wissen.</p>
 </section>
 
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
@@ -3390,7 +3394,7 @@ var h=e.insertRow();["kanaal","sleutel","aan",""].forEach(function(t){
 var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
 list.forEach(function(c){var r=e.insertRow();
 r.insertCell().textContent=c.n;
-var sc=r.insertCell();sc.className="num";sc.textContent=c.bits+"-bit #"+c.h;
+var sc=r.insertCell();sc.className="num";sc.textContent=c.bits+"-bit #"+c.h+(c.drv?" (afgeleid)":" (eigen)");
 var ac=r.insertCell();var cb=document.createElement("input");cb.type="checkbox";cb.checked=!!c.en;
 cb.onchange=function(){channelToggle(c.n,cb.checked)};ac.appendChild(cb);
 var dc=r.insertCell();dc.className="acts";var b=document.createElement("button");b.textContent="wis";
@@ -3412,13 +3416,13 @@ bmsg("chmsg",j.ok?"kanaal weg":"mislukt: "+(j.error||""),j.ok?1:0);channelsLoad(
 document.getElementById("ch-add").onclick=function(){
 var name=document.getElementById("ch-name").value.trim(),
 sec=document.getElementById("ch-secret").value.trim();
-if(!name||!sec){bmsg("chmsg","naam en secret nodig",0);return}
+if(!name){bmsg("chmsg","naam nodig (secret mag leeg = afgeleid uit naam)",0);return}
 fetch("channel/add",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"name="+encodeURIComponent(name)+"&secret="+encodeURIComponent(sec)+"&enabled=1"})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("ch-name").value="";document.getElementById("ch-secret").value="";
-bmsg("chmsg","kanaal toegevoegd",1);channelsLoad()}
+bmsg("chmsg","kanaal toegevoegd - "+(j.derived?("sleutel afgeleid uit naam"):("eigen sleutel"))+" ("+j.bits+"-bit #"+j.h+")",1);channelsLoad()}
 else bmsg("chmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("chmsg","mislukt",0)})};
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
@@ -5470,19 +5474,23 @@ void WebTask::handleChannelsJson() {
   int cnt = _acl->webChannelCount();
   char nm[24], nesc[24 * 6 + 1], hh[4];
   for (int i = 0; i < cnt; i++) {
-    if ((size_t)n > sizeof(g_json) - 120) break;
-    int bits = 0; bool en = false;
-    if (!_acl->webChannelGet(i, nm, sizeof(nm), &bits, &en, hh)) continue;
+    if ((size_t)n > sizeof(g_json) - 130) break;
+    int bits = 0; bool en = false, drv = false;
+    if (!_acl->webChannelGet(i, nm, sizeof(nm), &bits, &en, hh, &drv)) continue;
     jsonEscape(nm, nesc, sizeof(nesc));
-    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"n\":\"%s\",\"bits\":%d,\"en\":%s,\"h\":\"%s\"}",
-                  i == 0 ? "" : ",", nesc, bits, en ? "true" : "false", hh);
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+                  "%s{\"n\":\"%s\",\"bits\":%d,\"en\":%s,\"h\":\"%s\",\"drv\":%s}",
+                  i == 0 ? "" : ",", nesc, bits, en ? "true" : "false", hh, drv ? "true" : "false");
   }
   strlcat(g_json, "]}", sizeof(g_json));
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
 }
 
-/* POST /channel/add  (name, secret [32/64 hex], enabled=0|1) */
+/* POST /channel/add  (name, secret [leeg=hashtag/afgeleid, of 32/64 hex], enabled=0|1)
+ * Zoals de MeshCore-app: geen secret -> HASHTAG-kanaal, sleutel = sha256(naam)[:16].
+ * Het antwoord meldt of de sleutel is afgeleid + de kanaal-hash, zodat de GUI kan
+ * tonen wat er gebeurde. */
 void WebTask::handleChannelAdd() {
   if (!requireAuth()) return;
   if (!channelsAvailable()) return;
@@ -5490,15 +5498,27 @@ void WebTask::handleChannelAdd() {
   if (!getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"naam ontbreekt\"}"); return;
   }
-  if (!getArg(*_server, "secret", secret, sizeof(secret)) || secret[0] == 0) {
-    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"secret ontbreekt (32 of 64 hex)\"}"); return;
-  }
+  secret[0] = 0;
+  getArg(*_server, "secret", secret, sizeof(secret));   // leeg mag: hashtag-kanaal
   bool enabled = !(getArg(*_server, "enabled", en, sizeof(en)) && en[0] == '0');   // standaard aan
-  int r = _acl->webChannelAdd(name, secret, enabled ? 1 : 0);
-  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
-  _server->send(400, "application/json",
-      r == -3 ? "{\"ok\":false,\"error\":\"kanalenlijst vol\"}"
-              : "{\"ok\":false,\"error\":\"secret moet 32 of 64 hextekens zijn\"}");
+  int r = _acl->webChannelAdd(name, secret[0] ? secret : "", enabled ? 1 : 0);
+  if (r != 0) {
+    _server->send(400, "application/json",
+        r == -3 ? "{\"ok\":false,\"error\":\"kanalenlijst vol\"}"
+                : "{\"ok\":false,\"error\":\"secret moet 32 of 64 hextekens zijn (of laat leeg)\"}");
+    return;
+  }
+  /* Terugmelden wat er gebeurde: afgeleid vs eigen sleutel + de kanaal-hash. De
+   * lijst vinden op naam om de definitieve status/hash te lezen. */
+  int cnt = _acl->webChannelCount();
+  char nm[24], hh[4]; int bits = 0; bool cen = false, drv = false;
+  for (int i = 0; i < cnt; i++) {
+    if (_acl->webChannelGet(i, nm, sizeof(nm), &bits, &cen, hh, &drv) && strcmp(nm, name) == 0) break;
+  }
+  char out[96];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"derived\":%s,\"bits\":%d,\"h\":\"%s\"}",
+           drv ? "true" : "false", bits, hh);
+  _server->send(200, "application/json", out);
 }
 
 /* POST /channel/del  (name) */

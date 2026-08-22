@@ -1854,7 +1854,7 @@ int RoomMesh::channelCount() const {
   return n;
 }
 
-bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash) const {
+bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived) const {
   int n = 0;
   for (int i = 0; i < MAX_CHANNELS; i++) {
     if (!_channels[i].used) continue;
@@ -1863,6 +1863,7 @@ bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enab
       if (out_bits) *out_bits = _channels[i].secret_len * 8;
       if (out_enabled) *out_enabled = _channels[i].enabled;
       if (out_hash) *out_hash = _channels[i].hash;
+      if (out_derived) *out_derived = _channels[i].derived;
       return true;
     }
     n++;
@@ -1870,24 +1871,40 @@ bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enab
   return false;
 }
 
-/* IWebNode-brug: naam + bits + enabled + hash-hex (nooit het secret). */
-bool RoomMesh::webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex) {
+/* IWebNode-brug: naam + bits + enabled + hash-hex + afgeleid (nooit het secret). */
+bool RoomMesh::webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived) {
   uint8_t h = 0;
   char nm[24];
-  if (!channelGet(i, nm, bits, enabled, &h)) return false;
+  if (!channelGet(i, nm, bits, enabled, &h, derived)) return false;
   if (name && name_len) StrHelper::strncpy(name, nm, name_len);
   if (hashhex) { mesh::Utils::toHex(hashhex, &h, 1); hashhex[2] = 0; }
   return true;
 }
 
-/* Toevoegen/bijwerken op NAAM. secret_hex = 32 (128-bit) of 64 (256-bit) hextekens. */
+/* Toevoegen/bijwerken op NAAM.
+ *   secret_hex leeg/NULL -> HASHTAG-kanaal: de sleutel = de eerste 16 byte van
+ *     sha256(naam), EXACT zoals de MeshCore-app (docs/companion_protocol.md:
+ *     "#test" -> 9cd8fcf2...). Zo komt de node in hetzelfde kanaal als de app voor
+ *     dezelfde naam. Niet geheim: wie de naam kent leidt de sleutel af.
+ *   secret_hex = 32 of 64 hextekens -> expliciete 128-/256-bit sleutel. */
 int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled) {
-  if (!name || name[0] == 0 || !secret_hex) return -2;
-  int hexlen = (int)strlen(secret_hex);
-  if (hexlen != 32 && hexlen != 64) return -2;         // 128- of 256-bit
+  if (!name || name[0] == 0) return -2;
   uint8_t secret[PUB_KEY_SIZE];
   memset(secret, 0, sizeof(secret));
-  if (!mesh::Utils::fromHex(secret, hexlen / 2, secret_hex)) return -2;
+  uint8_t secret_len;
+  bool derived;
+  if (secret_hex == NULL || secret_hex[0] == 0) {
+    /* Naam-only: sleutel afleiden uit de naam (hashtag-kanaal). */
+    mesh::Utils::sha256(secret, 16, (const uint8_t*)name, strlen(name));
+    secret_len = 16;
+    derived = true;
+  } else {
+    int hexlen = (int)strlen(secret_hex);
+    if (hexlen != 32 && hexlen != 64) return -2;       // 128- of 256-bit
+    if (!mesh::Utils::fromHex(secret, hexlen / 2, secret_hex)) return -2;
+    secret_len = (uint8_t)(hexlen / 2);
+    derived = false;
+  }
 
   int idx = channelFindByName(name);                   // bijwerken?
   if (idx < 0) {
@@ -1898,9 +1915,10 @@ int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled)
   memset(&c, 0, sizeof(c));
   c.used = true;
   c.enabled = enabled;
+  c.derived = derived;
   StrHelper::strncpy(c.name, name, sizeof(c.name));
   memcpy(c.secret, secret, PUB_KEY_SIZE);
-  c.secret_len = (uint8_t)(hexlen / 2);
+  c.secret_len = secret_len;
   channelComputeHash(c);
   saveChannels();
   return 0;
@@ -1922,19 +1940,22 @@ int RoomMesh::channelSetEnabled(const char* name, bool en) {
   return 1;
 }
 
-/* Persistentie: één regel per kanaal  ->  c <enabled> <secrethex> <naam>
- * (naam als rest van de regel zodat spaties mogen; secret als hex). */
+/* Persistentie: één regel per kanaal  ->  c <enabled> <derived> <secrethex> <naam>
+ * (naam als rest van de regel zodat spaties mogen; secret als hex). Het secret
+ * staat OOK voor een afgeleid (hashtag) kanaal in het bestand -- het is niet
+ * geheim en zo hoeft loadChannels() niet opnieuw te hashen. */
 void RoomMesh::saveChannels() {
   if (_fs == NULL) return;
   File f = _fs->open(CHANNELS_CFG_PATH, "w", true);
   if (!f) return;
-  f.printf("#MUCHAN1\n");
+  f.printf("#MUCHAN2\n");
   char hex[PUB_KEY_SIZE * 2 + 1];
   for (int i = 0; i < MAX_CHANNELS; i++) {
     if (!_channels[i].used) continue;
     mesh::Utils::toHex(hex, _channels[i].secret, _channels[i].secret_len);
     hex[_channels[i].secret_len * 2] = 0;
-    f.printf("c %d %s %s\n", _channels[i].enabled ? 1 : 0, hex, _channels[i].name);
+    f.printf("c %d %d %s %s\n", _channels[i].enabled ? 1 : 0,
+             _channels[i].derived ? 1 : 0, hex, _channels[i].name);
   }
   f.printf(".\n");
   f.close();
@@ -1959,10 +1980,11 @@ void RoomMesh::loadChannels() {
     line[len] = 0;
     if (first) { first = false; continue; }
     if (line[0] != 'c') continue;
-    // c <enabled> <secrethex> <naam>
+    // c <enabled> <derived> <secrethex> <naam>
     char* p = line + 1;
     while (*p == ' ') p++;
-    int en = atoi(p);   while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    int en  = atoi(p);  while (*p && *p != ' ') p++; while (*p == ' ') p++;
+    int drv = atoi(p);  while (*p && *p != ' ') p++; while (*p == ' ') p++;
     char* hex = p;      while (*p && *p != ' ') p++; if (*p) { *p = 0; p++; } while (*p == ' ') p++;
     char* name = p;
     int hexlen = (int)strlen(hex);
@@ -1972,6 +1994,7 @@ void RoomMesh::loadChannels() {
     if (!mesh::Utils::fromHex(c.secret, hexlen / 2, hex)) continue;
     c.secret_len = (uint8_t)(hexlen / 2);
     c.enabled = en ? true : false;
+    c.derived = drv ? true : false;
     c.used = true;
     StrHelper::strncpy(c.name, name, sizeof(c.name));
     channelComputeHash(c);
@@ -2232,6 +2255,8 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     handleSensorNodeCommand(command + 11, reply);
   } else if (memcmp(command, "bot ", 4) == 0) {
     handleBotCommand(command + 4, reply);
+  } else if (memcmp(command, "channel ", 8) == 0) {
+    handleChannelCommand(command + 8, reply);
   } else if (memcmp(command, "room ", 5) == 0) {
     handleRoomCommand(command + 5, reply);
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
@@ -2545,6 +2570,56 @@ void RoomMesh::handleBotCommand(char* args, char* reply) {
     return;
   }
   strcpy(reply, "bot list|add <pubkey>|del <prefix>|post <msg>|sendto <pubkey> <msg>|advert [flood]|uri");
+}
+
+/* channel list | add <naam> [secrethex] | del <naam> | on <naam> | off <naam>
+ * Zonder secret bij 'add' -> hashtag-kanaal (sleutel uit de naam, zoals de app). */
+void RoomMesh::handleChannelCommand(char* args, char* reply) {
+  while (*args == ' ') args++;
+
+  if (strncmp(args, "list", 4) == 0) {
+    char* p = reply; int n = 0;
+    p += sprintf(p, "kanalen:");
+    for (int i = 0; i < MAX_CHANNELS; i++) {
+      if (!_channels[i].used) continue;
+      if ((p - reply) > 180) { p += sprintf(p, " ..."); break; }
+      p += sprintf(p, " %s(%d-bit,%s,%s)", _channels[i].name, _channels[i].secret_len * 8,
+                   _channels[i].enabled ? "aan" : "uit", _channels[i].derived ? "afgeleid" : "eigen");
+      n++;
+    }
+    if (n == 0) strcpy(reply, "kanalen: (geen)");
+    return;
+  }
+  if (memcmp(args, "add ", 4) == 0) {
+    char* nm = args + 4; while (*nm == ' ') nm++;
+    char* sp = strchr(nm, ' ');
+    char* sec = NULL;
+    if (sp) { *sp = 0; sec = sp + 1; while (*sec == ' ') sec++; if (*sec == 0) sec = NULL; }
+    if (*nm == 0) { strcpy(reply, "gebruik: channel add <naam> [secrethex]"); return; }
+    int r = channelAdd(nm, sec, true);
+    if (r == 0) {
+      int idx = channelFindByName(nm);
+      snprintf(reply, 200, "OK kanaal '%s' (%s, #%02x)", nm,
+               (idx >= 0 && _channels[idx].derived) ? "sleutel afgeleid uit naam" : "eigen sleutel",
+               (idx >= 0) ? _channels[idx].hash : 0);
+    } else if (r == -3) strcpy(reply, "Err - kanalenlijst vol");
+    else strcpy(reply, "Err - secret moet 32 of 64 hextekens zijn (of laat leeg)");
+    return;
+  }
+  if (memcmp(args, "del ", 4) == 0) {
+    char* nm = args + 4; while (*nm == ' ') nm++;
+    if (*nm == 0) { strcpy(reply, "gebruik: channel del <naam>"); return; }
+    strcpy(reply, channelDel(nm) == 1 ? "OK kanaal verwijderd" : "Err - niet gevonden");
+    return;
+  }
+  if (memcmp(args, "on ", 3) == 0 || memcmp(args, "off ", 4) == 0) {
+    bool on = (args[1] == 'n');
+    char* nm = args + (on ? 3 : 4); while (*nm == ' ') nm++;
+    if (*nm == 0) { strcpy(reply, "gebruik: channel on|off <naam>"); return; }
+    strcpy(reply, channelSetEnabled(nm, on) == 1 ? (on ? "OK aan" : "OK uit") : "Err - niet gevonden");
+    return;
+  }
+  strcpy(reply, "channel list|add <naam> [secrethex]|del <naam>|on <naam>|off <naam>");
 }
 
 /* read/readwrite/admin (+ aliassen) -> PERM_ACL_* ; 0 = onbekend. */
