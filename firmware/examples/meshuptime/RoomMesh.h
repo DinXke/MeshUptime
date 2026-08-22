@@ -273,7 +273,8 @@ struct BotChannel {
   uint8_t hash;                   // sha256(secret, secret_len)[0]
   bool    used;
   bool    enabled;                // meelezen/antwoorden aan/uit
-  bool    derived;                // true = sleutel uit de naam afgeleid (hashtag)
+  bool    derived;                // true = geen expliciet secret (naam-only add)
+  bool    is_public;              // true = de vaste publieke sleutel (het echte Public)
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
@@ -403,7 +404,7 @@ public:
   /* ---- IWebNode: hashtag-/publieke kanalen ---- */
   int  webChannelMax() override   { return channelMax(); }
   int  webChannelCount() override { return channelCount(); }
-  bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived) override;
+  bool webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived, bool* is_public) override;
   int  webChannelAdd(const char* name, const char* secret_hex, int enabled) override {
     return channelAdd(name, secret_hex, enabled != 0);
   }
@@ -425,10 +426,12 @@ public:
   /* Op index (over de GEBRUIKTE ingangen). out_name >= 24. Geeft naam, sleutellengte
    * in bits (128/256), enabled, de kanaal-hash en of de sleutel uit de naam is
    * afgeleid. Het SECRET wordt NOOIT teruggegeven (schrijf-alleen). false = geen. */
-  bool channelGet(int i, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived) const;
-  /* Toevoegen/bijwerken op NAAM. secret_hex leeg/NULL -> HASHTAG-kanaal: sleutel =
-   * eerste 16 byte van sha256(naam), exact zoals de MeshCore-app. Anders 32 of 64
-   * hextekens (128/256-bit expliciet). 0 ok, -2 ongeldige naam/secret, -3 vol. */
+  bool channelGet(int i, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived, bool* out_public) const;
+  /* Toevoegen/bijwerken op NAAM. secret_hex leeg/NULL -> naam-only: bij naam
+   * "public" (case-insensitief, met/zonder #) de VASTE publieke sleutel; anders een
+   * HASHTAG-kanaal (sleutel = eerste 16 byte van sha256(naam)), exact zoals de
+   * MeshCore-app. Een expliciete 32/64-hex sleutel wint altijd. 0 ok, -2 ongeldig,
+   * -3 vol. */
   int  channelAdd(const char* name, const char* secret_hex, bool enabled);
   int  channelDel(const char* name);                 // 1 ok, -2 niet gevonden
   int  channelSetEnabled(const char* name, bool en); // 1 ok, -2 niet gevonden

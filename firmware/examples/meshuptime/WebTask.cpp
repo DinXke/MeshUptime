@@ -1786,9 +1786,11 @@ mag op een prefix (&ge;12 hex).</p>
 kanaal op <code>ping</code>, <code>test</code> (signaalrapport) en <code>path</code>
 (route met repeater-namen). <b>Secret leeg laten</b> = een <b>hashtag-kanaal</b>: de
 sleutel wordt dan uit de naam afgeleid (eerste 16 byte van <code>sha256(naam)</code>),
-exact zoals de MeshCore-app &mdash; zelfde naam is zelfde kanaal. Geef je wél een
-secret op (32 hex = 128-bit of 64 hex = 256-bit), dan gebruikt de node die (bv. de
-publieke <i>Public</i>-sleutel <code>8b3387e9c5cdea6ac9e5edbaa115cd72</code>). Een
+exact zoals de MeshCore-app &mdash; zelfde naam is zelfde kanaal. De naam
+<b>Public</b> (met of zonder <code>#</code>) is een speciaal geval: zonder secret
+gebruikt de node de <b>vaste publieke sleutel</b> (<code>8b3387e9c5cdea6ac9e5edbaa115cd72</code>),
+zodat je op het ECHTE publieke kanaal uitkomt. Geef je wél een secret op (32 hex =
+128-bit of 64 hex = 256-bit), dan gebruikt de node die (die wint altijd). Een
 afgeleide sleutel is <b>niet geheim</b> (wie de naam kent leidt hem af); een eigen
 secret wordt hier niet teruggetoond. Zet een kanaal op <b>uit</b> om te stoppen met
 meelezen zonder het te wissen.</p>
@@ -3394,7 +3396,7 @@ var h=e.insertRow();["kanaal","sleutel","aan",""].forEach(function(t){
 var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
 list.forEach(function(c){var r=e.insertRow();
 r.insertCell().textContent=c.n;
-var sc=r.insertCell();sc.className="num";sc.textContent=c.bits+"-bit #"+c.h+(c.drv?" (afgeleid)":" (eigen)");
+var sc=r.insertCell();sc.className="num";sc.textContent=c.bits+"-bit #"+c.h+(c.pub?" (publiek)":(c.drv?" (afgeleid)":" (eigen)"));
 var ac=r.insertCell();var cb=document.createElement("input");cb.type="checkbox";cb.checked=!!c.en;
 cb.onchange=function(){channelToggle(c.n,cb.checked)};ac.appendChild(cb);
 var dc=r.insertCell();dc.className="acts";var b=document.createElement("button");b.textContent="wis";
@@ -3422,7 +3424,7 @@ headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"name="+encodeURIComponent(name)+"&secret="+encodeURIComponent(sec)+"&enabled=1"})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("ch-name").value="";document.getElementById("ch-secret").value="";
-bmsg("chmsg","kanaal toegevoegd - "+(j.derived?("sleutel afgeleid uit naam"):("eigen sleutel"))+" ("+j.bits+"-bit #"+j.h+")",1);channelsLoad()}
+bmsg("chmsg","kanaal toegevoegd - "+(j.public?"publiek kanaal (vaste sleutel)":(j.derived?"sleutel afgeleid uit naam":"eigen sleutel"))+" ("+j.bits+"-bit #"+j.h+")",1);channelsLoad()}
 else bmsg("chmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("chmsg","mislukt",0)})};
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
@@ -5474,13 +5476,14 @@ void WebTask::handleChannelsJson() {
   int cnt = _acl->webChannelCount();
   char nm[24], nesc[24 * 6 + 1], hh[4];
   for (int i = 0; i < cnt; i++) {
-    if ((size_t)n > sizeof(g_json) - 130) break;
-    int bits = 0; bool en = false, drv = false;
-    if (!_acl->webChannelGet(i, nm, sizeof(nm), &bits, &en, hh, &drv)) continue;
+    if ((size_t)n > sizeof(g_json) - 140) break;
+    int bits = 0; bool en = false, drv = false, pub = false;
+    if (!_acl->webChannelGet(i, nm, sizeof(nm), &bits, &en, hh, &drv, &pub)) continue;
     jsonEscape(nm, nesc, sizeof(nesc));
     n += snprintf(g_json + n, sizeof(g_json) - n,
-                  "%s{\"n\":\"%s\",\"bits\":%d,\"en\":%s,\"h\":\"%s\",\"drv\":%s}",
-                  i == 0 ? "" : ",", nesc, bits, en ? "true" : "false", hh, drv ? "true" : "false");
+                  "%s{\"n\":\"%s\",\"bits\":%d,\"en\":%s,\"h\":\"%s\",\"drv\":%s,\"pub\":%s}",
+                  i == 0 ? "" : ",", nesc, bits, en ? "true" : "false", hh,
+                  drv ? "true" : "false", pub ? "true" : "false");
   }
   strlcat(g_json, "]}", sizeof(g_json));
   _server->sendHeader("Cache-Control", "no-store");
@@ -5508,16 +5511,16 @@ void WebTask::handleChannelAdd() {
                 : "{\"ok\":false,\"error\":\"secret moet 32 of 64 hextekens zijn (of laat leeg)\"}");
     return;
   }
-  /* Terugmelden wat er gebeurde: afgeleid vs eigen sleutel + de kanaal-hash. De
-   * lijst vinden op naam om de definitieve status/hash te lezen. */
+  /* Terugmelden wat er gebeurde: publiek/afgeleid/eigen sleutel + de kanaal-hash.
+   * De lijst vinden op naam om de definitieve status/hash te lezen. */
   int cnt = _acl->webChannelCount();
-  char nm[24], hh[4]; int bits = 0; bool cen = false, drv = false;
+  char nm[24], hh[4]; int bits = 0; bool cen = false, drv = false, pub = false;
   for (int i = 0; i < cnt; i++) {
-    if (_acl->webChannelGet(i, nm, sizeof(nm), &bits, &cen, hh, &drv) && strcmp(nm, name) == 0) break;
+    if (_acl->webChannelGet(i, nm, sizeof(nm), &bits, &cen, hh, &drv, &pub) && strcmp(nm, name) == 0) break;
   }
-  char out[96];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"derived\":%s,\"bits\":%d,\"h\":\"%s\"}",
-           drv ? "true" : "false", bits, hh);
+  char out[110];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"derived\":%s,\"public\":%s,\"bits\":%d,\"h\":\"%s\"}",
+           drv ? "true" : "false", pub ? "true" : "false", bits, hh);
   _server->send(200, "application/json", out);
 }
 

@@ -48,6 +48,10 @@
 #define BOT_ID_NAME      "/bot_id"
 #define BOT_RECIPS_PATH  "/bot_recips"
 #define CHANNELS_CFG_PATH "/channels.cfg"
+/* De vaste, publiek bekende sleutel van het MeshCore-standaardkanaal "Public"
+ * (docs/faq.md + qr_codes.md). Een naam-only kanaal "public" krijgt DEZE sleutel
+ * (niet sha256("public")), zodat de node op het ECHTE publieke kanaal uitkomt. */
+#define PUBLIC_GROUP_SECRET_HEX  "8b3387e9c5cdea6ac9e5edbaa115cd72"
 /* Eigenaar-seed: de lijst begint met deze pubkey op een verse node. */
 #define BOT_OWNER_SEED_HEX  "2cb0c5eb473757805eab00f9dd0594c229d6e50b2acec6b57403b6259c9e126f"
 
@@ -1854,7 +1858,7 @@ int RoomMesh::channelCount() const {
   return n;
 }
 
-bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived) const {
+bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enabled, uint8_t* out_hash, bool* out_derived, bool* out_public) const {
   int n = 0;
   for (int i = 0; i < MAX_CHANNELS; i++) {
     if (!_channels[i].used) continue;
@@ -1864,6 +1868,7 @@ bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enab
       if (out_enabled) *out_enabled = _channels[i].enabled;
       if (out_hash) *out_hash = _channels[i].hash;
       if (out_derived) *out_derived = _channels[i].derived;
+      if (out_public) *out_public = _channels[i].is_public;
       return true;
     }
     n++;
@@ -1871,22 +1876,31 @@ bool RoomMesh::channelGet(int idx, char* out_name, int* out_bits, bool* out_enab
   return false;
 }
 
-/* IWebNode-brug: naam + bits + enabled + hash-hex + afgeleid (nooit het secret). */
-bool RoomMesh::webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived) {
+/* IWebNode-brug: naam + bits + enabled + hash-hex + afgeleid + publiek (nooit het secret). */
+bool RoomMesh::webChannelGet(int i, char* name, size_t name_len, int* bits, bool* enabled, char* hashhex, bool* derived, bool* is_public) {
   uint8_t h = 0;
   char nm[24];
-  if (!channelGet(i, nm, bits, enabled, &h, derived)) return false;
+  if (!channelGet(i, nm, bits, enabled, &h, derived, is_public)) return false;
   if (name && name_len) StrHelper::strncpy(name, nm, name_len);
   if (hashhex) { mesh::Utils::toHex(hashhex, &h, 1); hashhex[2] = 0; }
   return true;
 }
 
+/* Is dit secret (16 byte) de vaste publieke sleutel? */
+static bool channelSecretIsPublic(const uint8_t* secret, uint8_t secret_len) {
+  if (secret_len != 16) return false;
+  uint8_t pub[16];
+  if (!mesh::Utils::fromHex(pub, 16, PUBLIC_GROUP_SECRET_HEX)) return false;
+  return memcmp(secret, pub, 16) == 0;
+}
+
 /* Toevoegen/bijwerken op NAAM.
- *   secret_hex leeg/NULL -> HASHTAG-kanaal: de sleutel = de eerste 16 byte van
- *     sha256(naam), EXACT zoals de MeshCore-app (docs/companion_protocol.md:
- *     "#test" -> 9cd8fcf2...). Zo komt de node in hetzelfde kanaal als de app voor
- *     dezelfde naam. Niet geheim: wie de naam kent leidt de sleutel af.
- *   secret_hex = 32 of 64 hextekens -> expliciete 128-/256-bit sleutel. */
+ *   secret_hex leeg/NULL:
+ *     - naam is "public" (case-insensitief, met/zonder #) -> de VASTE publieke
+ *       sleutel (8b3387e9...), zodat de node op het ECHTE publieke kanaal uitkomt.
+ *     - anders -> HASHTAG-kanaal: sleutel = eerste 16 byte van sha256(naam), EXACT
+ *       zoals de MeshCore-app ("#test" -> 9cd8fcf2...). Niet geheim.
+ *   secret_hex = 32 of 64 hextekens -> expliciete 128-/256-bit sleutel (wint altijd). */
 int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled) {
   if (!name || name[0] == 0) return -2;
   uint8_t secret[PUB_KEY_SIZE];
@@ -1894,8 +1908,14 @@ int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled)
   uint8_t secret_len;
   bool derived;
   if (secret_hex == NULL || secret_hex[0] == 0) {
-    /* Naam-only: sleutel afleiden uit de naam (hashtag-kanaal). */
-    mesh::Utils::sha256(secret, 16, (const uint8_t*)name, strlen(name));
+    /* Naam-only. Speciale naam "public" (met of zonder #) -> vaste publieke sleutel. */
+    const char* base = name;
+    if (*base == '#') base++;
+    if (strcasecmp(base, "public") == 0) {
+      mesh::Utils::fromHex(secret, 16, PUBLIC_GROUP_SECRET_HEX);
+    } else {
+      mesh::Utils::sha256(secret, 16, (const uint8_t*)name, strlen(name));   // hashtag
+    }
     secret_len = 16;
     derived = true;
   } else {
@@ -1916,6 +1936,7 @@ int RoomMesh::channelAdd(const char* name, const char* secret_hex, bool enabled)
   c.used = true;
   c.enabled = enabled;
   c.derived = derived;
+  c.is_public = channelSecretIsPublic(secret, secret_len);
   StrHelper::strncpy(c.name, name, sizeof(c.name));
   memcpy(c.secret, secret, PUB_KEY_SIZE);
   c.secret_len = secret_len;
@@ -1995,6 +2016,7 @@ void RoomMesh::loadChannels() {
     c.secret_len = (uint8_t)(hexlen / 2);
     c.enabled = en ? true : false;
     c.derived = drv ? true : false;
+    c.is_public = channelSecretIsPublic(c.secret, c.secret_len);
     c.used = true;
     StrHelper::strncpy(c.name, name, sizeof(c.name));
     channelComputeHash(c);
@@ -2584,7 +2606,8 @@ void RoomMesh::handleChannelCommand(char* args, char* reply) {
       if (!_channels[i].used) continue;
       if ((p - reply) > 180) { p += sprintf(p, " ..."); break; }
       p += sprintf(p, " %s(%d-bit,%s,%s)", _channels[i].name, _channels[i].secret_len * 8,
-                   _channels[i].enabled ? "aan" : "uit", _channels[i].derived ? "afgeleid" : "eigen");
+                   _channels[i].enabled ? "aan" : "uit",
+                   _channels[i].is_public ? "publiek" : (_channels[i].derived ? "afgeleid" : "eigen"));
       n++;
     }
     if (n == 0) strcpy(reply, "kanalen: (geen)");
@@ -2599,9 +2622,10 @@ void RoomMesh::handleChannelCommand(char* args, char* reply) {
     int r = channelAdd(nm, sec, true);
     if (r == 0) {
       int idx = channelFindByName(nm);
-      snprintf(reply, 200, "OK kanaal '%s' (%s, #%02x)", nm,
-               (idx >= 0 && _channels[idx].derived) ? "sleutel afgeleid uit naam" : "eigen sleutel",
-               (idx >= 0) ? _channels[idx].hash : 0);
+      const char* mode = "eigen sleutel";
+      if (idx >= 0) mode = _channels[idx].is_public ? "publiek kanaal (vaste sleutel)"
+                          : (_channels[idx].derived ? "sleutel afgeleid uit naam" : "eigen sleutel");
+      snprintf(reply, 200, "OK kanaal '%s' (%s, #%02x)", nm, mode, (idx >= 0) ? _channels[idx].hash : 0);
     } else if (r == -3) strcpy(reply, "Err - kanalenlijst vol");
     else strcpy(reply, "Err - secret moet 32 of 64 hextekens zijn (of laat leeg)");
     return;

@@ -7,6 +7,18 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.2 — naam "Public" -> vaste publieke sleutel
+
+- **Speciale naam "Public"**: een kanaal toevoegen met de naam `Public` (case-
+  insensitief, met of zonder `#`) en ZONDER secret gebruikt nu de vaste publieke
+  sleutel `8b3387e9c5cdea6ac9e5edbaa115cd72` i.p.v. `sha256("public")` — zodat de
+  node op het ECHTE publieke kanaal uitkomt, net als de MeshCore-app. Andere namen
+  blijven hashtag-kanalen (`sha256(naam)[:16]`); een expliciete secret wint altijd.
+  De GUI/CLI/`/channel/add`-respons tonen nu drie soorten: "publiek kanaal (vaste
+  sleutel)", "sleutel afgeleid uit naam" of "eigen sleutel" (nieuwe `pub`-vlag in
+  `/channels.json`; `is_public` afgeleid door het secret met de publieke sleutel te
+  vergelijken, niet apart bewaard).
+
 ## v2.3.1 — kanaal op naam (sleutel afgeleid), zoals de app
 
 - **Kanaal toevoegen ZONDER secret** (web-GUI, `/channel/add`, CLI `channel add`):

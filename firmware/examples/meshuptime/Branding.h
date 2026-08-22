@@ -25,11 +25,13 @@
  *            kanaal-afzendernaam inline uit het bericht.
  *   v2.3.1 = kanaal toevoegen op NAAM zonder secret: sleutel afgeleid uit de naam
  *            (sha256[:16], hashtag-kanaal, zoals de MeshCore-app).
+ *   v2.3.2 = naam "Public" (met/zonder #) zonder secret -> de VASTE publieke
+ *            sleutel (het echte publieke kanaal), zoals de app.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.1"
+  #define MESHUPTIME_VERSION   "v2.3.2"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
