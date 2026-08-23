@@ -85,11 +85,17 @@
  *            net-commando's (ping/dns/http/traceroute/scan <host>) in een room wel
  *            berekend (zichtbaar in de web-GUI) maar nooit teruggepost in de room.
  *            main_room.cpp roept nu the_mesh.dm.loop() aan na sensors.loop().
+ *   v2.3.13 = bot-DM verfijningen: (a) `ping <ip/host>` in DM -> ICMP-pingtest i.p.v.
+ *            mesh-Pong (kaal `ping` blijft Pong); (b) self-loopback-guard: negeer een
+ *            DM waarvan de afzender een eigen node-identiteit is (bot/room/snode);
+ *            (c) companion-verbs (find/play/fall/vol/tune/mute/quiet/loc/...) -> gerichte
+ *            hint "stuur naar je companion" i.p.v. de node-commandolijst; (d) ernst-emoji
+ *            (rood/oranje/groen) nu OOK vooraan de room-post-alerts, niet enkel de DM.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.12"
+  #define MESHUPTIME_VERSION   "v2.3.13"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

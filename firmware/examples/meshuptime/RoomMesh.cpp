@@ -1584,11 +1584,13 @@ void RoomMesh::dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, co
                              uint8_t severity) {
   if (!text || text[0] == 0) return;
 
-  // room-deel: naar elke toegewezen, actieve room. GEEN ernst-emoji: die is voor
-  // de companion die de DM parseert; een room-post is voor mensen in de app.
+  // room-deel: naar elke toegewezen, actieve room. Sinds v2.3.13 met dezelfde
+  // ernst-emoji vooraan als de DM (op verzoek: emoji ook in de room-meldingen).
   if (mode & ALERT_MODE_ROOM) {
+    static char roomtext[200];
+    snprintf(roomtext, sizeof(roomtext), "%s%s", sevEmoji(severity), text);
     for (int i = 0; i < MAX_ROOMS; i++) {
-      if ((room_mask & (1 << i)) && rooms[i].active) addServerPost(i, text);
+      if ((room_mask & (1 << i)) && rooms[i].active) addServerPost(i, roomtext);
     }
   }
 
@@ -1925,6 +1927,18 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   char verb[12]; int vi = 0;
   while (text[vi] && text[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = text[vi]; vi++; }
   verb[vi] = 0;
+  /* Argument na de verb. `ping <ip/host>` (mét argument) is GEEN mesh-Pong maar de
+   * ICMP-pingtest -> die valt door naar het commandopad (recip). Kaal `ping` = Pong. */
+  const char* b_arg = text + vi; while (*b_arg == ' ') b_arg++;
+
+  /* Self-loopback-guard (v2.3.13): negeer een DM waarvan de afzender een EIGEN
+   * identiteit van deze node is (bot/room/snode). Geen kans op een zelf-lus, en
+   * we antwoorden nooit "onbekend commando" op iets wat we zelf de lucht in stuurden. */
+  if (memcmp(sender_pub, _bot_id.pub_key, PUB_KEY_SIZE) == 0) return;
+  for (int i = 0; i < _num_active_rooms; i++)
+    if (memcmp(sender_pub, rooms[i].id.pub_key, PUB_KEY_SIZE) == 0) return;
+  for (int i = 0; i < _num_active_snodes; i++)
+    if (memcmp(sender_pub, snodes[i].id.pub_key, PUB_KEY_SIZE) == 0) return;
 
   /* De lokale kloktijd op ontvangstmoment (RTC = UTC -> lokaal via de TZ), met de
    * zone-afkorting (CET/CEST). Onder TIME_FLOOR: "niet gesynct". */
@@ -1941,7 +1955,7 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   const char* bot_text = reply;
   static char cbuf[512];
 
-  if (!strcasecmp(verb, "ping")) {
+  if (!strcasecmp(verb, "ping") && !*b_arg) {
     snprintf(reply, sizeof(reply), "Pong (%s)", rxt);
   } else if (!strcasecmp(verb, "path")) {
     /* Afzendernaam uit de buurtlijst (adverts); val terug op de pubkey-prefix. */
@@ -2017,9 +2031,21 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
         bot_text = cbuf;
         if (async) { _bot_cmd_wait = true; memcpy(_bot_cmd_wait_pub, sender_pub, PUB_KEY_SIZE); }
       } else {
-        snprintf(reply, sizeof(reply),
-                 "onbekend commando. probeer: list, status, get <naam>, add/edit/del, "
-                 "neighbors, wifi, sys, help - of ping/path.");
+        /* Companion-verbs horen bij de T1000-E-companion, niet bij deze node-bot.
+         * Gerichte hint i.p.v. de node-commandolijst (voorkomt de "onbekend"-verwarring). */
+        static const char* kCompVerbs[] = { "find", "findstop", "play", "tunes", "tune",
+          "vol", "mute", "quiet", "fall", "loc", "preset", "gps" };
+        bool comp = false;
+        for (unsigned i = 0; i < sizeof(kCompVerbs) / sizeof(kCompVerbs[0]); i++)
+          if (!strcasecmp(verb, kCompVerbs[i])) { comp = true; break; }
+        if (comp)
+          snprintf(reply, sizeof(reply),
+                   "'%s' is een companion-commando -> stuur het naar je companion (T1000-E), "
+                   "niet naar deze node-bot.", verb);
+        else
+          snprintf(reply, sizeof(reply),
+                   "onbekend commando. probeer: list, status, get <naam>, add/edit/del, "
+                   "neighbors, wifi, sys, help - of ping/path.");
       }
     } else {
       Serial.printf("[botcmd] van %02X%02X%02X%02X recip=0 verb=\"%s\" (geweigerd)\n",
