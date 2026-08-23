@@ -80,11 +80,16 @@
  *            De ernst is per monitor en per vaste bron (netvoeding/wifi/batterij/
  *            test) in te stellen via de web-GUI, de CLI (mon.<ch>.sev / fa.<idx>.sev)
  *            en /mon/alarm (sev). ALLEEN de DM krijgt de emoji; de room-post niet.
+ *   v2.3.12 = FIX: room-variant riep dm.loop() nooit aan (stond enkel in main.cpp,
+ *            de sensor-variant). Daardoor werd de uitgestelde uitslag van async
+ *            net-commando's (ping/dns/http/traceroute/scan <host>) in een room wel
+ *            berekend (zichtbaar in de web-GUI) maar nooit teruggepost in de room.
+ *            main_room.cpp roept nu the_mesh.dm.loop() aan na sensors.loop().
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.11"
+  #define MESHUPTIME_VERSION   "v2.3.12"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

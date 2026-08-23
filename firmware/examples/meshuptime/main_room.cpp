@@ -693,6 +693,7 @@ void loop() {
 
   the_mesh.loop();
   sensors.loop();
+  the_mesh.dm.loop();   // v2.3.12: room-variant miste dit -> uitgestelde net-cmd-uitslag (ping/dns/...) werd nooit teruggepost in de room
 #ifdef WIFI_SSID
   wifi_task.loop();
   web_task.loop();
