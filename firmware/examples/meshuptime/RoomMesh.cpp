@@ -1742,6 +1742,25 @@ void RoomMesh::sendBotAlertDM(const uint8_t* pubkey, AlertTask* t) {
 /* ------------------------------------------------------------------ */
 /*  Bot: inkomend mesh-diagnose-pad (ping / path / help)               */
 /* ------------------------------------------------------------------ */
+
+/* Verklik-achtervoegsel voor bot-antwoorden: meldt afzenders die nog met 1-byte
+ * pad-hashes zenden (path.hash.mode 0; wordt door o.a. DinX-Home gefilterd) of
+ * hun flood ZONDER scope sturen (route ROUTE_TYPE_FLOOD i.p.v. TRANSPORT_FLOOD
+ * met transport-codes). Alleen wat uit het pakket ECHT afleidbaar is:
+ *  - de hash-grootte zit in de topbits van path_len en wordt ook bij een
+ *    zero-hop FLOOD gezet (setPathHashSizeAndCount), maar een zero-hop DIRECT
+ *    pakket draagt hem niet -> dan geen oordeel;
+ *  - "geen scope" geldt alleen voor floods; een DIRECT pakket floodt niet en
+ *    heeft dus geen scope nodig. */
+static void appendTxDiag(char* reply, size_t cap, const mesh::Packet* packet) {
+  size_t o = strlen(reply);
+  bool size_known = packet->isRouteFlood() || packet->getPathHashCount() > 0;
+  if (size_known && packet->getPathHashSize() == 1 && o < cap)
+    o += snprintf(reply + o, cap - o, " | 1-byte \xF0\x9F\x98\x9E");
+  if (packet->isRouteFlood() && !packet->hasTransportCodes() && o < cap)
+    snprintf(reply + o, cap - o, " | geen scope \xF0\x9F\x98\x9E");
+}
+
 /* De bot is GEEN monitoring-console: hij is een mesh-diagnose-responder met een
  * klein eigen setje. self_id is hier al _bot_id (in onRecvPacket gezet), en het
  * gedeelde geheim is al berekend, dus we antwoorden rechtstreeks als schone DM
@@ -1821,6 +1840,10 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   } else {
     snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
   }
+
+  /* Diagnose-commando's krijgen het verklik-achtervoegsel (1-byte / geen scope). */
+  if (!strcasecmp(verb, "ping") || !strcasecmp(verb, "path"))
+    appendTxDiag(reply, sizeof(reply), packet);
 
   /* 1) ACK het inkomende bericht, zodat de app niet blijft herzenden. De ack-hash
    *    gaat over de ORIGINELE berichtbytes + de afzender-pubkey (zoals het room-pad). */
@@ -2174,6 +2197,9 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
       snprintf(reply, sizeof(reply), "@%s via %s (%d hops) | SNR %.1f dB | RSSI %d dBm | %s",
                who, route, nhops, snr_db, rssi, rxt);
   }
+
+  /* Kanaal-commando's zijn altijd diagnose -> verklik 1-byte / geen scope. */
+  appendTxDiag(reply, sizeof(reply), packet);
 
   sendChannelReply(channel, reply);
 }

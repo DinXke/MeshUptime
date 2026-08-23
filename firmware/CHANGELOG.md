@@ -7,6 +7,24 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.8 — bot verklikt 1-byte pad-hashes en ongescopete floods
+
+De ping/test/path-antwoorden van de bot (zowel DM als in-kanaal) melden nu achteraan
+hoe de afzender zond, zodat legacy-instellingen zichtbaar worden in het kanaal zelf:
+
+- ` | 1-byte 😞` — het inkomende pakket droeg 1-byte pad-hashes (afzender staat nog op
+  `path.hash.mode 0`; delen van de mesh, o.a. DinX-Home, filteren die).
+- ` | geen scope 😞` — het inkomende pakket was een ongescopete flood
+  (`ROUTE_TYPE_FLOOD` zonder transport-codes i.p.v. `TRANSPORT_FLOOD`).
+
+Detectie: `packet->getPathHashSize()` (topbits van `path_len`, ook bij zero-hop floods
+gezet door `setPathHashSizeAndCount`) en `packet->isRouteFlood() && !packet->hasTransportCodes()`.
+Twee bewuste randgevallen: een zero-hop **DIRECT** pakket draagt geen hash-grootte →
+geen `1-byte`-oordeel; en `geen scope` geldt alleen voor floods, want een direct-geroute
+DM floodt niet en heeft dus geen scope nodig. Beide vlaggen tegelijk kan.
+Implementatie: één gedeelde `appendTxDiag()` in `RoomMesh.cpp`, aangeroepen na het
+opbouwen van de reply (DM: alleen `ping`/`path`; kanaal: alle drie de commando's).
+
 ## v2.3.7 — alle alert-types onder één gegrendelde kantelaar
 
 De grendels die de vaste kanalen (netvoeding/wifi) in v2.3.5 kregen, golden nog NIET

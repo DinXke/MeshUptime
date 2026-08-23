@@ -56,11 +56,16 @@
  *            + plausibele duur, sim-merk alleen bij een echte forcering, en een
  *            gedeelde symmetrische debounce (debounceStep) -- de batterij kreeg
  *            Schmitt-hysterese (3,40/3,50 V crit, 3,60/3,70 V laag) tegen geflikker.
+ *   v2.3.8 = bot verklikt legacy-afzenders: ping/test/path-antwoorden (DM en
+ *            kanaal) krijgen " | 1-byte [sad]" als het inkomende pakket nog
+ *            1-byte pad-hashes droeg en " | geen scope [sad]" als het een
+ *            ongescopete flood was (ROUTE_TYPE_FLOOD zonder transport-codes).
+ *            Zero-hop DIRECT draagt geen hash-grootte -> daar geen oordeel.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.7"
+  #define MESHUPTIME_VERSION   "v2.3.8"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
