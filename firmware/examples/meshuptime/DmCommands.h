@@ -205,6 +205,12 @@ public:
    * aanroep geldt 1, de standaard van sendFlood(). */
   void setPathHashSize(uint8_t n) { _path_hash_size = n; }
 
+  /* Een net juist door renderReply() gestart uitgesteld resultaat NIET via loop()
+   * naar een room laten afleveren. Gebruikt door het bot-DM-commandopad: dat kwam
+   * niet uit een room (room_idx=-1) en levert de uitslag zelf af via botAdhocPoll().
+   * Raakt alleen de routing-vlaggen; de onderliggende adhoc-toestand blijft staan. */
+  void cancelPendingAdhocRouting() { _ping_wait = false; _ping_from_room = false; }
+
 private:
   mesh::Mesh*   _mesh;
   DmDataSource* _data;

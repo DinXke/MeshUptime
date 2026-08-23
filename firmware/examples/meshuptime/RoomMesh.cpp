@@ -118,6 +118,8 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   memset(_bot_recips, 0, sizeof(_bot_recips));
   _active_is_bot = false;
   _bot_match_n = 0;
+  _bot_cmd_wait = false;
+  memset(_bot_cmd_wait_pub, 0, sizeof(_bot_cmd_wait_pub));
   memset(_channels, 0, sizeof(_channels));
 
   memset(rooms, 0, sizeof(rooms));
@@ -1461,6 +1463,18 @@ void RoomMesh::loop() {
     }
   }
 
+  /* Uitgestelde net-diagnose-uitslag van een bot-DM-commando (dns/ping/traceroute/
+   * port/http/...). Alleen consumeren als WIJ hem via een bot-DM startten
+   * (_bot_cmd_wait); de room-/DM-varianten leveren hun eigen uitslag af. Cadans =
+   * de normale mesh-lus. */
+  if (_bot_active && _bot_cmd_wait) {
+    static char abuf[512];
+    if (botAdhocPoll(abuf, sizeof(abuf))) {
+      botSendTo(_bot_cmd_wait_pub, abuf);
+      _bot_cmd_wait = false;
+    }
+  }
+
   if (set_radio_at && millisHasNowPassed(set_radio_at)) {
     set_radio_at = 0;
     radio_driver.setParams(pending_freq, pending_bw, pending_sf, pending_cr);
@@ -1610,6 +1624,14 @@ int RoomMesh::botRecipCount() const {
   int n = 0;
   for (int i = 0; i < MAX_BOT_RECIPS; i++) if (_bot_recips[i].level != 0) n++;
   return n;
+}
+
+bool RoomMesh::botRecipHas(const uint8_t* pubkey) const {
+  if (!pubkey) return false;
+  for (int i = 0; i < MAX_BOT_RECIPS; i++)
+    if (_bot_recips[i].level != 0 && memcmp(_bot_recips[i].pub_key, pubkey, PUB_KEY_SIZE) == 0)
+      return true;
+  return false;
 }
 
 bool RoomMesh::botRecipGetByIdx(int idx, uint8_t* pub_out) const {
@@ -1897,6 +1919,13 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   static char reply[280];
   reply[0] = 0;
 
+  /* Volledig-commandopad (alleen voor alert-ontvangers): het antwoord kan langer
+   * zijn dan één pakket, dus dan sturen we via botSendTo() (gechunkt) i.p.v. de
+   * enkele-pakket-weg onderaan. via_bot markeert dat; bot_text wijst het aan. */
+  bool via_bot = false;
+  const char* bot_text = reply;
+  static char cbuf[512];
+
   if (!strcasecmp(verb, "ping")) {
     snprintf(reply, sizeof(reply), "Pong (%s)", rxt);
   } else if (!strcasecmp(verb, "path")) {
@@ -1951,8 +1980,48 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
     snprintf(reply, sizeof(reply),
              "mesh-diagnose-bot: `ping` -> Pong; `path` -> afzender + tussenliggende "
              "repeaters + SNR/RSSI + tijd; `help`");
+    /* Ontvangers zien ook de volledige set. Dat groeit voorbij één pakket, dus dan
+     * via botSendTo() (gechunkt). */
+    if (botRecipHas(sender_pub)) {
+      strlcat(reply, " | extra (recip): list, status, get <naam>, add/edit/del, "
+                     "neighbors, wifi, sys", sizeof(reply));
+      via_bot = true;
+      bot_text = reply;
+    }
   } else {
-    snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
+    /* Onbekend verb OF een monitoring/admin-commando. Alleen alert-ontvangers
+     * krijgen de commando's; de rest krijgt geen hint over de commandoset. */
+    if (botRecipHas(sender_pub)) {
+      cbuf[0] = 0;
+      bool async = false;
+      int n = botCommandReply(sender_pub, text, cbuf, sizeof(cbuf), async);
+      Serial.printf("[botcmd] van %02X%02X%02X%02X recip=1 verb=\"%s\" n=%d async=%d\n",
+                    sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], verb, n, (int)async);
+      if (n > 0) {
+        via_bot = true;
+        bot_text = cbuf;
+        if (async) { _bot_cmd_wait = true; memcpy(_bot_cmd_wait_pub, sender_pub, PUB_KEY_SIZE); }
+      } else {
+        snprintf(reply, sizeof(reply),
+                 "onbekend commando. probeer: list, status, get <naam>, add/edit/del, "
+                 "neighbors, wifi, sys, help - of ping/path.");
+      }
+    } else {
+      Serial.printf("[botcmd] van %02X%02X%02X%02X recip=0 verb=\"%s\" (geweigerd)\n",
+                    sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], verb);
+      snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
+    }
+  }
+
+  /* Volledig-commandopad (of uitgebreide help): ACK + gechunkt antwoord via de bot,
+   * daarna klaar -- NIET doorvallen naar de diag-suffix of de enkele-pakket-weg. */
+  if (via_bot) {
+    uint32_t ack_hash;
+    mesh::Utils::sha256((uint8_t*)&ack_hash, 4, data, 5 + strlen((char*)&data[5]), sender_pub, PUB_KEY_SIZE);
+    mesh::Packet* ack = createAck(ack_hash);
+    if (ack) sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
+    botSendTo(sender_pub, bot_text);
+    return;
   }
 
   /* Zend-diagnose achteraan, binnen wat er van de 160 tekens over is.

@@ -7,6 +7,37 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.10 — bot beantwoordt de volledige commandoset via DM (gated op de recipientlijst)
+
+De notifier-bot (`BE-HSS-DinX-Bot`) was tot nu een kleine mesh-diagnose-responder:
+over DM kende hij enkel `ping`, `path` en `help`. Vanaf nu beantwoordt hij de
+**volledige monitoring/admin-commandoset** via DM — maar **alleen** voor de
+alert-ontvangers, d.w.z. wie met zijn **volledige pubkey** in de recipientlijst
+(`_bot_recips`) staat. Dat is dezelfde lijst die de waarschuwingen krijgt.
+
+**Open voor iedereen.** `ping`, `path` en `help`/`?` blijven ongewijzigd en open
+voor elke afzender. Een niet-ontvanger die iets anders stuurt, krijgt exact de oude
+weigering (`onbekend commando. stuur \`ping\` of \`path\``) — geen hint over de
+commandoset.
+
+**Gated + volle rechten.** Voor een ontvanger draaien de commando's met **volledige
+admin-rechten**. handleBotDm bouwt daarvoor een tijdelijke `ClientInfo` (admin +
+alarmrechten, geen room-scope) en hergebruikt dezelfde `DmCommands::renderReply`-kern
+als het room- en DM-pad. Zo werken `list`/`ls`, `status`, `get <naam>`,
+`add`/`edit`/`del` en de node-/netwerk-/bedien-commando's (`neighbors`, `wifi`, `sys`,
+`history`, `dns`, `ping`, `port`, `http`, `scan`, `traceroute`, `checknow`, `mute`,
+`snooze`, `reboot`, `ntp`, ...).
+
+**Lange antwoorden + async.** Commando-antwoorden kunnen groter zijn dan één pakket
+(bv. `list`/`status`) en gaan daarom **gechunkt** via `botSendTo()`. Een uitgestelde
+net-diagnose (`dns`, `ping <host>`, `traceroute`, ...) antwoordt eerst "gestart...";
+de uitslag komt **later als aparte bot-DM** terug (de room-routing van renderReply
+wordt daarvoor geannuleerd, de bot levert zelf af via `botAdhocPoll()`). `help` toont
+een ontvanger ook de extra commando's.
+
+**Debuglogging.** Altijd-aan `[botcmd]`-regel op Serial (afzender-prefix, recip-vlag,
+verb, lengte, async).
+
 ## v2.3.9 — zend-diagnose fijnregelbaar + uitleg-URL
 
 Voortbouwend op v2.3.8, alles instelbaar op de Bot-pagina van de web-GUI:

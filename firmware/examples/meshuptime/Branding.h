@@ -69,11 +69,16 @@
  *            afgekapt: past de URL niet in de 160 tekens, dan valt hij helemaal
  *            weg -- de GUI toont daarom live per commando hoeveel tekens er nog
  *            in passen (handig bij een shortener).
+ *   v2.3.10 = de bot beantwoordt nu de VOLLEDIGE monitoring/admin-commandoset via
+ *            DM, maar enkel voor de alert-ontvangers (volledige pubkey in de
+ *            recipientlijst). ping/path/help blijven open voor iedereen; de
+ *            commando's draaien met volle admin-rechten. Async net-diagnostiek
+ *            (dns/ping/...) komt via een aparte bot-DM terug. [botcmd]-debuglogging.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.9"
+  #define MESHUPTIME_VERSION   "v2.3.10"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

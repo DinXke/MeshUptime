@@ -297,6 +297,35 @@ protected:
     return dm.renderReply(*from, room_idx, line, out, out_len);
   }
 
+  /* BOT-DM-COMMANDOPAD. handleBotDm heeft de afzender al tegen _bot_recips
+   * gecontroleerd, dus hier draaien we met VOLLE admin-rechten. We bouwen een
+   * tijdelijke ClientInfo (STATIC: weg van de 16 KB loopTask-stapel) met alleen wat
+   * renderReply leest: isAdmin() + de rol-bits + alarmrechten. Geen scope
+   * (room_idx=-1). Loopt er een uitgestelde net-diagnose, dan de room-routing van
+   * renderReply annuleren -- wij leveren de uitslag zelf af via botAdhocPoll(). */
+  int botCommandReply(const uint8_t* sender_pub, const char* line,
+                      char* out, size_t out_len, bool& async_started) override {
+    static ClientInfo tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    tmp.id = mesh::Identity(sender_pub);
+    tmp.permissions = PERM_ACL_ADMIN | PERM_RECV_ALERTS_LO | PERM_RECV_ALERTS_HI;
+    tmp.out_path_len = OUT_PATH_UNKNOWN;
+    async_started = false;
+    int n = dm.renderReply(tmp, -1 /*geen room-scope*/, line, out, out_len);
+    if (dm_source.dmAdhocState() != 0 && !dm_source.dmAdhocReady()) {
+      async_started = true;
+      dm.cancelPendingAdhocRouting();
+    }
+    return n;
+  }
+
+  bool botAdhocPoll(char* out, size_t out_len) override {
+    if (!dm_source.dmAdhocReady()) return false;
+    StrHelper::strncpy(out, dm_source.dmAdhocResult(), out_len);
+    dm_source.dmAdhocClear();
+    return true;
+  }
+
 public:
   void beginApp() {
     for (int i = 0; i < MonitorSensors::MAX_MONITORS; i++) { st_mon_down[i] = false; st_mon_ann[i] = false; }

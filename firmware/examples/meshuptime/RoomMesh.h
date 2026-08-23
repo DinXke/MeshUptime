@@ -466,6 +466,9 @@ public:
   bool botRecipGetByIdx(int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
   int  botRecipAdd(const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
   int  botRecipDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet gevonden, -3 dubbelzinnig
+  /* Staat deze VOLLEDIGE pubkey (actief) in de ontvangerslijst? Bepaalt of de bot
+   * de volledige monitoring/admin-commandoset over DM voor deze afzender uitvoert. */
+  bool botRecipHas(const uint8_t* pubkey) const;
   int  botSendTo(const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
   int  botPost(const char* text);                              // aantal aangeschreven, <0 fout
 
@@ -553,6 +556,22 @@ protected:
     (void)from; (void)room_idx; (void)line; (void)out; (void)out_len; return 0;
   }
 
+  /* ---- app-hook: de bot beantwoordt de VOLLEDIGE monitoring/admin-commandoset
+   * over DM voor een alert-ontvanger (pubkey in _bot_recips). handleBotDm roept dit
+   * aan met VOLLE admin-rechten (main_room.cpp bouwt een tijdelijke ClientInfo). De
+   * lengte van 'out' terug (0 = geen herkend commando). Zet async_started=true als
+   * er een uitgestelde net-diagnose loopt; de uitslag komt dan later via
+   * botAdhocPoll(). Standaard: niets (de sensor-variant kent geen DmCommands). */
+  virtual int botCommandReply(const uint8_t* sender_pub, const char* line,
+                              char* out, size_t out_len, bool& async_started) {
+    (void)sender_pub; (void)line; (void)out; (void)out_len; async_started = false; return 0;
+  }
+  /* Uitgestelde net-diagnose-uitslag ophalen (na botCommandReply met async). true +
+   * tekst in 'out' zodra klaar; anders false. */
+  virtual bool botAdhocPoll(char* out, size_t out_len) {
+    (void)out; (void)out_len; return false;
+  }
+
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() { sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0"); }
 #endif
@@ -596,6 +615,12 @@ private:
    * getPeerSharedSecret/onPeerDataRecv lezen het. MEMBER, niet op de stapel. */
   uint8_t       _bot_match_pub[4][PUB_KEY_SIZE];
   int           _bot_match_n;
+
+  /* Wacht op een uitgestelde net-diagnose-uitslag die via een bot-DM-commando is
+   * gestart (botCommandReply meldde async). De uitslag wordt via botAdhocPoll()
+   * opgehaald en met botSendTo() naar deze pubkey teruggestuurd. */
+  bool          _bot_cmd_wait = false;
+  uint8_t       _bot_cmd_wait_pub[PUB_KEY_SIZE];
 
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
   BotChannel    _channels[MAX_CHANNELS];
