@@ -162,6 +162,37 @@
   #define MAX_POST_TEXT_LEN   (160 - 9)   /* 151, gelijk aan de room-server */
 #endif
 
+/* MeshCore's tekstlimiet voor één bericht (BaseChatMesh MAX_TEXT_LEN, 10 cipher-
+ * blokken). Hier los gedefinieerd: RoomMesh includeert BaseChatMesh niet. */
+#ifndef BOT_MAX_TEXT_LEN
+  #define BOT_MAX_TEXT_LEN    160
+#endif
+
+/* Uitleg-URL achter "geen scope" in de zend-diagnose. Ruim genoeg voor een
+ * gewone docs-link; de bot kapt de URL NOOIT af (zie buildTxDiag). */
+#ifndef MAX_DIAG_URL_LEN
+  #define MAX_DIAG_URL_LEN    96
+#endif
+#ifndef DEFAULT_DIAG_URL
+  #define DEFAULT_DIAG_URL    "https://nodenet.be/instellingen/regio-en-scope/"
+#endif
+
+/* Per welk bot-commando de zend-diagnose achter het antwoord komt. */
+#define DIAG_PING   0x01
+#define DIAG_TEST   0x02
+#define DIAG_PATH   0x04
+#define DIAG_ALL    (DIAG_PING | DIAG_TEST | DIAG_PATH)
+
+/* Hoe de uitleg-URL bij een ongescopet pakket meegaat. INLINE kan wegvallen als
+ * het antwoord al tegen de 160 tekens zit; SEPARATE past altijd. */
+#define DIAG_URL_OFF        0
+#define DIAG_URL_INLINE     1
+#define DIAG_URL_SEPARATE   2
+
+#ifndef DIAG_URL_MSG_PREFIX
+  #define DIAG_URL_MSG_PREFIX  "Meer info over regions en scopes: "
+#endif
+
 #ifndef ADVERT_LAT
   #define ADVERT_LAT   0.0
 #endif
@@ -400,8 +431,17 @@ public:
   }
   int         webBotSendTo(const char* pub_hex, const char* text) override;
   int         webBotPost(const char* text) override { return botPost(text); }
-  bool        webBotDiag() override { return _bot_diag; }
-  bool        webBotSetDiag(bool en) override { setBotDiag(en); return true; }
+  int         webBotDiagMask() override { return _bot_diag_mask; }
+  bool        webBotSetDiagMask(int mask) override {
+    setBotDiagMask((uint8_t)(mask & DIAG_ALL)); return true;
+  }
+  int         webBotDiagUrlMode() override { return _bot_diag_url_mode; }
+  const char* webBotDiagUrl() override     { return _bot_diag_url; }
+  bool        webBotSetDiagUrl(int mode, const char* url) override {
+    setBotDiagUrl((uint8_t)mode, url); return true;
+  }
+  int         webBotDiagUrlBudget(int kind) override { return diagUrlBudget(kind); }
+  int         webBotDiagUrlMax() override { return MAX_DIAG_URL_LEN; }
 
   /* ---- IWebNode: hashtag-/publieke kanalen ---- */
   int  webChannelMax() override   { return channelMax(); }
@@ -415,8 +455,13 @@ public:
 
   /* ---- Bot: publieke API (CLI + intern) ---- */
   bool botActive() const { return _bot_active; }
-  bool botDiag() const { return _bot_diag; }
-  void setBotDiag(bool en);   // persistent (zelfde bestand als de ontvangerslijst)
+  uint8_t botDiagMask() const { return _bot_diag_mask; }
+  void setBotDiagMask(uint8_t mask);   // persistent (bij de ontvangerslijst)
+  uint8_t botDiagUrlMode() const { return _bot_diag_url_mode; }
+  const char* botDiagUrl() const { return _bot_diag_url; }
+  void setBotDiagUrl(uint8_t mode, const char* url);  // url==NULL laat de huidige staan
+  /* Max. URL-lengte die INLINE nog past. kind: 0=ping, 1=test, 2=path. */
+  int  diagUrlBudget(int kind) const;
   int  botRecipCount() const;
   bool botRecipGetByIdx(int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
   int  botRecipAdd(const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
@@ -535,7 +580,9 @@ private:
    * gewone advert-timers, zichtbaar in de MeshCore-app als gewoon chatcontact. */
   mesh::LocalIdentity _bot_id;
   bool          _bot_active;
-  bool          _bot_diag;    // verklikker (1-byte/geen scope) in ping/test/path-antwoorden
+  uint8_t       _bot_diag_mask;   // zend-diagnose per commando: bit0 ping, 1 test, 2 path
+  uint8_t       _bot_diag_url_mode;  // DIAG_URL_OFF / _INLINE / _SEPARATE
+  char          _bot_diag_url[MAX_DIAG_URL_LEN + 1];
   char          _bot_name[24];
   unsigned long _bot_next_local_advert, _bot_next_flood_advert;
   BotRecip      _bot_recips[MAX_BOT_RECIPS];
@@ -618,6 +665,14 @@ private:
   void          loadOrCreateBotIdentity();
   void          saveBotRecips();
   void          loadBotRecips();
+  /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.
+   * `kind`: 0=ping, 1=test, 2=path (bepaalt of het masker dit type toelaat). */
+  size_t        buildTxDiag(char* out, size_t cap, size_t budget,
+                            const mesh::Packet* packet, int kind) const;
+  /* Los uitleg-bericht ("Meer info ...: <url>") als DIAG_URL_SEPARATE aan staat
+   * en dit pakket ongescoped was. Retour = lengte, 0 = niets sturen. */
+  size_t        buildDiagUrlMsg(char* out, size_t cap,
+                                const mesh::Packet* packet, int kind) const;
   mesh::Packet* createBotAdvert();
   void          sendBotAdvertisement(int delay_millis, bool flood);
   int           botRecipFindFree() const;
@@ -639,7 +694,8 @@ private:
   void          handleChannelText(mesh::Packet* packet, const mesh::GroupChannel& channel,
                                   const char* text);
   /* Bouwen + IN het kanaal versturen: "<botnaam>: <reply>". */
-  void          sendChannelReply(const mesh::GroupChannel& channel, const char* reply);
+  void          sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
+                                 uint32_t delay_millis = SERVER_RESPONSE_DELAY);
 
   /* ---- adverts + telemetrie voor sensor-nodes ---- */
   mesh::Packet* createSensorNodeAdvert(RoomSlot& slot);

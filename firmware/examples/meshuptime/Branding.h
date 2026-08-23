@@ -62,11 +62,18 @@
  *            transport-codes vs. kale ROUTE_TYPE_FLOOD). Onafhankelijke oordelen,
  *            dus mengelingen komen voor. Zero-hop DIRECT draagt geen hash-grootte
  *            -> daar geen oordeel. Aan/uit via de GUI (Bot-pagina), standaard AAN.
+ *   v2.3.9 = zend-diagnose fijnregelbaar in de GUI: PER COMMANDO aan/uit (masker
+ *            ping/test/path) en een uitleg-URL bij "geen scope" in drie standen
+ *            (uit / inline tussen haakjes / apart geflood kanaalbericht "Meer
+ *            info over regions en scopes: <url>"). Inline wordt NOOIT half
+ *            afgekapt: past de URL niet in de 160 tekens, dan valt hij helemaal
+ *            weg -- de GUI toont daarom live per commando hoeveel tekens er nog
+ *            in passen (handig bij een shortener).
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.8"
+  #define MESHUPTIME_VERSION   "v2.3.9"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

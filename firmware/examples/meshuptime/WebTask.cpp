@@ -1798,10 +1798,34 @@ en zet jezelf op de ontvangerslijst.</p>
 <div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Advert nu:</span>
 <button type="button" onclick="botAdvert(1)">flood</button>
 <button type="button" onclick="botAdvert(0)">zero-hop</button></div>
-<div class="quick" style="margin-top:.35rem"><label style="align-self:center">
-<input type="checkbox" id="bot-diag"> zend-diagnose achter ping/test/path-antwoorden:
-<code>2-byte</code>&#128077;/<code>1-byte</code>&#128542; en <code>scoped</code>&#128077;/<code>geen scope</code>&#128542;</label></div>
 <div id="botmsg"></div></div>
+
+<h2>Zend-diagnose &mdash; hoe de afzender zond</h2>
+<p class="why"><b>Wat het doet:</b> achter een bot-antwoord komt hoe het binnenkomende
+pakket verstuurd was: <code>2-byte</code>&#128077; of <code>1-byte</code>&#128542;
+(pad-hashgrootte) en <code>scoped</code>&#128077; of <code>geen scope</code>&#128542;.
+Twee losse oordelen, dus mengelingen komen voor. In een kanaal leest iedereen mee dat
+1-byte en ongescoped niet meer de bedoeling zijn.</p>
+<div class="card">
+<div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Toon bij:</span>
+<label><input type="checkbox" id="dg-ping"> ping</label>
+<label><input type="checkbox" id="dg-test"> test</label>
+<label><input type="checkbox" id="dg-path"> path</label></div>
+<div class="frow" style="margin-top:.45rem">
+<select id="dg-urlmode" style="width:auto">
+<option value="0">geen uitleg-URL</option>
+<option value="1">URL inline, tussen haakjes</option>
+<option value="2">URL als apart bericht in het kanaal</option></select>
+<input id="dg-url" placeholder="https://&hellip;" spellcheck="false" style="flex:1;min-width:12rem"></div>
+<div id="dg-fit" class="note" style="margin-top:.3rem"></div>
+<div class="quick" style="margin-top:.35rem"><button type="button" id="dg-save">bewaren</button></div>
+<div id="dgmsg"></div>
+<p class="note">De URL verschijnt alleen bij een <b>ongescopet</b> pakket. <b>Inline</b>
+past hem tussen haakjes achter <code>geen scope</code>, maar een antwoord mag hoogstens
+160&nbsp;tekens zijn &mdash; past de link er niet helemaal in, dan laat de bot hem
+<i>volledig</i> weg (nooit een halve link). <b>Apart bericht</b> heeft die last niet en
+werkt dus ook bij lange <code>path</code>-antwoorden; dat gaat als losse post naar het
+kanaal waar het commando vandaan kwam.</p></div>
 
 <h2>Ontvangers &mdash; wie de DM's krijgt</h2>
 <div class="card pad0"><table id="botrl"></table></div>
@@ -3429,7 +3453,13 @@ document.getElementById("bot-name").textContent=d.name;
 var kp=document.getElementById("bot-pub");kp.textContent=d.pub.slice(0,8)+"…"+d.pub.slice(-4);
 kp.title=d.pub+"  (klik om te kopiëren)";kp.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(d.pub)};
 document.getElementById("bot-uri").value=d.uri||"";
-var dg=document.getElementById("bot-diag");if(dg)dg.checked=!!d.diag;
+var m=d.diag||0;
+document.getElementById("dg-ping").checked=!!(m&1);
+document.getElementById("dg-test").checked=!!(m&2);
+document.getElementById("dg-path").checked=!!(m&4);
+document.getElementById("dg-urlmode").value=String(d.durlmode||0);
+document.getElementById("dg-url").value=d.durl||"";
+DFIT=d.dfit||[0,0,0];DURLMAX=d.durlmax||0;dgFit();
 try{drawQRon("bqr",d.uri)}catch(e){}
 botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)});
 channelsLoad()}
@@ -3466,12 +3496,39 @@ headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"flood="+(floo
 bmsg("botmsg",j.ok?("bot-advert verstuurd ("+(flood?"flood":"zero-hop")+")"):"mislukt",j.ok?1:0)})
 .catch(function(){bmsg("botmsg","mislukt",0)})}
 document.getElementById("bot-add").onclick=botAdd;
-document.getElementById("bot-diag").onchange=function(){var en=this.checked?1:0;
+
+/* ---- zend-diagnose: vinkjes, URL-modus en het live ruimte-tellertje ---- */
+var DFIT=[0,0,0],DURLMAX=0;
+function dgFit(){var e=document.getElementById("dg-fit");if(!e)return;
+var u=document.getElementById("dg-url").value.trim();
+var mode=document.getElementById("dg-urlmode").value;
+if(mode=="0"){e.textContent="Geen URL in de antwoorden.";e.style.color="var(--muted)";return}
+if(mode=="2"){e.textContent="Apart bericht: lengte speelt geen rol (past altijd). "
++u.length+" van max "+DURLMAX+" tekens gebruikt.";
+e.style.color=(u.length>DURLMAX?"var(--red)":"var(--muted)");return}
+/* inline: per commando tonen hoeveel er nog in past */
+var names=["ping","test","path"],fits=[],miss=[];
+for(var i=0;i<3;i++){if(u.length<=DFIT[i])fits.push(names[i]+" (≤"+DFIT[i]+")");
+else miss.push(names[i]+" (≤"+DFIT[i]+")")}
+var t="URL is "+u.length+" tekens. Past inline bij: "+(fits.length?fits.join(", "):"geen enkel commando");
+if(miss.length)t+=" — weggelaten bij: "+miss.join(", ");
+e.textContent=t;e.style.color=miss.length?"var(--amber)":"var(--accent)"}
+document.getElementById("dg-url").oninput=dgFit;
+document.getElementById("dg-urlmode").onchange=dgFit;
+document.getElementById("dg-save").onclick=function(){
+var m=(document.getElementById("dg-ping").checked?1:0)
+|(document.getElementById("dg-test").checked?2:0)
+|(document.getElementById("dg-path").checked?4:0);
+var mode=document.getElementById("dg-urlmode").value;
+var u=document.getElementById("dg-url").value.trim();
+if(u.length>DURLMAX){bmsg("dgmsg","URL te lang (max "+DURLMAX+" tekens)",0);return}
 fetch("bot/diag",{method:"POST",credentials:"include",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"enabled="+en})
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"mask="+m+"&urlmode="+mode+"&url="+encodeURIComponent(u)})
 .then(function(r){return r.json()}).then(function(j){
-bmsg("botmsg",j.ok?("verklikker "+(en?"aan":"uit")):"mislukt",j.ok?1:0)})
-.catch(function(){bmsg("botmsg","mislukt",0)})};
+if(j.ok){DFIT=j.dfit||DFIT;dgFit();bmsg("dgmsg","bewaard",1)}
+else bmsg("dgmsg","mislukt: "+(j.error||""),0)})
+.catch(function(){bmsg("dgmsg","mislukt",0)})};
 document.getElementById("bot-copy").onclick=function(){
 var i=document.getElementById("bot-uri");i.focus();i.select();
 if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -5491,10 +5548,16 @@ void WebTask::handleBotJson() {
   char pub[PUB_KEY_SIZE * 2 + 1] = {0}; _acl->webBotPubHex(pub, sizeof(pub));
   char uri[200] = {0}; _acl->webBotJoinUri(uri, sizeof(uri));
   char euri[300]; jsonEscape(uri, euri, sizeof(euri));
+  char durl[220]; jsonEscape(_acl->webBotDiagUrl(), durl, sizeof(durl));
 
   int n = snprintf(g_json, sizeof(g_json),
-      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,\"diag\":%d,\"recips\":[",
-      name, pub, euri, _acl->webBotRecipMax(), _acl->webBotDiag() ? 1 : 0);
+      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,"
+      "\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"durlmax\":%d,\"dfit\":[%d,%d,%d],"
+      "\"recips\":[",
+      name, pub, euri, _acl->webBotRecipMax(),
+      _acl->webBotDiagMask(), _acl->webBotDiagUrlMode(), durl,
+      _acl->webBotDiagUrlMax(),
+      _acl->webBotDiagUrlBudget(0), _acl->webBotDiagUrlBudget(1), _acl->webBotDiagUrlBudget(2));
   int cnt = _acl->webBotRecipCount();
   char rk[PUB_KEY_SIZE * 2 + 1];
   for (int i = 0; i < cnt; i++) {
@@ -5585,19 +5648,41 @@ void WebTask::handleBotPost() {
   _server->send(400, "application/json", "{\"ok\":false,\"error\":\"wachtrij vol of geen ontvangers\"}");
 }
 
-/* POST /bot/diag  (enabled=0/1) -- verklikker (1-byte/geen scope + droevige
- * smiley achter ping/test/path-antwoorden) aan/uit; persistent op de node. */
+/* POST /bot/diag -- zend-diagnose instellen; persistent op de node.
+ *   mask=<0-7>    bit0 ping, bit1 test, bit2 path (0 = helemaal uit)
+ *   urlmode=0..2  0=geen URL, 1=inline tussen haakjes, 2=apart kanaalbericht
+ *   url=<tekst>   de URL zelf (leeg = ongewijzigd laten)
+ * Elk veld is optioneel; wat ontbreekt blijft staan. */
 void WebTask::handleBotDiag() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
-  char en[4];
-  if (!getArg(*_server, "enabled", en, sizeof(en)) || en[0] == 0) {
-    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"enabled ontbreekt\"}");
+
+  bool any = false;
+  char buf[8];
+  if (getArg(*_server, "mask", buf, sizeof(buf)) && buf[0]) {
+    _acl->webBotSetDiagMask(atoi(buf));
+    any = true;
+  }
+  char url[256];
+  bool have_url = getArg(*_server, "url", url, sizeof(url));
+  if (getArg(*_server, "urlmode", buf, sizeof(buf)) && buf[0]) {
+    _acl->webBotSetDiagUrl(atoi(buf), have_url && url[0] ? url : NULL);
+    any = true;
+  } else if (have_url && url[0]) {
+    _acl->webBotSetDiagUrl(_acl->webBotDiagUrlMode(), url);
+    any = true;
+  }
+  if (!any) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"niets op te geven\"}");
     return;
   }
-  _acl->webBotSetDiag(en[0] == '1');
-  char out[48];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"diag\":%d}", _acl->webBotDiag() ? 1 : 0);
+
+  char eurl[220]; jsonEscape(_acl->webBotDiagUrl(), eurl, sizeof(eurl));
+  char out[320];
+  snprintf(out, sizeof(out),
+      "{\"ok\":true,\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"dfit\":[%d,%d,%d]}",
+      _acl->webBotDiagMask(), _acl->webBotDiagUrlMode(), eurl,
+      _acl->webBotDiagUrlBudget(0), _acl->webBotDiagUrlBudget(1), _acl->webBotDiagUrlBudget(2));
   _server->send(200, "application/json", out);
 }
 

@@ -158,8 +158,17 @@ public:
   virtual int  webBotPost(const char* text) { (void)text; return -1; }
   /* Verklikker in ping/test/path-antwoorden ("1-byte"/"geen scope" + droevige
    * smiley) aan/uit. Persistent op de node. */
-  virtual bool webBotDiag()           { return false; }
-  virtual bool webBotSetDiag(bool en) { (void)en; return false; }
+  /* Masker: bit0 ping, bit1 test, bit2 path. 0 = zend-diagnose helemaal uit. */
+  virtual int  webBotDiagMask()          { return 0; }
+  virtual bool webBotSetDiagMask(int m)  { (void)m; return false; }
+  /* Uitleg-URL bij "geen scope": 0=uit, 1=inline tussen haakjes, 2=apart bericht. */
+  virtual int  webBotDiagUrlMode()    { return 0; }
+  virtual const char* webBotDiagUrl() { return ""; }
+  virtual bool webBotSetDiagUrl(int mode, const char* url) { (void)mode; (void)url; return false; }
+  /* Max. URL-lengte die nog in een antwoord past (0=ping, 1=test, 2=path), en de
+   * harde veldlimiet. De GUI toont daarmee live of een (verkorte) URL past. */
+  virtual int  webBotDiagUrlBudget(int kind) { (void)kind; return 0; }
+  virtual int  webBotDiagUrlMax()            { return 0; }
 
   /* ---- HASHTAG-/PUBLIEKE KANALEN (web-GUI) ----------------------------------
    * De bot leest de ingeschakelde kanalen mee en antwoordt IN het kanaal op

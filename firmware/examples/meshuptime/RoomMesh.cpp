@@ -110,7 +110,9 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   _post_cb = NULL;
   _post_cb_ctx = NULL;
   _bot_active = false;
-  _bot_diag = true;   // verklikker standaard AAN; persistente stand komt uit loadBotRecips()
+  _bot_diag_mask = DIAG_ALL;   // standaard bij alle drie; stand komt uit loadBotRecips()
+  _bot_diag_url_mode = DIAG_URL_SEPARATE;
+  StrHelper::strncpy(_bot_diag_url, DEFAULT_DIAG_URL, sizeof(_bot_diag_url));
   _bot_name[0] = 0;
   _bot_next_local_advert = _bot_next_flood_advert = 0;
   memset(_bot_recips, 0, sizeof(_bot_recips));
@@ -1654,8 +1656,11 @@ void RoomMesh::saveBotRecips() {
   File f = _fs->open(BOT_RECIPS_PATH, "w", true);
   if (!f) return;
   f.printf("#MUBOT1\n");
-  /* Verklikker-stand als extra regeltype 'd'; oude parsers slaan 'm gewoon over. */
-  f.printf("d %d\n", _bot_diag ? 1 : 0);
+  /* Zend-diagnose als extra regeltypes; oude parsers slaan ze gewoon over.
+   *   d <masker>        bit0 ping, bit1 test, bit2 path
+   *   u <modus> <url>   0=uit, 1=inline, 2=apart bericht */
+  f.printf("d %d\n", (int)_bot_diag_mask);
+  f.printf("u %d %s\n", (int)_bot_diag_url_mode, _bot_diag_url);
   char hex[PUB_KEY_SIZE * 2 + 1];
   for (int i = 0; i < MAX_BOT_RECIPS; i++) {
     if (_bot_recips[i].level == 0) continue;
@@ -1670,7 +1675,8 @@ void RoomMesh::loadBotRecips() {
   if (_fs == NULL || !_fs->exists(BOT_RECIPS_PATH)) return;
   File f = _fs->open(BOT_RECIPS_PATH, "r");
   if (!f) return;
-  char line[96];
+  /* Ruim genoeg voor de langste regel: "u 1 " + een URL van MAX_DIAG_URL_LEN. */
+  char line[MAX_DIAG_URL_LEN + 32];
   bool first = true;
   int bi = 0;
   memset(_bot_recips, 0, sizeof(_bot_recips));
@@ -1684,7 +1690,20 @@ void RoomMesh::loadBotRecips() {
     }
     line[len] = 0;
     if (first) { first = false; continue; }
-    if (line[0] == 'd' && line[1] == ' ') { _bot_diag = atoi(line + 2) != 0; continue; }
+    if (line[0] == 'd' && line[1] == ' ') {
+      /* Legacy: "d 1" was de enkele aan/uit-schakelaar -> alle drie aan. */
+      int v = atoi(line + 2);
+      _bot_diag_mask = (v == 1) ? DIAG_ALL : (uint8_t)(v & DIAG_ALL);
+      continue;
+    }
+    if (line[0] == 'u' && line[1] == ' ') {
+      char* p = line + 2;
+      int m = atoi(p);
+      _bot_diag_url_mode = (m < 0 || m > DIAG_URL_SEPARATE) ? DIAG_URL_OFF : (uint8_t)m;
+      while (*p && *p != ' ') p++; while (*p == ' ') p++;
+      if (*p) StrHelper::strncpy(_bot_diag_url, p, sizeof(_bot_diag_url));
+      continue;
+    }
     if (line[0] != 'b') continue;
     char* p = line + 1;
     while (*p == ' ') p++;
@@ -1701,9 +1720,55 @@ void RoomMesh::loadBotRecips() {
   f.close();
 }
 
-void RoomMesh::setBotDiag(bool en) {
-  _bot_diag = en;
+void RoomMesh::setBotDiagMask(uint8_t mask) {
+  _bot_diag_mask = mask & DIAG_ALL;
   saveBotRecips();
+}
+
+/* Los uitleg-bericht, alleen bij DIAG_URL_SEPARATE en een ongescopet pakket.
+ * Dit gaat als TWEEDE bericht de lucht in, dus het botst niet met de 160-teken-
+ * limiet van het antwoord zelf -- juist daarom is dit de betrouwbare stand voor
+ * lange path-antwoorden. */
+size_t RoomMesh::buildDiagUrlMsg(char* out, size_t cap,
+                                 const mesh::Packet* packet, int kind) const {
+  out[0] = 0;
+  if (_bot_diag_url_mode != DIAG_URL_SEPARATE || !_bot_diag_url[0]) return 0;
+  if (kind < 0 || kind > 2 || !(_bot_diag_mask & (1 << kind))) return 0;
+  if (!packet->isRouteFlood() || packet->hasTransportCodes()) return 0;  // was gescoped
+  int n = snprintf(out, cap, "%s%s", DIAG_URL_MSG_PREFIX, _bot_diag_url);
+  if (n < 0) { out[0] = 0; return 0; }
+  return (size_t)n >= cap ? cap - 1 : (size_t)n;
+}
+
+void RoomMesh::setBotDiagUrl(uint8_t mode, const char* url) {
+  _bot_diag_url_mode = (mode > DIAG_URL_SEPARATE) ? DIAG_URL_SEPARATE : mode;
+  if (url) StrHelper::strncpy(_bot_diag_url, url, sizeof(_bot_diag_url));
+  saveBotRecips();
+}
+
+/* Hoeveel tekens mag de uitleg-URL hoogstens zijn om nog te PASSEN in een
+ * antwoord van dit type? De GUI toont dat live naast het URL-veld, zodat een
+ * verkorte link meetbaar is i.p.v. giswerk.
+ *
+ * Pessimistisch gerekend op het KANAAL-pad (dat heeft "<botnaam>: " ervoor, dus
+ * het is krapper dan een DM) met maximale veldbreedtes. Klopt de schatting niet
+ * precies, dan is het gevolg hooguit dat de URL in een enkel geval toch nog
+ * past terwijl de GUI "nee" zei -- buildTxDiag() beslist uiteindelijk zelf, en
+ * laat de URL altijd HEEL weg als hij niet past. */
+int RoomMesh::diagUrlBudget(int kind) const {
+  const int WHO  = 23;   // sender[24]
+  const int TIME = 20;   // fmtLocalHMS, bv. "14:22:10 CEST"
+  const int FLAGS = 33;  // " | 3-byte [duim]" (14) + " | geen scope [sad]" (19)
+  const int ROUTE = 55;  // elastische repeaterlijst, gekapt op ~50 + "…"
+  int base;
+  switch (kind) {
+    case 0:  base = 1 + WHO + 7 + TIME + 1; break;                       // ping
+    case 1:  base = 1 + WHO + 49 + TIME + 1; break;                      // test
+    default: base = 1 + WHO + 5 + ROUTE + 11 + 15 + 16 + 3 + TIME; break; // path
+  }
+  int prefix = (int)strlen(_bot_name[0] ? _bot_name : "bot") + 2;
+  int left = (int)BOT_MAX_TEXT_LEN - prefix - base - FLAGS - 3;   // 3 = " ()"
+  return left < 0 ? 0 : left;
 }
 
 /* Advert als CHAT-contact (type=1), zodat de MeshCore-app de bot als gewoon
@@ -1755,28 +1820,59 @@ void RoomMesh::sendBotAlertDM(const uint8_t* pubkey, AlertTask* t) {
 /* Zend-diagnose-achtervoegsel voor bot-antwoorden: duim omhoog voor moderne
  * afzenders (2-byte pad-hashes, gescopete flood), droevige smiley voor legacy
  * (1-byte hashes -- worden door o.a. DinX-Home gefilterd -- of een flood zonder
- * scope: ROUTE_TYPE_FLOOD i.p.v. TRANSPORT_FLOOD met transport-codes). Alleen
- * wat uit het pakket ECHT afleidbaar is:
+ * scope: ROUTE_TYPE_FLOOD i.p.v. TRANSPORT_FLOOD met transport-codes). Achter
+ * "geen scope" komt optioneel een uitleg-URL tussen haakjes.
+ *
+ * Alleen wat uit het pakket ECHT afleidbaar is:
  *  - de hash-grootte zit in de topbits van path_len en wordt ook bij een
  *    zero-hop FLOOD gezet (setPathHashSizeAndCount), maar een zero-hop DIRECT
  *    pakket draagt hem niet -> dan geen oordeel;
  *  - het scope-oordeel geldt alleen voor floods; een DIRECT pakket floodt niet
- *    en heeft dus geen scope nodig. */
-static void appendTxDiag(char* reply, size_t cap, const mesh::Packet* packet) {
-  size_t o = strlen(reply);
-  bool size_known = packet->isRouteFlood() || packet->getPathHashCount() > 0;
-  if (size_known && o < cap) {
-    if (packet->getPathHashSize() >= 2)
-      o += snprintf(reply + o, cap - o, " | %d-byte \xF0\x9F\x91\x8D", (int)packet->getPathHashSize());
-    else
-      o += snprintf(reply + o, cap - o, " | 1-byte \xF0\x9F\x98\x9E");
+ *    en heeft dus geen scope nodig.
+ *
+ * De beide oordelen zijn ONAFHANKELIJK (verschillende pakketvelden), dus een
+ * mengeling als "2-byte [duim] | geen scope [sad]" is normaal.
+ *
+ * `budget` = het aantal bytes dat er binnen de 160-tekenlimiet nog BIJ mag. De
+ * korte oordelen krijgen voorrang; de (lange) URL komt er alleen bij als hij er
+ * HELEMAAL in past. Zo levert een lang path-antwoord hooguit geen URL op, nooit
+ * een halve, kapotte link. Retour = de lengte van het achtervoegsel. */
+size_t RoomMesh::buildTxDiag(char* out, size_t cap, size_t budget,
+                             const mesh::Packet* packet, int kind) const {
+  out[0] = 0;
+  if (cap == 0) return 0;
+  if (kind < 0 || kind > 2) return 0;
+  if (!(_bot_diag_mask & (1 << kind))) return 0;   // dit commando staat uit
+  if (budget > cap - 1) budget = cap - 1;
+  size_t o = 0;
+
+  /* Pad-hashgrootte. Een zero-hop DIRECT pakket draagt hem niet -> geen oordeel. */
+  if (packet->isRouteFlood() || packet->getPathHashCount() > 0) {
+    char f[24];
+    int n = (packet->getPathHashSize() >= 2)
+          ? snprintf(f, sizeof(f), " | %d-byte \xF0\x9F\x91\x8D", (int)packet->getPathHashSize())
+          : snprintf(f, sizeof(f), " | 1-byte \xF0\x9F\x98\x9E");
+    if (n > 0 && o + (size_t)n <= budget) { memcpy(out + o, f, n); o += n; out[o] = 0; }
   }
-  if (packet->isRouteFlood() && o < cap) {
-    if (packet->hasTransportCodes())
-      snprintf(reply + o, cap - o, " | scoped \xF0\x9F\x91\x8D");
-    else
-      snprintf(reply + o, cap - o, " | geen scope \xF0\x9F\x98\x9E");
+
+  /* Scope -- alleen zinvol voor floods; een DIRECT pakket floodt niet. */
+  if (packet->isRouteFlood()) {
+    if (packet->hasTransportCodes()) {
+      const char* f = " | scoped \xF0\x9F\x91\x8D";
+      size_t n = strlen(f);
+      if (o + n <= budget) { memcpy(out + o, f, n); o += n; out[o] = 0; }
+    } else {
+      const char* f = " | geen scope \xF0\x9F\x98\x9E";
+      size_t n = strlen(f);
+      if (o + n <= budget) { memcpy(out + o, f, n); o += n; out[o] = 0; }
+      /* Uitleg-URL tussen haakjes -- alles of niets. */
+      if (_bot_diag_url_mode == DIAG_URL_INLINE && _bot_diag_url[0]) {
+        size_t un = strlen(_bot_diag_url) + 3;   // " (" + url + ")"
+        if (o + un <= budget) o += snprintf(out + o, cap - o, " (%s)", _bot_diag_url);
+      }
+    }
   }
+  return o;
 }
 
 /* De bot is GEEN monitoring-console: hij is een mesh-diagnose-responder met een
@@ -1798,7 +1894,7 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   uint32_t now_s = getRTCClock()->getCurrentTime();
   char rxt[40]; fmtLocalHMS(now_s, rxt, sizeof(rxt));
 
-  static char reply[200];
+  static char reply[280];
   reply[0] = 0;
 
   if (!strcasecmp(verb, "ping")) {
@@ -1859,10 +1955,17 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
     snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
   }
 
-  /* Diagnose-commando's krijgen het verklik-achtervoegsel (1-byte / geen scope),
-   * tenzij de verklikker in de GUI uit staat. */
-  if (_bot_diag && (!strcasecmp(verb, "ping") || !strcasecmp(verb, "path")))
-    appendTxDiag(reply, sizeof(reply), packet);
+  /* Zend-diagnose achteraan, binnen wat er van de 160 tekens over is.
+   * De DM-bot kent geen `test`; ping=0, path=2. */
+  int diag_kind = !strcasecmp(verb, "ping") ? 0 : (!strcasecmp(verb, "path") ? 2 : -1);
+  if (diag_kind >= 0) {
+    size_t used = strlen(reply);
+    if (used < BOT_MAX_TEXT_LEN) {
+      char diag[MAX_DIAG_URL_LEN + 64];
+      if (buildTxDiag(diag, sizeof(diag), BOT_MAX_TEXT_LEN - used, packet, diag_kind))
+        strlcat(reply, diag, sizeof(reply));
+    }
+  }
 
   /* 1) ACK het inkomende bericht, zodat de app niet blijft herzenden. De ack-hash
    *    gaat over de ORIGINELE berichtbytes + de afzender-pubkey (zoals het room-pad). */
@@ -1878,13 +1981,17 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   memcpy(out, &ts, 4);
   out[4] = (TXT_TYPE_PLAIN << 2);
   int rlen = (int)strlen(reply);
-  /* Eén pakket: MeshCore's tekstlimiet is 160 (MAX_TEXT_LEN). Kap voor de zekerheid;
+  /* Eén pakket: MeshCore's tekstlimiet is 160 (BOT_MAX_TEXT_LEN). Kap voor de zekerheid;
    * ping/help en een normale path-regel passen daar ruim binnen. */
   if (rlen > 160) rlen = 160;
   memcpy(&out[5], reply, rlen);
   mesh::Identity dest(sender_pub);
   mesh::Packet* rpkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, dest, secret, out, 5 + rlen);
   if (rpkt) sendFloodScoped(default_scope, rpkt, TXT_ACK_DELAY + SERVER_RESPONSE_DELAY, _prefs.path_hash_mode + 1);
+
+  /* Geen los uitleg-bericht in het DM-pad: dat hoort in het KANAAL waar de
+   * trigger vandaan kwam (daar leest de rest mee). In een DM heeft de inline
+   * variant al alles gezegd. */
 }
 
 /* ================================================================== */
@@ -2185,7 +2292,7 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
   int rssi = (int)radio_driver.getLastRSSI();
   int nhops = (int)packet->getPathHashCount();
 
-  static char reply[200];
+  static char reply[280];
   const char* who = sender[0] ? sender : "?";
 
   if (is_ping) {
@@ -2217,15 +2324,28 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
                who, route, nhops, snr_db, rssi, rxt);
   }
 
-  /* Kanaal-commando's zijn altijd diagnose -> verklik 1-byte / geen scope,
-   * tenzij de verklikker in de GUI uit staat. */
-  if (_bot_diag) appendTxDiag(reply, sizeof(reply), packet);
+  /* Zend-diagnose achteraan. sendChannelReply() zet er nog "<botnaam>: " voor,
+   * dus dat gaat van het budget af. */
+  int kind = is_ping ? 0 : (is_test ? 1 : 2);
+  size_t used = strlen(reply) + strlen(_bot_name[0] ? _bot_name : "bot") + 2;
+  if (used < BOT_MAX_TEXT_LEN) {
+    char diag[MAX_DIAG_URL_LEN + 64];
+    if (buildTxDiag(diag, sizeof(diag), BOT_MAX_TEXT_LEN - used, packet, kind))
+      strlcat(reply, diag, sizeof(reply));
+  }
 
   sendChannelReply(channel, reply);
+
+  /* Uitleg-URL op "apart bericht": als losse kanaalpost erachteraan, zodat de
+   * hele mesh meeleest dat ongescoped zenden niet meer de bedoeling is. */
+  char extra[MAX_DIAG_URL_LEN + 64];
+  if (buildDiagUrlMsg(extra, sizeof(extra), packet, kind))
+    sendChannelReply(channel, extra, SERVER_RESPONSE_DELAY * 3);
 }
 
 /* "<botnaam>: <reply>" bouwen en IN het kanaal versturen (geflood). */
-void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* reply) {
+void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
+                                uint32_t delay_millis) {
   static uint8_t temp[MAX_PACKET_PAYLOAD];
   uint32_t ts = getRTCClock()->getCurrentTimeUnique();
   memcpy(temp, &ts, 4);
@@ -2237,7 +2357,7 @@ void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* r
    * ondertekend, maar houd de dispatch-toestand netjes). */
   mesh::GroupChannel ch = channel;   // niet-const kopie voor de API
   mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
-  if (pkt) sendFloodScoped(default_scope, pkt, SERVER_RESPONSE_DELAY, _prefs.path_hash_mode + 1);
+  if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
 }
 
 /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Enqueue als een

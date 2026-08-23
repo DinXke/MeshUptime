@@ -7,6 +7,43 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.9 — zend-diagnose fijnregelbaar + uitleg-URL
+
+Voortbouwend op v2.3.8, alles instelbaar op de Bot-pagina van de web-GUI:
+
+**Per commando aan/uit.** De enkele schakelaar is een masker geworden: `ping`, `test`
+en `path` zijn los aan te vinken (bit0/1/2). 0 = zend-diagnose helemaal uit. Een oude
+`d 1`-regel in het configbestand wordt gelezen als "alle drie aan".
+
+**Uitleg-URL bij `geen scope`** in drie standen:
+
+1. **uit** — geen URL.
+2. **inline** — tussen haakjes achter `geen scope 😞`.
+3. **apart bericht** (standaard) — een losse, **geflooda** kanaalpost
+   `Meer info over regions en scopes: <url>`, ~3× de normale antwoordvertraging later
+   zodat hij niet met het antwoord zelf botst in de zendwachtrij. Flood is bewust:
+   ook stations verderop moeten meelezen dat 1-byte en ongescoped niet meer de
+   bedoeling zijn. Gaat alleen naar het kanaal waar het commando vandaan kwam; het
+   DM-pad krijgt geen los bericht (daar zegt de inline variant al genoeg).
+
+De URL verschijnt uitsluitend bij een **ongescopet** pakket — dat is het moment waarop
+de uitleg iets toevoegt.
+
+**Nooit een halve link.** Een antwoord mag hoogstens 160 tekens zijn (MeshCore's
+`MAX_TEXT_LEN`). Past de inline-URL er niet volledig in, dan laat de bot hem *helemaal*
+weg in plaats van hem af te kappen tot een kapotte link; de korte 👍/😞-oordelen krijgen
+voorrang. Omdat een `path`-antwoord met repeaterlijst al tegen die grens zit, is
+"apart bericht" daar de betrouwbare stand.
+
+**Live ruimte-teller in de GUI.** Naast het URL-veld staat hoeveel tekens er per
+commando nog inline in passen (`dfit` uit `bot.json`, berekend op het krappere
+kanaal-pad inclusief de `<botnaam>: `-prefix). Nuttig bij een URL-shortener: je ziet
+meteen of een verkorte link bij `ping`/`test`/`path` past of stilletjes wegvalt.
+
+Endpoint: `POST /bot/diag` met `mask=0..7`, `urlmode=0..2`, `url=<tekst>` (elk veld
+optioneel). Leeskant: `bot.json` velden `diag`, `durlmode`, `durl`, `durlmax`, `dfit`.
+Persistent als `d <masker>` en `u <modus> <url>` in het ontvangersbestand.
+
 ## v2.3.8 — zend-diagnose (👍/😞) achter de ping/test/path-antwoorden
 
 De ping/test/path-antwoorden van de bot (zowel DM als in-kanaal) melden nu achteraan
