@@ -74,11 +74,17 @@
  *            recipientlijst). ping/path/help blijven open voor iedereen; de
  *            commando's draaien met volle admin-rechten. Async net-diagnostiek
  *            (dns/ping/...) komt via een aparte bot-DM terug. [botcmd]-debuglogging.
+ *   v2.3.11 = per-monitor ERNST (hoog/midden/laag) + een ernst-emoji vooraan elke
+ *            alert-DM, zodat een companion (T1000-E) er zijn buzzer-tune op kiest:
+ *            🔴 hoog, 🟠 midden, 🟢 laag. Herstelmeldingen zijn altijd 🟢 groen.
+ *            De ernst is per monitor en per vaste bron (netvoeding/wifi/batterij/
+ *            test) in te stellen via de web-GUI, de CLI (mon.<ch>.sev / fa.<idx>.sev)
+ *            en /mon/alarm (sev). ALLEEN de DM krijgt de emoji; de room-post niet.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.10"
+  #define MESHUPTIME_VERSION   "v2.3.11"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

@@ -332,7 +332,12 @@ public:
    * op een OVERGANG stelt main_room.cpp de tekst samen en roept dit aan met de
    * per-sensor mode (dm/room/both) en de room-set. Room-deel -> addServerPost naar
    * elke room in room_mask; DM-deel -> het bestaande AlertTask/sendAlert-pad. */
-  void dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, const char* text);
+  /* severity = MON_SEV_* (uit MonitorStore.h): de ernst-emoji die vooraan de
+   * alert-DM komt, zodat een companion (T1000-E) er zijn buzzer-tune op kiest.
+   * Standaard 0 = MON_SEV_HIGH (rood). ALLEEN de DM krijgt de emoji-prefix; de
+   * room-post blijft schoon. Herstel: de aanroeper geeft MON_SEV_LOW mee. */
+  void dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, const char* text,
+                     uint8_t severity = 0 /* MON_SEV_HIGH */);
 
   /* Optionele externe fan-out (bv. MQTT/push later). Wordt bij ELKE server-post
    * aangeroepen. */

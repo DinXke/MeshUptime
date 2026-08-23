@@ -102,6 +102,19 @@
 #define MON_ALERT_BOTH     3
 #define MON_ALERT_DEFAULT  MON_ALERT_BOTH
 
+/* ERNST per alarmbron (v2.3.11). Een companion (T1000-E) leest de ernst-emoji
+ * vooraan de alert-DM en kiest daarop zijn buzzer-tune. H(oog)/M(idden)/L(aag).
+ * De emoji-toewijzing zit in RoomMesh::dispatchAlert (sevEmoji): H -> rood, M ->
+ * oranje, L -> groen. HERSTELMELDINGEN zijn ALTIJD laag/groen, ongeacht de
+ * ingestelde ernst van de monitor -- dat wordt bij dispatch afgedwongen, niet
+ * hier opgeslagen. HIGH == 0, zodat een leeg/oud veld (memset 0) op de veiligste,
+ * meest opvallende stand valt en een bestand van vóór deze versie een monitor als
+ * 'hoog' inleest -- geen stille verlaging van de ernst na een update. */
+#define MON_SEV_HIGH     0
+#define MON_SEV_MEDIUM   1
+#define MON_SEV_LOW      2
+#define MON_SEV_DEFAULT  MON_SEV_HIGH
+
 /* ROOM-LIDMAATSCHAPSSET per sensor: een bitmasker van room-indexen (bit i = room
  * i). Een sensor kan zo in MEERDERE rooms tegelijk posten. Standaard room 0
  * ("Storingen"). uint16_t = tot 16 rooms; ruim boven MAX_ROOMS. */
@@ -196,6 +209,11 @@ struct MonitorCfgEntry {
    * sensor-variant negeert deze velden -- die alarmeert altijd via DM. */
   uint8_t  alert_mode;     /* MON_ALERT_DM | MON_ALERT_ROOM */
   uint16_t rooms_mask;     /* bit i = room i */
+
+  /* ERNST van deze monitor (MON_SEV_*, v2.3.11). Bij het LEZEN optioneel (oude
+   * bestanden -> MON_SEV_DEFAULT = hoog); bij het SCHRIJVEN altijd. Bepaalt de
+   * ernst-emoji vooraan de storings-DM. Herstel is altijd laag (bij dispatch). */
+  uint8_t  severity;       /* MON_SEV_HIGH | MON_SEV_MEDIUM | MON_SEV_LOW */
 
   /* SENSOR-NODE-set (room-variant): op welke virtuele sensor-nodes deze sensor als
    * telemetrie-kanaal verschijnt. Bij het LEZEN optioneel (oude bestanden krijgen
@@ -401,6 +419,10 @@ struct MonitorCfg {
   uint16_t fixed_rooms_mask[MON_FA_COUNT];
   /* SENSOR-NODE-set voor de vaste bronnen, symmetrisch met fixed_rooms_mask. */
   uint16_t fixed_sensornodes[MON_FA_COUNT];
+  /* ERNST per vaste bron (MON_SEV_*, v2.3.11). Standaard (zie setDefaults):
+   * batt-krit/netvoeding/wifi = hoog, batt-laag = midden, test = hoog. Herstel
+   * is altijd laag (bij dispatch afgedwongen, niet hier). */
+  uint8_t  fixed_severity[MON_FA_COUNT];
 
   MonitorCfgEntry mons[MON_MAX_MONITORS];
 };

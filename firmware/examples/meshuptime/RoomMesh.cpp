@@ -1568,10 +1568,24 @@ void RoomMesh::sendAlertDM(const ClientInfo* c, AlertTask* t) {
   t->send_expiry = futureMillis(ALERT_ACK_EXPIRY_MILLIS);
 }
 
-void RoomMesh::dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, const char* text) {
+/* De ernst-emoji + spatie die vooraan de alert-DM komt. Een companion (T1000-E)
+ * leest juist deze eerste bytes om zijn buzzer-tune te kiezen; de UTF-8 staat als
+ * expliciete byte-escapes zodat de bron-encodering er niets aan kan verschuiven.
+ *   MON_SEV_HIGH(0)   -> rood   F0 9F 94 B4
+ *   MON_SEV_MEDIUM(1) -> oranje F0 9F 9F A0
+ *   MON_SEV_LOW(2)    -> groen  F0 9F 9F A2   (ook alle herstelmeldingen) */
+static const char* sevEmoji(uint8_t sev) {
+  if (sev == 1) return "\xF0\x9F\x9F\xA0 ";   /* oranje: midden */
+  if (sev == 2) return "\xF0\x9F\x9F\xA2 ";   /* groen: laag / herstel */
+  return "\xF0\x9F\x94\xB4 ";                 /* rood: hoog (en de veilige default) */
+}
+
+void RoomMesh::dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, const char* text,
+                             uint8_t severity) {
   if (!text || text[0] == 0) return;
 
-  // room-deel: naar elke toegewezen, actieve room
+  // room-deel: naar elke toegewezen, actieve room. GEEN ernst-emoji: die is voor
+  // de companion die de DM parseert; een room-post is voor mensen in de app.
   if (mode & ALERT_MODE_ROOM) {
     for (int i = 0; i < MAX_ROOMS; i++) {
       if ((room_mask & (1 << i)) && rooms[i].active) addServerPost(i, text);
@@ -1580,11 +1594,12 @@ void RoomMesh::dispatchAlert(uint8_t mode, uint16_t room_mask, bool high_pri, co
 
   // DM-deel: SCHONE DM vanaf de bot naar ELKE ontvanger in de bot-lijst
   // (herhaal-tot-ACK per ontvanger). Vervangt de oude room-identiteit-DM zodat
-  // dm/both nu als een gewoon chatcontact in de app tonen.
+  // dm/both nu als een gewoon chatcontact in de app tonen. De alert-DM begint
+  // ALTIJD met de ernst-emoji + spatie (het contract met de T1000-E-companion).
   if ((mode & ALERT_MODE_DM) && _bot_active && botRecipCount() > 0 &&
       num_alert_tasks < ROOM_MAX_ALERTS) {
     AlertTask* t = &alert_tasks[num_alert_tasks];
-    StrHelper::strncpy(t->text, text, sizeof(t->text));
+    snprintf(t->text, sizeof(t->text), "%s%s", sevEmoji(severity), text);
     t->high_pri = high_pri;
     t->from_bot = true;
     t->send_expiry = 0;

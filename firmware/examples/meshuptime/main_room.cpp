@@ -197,6 +197,7 @@ protected:
     uint8_t  mode;
     uint16_t rooms;
     bool     high_pri;      // ernst van de STORING (herstel is altijd LOW_PRI)
+    uint8_t  severity;      // MON_SEV_* voor de ernst-emoji vooraan de storings-DM
   };
   template <typename DownText, typename UpText>
   void edgeLatched(bool& was_down, bool& announced, const EdgeIn& in,
@@ -212,14 +213,15 @@ protected:
     if (in.down_now) {
       if (grace) { announced = false; FIXEDGE_DIAG("%s DOWN in boot-grace -> onderdrukt", tag); return; }
       announced = true;
-      dispatchAlert(in.mode, in.rooms, in.high_pri, down_text());
+      dispatchAlert(in.mode, in.rooms, in.high_pri, down_text(), in.severity);
       FIXEDGE_DIAG("%s DOWN gemeld", tag);
     } else {
       const bool was_ann = announced;
       announced = false;
       if (grace) { FIXEDGE_DIAG("%s UP in boot-grace -> geen herstel", tag); return; }
       if (was_ann && in.recovery_ok) {
-        dispatchAlert(in.mode, in.rooms, false, up_text());   // herstel = LOW_PRI
+        // herstel = LOW_PRI EN altijd groen (MON_SEV_LOW), ongeacht de ernst van de storing
+        dispatchAlert(in.mode, in.rooms, false, up_text(), MON_SEV_LOW);
         FIXEDGE_DIAG("%s HERSTEL gemeld (announced=1 dur_ok=1)", tag);
       } else {
         FIXEDGE_DIAG("%s herstel ONDERDRUKT (announced=%d dur_ok=%d) -- geen spook-terug",
@@ -240,7 +242,8 @@ protected:
     char t1[48];
     EdgeIn bc = { sensors.battAlertDown(MonitorSensors::BATT_CRIT), true, snoozed,
                   sensors.battInBootGrace(), sensors.battRecoveryOk(MonitorSensors::BATT_CRIT),
-                  sensors.fixedAlertMode(MON_FA_BATT_CRIT), sensors.fixedRoomsMask(MON_FA_BATT_CRIT), true };
+                  sensors.fixedAlertMode(MON_FA_BATT_CRIT), sensors.fixedRoomsMask(MON_FA_BATT_CRIT), true,
+                  sensors.fixedSeverity(MON_FA_BATT_CRIT) };
     edgeLatched(st_batt_crit, st_batt_crit_ann, bc,
       [&]() -> const char* { snprintf(t1, sizeof(t1), "Batterij kritisch (%.2fV)!", v); return t1; },
       []()  -> const char* { return "Batterij hersteld"; }, "batt.crit");
@@ -248,7 +251,8 @@ protected:
     char t2[48];
     EdgeIn bl = { sensors.battAlertDown(MonitorSensors::BATT_LOW), true, snoozed,
                   sensors.battInBootGrace(), sensors.battRecoveryOk(MonitorSensors::BATT_LOW),
-                  sensors.fixedAlertMode(MON_FA_BATT_LOW), sensors.fixedRoomsMask(MON_FA_BATT_LOW), false };
+                  sensors.fixedAlertMode(MON_FA_BATT_LOW), sensors.fixedRoomsMask(MON_FA_BATT_LOW), false,
+                  sensors.fixedSeverity(MON_FA_BATT_LOW) };
     edgeLatched(st_batt_low, st_batt_low_ann, bl,
       [&]() -> const char* { snprintf(t2, sizeof(t2), "Batterij laag (%.2fV)", v); return t2; },
       []()  -> const char* { return "Batterij weer op peil"; }, "batt.low");
@@ -265,7 +269,8 @@ protected:
       const int slot = i;
       EdgeIn mi = { !sensors.monitorIsUp(i), sensors.monitorMeasurable(i), sensors.isMuted(i),
                     false, sensors.monitorRecoveryOk(i),
-                    sensors.monitorAlertMode(i), sensors.monitorRoomsMask(i), false };
+                    sensors.monitorAlertMode(i), sensors.monitorRoomsMask(i), false,
+                    sensors.monitorSeverity(i) };
       edgeLatched(st_mon_down[i], st_mon_ann[i], mi,
         [slot]() -> const char* { sensors.monitorNoteDown(slot); return sensors.monitorAlertText(slot); },
         [slot]() -> const char* { const char* s = sensors.recoverAlertText(slot); sensors.monitorNoteClear(slot); return s; },
@@ -277,14 +282,16 @@ protected:
      * harde herstel-grendel. */
     EdgeIn fp = { sensors.fixedAlertDown(MonitorSensors::FIXED_POWER), true, snoozed,
                   sensors.fixedInBootGrace(), sensors.fixedRecoveryOk(MonitorSensors::FIXED_POWER),
-                  sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS), false };
+                  sensors.fixedAlertMode(MON_FA_MAINS), sensors.fixedRoomsMask(MON_FA_MAINS), false,
+                  sensors.fixedSeverity(MON_FA_MAINS) };
     edgeLatched(st_mains_down, st_mains_announced, fp,
       []() -> const char* { return sensors.fixedAlertText(MonitorSensors::FIXED_POWER); },
       []() -> const char* { return sensors.fixedRecoverAlertText(MonitorSensors::FIXED_POWER); }, "mains");
 
     EdgeIn fw = { sensors.fixedAlertDown(MonitorSensors::FIXED_WIFI), true, snoozed,
                   sensors.fixedInBootGrace(), sensors.fixedRecoveryOk(MonitorSensors::FIXED_WIFI),
-                  sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI), false };
+                  sensors.fixedAlertMode(MON_FA_WIFI), sensors.fixedRoomsMask(MON_FA_WIFI), false,
+                  sensors.fixedSeverity(MON_FA_WIFI) };
     edgeLatched(st_wifi_down, st_wifi_announced, fw,
       []() -> const char* { return sensors.fixedAlertText(MonitorSensors::FIXED_WIFI); },
       []() -> const char* { return sensors.fixedRecoverAlertText(MonitorSensors::FIXED_WIFI); }, "wifi");
@@ -496,7 +503,8 @@ int MonitorDmSource::dmNodeCommand(const char* line, uint8_t role, char* out, si
     /* Testalarm via de fa.<TEST>-config (route + room-set), zoals /alert/test. */
     the_mesh.dispatchAlert(sensors.fixedAlertMode(MON_FA_TEST),
                            sensors.fixedRoomsMask(MON_FA_TEST), false,
-                           "Testalarm (handmatig aangevraagd)");
+                           "Testalarm (handmatig aangevraagd)",
+                           sensors.fixedSeverity(MON_FA_TEST));
     snprintf(out, out_len, "testalarm afgevuurd (volgens fa.test-instelling)");
     return (int)strlen(out);
   }

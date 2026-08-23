@@ -85,7 +85,11 @@ void MonitorStore::setDefaults(MonitorCfg& cfg) {
     cfg.fixed_alert_mode[i] = MON_ALERT_DEFAULT;
     cfg.fixed_rooms_mask[i] = MON_ROOMS_DEFAULT;
     cfg.fixed_sensornodes[i] = MON_SNODES_DEFAULT;
+    /* Ernst per vaste bron (v2.3.11): alles hoog, behalve batterij-laag = midden.
+     * De memset zette alles al op 0 (=hoog); alleen batt-laag wijkt af. */
+    cfg.fixed_severity[i] = MON_SEV_HIGH;
   }
+  cfg.fixed_severity[MON_FA_BATT_LOW] = MON_SEV_MEDIUM;
   /* channel == 0 in alle vakjes: memset heeft dat al gedaan. Expliciet houden
    * we het niet, want een leeg vakje IS een nul-kanaal. */
 }
@@ -175,8 +179,8 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
       break;
     }
 
-    /* Ruim genoeg voor de langste regel: de m-regel telt nu tot 14 velden
-     * (m ch int naam adres send_ms alert rooms snodes kind interp snmparg comm oid). */
+    /* Ruim genoeg voor de langste regel: de m-regel telt nu tot 15 velden
+     * (m ch int naam adres send_ms alert rooms snodes kind interp snmparg comm oid sev). */
     char* parts[16];
     int n = splitTokens(line, parts, 16);
     if (n < 2) continue;               /* onvolledige regel: overslaan */
@@ -260,6 +264,12 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
            * standaard. */
           staged.fixed_sensornodes[fi] = (n >= 5)
               ? (uint16_t)strtoul(parts[4], NULL, 10) : MON_SNODES_DEFAULT;
+          /* Veld 6 (ernst) optioneel: ontbreekt hij, dan houdt staged de door
+           * setDefaults gezette bron-standaard (hoog, of midden voor batt-laag). */
+          if (n >= 6) {
+            int sv = atoi(parts[5]);
+            if (sv >= MON_SEV_HIGH && sv <= MON_SEV_LOW) staged.fixed_severity[fi] = (uint8_t)sv;
+          }
         }
       }
     } else if (strcmp(parts[0], "m") == 0) {
@@ -308,6 +318,14 @@ bool MonitorStore::load(fs::FS& fs, MonitorCfg& cfg) {
         }
         if (e.kind > MON_KIND_SNMP) e.kind = MON_KIND_HOST;
         if (e.snmp_interp > MON_SNMP_STATUS) e.snmp_interp = MON_SNMP_NUMERIC;
+        /* Veld 15 (ernst, v2.3.11) optioneel: oude bestanden -> hoog (de veiligste
+         * stand). De regel is bewust ACHTERAAN gezet zodat een oude parser (die tot
+         * veld 14 leest) hem gewoon negeert en een nieuw bestand leesbaar blijft. */
+        e.severity = MON_SEV_DEFAULT;
+        if (n >= 15) {
+          int sv = atoi(parts[14]);
+          if (sv >= MON_SEV_HIGH && sv <= MON_SEV_LOW) e.severity = (uint8_t)sv;
+        }
       }
       num_mons++;
     }
@@ -404,11 +422,12 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
   len = snprintf(line, sizeof(line), "phb %u\n", (unsigned)cfg.push_hb_s);
   f.write((const uint8_t*)line, len);
 
-  /* Alarm-bezorging van de vaste bronnen (MON_FA_*): route + room-set + snode-set. */
+  /* Alarm-bezorging van de vaste bronnen (MON_FA_*): route + room-set + snode-set
+   * + ernst (veld 6, v2.3.11). Ernst achteraan zodat een oude parser hem negeert. */
   for (int i = 0; i < MON_FA_COUNT; i++) {
-    len = snprintf(line, sizeof(line), "fa %d %u %u %u\n", i,
+    len = snprintf(line, sizeof(line), "fa %d %u %u %u %u\n", i,
                    (unsigned)cfg.fixed_alert_mode[i], (unsigned)cfg.fixed_rooms_mask[i],
-                   (unsigned)cfg.fixed_sensornodes[i]);
+                   (unsigned)cfg.fixed_sensornodes[i], (unsigned)cfg.fixed_severity[i]);
     f.write((const uint8_t*)line, len);
   }
 
@@ -422,13 +441,16 @@ bool MonitorStore::save(fs::FS& fs, const MonitorCfg& cfg) {
      * raden wat de standaard was toen dit weggeschreven werd. */
     char comm_hex[52]; monObfToHex(e.snmp_community, comm_hex, sizeof(comm_hex));
     const char* oid = (e.snmp_oid[0]) ? e.snmp_oid : "-";
-    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u %u %u %u %ld %s %s\n",
+    /* Ernst (v2.3.11) als laatste veld -- achter de OID, zodat een oude parser (die
+     * tot en met de OID leest) hem gewoon negeert en oude/nieuwe versies elkaars
+     * bestand blijven lezen. */
+    len = snprintf(line, sizeof(line), "m %u %u %s %s %u %u %u %u %u %u %ld %s %s %u\n",
                    (unsigned)e.channel, (unsigned)e.interval_s, e.name, e.host,
                    (unsigned)(e.send_ms ? 1 : 0),
                    (unsigned)e.alert_mode, (unsigned)e.rooms_mask,
                    (unsigned)e.sensornodes,
                    (unsigned)e.kind, (unsigned)e.snmp_interp, (long)e.snmp_arg,
-                   comm_hex, oid);
+                   comm_hex, oid, (unsigned)e.severity);
     if (f.write((const uint8_t*)line, len) != (size_t)len) {
       /* Schijf vol of stuk: het kladbestand is nu onbetrouwbaar, dus laten we
        * de bestaande .cfg met rust. */

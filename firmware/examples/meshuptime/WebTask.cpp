@@ -108,8 +108,8 @@ static char g_json[14336];
  * mee. */
 /* 820 voor de kopblokken: vaste velden ~300 + budget ~200 + ad-hoc ~300 (de
  * ping-uitslagtekst) + sim/rec/rep/test ~320 -- ruim afgerond. */
-/* 360 per monitor: bovenop "am"/"rm"/"sn" draagt een SNMP-monitor nu ook "knd",
- * "itp" en de OID (tot 80 tekens) -- ~110 byte extra in het duurste geval. */
+/* 360 per monitor: bovenop "am"/"rm"/"sn"/"msv" draagt een SNMP-monitor nu ook
+ * "knd", "itp" en de OID (tot 80 tekens) -- ~110 byte extra in het duurste geval. */
 static_assert(300 + 820 + 4 * 210 + MON_MAX_MONITORS * 360 + 130 + JSON_TAIL
               <= sizeof(g_json),
               "g_json te klein voor MON_MAX_MONITORS -- zie de rekensom hierboven");
@@ -1009,6 +1009,16 @@ een andere dienst onder de oude naam. Dat is precies de stille fout waarvoor die
 onveranderlijke nummering bedoeld is. Verander je het adres, verander dan ook de
 <b>naam</b> mee, en werk die naam ook bij in MeshManager &mdash; anders liegt de
 grafiek daar zonder dat er iets stuk lijkt.</p>
+
+<p class="note"><b>De velden achter <code>bewerk</code>:</b>
+<b>a</b> = alarmroute (<i>dm</i>/<i>room</i>/<i>both</i>),
+<b>r</b> = room-set voor de post-tekst (bv <code>0,1</code>),
+<b>s</b> = op welke sensor-nodes dit kanaal als telemetrie verschijnt, en
+<b>e</b> = <b>ernst</b>. De ernst zet de emoji vooraan de storings-DM &mdash;
+🔴&nbsp;hoog, 🟠&nbsp;midden, 🟢&nbsp;laag &mdash; en een companion (T1000-E) kiest
+daarop zijn buzzer-tune. <b>Herstelmeldingen</b> (&quot;weer bereikbaar&quot;) zijn
+altijd 🟢&nbsp;groen, ongeacht de ingestelde ernst. Alleen de <b>DM</b> krijgt de
+emoji; de room-post blijft schoon.</p>
 
 <div class="card"><div class="budget" id="bud"></div>
 <p class="note" id="budnote"></p></div>
@@ -2218,9 +2228,14 @@ var iA=document.createElement("select");iA.className="n3";
 var iR=document.createElement("input");iR.className="n3";iR.maxLength=12;iR.value=m2l(m.rm||1);iR.title="rooms (post-tekst), bv 0,1";
 /* sn = op welke sensor-nodes dit kanaal als telemetrie verschijnt (bv 0,1). */
 var iS=document.createElement("input");iS.className="n3";iS.maxLength=12;iS.value=m2l(m.sn||1);iS.title="sensor-nodes (telemetrie), bv 0,1";
+/* e = ernst -> de emoji vooraan de storings-DM waarop de T1000-E-companion zijn
+   buzzer-tune kiest. 0 hoog (rood), 1 midden (oranje), 2 laag (groen). */
+var iE=document.createElement("select");iE.className="n3";iE.title="ernst: emoji vooraan de storings-DM (companion-buzzer). Herstel is altijd groen.";
+[["0","🔴 hoog"],["1","🟠 midden"],["2","🟢 laag"]].forEach(function(o){var op=document.createElement("option");op.value=o[0];op.textContent=o[1];if(o[0]===String(m.msv||0))op.selected=true;iE.appendChild(op)});
 cells[3].appendChild(document.createTextNode(" a:"));cells[3].appendChild(iA);
 cells[3].appendChild(document.createTextNode(" r:"));cells[3].appendChild(iR);
 cells[3].appendChild(document.createTextNode(" s:"));cells[3].appendChild(iS);
+cells[3].appendChild(document.createTextNode(" e:"));cells[3].appendChild(iE);
 
 cells[CACTS].textContent="";
 var ok=document.createElement("button");ok.textContent="opslaan";ok.className="go";
@@ -2282,13 +2297,13 @@ if(iv!=m.i)  {cmds.push("sensor set mon."+m.ch+".int "+iv)}
 /* Alarm-route (am) + room-set (rm) + sensor-node-set (sn) gaan NIET via 'sensor
    set' maar via /mon/alarm (op het stabiele kanaal m.ch). Alleen versturen als er
    iets aan veranderd is. */
-var nam=parseInt(iA.value,10),nrm=l2m(iR.value),nsn=l2m(iS.value);
-var alarmChg=(nam!=(m.am||3))||(nrm!=(m.rm||1))||(nsn!=(m.sn||1));
+var nam=parseInt(iA.value,10),nrm=l2m(iR.value),nsn=l2m(iS.value),nsv=parseInt(iE.value,10);
+var alarmChg=(nam!=(m.am||3))||(nrm!=(m.rm||1))||(nsn!=(m.sn||1))||(nsv!=(m.msv||0));
 function saveAlarm(cb){
 if(!alarmChg){if(cb)cb();return}
 fetch("mon/alarm",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"ch="+m.ch+"&am="+nam+"&rm="+nrm+"&sn="+nsn})
+body:"ch="+m.ch+"&am="+nam+"&rm="+nrm+"&sn="+nsn+"&sev="+nsv})
 .then(function(r){return r.json().catch(function(){return{ok:r.ok}})})
 .then(function(j){if(!j.ok)tsay("alarm/koppeling kanaal "+m.ch+" geweigerd: "+(j.error||""),0);
 if(cb)cb()}).catch(function(){tsay("alarm/koppeling niet opgeslagen",0);if(cb)cb()})}
@@ -4305,7 +4320,7 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           ",{\"ch\":%u,\"n\":\"%s\",\"h\":\"%s\",\"i\":%u,\"st\":\"%s\","
           "\"ms\":%lu,\"f\":%lu,\"c\":%lu,\"k\":\"%s\",\"age\":%lu,\"sev\":\"%s\","
           "\"si\":%u,\"sm\":\"%s\",\"sl\":%lu,\"tms\":%d,\"tb\":%u,\"drop\":%d,"
-          "\"am\":%u,\"rm\":%u,\"sn\":%u,\"knd\":%u,\"itp\":%u,\"oid\":\"%s\"}",
+          "\"am\":%u,\"rm\":%u,\"sn\":%u,\"msv\":%u,\"knd\":%u,\"itp\":%u,\"oid\":\"%s\"}",
           (unsigned)_mon->monitorChannel(i),
           _mon->monitorName(i),
           push ? "(gemeld)" : _mon->monitorHost(i),
@@ -4329,10 +4344,12 @@ int WebTask::appendMonitors(char* buf, size_t len, int n) {
           _mon->monitorDropped(i) ? 1 : 0,
           /* am = alarm-route (1=dm,2=room,3=both), rm = room-set bitmasker,
            * sn = sensor-node-set bitmasker (welke virtuele sensor-nodes dit kanaal
-           * als telemetrie tonen). Alleen betekenisvol in de room-variant. */
+           * als telemetrie tonen), msv = ingestelde ernst (0 hoog,1 midden,2 laag)
+           * voor de ernst-emoji vooraan de storings-DM. Room-variant. */
           (unsigned)_mon->monitorAlertMode(i),
           (unsigned)_mon->monitorRoomsMask(i),
           (unsigned)_mon->monitorSensorNodesMask(i),
+          (unsigned)_mon->monitorSeverity(i),
           /* knd = soort (0 host, 1 snmp), itp = SNMP-interpretatie, oid = de OID
            * (het community wordt NOOIT geexposeerd). */
           (unsigned)_mon->monitorKind(i),
@@ -5785,7 +5802,9 @@ void WebTask::handleChannelToggle() {
                 r == 1 ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"niet gevonden\"}");
 }
 
-/* POST /mon/alarm  (idx | ch, am, rm)  -- per-sensor alarmroute + room-set.
+/* POST /mon/alarm  (idx | ch, am, rm [, sn] [, sev])  -- per-sensor alarmroute +
+ * room-set + sensor-node-set + ernst. sev (0 hoog/1 midden/2 laag) is optioneel en
+ * bepaalt de ernst-emoji vooraan de storings-DM; afwezig = ongewijzigd.
  *
  * DE IDENTIFICATIE. De MeshManager-server nam `idx` = de POSITIE in de mon[]-array
  * van /status.json. Die array begint met VIER vaste cellen (kanaal 1 'spanning',
@@ -5891,6 +5910,15 @@ void WebTask::handleMonAlarm() {
     if (so == 0) strcpy(snlist, "none"); else snlist[so] = 0;
   }
 
+  /* Optioneel: `sev` = ernst (0 hoog, 1 midden, 2 laag) voor de ernst-emoji vooraan
+   * de storings-DM. Afwezig of -1 -> ongewijzigd. */
+  const int sev = getArgInt(*_server, "sev", -1);
+  if (sev > MON_SEV_LOW) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"sev: 0=hoog, 1=midden, 2=laag\"}");
+    return;
+  }
+
   /* am gaat als getal direct door (parseAlertMode accepteert 1/2/3). */
   snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.alert %d", ch, am);
   _acl->handleCommandWeb(0, g_cmd, g_reply);
@@ -5900,11 +5928,16 @@ void WebTask::handleMonAlarm() {
     snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.snodes %s", ch, snlist);
     _acl->handleCommandWeb(0, g_cmd, g_reply);
   }
+  if (sev >= 0) {
+    snprintf(g_cmd, sizeof(g_cmd), "sensor set mon.%d.sev %d", ch, sev);
+    _acl->handleCommandWeb(0, g_cmd, g_reply);
+  }
 
   /* Definitieve controle via de getters -- niet de CLI-tekst parsen. */
   bool ok = ((int)_mon->monitorAlertMode(slot) == am) &&
             ((int)_mon->monitorRoomsMask(slot) == rm) &&
-            (sn < 0 || (int)_mon->monitorSensorNodesMask(slot) == sn);
+            (sn < 0 || (int)_mon->monitorSensorNodesMask(slot) == sn) &&
+            (sev < 0 || (int)_mon->monitorSeverity(slot) == sev);
   if (!ok) {
     char msg[192];
     snprintf(msg, sizeof(msg),

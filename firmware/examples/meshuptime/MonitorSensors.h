@@ -294,6 +294,11 @@ public:
    * (bitmasker van room-indexen). De sensor-variant negeert deze. */
   uint8_t     monitorAlertMode(int slot) const;
   uint16_t    monitorRoomsMask(int slot) const;
+  /* ERNST per monitor (MON_SEV_*, v2.3.11): bepaalt de ernst-emoji vooraan de
+   * storings-DM. Leeg vakje -> MON_SEV_DEFAULT (hoog). setMonitorSeverity schrijft
+   * naar flash via markDirty(). */
+  uint8_t     monitorSeverity(int slot) const;
+  bool        setMonitorSeverity(int slot, uint8_t sev);
   /* SENSOR-NODE-set per monitor: op welke virtuele sensor-nodes deze sensor als
    * telemetrie-kanaal verschijnt (bitmasker). */
   uint16_t    monitorSensorNodesMask(int slot) const;
@@ -309,6 +314,9 @@ public:
   bool        setFixedAlertMode(int idx, uint8_t mode);
   bool        setFixedRoomsMask(int idx, uint16_t mask);
   bool        setFixedSensorNodesMask(int idx, uint16_t mask);
+  /* ERNST per vaste bron (MON_SEV_*, v2.3.11). */
+  uint8_t     fixedSeverity(int idx) const;
+  bool        setFixedSeverity(int idx, uint8_t sev);
 
   /* SUBSET-telemetrie voor een virtuele sensor-node: als querySensors(), maar met
    * ALLEEN de kanalen van de sensoren die aan sensor-node `snode_idx` gekoppeld

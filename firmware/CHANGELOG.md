@@ -7,6 +7,55 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.3.11 — per-monitor ernst + ernst-emoji vooraan de alert-DM (companion-buzzer)
+
+Een companion (T1000-E) die naast de node hangt, moet aan een **binnenkomende
+alert-DM** kunnen zien hoe erg de storing is, zonder de tekst te lezen: hij kiest
+zijn **buzzer-tune** op de eerste tekens. Daarvoor begint vanaf nu **elke alert-DM**
+met een **ernst-emoji + spatie**:
+
+- 🔴 (`F0 9F 94 B4`) — **hoog**
+- 🟠 (`F0 9F 9F A0`) — **midden**
+- 🟢 (`F0 9F 9F A2`) — **laag** en **elke herstelmelding** ("weer bereikbaar"),
+  ongeacht de ingestelde ernst.
+
+Voorbeeld: `🔴 hoas onbereikbaar (30s)` · `🟠 Batterij laag (3.55V)` ·
+`🟢 hoas weer bereikbaar (na 2m)`.
+
+**Alleen de DM krijgt de emoji.** De room-post (de tekst die in een room verschijnt,
+voor mensen in de app) blijft schoon — de emoji is er voor de companion die de DM
+parseert. Zo blijft de room-tekst leesbaar en verandert er niets aan wat mensen zien.
+
+**Per monitor én per vaste bron instelbaar.** Elke monitor draagt een ernst-veld
+(`severity`, H/M/L); ook de vaste bronnen (netvoeding, wifi, batterij-kritisch,
+batterij-laag, test) hebben er een. **Standaarden:** netvoeding / wifi / monitor-down
+/ batterij-kritisch = **hoog**, batterij-laag = **midden**. Herstel is altijd laag.
+Nieuwe monitors starten op **hoog** — de veiligste, meest opvallende stand. Een
+bestand van vóór deze versie leest elke monitor als **hoog** in (geen stille
+verlaging na een update): `MON_SEV_HIGH == 0`, dus een ontbrekend veld valt op hoog.
+
+**Drie instelwegen, één zeef.** De ernst gaat door dezelfde keuring en dezelfde
+opslag (`/monitors.cfg`) als de rest:
+
+- **web-GUI** — een `e:`-selector (🔴 hoog / 🟠 midden / 🟢 laag) naast de bestaande
+  `a:`/`r:`/`s:`-velden in de bewerk-rij van een monitor; uitleg staat in de
+  "?"-help onder de tabel.
+- **CLI / DM** — `sensor set mon.<ch>.sev high|medium|low` (of `h`/`m`/`l`, `0`/`1`/`2`),
+  `sensor set fa.<idx>.sev ...` voor de vaste bronnen, en `edit <naam> sev=high` over
+  een bot-DM.
+- **POST `/mon/alarm`** — een optioneel `sev`-veld (0 hoog / 1 midden / 2 laag) naast
+  `am`/`rm`/`sn`; afwezig = ongewijzigd.
+
+**Persistent, backward-compatibel.** De ernst staat als **laatste veld** op de `m`- en
+`fa`-regels in `/monitors.cfg`, achter de bestaande velden, zodat een oude parser hem
+negeert en een oud bestand door deze versie (met de veilige hoog-default) gelezen wordt.
+`status.json` draagt de ingestelde ernst als `msv` (0/1/2), los van het bestaande
+weergave-`sev` (ok/bad/warn/unk).
+
+Het alert-dispatch-pad (`RoomMesh::dispatchAlert`) zet de emoji op het DM-tekst-bouwmoment
+via `sevEmoji()`; de v2.3.7 `edgeLatched`/debounce-logica is ongemoeid gelaten (herstel
+geeft `MON_SEV_LOW` mee, storing de ernst van de bron).
+
 ## v2.3.10 — bot beantwoordt de volledige commandoset via DM (gated op de recipientlijst)
 
 De notifier-bot (`BE-HSS-DinX-Bot`) was tot nu een kleine mesh-diagnose-responder:

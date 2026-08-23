@@ -1032,6 +1032,13 @@ uint16_t    MonitorSensors::monitorInterval(int slot) const  { return monitorUse
  * een monitor uit een oud bestand nooit stil ongealarmeerd blijft. */
 uint8_t     MonitorSensors::monitorAlertMode(int slot) const { uint8_t m = monitorUsed(slot) ? _cfg.mons[slot].alert_mode : 0; return m ? m : MON_ALERT_DEFAULT; }
 uint16_t    MonitorSensors::monitorRoomsMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].rooms_mask : MON_ROOMS_DEFAULT; }
+uint8_t     MonitorSensors::monitorSeverity(int slot) const { uint8_t s = monitorUsed(slot) ? _cfg.mons[slot].severity : MON_SEV_DEFAULT; return s <= MON_SEV_LOW ? s : MON_SEV_DEFAULT; }
+bool MonitorSensors::setMonitorSeverity(int slot, uint8_t sev) {
+  if (!monitorUsed(slot) || sev > MON_SEV_LOW) return false;
+  _cfg.mons[slot].severity = sev;
+  markDirty();
+  return true;
+}
 uint16_t    MonitorSensors::monitorSensorNodesMask(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].sensornodes : MON_SNODES_DEFAULT; }
 uint8_t     MonitorSensors::monitorKind(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].kind : MON_KIND_HOST; }
 const char* MonitorSensors::monitorSnmpOid(int slot) const { return monitorUsed(slot) ? _cfg.mons[slot].snmp_oid : ""; }
@@ -1063,6 +1070,17 @@ bool MonitorSensors::setFixedRoomsMask(int idx, uint16_t mask) {
 bool MonitorSensors::setFixedSensorNodesMask(int idx, uint16_t mask) {
   if (idx < 0 || idx >= MON_FA_COUNT) return false;
   _cfg.fixed_sensornodes[idx] = mask;
+  markDirty();
+  return true;
+}
+uint8_t MonitorSensors::fixedSeverity(int idx) const {
+  if (idx < 0 || idx >= MON_FA_COUNT) return MON_SEV_DEFAULT;
+  uint8_t s = _cfg.fixed_severity[idx];
+  return s <= MON_SEV_LOW ? s : MON_SEV_DEFAULT;
+}
+bool MonitorSensors::setFixedSeverity(int idx, uint8_t sev) {
+  if (idx < 0 || idx >= MON_FA_COUNT || sev > MON_SEV_LOW) return false;
+  _cfg.fixed_severity[idx] = sev;
   markDirty();
   return true;
 }
@@ -2334,7 +2352,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
   if (strcasecmp(argv[0], "edit") == 0) {
     if (argc < 3) {
       snprintf(s_dm_buf, sizeof(s_dm_buf),
-               "edit <naam|kanaal> [host=..] [int=..] [naam=..] [ms=0|1] [alert=dm|room|both] [rooms=0,1]");
+               "edit <naam|kanaal> [host=..] [int=..] [naam=..] [ms=0|1] [alert=dm|room|both] [rooms=0,1] [sev=high|medium|low]");
       return s_dm_buf;
     }
     int slot = resolveTarget(argv[1]);
@@ -2366,6 +2384,7 @@ const char* MonitorSensors::handleDmMonCommand(const char* line) {
       else if (strcmp(key, "mode")  == 0) field = "alert";   // alias van 'alert'
       else if (strcmp(key, "rooms") == 0) field = "rooms";    // "0,1"
       else if (strcmp(key, "snodes") == 0) field = "snodes";  // "0,1" (sensor-nodes)
+      else if (strcmp(key, "sev")   == 0) field = "sev";      // high|medium|low
       else if (strcmp(key, "type") == 0) field = "type";      // snmp | host
       else if (strcmp(key, "community") == 0) field = "community";
       else if (strcmp(key, "oid") == 0) field = "oid";
@@ -3353,6 +3372,9 @@ MonitorSensors::MonResult MonitorSensors::createMonitor(const char* name, const 
    * Reconfigureerbaar via mon.<ch>.alert / mon.<ch>.rooms. */
   e.alert_mode = MON_ALERT_DEFAULT;
   e.rooms_mask = MON_ROOMS_DEFAULT;
+  /* Ernst standaard HOOG (monitor-down = hoog, v2.3.11). Reconfigureerbaar via
+   * mon.<ch>.sev of de web-GUI. */
+  e.severity = MON_SEV_DEFAULT;
   /* Nieuwe monitor verschijnt standaard op sensor-node 0 ("BE-HSS-DinX-Up").
    * Reconfigureerbaar via mon.<ch>.snodes. */
   e.sensornodes = MON_SNODES_DEFAULT;
@@ -3766,6 +3788,16 @@ static uint8_t parseAlertMode(const char* v) {
   return 0;
 }
 
+/* Ernst uit tekst: "high"/"hoog"/"h"/"0", "medium"/"midden"/"m"/"1",
+ * "low"/"laag"/"l"/"2". Geeft 0xFF bij onzin, zodat de aanroeper kan weigeren. */
+static uint8_t parseSeverity(const char* v) {
+  while (*v == ' ') v++;
+  if (!strcasecmp(v, "high") || !strcasecmp(v, "hoog") || !strcasecmp(v, "h") || !strcmp(v, "0")) return MON_SEV_HIGH;
+  if (!strcasecmp(v, "medium") || !strcasecmp(v, "midden") || !strcasecmp(v, "m") || !strcmp(v, "1")) return MON_SEV_MEDIUM;
+  if (!strcasecmp(v, "low") || !strcasecmp(v, "laag") || !strcasecmp(v, "l") || !strcmp(v, "2")) return MON_SEV_LOW;
+  return 0xFF;
+}
+
 /* Een lijst van room-INDEXEN ("0", "0,1", "1 2") -> bitmasker. "" of "none" = 0. */
 static uint16_t parseRoomsMask(const char* v) {
   while (*v == ' ') v++;
@@ -4025,6 +4057,13 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
       markDirty();
       return true;
     }
+    if (strcmp(field, "sev") == 0) {     /* ernst: high|medium|low (of h/m/l, 0/1/2) */
+      uint8_t s = parseSeverity(value);
+      if (s == 0xFF) return false;
+      _cfg.mons[slot].severity = s;
+      markDirty();
+      return true;
+    }
     /* ---- SNMP-velden ---- */
     if (strcmp(field, "type") == 0) {          /* snmp | host/ping */
       if (!strcasecmp(value, "snmp")) _cfg.mons[slot].kind = MON_KIND_SNMP;
@@ -4083,6 +4122,11 @@ bool MonitorSensors::setSettingValue(const char* name, const char* value) {
     }
     if (strcmp(field, "snodes") == 0) {
       return setFixedSensorNodesMask(fi, parseRoomsMask(value));   // "0,1"/"none"
+    }
+    if (strcmp(field, "sev") == 0) {   /* ernst: high|medium|low (of h/m/l, 0/1/2) */
+      uint8_t s = parseSeverity(value);
+      if (s == 0xFF) return false;
+      return setFixedSeverity(fi, s);
     }
     return false;
   }
