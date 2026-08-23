@@ -104,10 +104,11 @@ static void set_defaults() {
   mu_cfg.quiet_end       = 0xFF;
   mu_cfg.fall_enabled    = 0;      // default OFF (needs on-device tuning)
   mu_cfg.gps_mode        = MU_GPS_ONDEMAND;
-  mu_cfg.msg_tune_enabled= 1;
+  mu_cfg.msg_tune_enabled= 0;      // ordinary-message tune OFF by default (respects buzzer_quiet)
   mu_cfg.fall_nomotion_min = 0;    // dead-man off by default
   mu_cfg.quiet_level     = 0;      // quiet-hours = full mute by default
   mu_cfg.rxps_level      = 0;      // RXPS OFF by default (continuous RX, never miss an alert)
+  mu_cfg.mute_follow_app = 0;      // default: our alerts are INDEPENDENT of the app's buzzer_quiet
   for (int i = 0; i < MU_TUNE_COUNT; i++)
     mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;   // follow the global default
 
@@ -168,6 +169,7 @@ void mu_config_begin() {
         // documented defaults instead (quiet = full mute, slots follow global).
         mu_cfg.quiet_level = 0;
         mu_cfg.rxps_level  = 0;
+        mu_cfg.mute_follow_app = 0;
         for (int i = 0; i < MU_TUNE_COUNT; i++) mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;
         mu_cfg.version = MU_CFG_VERSION;
         mu_cfg.size    = (uint16_t)sizeof(MuConfig);

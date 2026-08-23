@@ -18,8 +18,12 @@ phone app required):
 
 App-compatibility is a **hard requirement**: every feature is strictly additive
 and the stock MeshCore companion app keeps working unchanged (pairing, messages,
-telemetry). See [`PROTOCOL.md`](PROTOCOL.md) §0 for the guarantee and the exact
-severity contract, command set, menu and battery encoding as implemented.
+telemetry). Our **severity-marked alerts, find-me, low-battery and `!play`** sound
+independently of the app's `buzzer_quiet` (which the app forces on while connected)
+so the pager still alerts with a phone nearby; the generic **ordinary-message**
+tune stays default-OFF and stock-like (respects `buzzer_quiet`). See
+[`PROTOCOL.md`](PROTOCOL.md) §0 for the guarantee and the exact severity contract,
+command set, menu and battery encoding as implemented.
 
 ### Coarse buzzer volume
 

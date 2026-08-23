@@ -26,10 +26,20 @@ the official app/EasySkyMesh keep working unchanged. Concretely, and verified:
   to an app-facing frame is the *value* in the battery field of
   `CMD_GET_BATT_AND_STORAGE` and `CMD_GET_STATS` (still a plain `uint16` mV) — see
   §7. Our battery **%** appears only in our own DM/`!cfg`/serial/menu output.
-- **(c) Buzzer + button coexist with the app.** Our audio also honours the stock
-  `NodePrefs.buzzer_quiet` pref (the app's mute icon) and stays silent when it is
-  set, instead of overriding it. Our `!mute` is an independent, additive gate. The
-  button is otherwise unused by the stock T1000-E companion (no display build).
+- **(c) Buzzer + button coexist; alerts are INDEPENDENT of `buzzer_quiet`.** We
+  never write `NodePrefs.buzzer_quiet` (the stock code/app own it). Crucially, our
+  alert audio is **intentionally decoupled** from it: the official app forces
+  `buzzer_quiet = 1` whenever it is *connected* to the T1000-E, so honouring it
+  would silence MeshUptime alerts exactly when a phone is nearby — defeating the
+  pager. The intentional pager alerts — **severity-marked** DMs (🔴/🟠/🟢),
+  **find-me**, **low-battery**, and **`!play`** previews — are therefore gated
+  **only by our own `!mute` + quiet-period**, and sound whether or not the app is
+  connected. Opt-in `!mute followapp on` (default **off**) makes even those follow
+  `buzzer_quiet`. **Exception:** the generic **message** tune for *ordinary,
+  non-severity* DMs / channel messages is **default OFF** and, when enabled, still
+  respects `buzzer_quiet` (stock-like) — so ordinary chatter stays silent while the
+  app is connected, exactly as the app intends. The button is otherwise unused by
+  the stock T1000-E companion (no display build).
 - **(d) Identity + FS layout unchanged.** We persist only `/mu_cfg.dat` on the same
   InternalFS. Identity keys, `NodePrefs`, contacts and channels are never rewritten
   by our code. (The menu's radio-param change calls the stock `savePrefs()` — the
@@ -57,7 +67,8 @@ blink pattern, subject to mute and quiet-hours (see §3).
 
 - A DM starting with `!` is treated as a **command** (§2), never an alert.
 - Any other (unmarked, non-command) DM optionally plays a subtle **message**
-  tune (slot `msg`, default Mario "coin", `!msgtune on|off`).
+  tune (slot `msg`, default Mario "coin", `!msgtune on|off`, **default OFF** and
+  respects `buzzer_quiet` — see §3/§0c).
 - `find` slot (Mario main theme) and `msg` slot are configurable too.
 
 The emoji check is on the DM **text**; it is independent of the sender. Command
@@ -86,6 +97,7 @@ printed line on the serial console.
 | `!find` | Loop the find melody + LED beacon until a button press, `!findstop`, or a 5-minute timeout. If started by DM, a short `gevonden` DM is sent back when a button press stops it. |
 | `!findstop` | Stop the find loop. |
 | `!mute on\|off` | Mute/unmute alert audio. LED alerts still show while muted. |
+| `!mute followapp on\|off` | Opt-in (default **off**): when on, our alert audio also follows the app's `buzzer_quiet`. Default off = our marked alerts sound even while the app is connected. |
 | `!vol 0..3` | **Global default** coarse volume. Driven by PWM duty (`0` silent, `1` soft, `2` normal, `3` loud). A passive magnetic buzzer dims only coarsely; 1–3 are approximate (see §3). |
 | `!vol <H\|M\|L\|find\|msg> 0..3` | **Per-slot** volume override. `255` (reported) means "follow the global default". Report with no value. |
 | `!tune <H\|M\|L\|find\|msg> <RTTTL>` | Store a new RTTTL for a slot (persisted) and play it as a preview. |
@@ -108,7 +120,7 @@ printed line on the serial console.
 | `!sos <64hex>` | Set the recipient for button long-press SOS and fall alerts. |
 | `!fall on\|off` | Arm/disarm fall + no-motion detection. |
 | `!fall nomotion <minutes>` | Dead-man no-motion timeout in minutes (`0` = off). |
-| `!msgtune on\|off` | Enable/disable the subtle tune on plain DMs. |
+| `!msgtune on\|off` | Enable/disable the subtle tune on plain (non-severity) DMs. **Default OFF.** When on it still respects `buzzer_quiet` (silent while the app is connected), unlike our severity alerts. |
 | `!help` | List commands. |
 
 ### Allowlist seed (built-in defaults)
@@ -128,7 +140,10 @@ The **effective volume** of a slot is computed as:
 
 1. Start from the slot's own volume, or the global default if the slot is set to
    `255` (`mu_slot_base_vol()`).
-2. If `!mute on`, or the app's stock `buzzer_quiet` pref is set → **0** (silent).
+2. If `!mute on` → **0** (silent). Otherwise the app's `buzzer_quiet` (forced on
+   while the app is connected) silences a tune **only** when it is the generic
+   **message** tune, or when `!mute followapp on` (default off). Severity alerts,
+   find-me, low-battery and `!play` ignore `buzzer_quiet` by default.
 3. If inside the quieter-period window, clamp to the window's cap
    (`mute` = 0, or the configured `0..3`).
 
@@ -138,8 +153,9 @@ coarse, and the 1–3 loudness steps are approximate. Independently of audio:
 
 - **Alert severities (H/M/L)** still run their **LED** pattern when audio is
   suppressed — a muted device still signals visually.
-- The **message** tick (`msg`) follows the audio gate fully (a muted device is
-  fully dark for ordinary chatter).
+- The **message** tick (`msg`) follows the audio gate fully **and additionally
+  respects `buzzer_quiet`** (stock-like). It is **default OFF** (`!msgtune on` to
+  enable); a muted or app-connected device stays fully dark for ordinary chatter.
 - **Find** ignores mute (it is an explicit request) but honours the quieter-period
   cap for its audio; the LED beacon always runs.
 - The **fall pre-alarm** uses the `H` tune and therefore follows the same mute and

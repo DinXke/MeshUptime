@@ -97,13 +97,23 @@ int mu_quiet_cap() {
 // Effective volume for a slot: global/per-slot base, gated by mute and the
 // quiet-period cap. Returns 0 when audio must stay silent.
 //
-// App-compat (PROTOCOL §0c): we COEXIST with the stock companion's own mute — if
-// the phone app sets NodePrefs.buzzer_quiet (its mute icon), we honour it too and
-// stay silent, rather than fighting it. Our own !mute is independent and additive.
+// App-compat (PROTOCOL §0c). buzzer_quiet handling is scoped by slot:
+//  - The intentional pager alerts (severity H/M/L, find, low-battery, !play) are
+//    INTENTIONALLY DECOUPLED from NodePrefs.buzzer_quiet. The official app forces
+//    buzzer_quiet=1 whenever it is CONNECTED, so honouring it would silence our
+//    alerts exactly when a phone is nearby — defeating the pager. They are gated
+//    ONLY by our own !mute + quiet-period (unless the user opts in via
+//    `!mute followapp on`, default OFF).
+//  - The generic MESSAGE tune (ordinary, non-severity DMs / channel msgs) behaves
+//    like the stock beep: it is default OFF and, when enabled, STILL respects
+//    buzzer_quiet — so ordinary chatter stays silent while the app is connected
+//    (the phone handles those), which is exactly why the app sets buzzer_quiet.
+// We never write buzzer_quiet ourselves; we only read it where the rules require.
 static uint8_t effective_vol(int tune_slot, bool ignore_mute) {
   if (!ignore_mute) {
     if (mu_cfg.mute) return 0;
-    if (the_mesh.getNodePrefs()->buzzer_quiet) return 0;   // app's stock mute icon
+    bool follow_bq = (tune_slot == MU_TUNE_MSG) || mu_cfg.mute_follow_app;
+    if (follow_bq && the_mesh.getNodePrefs()->buzzer_quiet) return 0;
   }
   uint8_t v = mu_slot_base_vol(tune_slot);
   int cap = mu_quiet_cap();

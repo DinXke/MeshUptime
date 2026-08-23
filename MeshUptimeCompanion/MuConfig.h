@@ -62,7 +62,7 @@ struct MuConfig {
   uint8_t  quiet_level;     // during quiet-hours: 0 = mute, 1..3 = reduced volume cap
   uint8_t  tune_vol[MU_TUNE_COUNT];  // per-slot volume 0..3, or MU_VOL_DEFAULT
   uint8_t  rxps_level;      // RX power-saving: 0=off/continuous, 1=conservative, 2=balanced
-  uint8_t  _pad2[1];
+  uint8_t  mute_follow_app; // 1 = our audio ALSO follows the app's buzzer_quiet; 0 (default) = independent
 };
 
 extern MuConfig mu_cfg;

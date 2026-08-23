@@ -311,10 +311,21 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
                                      mu_reply(ctx, "find: bezig (knop/ !findstop /5min)"); return true; }
   if (!strcmp(cmd, "findstop"))    { mu_find_stop(); mu_reply(ctx, "find: gestopt"); return true; }
   if (!strcmp(cmd, "mute")) {
-    char a[8]; next_tok(args, a, sizeof(a), true);
+    char a[12]; const char* p = next_tok(args, a, sizeof(a), true);
+    if (!strcmp(a, "followapp")) {
+      // Opt-in: also follow the app's buzzer_quiet. Default OFF so alerts always
+      // sound even while the app is connected (the app forces buzzer_quiet then).
+      char b[8]; next_tok(p, b, sizeof(b), true);
+      if (!strcmp(b, "on")) mu_cfg.mute_follow_app = 1;
+      else if (!strcmp(b, "off")) mu_cfg.mute_follow_app = 0;
+      else { mu_reply(ctx, "mute followapp on|off (default off=onafhankelijk)"); return true; }
+      mu_config_save();
+      mu_reply(ctx, "mute followapp: %s", mu_cfg.mute_follow_app ? "on" : "off");
+      return true;
+    }
     if (!strcmp(a, "on"))  mu_cfg.mute = 1;
     else if (!strcmp(a, "off")) mu_cfg.mute = 0;
-    else { mu_reply(ctx, "mute on|off"); return true; }
+    else { mu_reply(ctx, "mute on|off | mute followapp on|off"); return true; }
     mu_config_save(); mu_reply(ctx, "mute: %s", mu_cfg.mute ? "on" : "off"); return true;
   }
   if (!strcmp(cmd, "vol")) {
