@@ -400,6 +400,8 @@ public:
   }
   int         webBotSendTo(const char* pub_hex, const char* text) override;
   int         webBotPost(const char* text) override { return botPost(text); }
+  bool        webBotDiag() override { return _bot_diag; }
+  bool        webBotSetDiag(bool en) override { setBotDiag(en); return true; }
 
   /* ---- IWebNode: hashtag-/publieke kanalen ---- */
   int  webChannelMax() override   { return channelMax(); }
@@ -413,6 +415,8 @@ public:
 
   /* ---- Bot: publieke API (CLI + intern) ---- */
   bool botActive() const { return _bot_active; }
+  bool botDiag() const { return _bot_diag; }
+  void setBotDiag(bool en);   // persistent (zelfde bestand als de ontvangerslijst)
   int  botRecipCount() const;
   bool botRecipGetByIdx(int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
   int  botRecipAdd(const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
@@ -531,6 +535,7 @@ private:
    * gewone advert-timers, zichtbaar in de MeshCore-app als gewoon chatcontact. */
   mesh::LocalIdentity _bot_id;
   bool          _bot_active;
+  bool          _bot_diag;    // verklikker (1-byte/geen scope) in ping/test/path-antwoorden
   char          _bot_name[24];
   unsigned long _bot_next_local_advert, _bot_next_flood_advert;
   BotRecip      _bot_recips[MAX_BOT_RECIPS];

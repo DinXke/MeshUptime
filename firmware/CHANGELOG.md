@@ -7,15 +7,22 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
-## v2.3.8 — bot verklikt 1-byte pad-hashes en ongescopete floods
+## v2.3.8 — zend-diagnose (👍/😞) achter de ping/test/path-antwoorden
 
 De ping/test/path-antwoorden van de bot (zowel DM als in-kanaal) melden nu achteraan
-hoe de afzender zond, zodat legacy-instellingen zichtbaar worden in het kanaal zelf:
+HOE de afzender zond, zodat zowel legacy- als correcte instellingen zichtbaar worden
+in het kanaal zelf:
 
-- ` | 1-byte 😞` — het inkomende pakket droeg 1-byte pad-hashes (afzender staat nog op
-  `path.hash.mode 0`; delen van de mesh, o.a. DinX-Home, filteren die).
-- ` | geen scope 😞` — het inkomende pakket was een ongescopete flood
-  (`ROUTE_TYPE_FLOOD` zonder transport-codes i.p.v. `TRANSPORT_FLOOD`).
+- ` | 2-byte 👍` / ` | 1-byte 😞` — de pad-hashgrootte van het inkomende pakket.
+  1-byte betekent dat de afzender nog op `path.hash.mode 0` staat; delen van de mesh
+  (o.a. DinX-Home) filteren die. De echte grootte wordt getoond (2 of 3).
+- ` | scoped 👍` / ` | geen scope 😞` — gescopete flood (`TRANSPORT_FLOOD` mét
+  transport-codes) versus een kale `ROUTE_TYPE_FLOOD`.
+
+De twee oordelen zijn ONAFHANKELIJK: hashgrootte en scope zitten in verschillende
+pakketvelden, dus elke mengeling komt voor en wordt ook zo getoond —
+`| 2-byte 👍 | geen scope 😞` (modern gehasht maar ongescoped) net zo goed als
+`| 1-byte 😞 | scoped 👍`. Beide duimen omhoog = niets aan te merken.
 
 Detectie: `packet->getPathHashSize()` (topbits van `path_len`, ook bij zero-hop floods
 gezet door `setPathHashSizeAndCount`) en `packet->isRouteFlood() && !packet->hasTransportCodes()`.
@@ -24,6 +31,13 @@ geen `1-byte`-oordeel; en `geen scope` geldt alleen voor floods, want een direct
 DM floodt niet en heeft dus geen scope nodig. Beide vlaggen tegelijk kan.
 Implementatie: één gedeelde `appendTxDiag()` in `RoomMesh.cpp`, aangeroepen na het
 opbouwen van de reply (DM: alleen `ping`/`path`; kanaal: alle drie de commando's).
+
+**Aan/uit in de GUI:** checkbox op de Bot-pagina ("verklik legacy-afzenders"), standaard
+AAN. Leeskant `bot.json` veld `diag`; zetten via `POST /bot/diag` (form `enabled=0|1`).
+Persistent als extra regeltype `d <0|1>` in het bestaande ontvangersbestand (`#MUBOT1`);
+oude parsers slaan die regel gewoon over. De bot-antwoorden zelf blijven ALTIJD een
+gescopete flood met 2-byte pad-hashes (`sendFloodScoped`, `path.hash.mode+1`) — juist
+zodat iedereen in het kanaal de verklikker meeleest, ook wie zero-hop zond.
 
 ## v2.3.7 — alle alert-types onder één gegrendelde kantelaar
 

@@ -110,6 +110,7 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   _post_cb = NULL;
   _post_cb_ctx = NULL;
   _bot_active = false;
+  _bot_diag = true;   // verklikker standaard AAN; persistente stand komt uit loadBotRecips()
   _bot_name[0] = 0;
   _bot_next_local_advert = _bot_next_flood_advert = 0;
   memset(_bot_recips, 0, sizeof(_bot_recips));
@@ -1653,6 +1654,8 @@ void RoomMesh::saveBotRecips() {
   File f = _fs->open(BOT_RECIPS_PATH, "w", true);
   if (!f) return;
   f.printf("#MUBOT1\n");
+  /* Verklikker-stand als extra regeltype 'd'; oude parsers slaan 'm gewoon over. */
+  f.printf("d %d\n", _bot_diag ? 1 : 0);
   char hex[PUB_KEY_SIZE * 2 + 1];
   for (int i = 0; i < MAX_BOT_RECIPS; i++) {
     if (_bot_recips[i].level == 0) continue;
@@ -1681,6 +1684,7 @@ void RoomMesh::loadBotRecips() {
     }
     line[len] = 0;
     if (first) { first = false; continue; }
+    if (line[0] == 'd' && line[1] == ' ') { _bot_diag = atoi(line + 2) != 0; continue; }
     if (line[0] != 'b') continue;
     char* p = line + 1;
     while (*p == ' ') p++;
@@ -1695,6 +1699,11 @@ void RoomMesh::loadBotRecips() {
     bi++;
   }
   f.close();
+}
+
+void RoomMesh::setBotDiag(bool en) {
+  _bot_diag = en;
+  saveBotRecips();
 }
 
 /* Advert als CHAT-contact (type=1), zodat de MeshCore-app de bot als gewoon
@@ -1743,22 +1752,31 @@ void RoomMesh::sendBotAlertDM(const uint8_t* pubkey, AlertTask* t) {
 /*  Bot: inkomend mesh-diagnose-pad (ping / path / help)               */
 /* ------------------------------------------------------------------ */
 
-/* Verklik-achtervoegsel voor bot-antwoorden: meldt afzenders die nog met 1-byte
- * pad-hashes zenden (path.hash.mode 0; wordt door o.a. DinX-Home gefilterd) of
- * hun flood ZONDER scope sturen (route ROUTE_TYPE_FLOOD i.p.v. TRANSPORT_FLOOD
- * met transport-codes). Alleen wat uit het pakket ECHT afleidbaar is:
+/* Zend-diagnose-achtervoegsel voor bot-antwoorden: duim omhoog voor moderne
+ * afzenders (2-byte pad-hashes, gescopete flood), droevige smiley voor legacy
+ * (1-byte hashes -- worden door o.a. DinX-Home gefilterd -- of een flood zonder
+ * scope: ROUTE_TYPE_FLOOD i.p.v. TRANSPORT_FLOOD met transport-codes). Alleen
+ * wat uit het pakket ECHT afleidbaar is:
  *  - de hash-grootte zit in de topbits van path_len en wordt ook bij een
  *    zero-hop FLOOD gezet (setPathHashSizeAndCount), maar een zero-hop DIRECT
  *    pakket draagt hem niet -> dan geen oordeel;
- *  - "geen scope" geldt alleen voor floods; een DIRECT pakket floodt niet en
- *    heeft dus geen scope nodig. */
+ *  - het scope-oordeel geldt alleen voor floods; een DIRECT pakket floodt niet
+ *    en heeft dus geen scope nodig. */
 static void appendTxDiag(char* reply, size_t cap, const mesh::Packet* packet) {
   size_t o = strlen(reply);
   bool size_known = packet->isRouteFlood() || packet->getPathHashCount() > 0;
-  if (size_known && packet->getPathHashSize() == 1 && o < cap)
-    o += snprintf(reply + o, cap - o, " | 1-byte \xF0\x9F\x98\x9E");
-  if (packet->isRouteFlood() && !packet->hasTransportCodes() && o < cap)
-    snprintf(reply + o, cap - o, " | geen scope \xF0\x9F\x98\x9E");
+  if (size_known && o < cap) {
+    if (packet->getPathHashSize() >= 2)
+      o += snprintf(reply + o, cap - o, " | %d-byte \xF0\x9F\x91\x8D", (int)packet->getPathHashSize());
+    else
+      o += snprintf(reply + o, cap - o, " | 1-byte \xF0\x9F\x98\x9E");
+  }
+  if (packet->isRouteFlood() && o < cap) {
+    if (packet->hasTransportCodes())
+      snprintf(reply + o, cap - o, " | scoped \xF0\x9F\x91\x8D");
+    else
+      snprintf(reply + o, cap - o, " | geen scope \xF0\x9F\x98\x9E");
+  }
 }
 
 /* De bot is GEEN monitoring-console: hij is een mesh-diagnose-responder met een
@@ -1841,8 +1859,9 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
     snprintf(reply, sizeof(reply), "onbekend commando. stuur `ping` of `path`.");
   }
 
-  /* Diagnose-commando's krijgen het verklik-achtervoegsel (1-byte / geen scope). */
-  if (!strcasecmp(verb, "ping") || !strcasecmp(verb, "path"))
+  /* Diagnose-commando's krijgen het verklik-achtervoegsel (1-byte / geen scope),
+   * tenzij de verklikker in de GUI uit staat. */
+  if (_bot_diag && (!strcasecmp(verb, "ping") || !strcasecmp(verb, "path")))
     appendTxDiag(reply, sizeof(reply), packet);
 
   /* 1) ACK het inkomende bericht, zodat de app niet blijft herzenden. De ack-hash
@@ -2198,8 +2217,9 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
                who, route, nhops, snr_db, rssi, rxt);
   }
 
-  /* Kanaal-commando's zijn altijd diagnose -> verklik 1-byte / geen scope. */
-  appendTxDiag(reply, sizeof(reply), packet);
+  /* Kanaal-commando's zijn altijd diagnose -> verklik 1-byte / geen scope,
+   * tenzij de verklikker in de GUI uit staat. */
+  if (_bot_diag) appendTxDiag(reply, sizeof(reply), packet);
 
   sendChannelReply(channel, reply);
 }

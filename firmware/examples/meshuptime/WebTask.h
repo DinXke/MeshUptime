@@ -279,12 +279,14 @@ private:
    *  /bot/advert (POST)   : flood=0/1.
    *  /bot/sendto (POST)   : key (64hex) + msg -- ad-hoc schone DM (flash-melding).
    *  /bot/post (POST)     : msg -- DM de hele ontvangerslijst.
+   *  /bot/diag (POST)     : enabled=0/1 -- verklikker (1-byte/geen scope) aan/uit.
    * De v2c-community en gedeelde geheimen komen NOOIT in deze endpoints voor. */
   void handleBotJson();
   void handleBotRecip();
   void handleBotAdvert();
   void handleBotSendto();
   void handleBotPost();
+  void handleBotDiag();
 
   /* Hashtag-/publieke kanalen: /channels.json (GET), /channel/add|del|toggle (POST). */
   void handleChannelsJson();
@@ -345,6 +347,7 @@ private:
   friend void web_route_botadvert();
   friend void web_route_botsendto();
   friend void web_route_botpost();
+  friend void web_route_botdiag();
   friend void web_route_channelsjson();
   friend void web_route_channeladd();
   friend void web_route_channeldel();

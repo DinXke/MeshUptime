@@ -56,11 +56,12 @@
  *            + plausibele duur, sim-merk alleen bij een echte forcering, en een
  *            gedeelde symmetrische debounce (debounceStep) -- de batterij kreeg
  *            Schmitt-hysterese (3,40/3,50 V crit, 3,60/3,70 V laag) tegen geflikker.
- *   v2.3.8 = bot verklikt legacy-afzenders: ping/test/path-antwoorden (DM en
- *            kanaal) krijgen " | 1-byte [sad]" als het inkomende pakket nog
- *            1-byte pad-hashes droeg en " | geen scope [sad]" als het een
- *            ongescopete flood was (ROUTE_TYPE_FLOOD zonder transport-codes).
- *            Zero-hop DIRECT draagt geen hash-grootte -> daar geen oordeel.
+ *   v2.3.8 = ZEND-DIAGNOSE achter de ping/test/path-antwoorden (DM en kanaal):
+ *            " | 2-byte [duim]" of " | 1-byte [sad]" (pad-hashgrootte) en
+ *            " | scoped [duim]" of " | geen scope [sad]" (TRANSPORT_FLOOD met
+ *            transport-codes vs. kale ROUTE_TYPE_FLOOD). Onafhankelijke oordelen,
+ *            dus mengelingen komen voor. Zero-hop DIRECT draagt geen hash-grootte
+ *            -> daar geen oordeel. Aan/uit via de GUI (Bot-pagina), standaard AAN.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 

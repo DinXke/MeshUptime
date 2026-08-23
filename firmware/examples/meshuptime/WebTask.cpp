@@ -464,6 +464,7 @@ void web_route_monsnmp()      { if (g_self) g_self->handleMonSnmp(); }
 void web_route_contactsjson() { if (g_self) g_self->handleContactsJson(); }
 void web_route_botjson()      { if (g_self) g_self->handleBotJson(); }
 void web_route_botrecip()     { if (g_self) g_self->handleBotRecip(); }
+void web_route_botdiag()      { if (g_self) g_self->handleBotDiag(); }
 void web_route_botadvert()    { if (g_self) g_self->handleBotAdvert(); }
 void web_route_botsendto()    { if (g_self) g_self->handleBotSendto(); }
 void web_route_botpost()      { if (g_self) g_self->handleBotPost(); }
@@ -1797,6 +1798,9 @@ en zet jezelf op de ontvangerslijst.</p>
 <div class="quick"><span style="align-self:center;color:var(--muted);font-size:.8rem">Advert nu:</span>
 <button type="button" onclick="botAdvert(1)">flood</button>
 <button type="button" onclick="botAdvert(0)">zero-hop</button></div>
+<div class="quick" style="margin-top:.35rem"><label style="align-self:center">
+<input type="checkbox" id="bot-diag"> zend-diagnose achter ping/test/path-antwoorden:
+<code>2-byte</code>&#128077;/<code>1-byte</code>&#128542; en <code>scoped</code>&#128077;/<code>geen scope</code>&#128542;</label></div>
 <div id="botmsg"></div></div>
 
 <h2>Ontvangers &mdash; wie de DM's krijgt</h2>
@@ -3425,6 +3429,7 @@ document.getElementById("bot-name").textContent=d.name;
 var kp=document.getElementById("bot-pub");kp.textContent=d.pub.slice(0,8)+"…"+d.pub.slice(-4);
 kp.title=d.pub+"  (klik om te kopiëren)";kp.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(d.pub)};
 document.getElementById("bot-uri").value=d.uri||"";
+var dg=document.getElementById("bot-diag");if(dg)dg.checked=!!d.diag;
 try{drawQRon("bqr",d.uri)}catch(e){}
 botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)});
 channelsLoad()}
@@ -3461,6 +3466,12 @@ headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"flood="+(floo
 bmsg("botmsg",j.ok?("bot-advert verstuurd ("+(flood?"flood":"zero-hop")+")"):"mislukt",j.ok?1:0)})
 .catch(function(){bmsg("botmsg","mislukt",0)})}
 document.getElementById("bot-add").onclick=botAdd;
+document.getElementById("bot-diag").onchange=function(){var en=this.checked?1:0;
+fetch("bot/diag",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"enabled="+en})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("botmsg",j.ok?("verklikker "+(en?"aan":"uit")):"mislukt",j.ok?1:0)})
+.catch(function(){bmsg("botmsg","mislukt",0)})};
 document.getElementById("bot-copy").onclick=function(){
 var i=document.getElementById("bot-uri");i.focus();i.select();
 if(navigator.clipboard&&navigator.clipboard.writeText)
@@ -3837,6 +3848,7 @@ void WebTask::routes() {
   _server->on("/bot/advert", HTTP_POST, web_route_botadvert);
   _server->on("/bot/sendto", HTTP_POST, web_route_botsendto);
   _server->on("/bot/post", HTTP_POST, web_route_botpost);
+  _server->on("/bot/diag", HTTP_POST, web_route_botdiag);
   _server->on("/channels.json", HTTP_GET, web_route_channelsjson);
   _server->on("/channel/add", HTTP_POST, web_route_channeladd);
   _server->on("/channel/del", HTTP_POST, web_route_channeldel);
@@ -5481,8 +5493,8 @@ void WebTask::handleBotJson() {
   char euri[300]; jsonEscape(uri, euri, sizeof(euri));
 
   int n = snprintf(g_json, sizeof(g_json),
-      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,\"recips\":[",
-      name, pub, euri, _acl->webBotRecipMax());
+      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,\"diag\":%d,\"recips\":[",
+      name, pub, euri, _acl->webBotRecipMax(), _acl->webBotDiag() ? 1 : 0);
   int cnt = _acl->webBotRecipCount();
   char rk[PUB_KEY_SIZE * 2 + 1];
   for (int i = 0; i < cnt; i++) {
@@ -5571,6 +5583,22 @@ void WebTask::handleBotPost() {
     return;
   }
   _server->send(400, "application/json", "{\"ok\":false,\"error\":\"wachtrij vol of geen ontvangers\"}");
+}
+
+/* POST /bot/diag  (enabled=0/1) -- verklikker (1-byte/geen scope + droevige
+ * smiley achter ping/test/path-antwoorden) aan/uit; persistent op de node. */
+void WebTask::handleBotDiag() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+  char en[4];
+  if (!getArg(*_server, "enabled", en, sizeof(en)) || en[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"enabled ontbreekt\"}");
+    return;
+  }
+  _acl->webBotSetDiag(en[0] == '1');
+  char out[48];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"diag\":%d}", _acl->webBotDiag() ? 1 : 0);
+  _server->send(200, "application/json", out);
 }
 
 /* ================================================================== */

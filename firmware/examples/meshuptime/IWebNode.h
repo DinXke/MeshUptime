@@ -156,6 +156,10 @@ public:
   virtual int  webBotSendTo(const char* pub_hex, const char* text) { (void)pub_hex; (void)text; return -1; }
   /* DM de HELE ontvangerslijst. Retour = aantal ontvangers aangeschreven, <0 fout. */
   virtual int  webBotPost(const char* text) { (void)text; return -1; }
+  /* Verklikker in ping/test/path-antwoorden ("1-byte"/"geen scope" + droevige
+   * smiley) aan/uit. Persistent op de node. */
+  virtual bool webBotDiag()           { return false; }
+  virtual bool webBotSetDiag(bool en) { (void)en; return false; }
 
   /* ---- HASHTAG-/PUBLIEKE KANALEN (web-GUI) ----------------------------------
    * De bot leest de ingeschakelde kanalen mee en antwoordt IN het kanaal op
