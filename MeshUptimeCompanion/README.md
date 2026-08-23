@@ -5,15 +5,30 @@ LR1110). On top of a stock companion node it adds, running **standalone** (no
 phone app required):
 
 1. **Severity tunes** on incoming MeshUptime alert DMs (🔴/🟠/🟢), with green-LED
-   patterns, default **Super Mario** melodies, mute + quiet-hours.
+   patterns, default **Super Mario** melodies, a **named built-in tune library**,
+   **per-slot volume**, mute + a configurable **quieter period**.
 2. A **DM + serial-CLI command protocol** (one shared parser) with an allowlist,
-   find-me, configurable tunes, presets, GPS control and persistence.
+   find-me, configurable tunes, presets, GPS control and persistence, **plus an
+   interactive ASCII-art serial menu** on top.
 3. **Button** actions: press-to-silence, short-press ack, long-press SOS+GPS.
 4. **Fall / no-motion** detection on the QMA6100P accelerometer (default OFF).
-5. **PowerSaving-v17 RXPS**, on-demand GPS and nRF light-sleep for battery life.
+5. **On-demand GPS + nRF light-sleep** for battery life, with **RXPS as an
+   opt-in, default-OFF** option (continuous RX by default so no alert DM is ever
+   missed).
 
-See [`PROTOCOL.md`](PROTOCOL.md) for the exact severity contract and the full
-command set as implemented.
+App-compatibility is a **hard requirement**: every feature is strictly additive
+and the stock MeshCore companion app keeps working unchanged (pairing, messages,
+telemetry). See [`PROTOCOL.md`](PROTOCOL.md) §0 for the guarantee and the exact
+severity contract, command set, menu and battery encoding as implemented.
+
+### Coarse buzzer volume
+
+The T1000-E buzzer is a **passive magnetic buzzer** with no true amplitude
+control. Volume is implemented best-effort by driving the buzzer pin from the
+nRF52 **hardware PWM at a variable duty cycle** (lower duty = quieter): a custom
+non-blocking RTTTL player (`MuBuzzer`) replaces the stock fixed-50%-duty
+`tone()` playback. Four coarse levels only — `0` silent, `1` soft, `2` normal,
+`3` loud — a magnetic buzzer dims coarsely and levels 1–3 are approximate.
 
 ---
 
@@ -21,17 +36,25 @@ command set as implemented.
 
 Nothing in the MeshCore checkout is modified. This folder ships:
 
-- **New modules**: `MuAlert.cpp` (tune/LED/find engine + DM hook + serial CLI),
-  `MuCommand.cpp` (shared parser), `MuButton.cpp`, `MuFall.cpp`,
-  `QMA6100P.{h,cpp}` (accelerometer driver), `MuConfig.{h,cpp}` (additive
-  persistence), `MuTunes.h` (default RTTTL + LED patterns), `MuBattery.{h,cpp}`
-  (the battery-curve seam), `MeshUptime.h`, `MuHooks.h`.
+- **New modules**: `MuAlert.cpp` (tune/LED/find engine + DM hook + serial CLI +
+  low-battery warning), `MuCommand.cpp` (shared parser), `MuMenu.cpp`
+  (interactive ASCII serial menu), `MuBuzzer.{h,cpp}` (custom PWM-duty RTTTL
+  player with coarse volume), `MuButton.cpp`, `MuFall.cpp`, `QMA6100P.{h,cpp}`
+  (accelerometer driver), `MuConfig.{h,cpp}` (additive persistence),
+  `MuTunes.h` (named tune library + default RTTTL + LED patterns),
+  `MuBattery.{h,cpp}` (battery curve + app-facing mV encoder), `MeshUptime.h`,
+  `MuHooks.h`.
 - **Two lightly-patched copies** of the stock companion sources, compiled
-  *instead of* the originals:
+  *instead of* the originals. All edits are small and additive:
   - `app_main.cpp` — stock `examples/companion_radio/main.cpp` + calls to
-    `mu_begin()` / `mu_loop()` and a `mu_wants_cpu()` guard on light-sleep.
-  - `MyMesh.cpp` — stock `examples/companion_radio/MyMesh.cpp` + **one** hook
-    line in `onMessageRecv()` calling `mu_on_direct_msg()`.
+    `mu_begin()` / `mu_loop()` and a `mu_wants_cpu()` guard on light-sleep. (The
+    stock `genericBuzzer` global is dropped in favour of `MuBuzzer`.)
+  - `MyMesh.cpp` — stock `examples/companion_radio/MyMesh.cpp` plus: **(1)** one
+    hook line in `onMessageRecv()` calling `mu_on_direct_msg()` *after* the normal
+    `queueMessage()` (never consumes the message); **(2)** RXPS made opt-in and
+    default-OFF (continuous RX) via `mu_rxps_apply()`; **(3)** the standard
+    battery frames (`CMD_GET_BATT_AND_STORAGE`, `CMD_GET_STATS`) fed an *encoded*
+    mV so the app's own linear formula shows the correct % — structure unchanged.
   Everything else (`MyMesh.h`, `DataStore.*`, `NodePrefs.h`, `AbstractUITask.h`)
   is used unmodified from the MeshCore checkout.
 - **`platformio.local.ini.example`** — the build env, layered onto MeshCore via
@@ -117,12 +140,25 @@ be re-added to every contact and re-authorised on the mesh — so back up first.
 
 ## Status & limitations
 
-- **Volume** (`!vol`) is best-effort only: the passive buzzer has no amplitude
-  control; `0` = silent, `1..3` = full volume (see PROTOCOL §2).
+- **Volume** (`!vol`, per-slot `!vol <slot>`) is best-effort: the passive
+  magnetic buzzer has no true amplitude control. It is driven by PWM duty cycle
+  (lower = quieter), which dims only **coarsely** — `0` silent, `1` soft, `2`
+  normal, `3` loud, with 1–3 approximate (see PROTOCOL §2/§3). The duty→loudness
+  mapping (`MuBuzzer.cpp vol_duty_pct`) is a first cut and wants on-device tuning.
 - **Fall detection** ships **disabled** with placeholder thresholds; it needs
   on-device tuning (`MuFall.cpp` constants) and the QMA6100P register set is
   from the datasheet, not yet hardware-validated.
-- **Battery %** uses a placeholder linear curve behind the single
-  `battery_percent_from_mv()` seam; the corrected curve drops in there.
+- **Battery %** uses the corrected LiPo discharge curve in the single
+  `battery_percent_from_mv()` seam. The curve is for light load / rest — validate
+  against a real on-device discharge log under LoRa-TX/GPS load.
+- **RXPS** is opt-in and default-OFF (continuous RX). Enabling it (`!rxps
+  conservative|balanced`, or menu §6) trades battery for a **risk of missed alert
+  DMs** — the RX duty-cycle timings are from PowerSaving-v17 and unvalidated on
+  this exact node.
+- **App battery encoding** (PROTOCOL §7): the value in the app's battery frame is
+  a virtual mV chosen so the app's own linear %-formula shows the correct %. If
+  the app displays that number as a raw *voltage* anywhere, it will be the encoded
+  value, not the true cell voltage. Our own DM/`!cfg`/serial/menu/telemetry paths
+  always report the **real** voltage.
 - The two copied companion sources are pinned to the MeshCore version they were
   copied from; re-copy + re-apply the small hooks when bumping MeshCore.

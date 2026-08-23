@@ -25,8 +25,10 @@
 #define MU_GPS_ON       1
 #define MU_GPS_ONDEMAND 2
 
+#define MU_VOL_DEFAULT 0xFF   // per-slot sentinel: "follow the global default vol"
+
 #define MU_CFG_MAGIC   0x3143554DUL   // "MUC1"
-#define MU_CFG_VERSION 1
+#define MU_CFG_VERSION 2              // v2: per-slot volume + quiet-period level
 
 struct MuConfig {
   uint32_t magic;
@@ -34,7 +36,7 @@ struct MuConfig {
   uint16_t size;
 
   uint8_t  mute;            // 1 = alert tunes muted (LED still blinks)
-  uint8_t  vol;             // 0..3 coarse; 0 = silent. HW has no true volume.
+  uint8_t  vol;             // 0..3 coarse GLOBAL default; 0 = silent.
   uint8_t  quiet_start;     // hour 0..23 (UTC), 0xFF = quiet-hours disabled
   uint8_t  quiet_end;       // hour 0..23 (UTC)
   uint8_t  fall_enabled;    // 1 = fall/no-motion detection armed
@@ -55,9 +57,22 @@ struct MuConfig {
   uint8_t  allow_pub[MU_ALLOW_MAX][MU_PUB_LEN];
 
   char     presets[MU_PRESET_MAX][MU_PRESET_LEN];
+
+  // --- v2 additive fields (appended at the end for forward-compatible load) ---
+  uint8_t  quiet_level;     // during quiet-hours: 0 = mute, 1..3 = reduced volume cap
+  uint8_t  tune_vol[MU_TUNE_COUNT];  // per-slot volume 0..3, or MU_VOL_DEFAULT
+  uint8_t  rxps_level;      // RX power-saving: 0=off/continuous, 1=conservative, 2=balanced
+  uint8_t  _pad2[1];
 };
 
 extern MuConfig mu_cfg;
+
+// Effective per-slot volume (resolves the MU_VOL_DEFAULT sentinel to the global).
+static inline uint8_t mu_slot_base_vol(int slot) {
+  if (slot < 0 || slot >= MU_TUNE_COUNT) return mu_cfg.vol;
+  uint8_t v = mu_cfg.tune_vol[slot];
+  return (v == MU_VOL_DEFAULT) ? mu_cfg.vol : v;
+}
 
 void   mu_config_begin();          // load or create defaults, seed allowlist
 void   mu_config_save();           // persist current mu_cfg

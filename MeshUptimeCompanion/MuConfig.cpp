@@ -106,6 +106,10 @@ static void set_defaults() {
   mu_cfg.gps_mode        = MU_GPS_ONDEMAND;
   mu_cfg.msg_tune_enabled= 1;
   mu_cfg.fall_nomotion_min = 0;    // dead-man off by default
+  mu_cfg.quiet_level     = 0;      // quiet-hours = full mute by default
+  mu_cfg.rxps_level      = 0;      // RXPS OFF by default (continuous RX, never miss an alert)
+  for (int i = 0; i < MU_TUNE_COUNT; i++)
+    mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;   // follow the global default
 
   strncpy(mu_cfg.tunes[MU_TUNE_HIGH], MU_DEF_TUNE_HIGH, MU_RTTTL_MAX - 1);
   strncpy(mu_cfg.tunes[MU_TUNE_MED],  MU_DEF_TUNE_MED,  MU_RTTTL_MAX - 1);
@@ -153,9 +157,24 @@ void mu_config_begin() {
     memset(&tmp, 0, sizeof(tmp));
     int n = f.read((uint8_t*)&tmp, sizeof(tmp));
     f.close();
-    if (n == (int)sizeof(tmp) && tmp.magic == MU_CFG_MAGIC &&
-        tmp.version == MU_CFG_VERSION && tmp.size == sizeof(MuConfig)) {
+    // Forward-compatible load: accept the current layout, OR an older/shorter
+    // blob (v1 had no trailing volume fields). We read whatever was stored into
+    // the front of the struct and back-fill the new fields with sane defaults.
+    if (n > 0 && n <= (int)sizeof(tmp) && tmp.magic == MU_CFG_MAGIC &&
+        tmp.version >= 1 && tmp.version <= MU_CFG_VERSION) {
       memcpy(&mu_cfg, &tmp, sizeof(mu_cfg));
+      if (tmp.version < 2) {
+        // Migrate v1 -> v2: the appended fields came in as zero; give them the
+        // documented defaults instead (quiet = full mute, slots follow global).
+        mu_cfg.quiet_level = 0;
+        mu_cfg.rxps_level  = 0;
+        for (int i = 0; i < MU_TUNE_COUNT; i++) mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;
+        mu_cfg.version = MU_CFG_VERSION;
+        mu_cfg.size    = (uint16_t)sizeof(MuConfig);
+        loaded = true;
+        mu_config_save();   // rewrite in the new layout
+        return;
+      }
       loaded = true;
     }
   }

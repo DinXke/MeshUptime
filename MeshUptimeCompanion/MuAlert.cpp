@@ -1,8 +1,8 @@
 #include "MeshUptime.h"
 #include "MuTunes.h"
 #include "MuHooks.h"
+#include "MuBattery.h"
 #include "MyMesh.h"                 // the_mesh, rtc_clock, board, sensors (via target.h)
-#include <helpers/ui/buzzer.h>
 
 // Green LED (T1000-E: LED_GREEN = P0.24, active HIGH).
 #ifndef LED_PIN
@@ -74,12 +74,7 @@ static void led_loop() {
 
 // ---- buzzer helpers --------------------------------------------------------
 static void buzzer_stop() {
-  // With _is_quiet set first, genericBuzzer::play() still calls rtttl::stop()
-  // (when a note is playing) and then returns without starting anything — so
-  // this halts the tune AND drops BUZZER_EN, with no transient re-enable. The
-  // melody argument is never used on this path.
-  mu_buzzer.quiet(true);
-  if (mu_buzzer.isPlaying()) mu_buzzer.play("x");
+  mu_buzzer.stop();          // halts the tune and drops BUZZER_EN
 }
 
 // ---- quiet hours -----------------------------------------------------------
@@ -94,11 +89,41 @@ bool mu_in_quiet_hours() {
   return hour >= s || hour < e;       // wraps past midnight
 }
 
+int mu_quiet_cap() {
+  if (!mu_in_quiet_hours()) return -1;      // no cap outside the window
+  return (int)mu_cfg.quiet_level;           // 0 = mute, 1..3 = reduced volume
+}
+
+// Effective volume for a slot: global/per-slot base, gated by mute and the
+// quiet-period cap. Returns 0 when audio must stay silent.
+//
+// App-compat (PROTOCOL §0c): we COEXIST with the stock companion's own mute — if
+// the phone app sets NodePrefs.buzzer_quiet (its mute icon), we honour it too and
+// stay silent, rather than fighting it. Our own !mute is independent and additive.
+static uint8_t effective_vol(int tune_slot, bool ignore_mute) {
+  if (!ignore_mute) {
+    if (mu_cfg.mute) return 0;
+    if (the_mesh.getNodePrefs()->buzzer_quiet) return 0;   // app's stock mute icon
+  }
+  uint8_t v = mu_slot_base_vol(tune_slot);
+  int cap = mu_quiet_cap();
+  if (cap >= 0 && (uint8_t)cap < v) v = (uint8_t)cap;
+  return v;
+}
+
 // ---- public tune API -------------------------------------------------------
+void mu_play_rtttl(const char* rtttl, uint8_t volume) {
+  if (!rtttl || !rtttl[0]) return;
+  if (volume == 0) volume = 2;              // preview: audible by default
+  if (volume > 3) volume = 3;
+  mu_buzzer.play(rtttl, volume);
+}
+
 void mu_play_tune(int tune_slot) {
   if (tune_slot < 0 || tune_slot >= MU_TUNE_COUNT) return;
 
-  bool audio_ok = !mu_cfg.mute && mu_cfg.vol > 0 && !mu_in_quiet_hours();
+  uint8_t vol = effective_vol(tune_slot, false);
+  bool audio_ok = vol > 0;
 
   // LED shows for alert severities even when audio is suppressed; the plain
   // "message" tick follows the audio gate so a muted device stays fully dark
@@ -106,10 +131,7 @@ void mu_play_tune(int tune_slot) {
   bool led_ok = (tune_slot != MU_TUNE_MSG) || audio_ok;
   if (led_ok) led_start(tune_slot, tune_slot == MU_TUNE_FIND);
 
-  if (audio_ok) {
-    mu_buzzer.quiet(false);
-    mu_buzzer.play(mu_cfg.tunes[tune_slot]);
-  }
+  if (audio_ok) mu_buzzer.play(mu_cfg.tunes[tune_slot], vol);
 }
 
 bool mu_is_playing() {
@@ -136,10 +158,8 @@ void mu_find_start(const uint8_t* dm_initiator_pub) {
   // Find melody ignores mute (it is an explicit request) but honours quiet-hours
   // only for the audio; LED beacon always runs.
   led_start(MU_TUNE_FIND, true);
-  if (!mu_in_quiet_hours()) {
-    mu_buzzer.quiet(false);
-    mu_buzzer.play(mu_cfg.tunes[MU_TUNE_FIND]);
-  }
+  uint8_t v = effective_vol(MU_TUNE_FIND, true);   // find ignores mute...
+  if (v > 0) mu_buzzer.play(mu_cfg.tunes[MU_TUNE_FIND], v);  // ...but honours quiet cap
 }
 
 void mu_find_stop() {
@@ -158,9 +178,9 @@ static void find_loop() {
   if (!find_active) return;
   if ((int32_t)(millis() - find_deadline) >= 0) { mu_stop_all(); return; }
   // Re-trigger the melody when it finishes so it loops until stopped.
-  if (!mu_buzzer.isPlaying() && !mu_in_quiet_hours()) {
-    mu_buzzer.quiet(false);
-    mu_buzzer.play(mu_cfg.tunes[MU_TUNE_FIND]);
+  if (!mu_buzzer.isPlaying()) {
+    uint8_t v = effective_vol(MU_TUNE_FIND, true);
+    if (v > 0) mu_buzzer.play(mu_cfg.tunes[MU_TUNE_FIND], v);
   }
 }
 
@@ -223,12 +243,18 @@ void mu_serial_loop() {
     if (c == '\r') continue;
     if (c == '\n') {
       ser_line[ser_len] = 0;
-      if (ser_len > 0) {
-        MuCmdCtx ctx;
-        ctx.from_serial = true;
-        ctx.sender_admin = true;              // serial is always trusted
-        memset(ctx.sender_pub, 0, MU_PUB_LEN);
-        mu_handle_command(ser_line, ctx);
+      // The interactive ASCII menu gets first refusal on each line: it opens on a
+      // bare Enter or the word "menu", and while open it owns navigation input.
+      // Anything it does not consume falls through to the normal CLI parser, so
+      // the individual `!`/CLI commands keep working for scripting.
+      if (!mu_menu_handle_line(ser_line)) {
+        if (ser_len > 0) {
+          MuCmdCtx ctx;
+          ctx.from_serial = true;
+          ctx.sender_admin = true;              // serial is always trusted
+          memset(ctx.sender_pub, 0, MU_PUB_LEN);
+          mu_handle_command(ser_line, ctx);
+        }
       }
       ser_len = 0;
     } else if (ser_len < sizeof(ser_line) - 1) {
@@ -242,8 +268,7 @@ void mu_begin() {
   pinMode(LED_PIN, OUTPUT);
   led_write(false);
 
-  mu_buzzer.begin();       // sets pins; also drives BUZZER_EN
-  mu_buzzer.quiet(true);   // idle: EN low until we actually play
+  mu_buzzer.begin();       // custom PWM-duty player; EN rail idles low
 
   mu_config_begin();
 
@@ -251,24 +276,65 @@ void mu_begin() {
   if (mu_cfg.gps_mode == MU_GPS_ON) sensors.setSettingValue("gps", "1");
   else                             sensors.setSettingValue("gps", "0");
 
+  // Apply persisted RXPS level (default 0 = off/continuous RX). The_mesh.begin()
+  // already ran with the default OFF; re-apply now that our config is loaded.
+  mu_rxps_apply(mu_cfg.rxps_level);
+
   mu_button_begin();
   mu_fall_begin();
 
   Serial.println("MeshUptimeCompanion ready. Type !help for commands.");
 }
 
+// ---- low-battery warning ---------------------------------------------------
+// Hooked to AUTO_SHUTDOWN_MILLIVOLTS: as the cell approaches the graceful-
+// shutdown voltage we sound a short warning tune and print a notice (and DM the
+// target once per low episode). Uses the REAL mV + true % for our own output.
+#ifndef AUTO_SHUTDOWN_MILLIVOLTS
+  #define AUTO_SHUTDOWN_MILLIVOLTS 3400
+#endif
+#define MU_LOWBAT_WARN_MV   (AUTO_SHUTDOWN_MILLIVOLTS + 150)  // start warning here
+#define MU_LOWBAT_CLEAR_MV  (AUTO_SHUTDOWN_MILLIVOLTS + 300)  // hysteresis clear
+#define MU_LOWBAT_PERIOD_MS (5UL * 60UL * 1000UL)
+
+static bool          lowbat_active = false;
+static unsigned long lowbat_next   = 0;
+static unsigned long lowbat_check  = 0;
+
+static void lowbat_loop() {
+  if ((int32_t)(millis() - lowbat_check) < 0) return;
+  lowbat_check = millis() + 30000UL;            // sample every 30 s
+  uint16_t mv = board.getBattMilliVolts();
+  if (mv == 0) return;
+  if (!lowbat_active && mv <= MU_LOWBAT_WARN_MV) {
+    lowbat_active = true;
+    lowbat_next = millis();                     // warn immediately
+  } else if (lowbat_active && mv >= MU_LOWBAT_CLEAR_MV) {
+    lowbat_active = false;
+  }
+  if (lowbat_active && (int32_t)(millis() - lowbat_next) >= 0) {
+    lowbat_next = millis() + MU_LOWBAT_PERIOD_MS;
+    int pct = battery_percent_from_mv(mv);
+    Serial.printf("LOW BATTERY: %dmV (%d%%) -> shutdown near %dmV\r\n",
+                  (int)mv, pct, (int)AUTO_SHUTDOWN_MILLIVOLTS);
+    uint8_t v = mu_cfg.mute ? 0 : mu_slot_base_vol(MU_TUNE_HIGH);
+    if (v > 0) mu_play_rtttl(MU_DEF_TUNE_LOWBAT, v);
+    if (mu_cfg.has_target) {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "accu laag: %dmV (%d%%)", (int)mv, pct);
+      mu_send_dm(mu_cfg.target_pub, msg, false);
+    }
+  }
+}
+
 void mu_loop() {
-  mu_buzzer.loop();
+  mu_buzzer.loop();        // custom player advances notes + drops EN when done
   led_loop();
   find_loop();
 
-  // Power down BUZZER_EN once a one-shot tune has finished (not during find).
-  if (!find_active && !mu_buzzer.isPlaying() && !mu_buzzer.isQuiet()) {
-    mu_buzzer.quiet(true);
-  }
-
   mu_button_loop();
   mu_fall_loop();
+  lowbat_loop();
   mu_serial_loop();
 }
 

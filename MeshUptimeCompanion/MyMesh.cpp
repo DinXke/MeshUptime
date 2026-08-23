@@ -3,7 +3,8 @@
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
 #include "helpers/radiolib/RXPowerSaving.h"
-#include "MuHooks.h"   // MeshUptimeCompanion: standalone DM hook
+#include "MuHooks.h"    // MeshUptimeCompanion: standalone DM hook
+#include "MuBattery.h"  // MeshUptimeCompanion: app-facing battery-mV encoder
 
 #define CMD_APP_START                 1
 #define CMD_SEND_TXT_MSG              2
@@ -267,31 +268,54 @@ bool MyMesh::getCADEnabled() const {
   return false; // hardware CAD before TX (disabled by default, until configurable)
 }
 
+// MeshUptimeCompanion: RXPS is OPT-IN and DEFAULT OFF. This is a carried alert
+// pager, so out of the box it stays in CONTINUOUS RX (a slept RX window could
+// miss an incoming alert DM). The stock PowerSaving-v17 companion always enabled
+// RXPS here; we gate it on a persisted level the user can raise to trade battery
+// for a small risk of missed alerts. 0 = off/continuous, 1 = conservative,
+// 2 = balanced. The desired level + last radio params are cached so the setting
+// can be re-applied after the config loads or when the user changes it live.
+static uint8_t g_mu_rxps_level = 0;      // default OFF
+static uint8_t g_mu_last_sf    = 0;
+static float   g_mu_last_bw    = 0;
+
 static void applyCompanionRxPowerSaving(uint8_t sf, float bw) {
+  g_mu_last_sf = sf;
+  g_mu_last_bw = bw;
 #ifdef WRAPPER_CLASS
   RxPowerSavingControl* control = &radio_driver;
-
-  // setRxPowerSaving() rejects out-of-range periods without touching the
-  // wrapper's state, so on any failure we must explicitly stand the duty cycle
-  // down. Otherwise it would stay armed with the *previous* SF/BW timings -
-  // e.g. SF5/BW500 yields rx=655us (below the 1ms minimum), and the radio would
-  // keep sleeping in windows sized for SF11, missing every preamble.
-  uint32_t rx_us = 0;
-  uint32_t sleep_us = 0;
-  bool ok = calcRxPowerSavingLevel(RX_POWERSAVING_BALANCED_LEVEL, sf, bw,
-                                   RX_POWERSAVING_PROFILE_PREAMBLE, &rx_us, &sleep_us) &&
+  if (g_mu_rxps_level == 0) {
+    control->setRxPowerSaving(false, RX_POWERSAVING_DEFAULT_RX_US,
+                              RX_POWERSAVING_DEFAULT_SLEEP_US);
+    MESH_DEBUG_PRINTLN("RX Power Saving: OFF (continuous RX)");
+    return;
+  }
+  uint8_t level = (g_mu_rxps_level == 1) ? RX_POWERSAVING_CONSERVATIVE_LEVEL
+                                         : RX_POWERSAVING_BALANCED_LEVEL;
+  uint32_t rx_us = 0, sleep_us = 0;
+  bool ok = calcRxPowerSavingLevel(level, sf, bw, RX_POWERSAVING_PROFILE_PREAMBLE,
+                                   &rx_us, &sleep_us) &&
             control->setRxPowerSaving(true, rx_us, sleep_us);
   if (!ok) {
+    // Bad params for this SF/BW -> fall back to continuous RX rather than leave
+    // the duty cycle armed with stale timings that would sleep through preambles.
     control->setRxPowerSaving(false, RX_POWERSAVING_DEFAULT_RX_US,
                               RX_POWERSAVING_DEFAULT_SLEEP_US);
   }
-  MESH_DEBUG_PRINTLN("RX Power Saving: companion level=5,preamble=16,rx=%lu,sleep=%lu,%s",
-                     (unsigned long)rx_us, (unsigned long)sleep_us,
+  MESH_DEBUG_PRINTLN("RX Power Saving: level=%u rx=%lu sleep=%lu %s",
+                     (unsigned)level, (unsigned long)rx_us, (unsigned long)sleep_us,
                      ok ? "accepted" : "unavailable - continuous RX");
 #else
-  (void)sf;
-  (void)bw;
+  (void)sf; (void)bw;
 #endif
+}
+
+// Bridge for MuCommand/MuMenu (declared in MeshUptime.h). Sets the desired level
+// and re-applies it to the radio with the last-known SF/BW.
+void mu_rxps_apply(uint8_t level) {
+  if (level > 2) level = 2;
+  g_mu_rxps_level = level;
+  applyCompanionRxPowerSaving(g_mu_last_sf, g_mu_last_bw);
 }
 
 int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
@@ -1507,7 +1531,11 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint8_t reply[11];
     int i = 0;
     reply[i++] = RESP_CODE_BATT_AND_STORAGE;
-    uint16_t battery_millivolts = board.getBattMilliVolts();
+    // MeshUptimeCompanion: feed the app an ENCODED mV so its own linear formula
+    // ((mv-3000)*100/1200) recovers our corrected LiPo %. Frame STRUCTURE is
+    // unchanged (still a uint16 mV). Our own outputs keep the REAL mV. See
+    // MuBattery.h / PROTOCOL.md §7.
+    uint16_t battery_millivolts = battery_app_mv(board.getBattMilliVolts());
     uint32_t used = _store->getStorageUsedKb();
     uint32_t total = _store->getStorageTotalKb();
     memcpy(&reply[i], &battery_millivolts, 2); i += 2;
@@ -1902,7 +1930,8 @@ void MyMesh::handleCmdFrame(size_t len) {
       int i = 0;
       out_frame[i++] = RESP_CODE_STATS;
       out_frame[i++] = STATS_TYPE_CORE;
-      uint16_t battery_mv = board.getBattMilliVolts();
+      // MeshUptimeCompanion: encoded mV (see CMD_GET_BATT_AND_STORAGE above).
+      uint16_t battery_mv = battery_app_mv(board.getBattMilliVolts());
       uint32_t uptime_secs = _ms->getMillis() / 1000;
       uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
       memcpy(&out_frame[i], &battery_mv, 2); i += 2;

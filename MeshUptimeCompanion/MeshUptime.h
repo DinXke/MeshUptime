@@ -5,9 +5,7 @@
 
 #include <Arduino.h>
 #include "MuConfig.h"
-
-class genericBuzzer;
-extern genericBuzzer mu_buzzer;   // defined in app_main.cpp
+#include "MuBuzzer.h"     // MuBuzzer mu_buzzer (custom PWM-duty player, extern)
 
 // Lifecycle (called from app_main.cpp)
 void mu_begin();
@@ -15,12 +13,20 @@ void mu_loop();
 bool mu_wants_cpu();   // true while a tune/LED/find/fall-prealarm is active -> no light sleep
 
 // ---- Tune / LED / find engine (MuAlert.cpp) --------------------------------
-void mu_play_tune(int tune_slot);   // respects mute + quiet-hours; MU_TUNE_*
+void mu_play_tune(int tune_slot);   // respects mute + quiet-hours + per-slot vol; MU_TUNE_*
+void mu_play_rtttl(const char* rtttl, uint8_t volume); // raw preview (ignores mute/quiet)
 void mu_stop_all();                 // stop tune + LED + find (button/any-press priority)
 bool mu_is_playing();               // tune or find currently sounding
 void mu_find_start(const uint8_t* dm_initiator_pub /*NULL if from serial*/);
 void mu_find_stop();
 bool mu_in_quiet_hours();
+// Quiet-period volume cap: 0..3 while inside the window, or -1 when not (no cap).
+int  mu_quiet_cap();
+
+// ---- RXPS opt-in (default OFF = continuous RX) — bridge into MyMesh.cpp ------
+// level: 0 = off (continuous RX), 1 = conservative, 2 = balanced. Sets the
+// desired level and re-applies it to the radio immediately.
+void mu_rxps_apply(uint8_t level);
 
 // ---- Command context + shared parser (MuCommand.cpp) -----------------------
 struct MuCmdCtx {
@@ -53,3 +59,9 @@ void mu_fall_cancel();       // button-cancel during the pre-alarm window
 
 // ---- Serial CLI (MuAlert.cpp drives it) ------------------------------------
 void mu_serial_loop();
+
+// ---- Interactive ASCII serial menu (MuMenu.cpp) ----------------------------
+// Returns true if the menu consumed the line (so the CLI parser should skip it).
+bool mu_menu_is_active();
+bool mu_menu_handle_line(const char* line);   // feed one serial line
+void mu_menu_open();                          // print the top-level menu

@@ -1,11 +1,7 @@
 #include <Arduino.h>   // needed for PlatformIO
 #include <Mesh.h>
 #include "MyMesh.h"
-#include "MeshUptime.h"      // MeshUptimeCompanion additions
-#include <helpers/ui/buzzer.h>
-
-// Global buzzer engine (RTTTL, non-blocking). Shared by alert/find/button modules.
-genericBuzzer mu_buzzer;
+#include "MeshUptime.h"      // MeshUptimeCompanion additions (defines MuBuzzer mu_buzzer)
 
 #ifdef ESP32_PLATFORM
 #include "esp_pm.h"

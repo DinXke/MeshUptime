@@ -34,10 +34,10 @@ build_flags = ${t1000-e.build_flags}
   -D BLE_TX_POWER=0
   -D PIN_BUZZER=25
   -D PIN_BUZZER_EN=37        ; P1.5 — required for T1000-E buzzer
+  -D AUTO_SHUTDOWN_MILLIVOLTS=3400   ; graceful low-batt (matches heltec_v3); drives our warning
   -D ADVERT_NAME='"@@MAC"'
 build_src_filter = ${t1000-e.build_src_filter}
   +<helpers/nrf52/SerialBLEInterface.cpp>
-  +<helpers/ui/buzzer.cpp>
   +<../examples/companion_radio/DataStore.cpp>
   +<../../MU-companion/MeshUptimeCompanion/*.cpp>
 lib_deps = ${t1000-e.lib_deps}

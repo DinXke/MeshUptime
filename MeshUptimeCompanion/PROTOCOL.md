@@ -10,6 +10,36 @@ below exactly as implemented.
 
 ---
 
+## 0. App-compatibility guarantee (HARD requirement)
+
+Every MeshUptimeCompanion feature is **strictly additive**. The device stays a
+fully-compatible stock MeshCore companion: pairing, message sync and telemetry in
+the official app/EasySkyMesh keep working unchanged. Concretely, and verified:
+
+- **(a) Messages are never consumed.** The only hook in `MyMesh::onMessageRecv()`
+  runs *after* the normal `queueMessage(...)` and only reads the text. An alert DM
+  (emoji-prefixed) or a `!`-command triggers our action **and** is still delivered
+  to the app as an ordinary message. The hook never returns early, never edits the
+  packet/text, never deletes it.
+- **(b) No standard protocol frame is restructured.** The APP_START handshake,
+  contact/message frames, `CMD_GET_STATS`, etc. are untouched. The **only** change
+  to an app-facing frame is the *value* in the battery field of
+  `CMD_GET_BATT_AND_STORAGE` and `CMD_GET_STATS` (still a plain `uint16` mV) — see
+  §7. Our battery **%** appears only in our own DM/`!cfg`/serial/menu output.
+- **(c) Buzzer + button coexist with the app.** Our audio also honours the stock
+  `NodePrefs.buzzer_quiet` pref (the app's mute icon) and stays silent when it is
+  set, instead of overriding it. Our `!mute` is an independent, additive gate. The
+  button is otherwise unused by the stock T1000-E companion (no display build).
+- **(d) Identity + FS layout unchanged.** We persist only `/mu_cfg.dat` on the same
+  InternalFS. Identity keys, `NodePrefs`, contacts and channels are never rewritten
+  by our code. (The menu's radio-param change calls the stock `savePrefs()` — the
+  same prefs file the stock `CMD_SET_RADIO_PARAMS` writes — never the identity.)
+
+**RXPS is opt-in and default-OFF** (continuous RX) so a carried pager never sleeps
+through an alert DM — see §8.
+
+---
+
 ## 1. Severity-emoji alert contract
 
 The MeshUptime bot prefixes every alert DM with a severity emoji at the very
@@ -56,11 +86,16 @@ printed line on the serial console.
 | `!find` | Loop the find melody + LED beacon until a button press, `!findstop`, or a 5-minute timeout. If started by DM, a short `gevonden` DM is sent back when a button press stops it. |
 | `!findstop` | Stop the find loop. |
 | `!mute on\|off` | Mute/unmute alert audio. LED alerts still show while muted. |
-| `!vol 0..3` | Coarse volume. **Limitation:** the T1000-E buzzer is a fixed-amplitude passive buzzer driven by a square wave — there is no true volume control. `0` = silent (treated as muted); `1..3` all play at full amplitude (stored, best-effort). |
+| `!vol 0..3` | **Global default** coarse volume. Driven by PWM duty (`0` silent, `1` soft, `2` normal, `3` loud). A passive magnetic buzzer dims only coarsely; 1–3 are approximate (see §3). |
+| `!vol <H\|M\|L\|find\|msg> 0..3` | **Per-slot** volume override. `255` (reported) means "follow the global default". Report with no value. |
 | `!tune <H\|M\|L\|find\|msg> <RTTTL>` | Store a new RTTTL for a slot (persisted) and play it as a preview. |
+| `!tune <H\|M\|L\|find\|msg> preset <name\|nr>` | Assign a **built-in library tune** (§9) to the slot instead of pasting RTTTL. Persisted + previewed. |
 | `!tune <H\|M\|L\|find\|msg>` | Report the slot's current RTTTL. |
-| `!quiet <startH>-<endH>` | Quiet-hours window in whole hours, UTC (e.g. `!quiet 22-7`). Audio is suppressed inside the window; LED still shows. Applied only when the RTC looks set. |
-| `!quiet off` | Disable quiet-hours. |
+| `!tunes` | List the built-in tune library (numbered). |
+| `!play <name\|nr>` | Play a library tune now as a preview (buzzer), at the global volume. |
+| `!rxps off\|conservative\|balanced` | RX power-saving level. **Default `off` = continuous RX.** `conservative`/`balanced` reuse the PowerSaving-v17 duty-cycle levels and trade battery for a **risk of missed alert DMs**. Persisted (§8). |
+| `!quiet <startH>-<endH> [mute\|0..3]` | Quieter-period window in whole hours, UTC (e.g. `!quiet 22-7`). Trailing arg: `mute` (default, full silence) or a volume cap `0..3` (reduced-volume "quieter period"). Audio is capped/suppressed inside the window; LED still shows. Applied only when the RTC looks set. |
+| `!quiet off` | Disable the quieter period. |
 | `!gps on\|off\|ondemand` | GPS power policy. `on` = continuous, `off` = never, `ondemand` = normally off, woken by `!loc`. |
 | `!loc` | Reply the current GPS `lat,lon`. If there is no fix and GPS is not `on`, it wakes the GPS and asks you to retry shortly. |
 | `!cfg` | Report the full configuration (mute, vol, msgtune, battery mV + %, quiet, gps, fall, no-motion, allowlist count, target/sos set, last known location) as a few reply lines. |
@@ -87,19 +122,30 @@ Presets default to `#1 = "OK"`, `#2 = "SOS - hulp nodig"`, `#3 = "Onderweg"`.
 
 ---
 
-## 3. Mute / quiet-hours / volume interaction
+## 3. Mute / quieter-period / volume interaction
 
-Audio for a tune plays only when **all** hold: not muted, `vol > 0`, and not
-inside quiet-hours. Independently:
+The **effective volume** of a slot is computed as:
+
+1. Start from the slot's own volume, or the global default if the slot is set to
+   `255` (`mu_slot_base_vol()`).
+2. If `!mute on`, or the app's stock `buzzer_quiet` pref is set → **0** (silent).
+3. If inside the quieter-period window, clamp to the window's cap
+   (`mute` = 0, or the configured `0..3`).
+
+A volume of `0` means no audio. On the passive magnetic buzzer, volume is applied
+as a PWM **duty cycle** (`MuBuzzer`): `1` ≈ 4 %, `2` ≈ 15 %, `3` ≈ 50 % duty —
+coarse, and the 1–3 loudness steps are approximate. Independently of audio:
 
 - **Alert severities (H/M/L)** still run their **LED** pattern when audio is
   suppressed — a muted device still signals visually.
 - The **message** tick (`msg`) follows the audio gate fully (a muted device is
   fully dark for ordinary chatter).
-- **Find** ignores mute (it is an explicit request) but honours quiet-hours for
-  its audio; the LED beacon always runs.
-- The **fall pre-alarm** uses the `H` tune and therefore follows the same mute
-  and quiet-hours rules — note this if you rely on the dead-man alarm at night.
+- **Find** ignores mute (it is an explicit request) but honours the quieter-period
+  cap for its audio; the LED beacon always runs.
+- The **fall pre-alarm** uses the `H` tune and therefore follows the same mute and
+  quieter-period rules — note this if you rely on the dead-man alarm at night.
+- The **low-battery warning** (§7) plays the built-in `warning` tune at the `H`
+  slot's volume and is suppressed by `!mute`.
 
 ---
 
@@ -138,6 +184,11 @@ recipient (falling back to `target`).
 The detection thresholds are **conservative placeholders and need on-device
 tuning**; the whole module ships **disabled** (`!fall on` to arm).
 
+This feature is a **backup of the backup**: it is **not certified**, best-effort,
+and **not a replacement for any internal/professional alarm system**. The reliable
+core is the manual button (short = ack, long = SOS+GPS, §4); auto fall-detection
+is an extra, unvalidated layer.
+
 ---
 
 ## 6. Persistence & key safety
@@ -148,7 +199,109 @@ identity (private/public key), NodePrefs, contacts and channels are never
 touched, so an app-region reflash (nRF52 UF2) leaves identity **and** this
 config intact. See `README.md` for the key-safe flashing procedure.
 
-The battery percentage shown by `!cfg` comes from a single seam
-`battery_percent_from_mv()` (`MuBattery.cpp`) — a deliberately dumb linear
-placeholder awaiting the corrected discharge curve. The raw millivolt reading
-from the board is used unchanged.
+v2 of `/mu_cfg.dat` appends per-slot volumes, the quieter-period level and the
+RXPS level at the end of the record; an older v1 file is migrated forward on load
+(new fields back-filled with defaults, then rewritten) — it is never discarded, so
+the allowlist/target/tunes survive the upgrade.
+
+---
+
+## 7. Battery percentage + app encoding + low-battery warning
+
+The raw millivolt reading from the board (`getBattMilliVolts()`) is used
+unchanged. The **true %** comes from `battery_percent_from_mv()` (`MuBattery.cpp`),
+now the corrected piecewise-linear **LiPo discharge curve** (from analysis-agent
+a17c9acb) instead of the old naive linear map that "stuck at 50–60 % then cliffed".
+
+**Our own outputs** (`!cfg`, serial, menu §8, mesh **telemetry**/LPP voltage) always
+report the **real voltage and the true %**.
+
+**App encoding (compat trade-off).** The official app derives % from the raw mV it
+receives with a fixed linear formula `pct = (mv - 3000) * 100 / 1200`, which is
+wrong for a real LiPo. So the value we place in the standard battery field of
+`CMD_GET_BATT_AND_STORAGE` and `CMD_GET_STATS` is a **virtual** mV:
+
+```
+app_mv = 3000 + true_percent * 12      (clamped to [3000, 4200])
+```
+
+Run through the app's own formula this recovers our true %. The frame **structure**
+is unchanged (still a `uint16` mV), so full protocol compatibility is preserved.
+**Trade-off:** if the app shows this number as a raw *voltage* anywhere, it will be
+the encoded value, not the true cell voltage — but the **percentage is correct**.
+`battery_app_mv()` (`MuBattery.cpp`) does the encoding; only the two app frames use
+it. Telemetry deliberately does **not**, so mesh-side monitoring keeps true volts.
+
+**Low-battery warning.** The env defines `AUTO_SHUTDOWN_MILLIVOLTS=3400` (matches
+the heltec_v3 profile). Independently, `MuAlert.cpp` samples the battery every 30 s
+and, from `AUTO_SHUTDOWN_MILLIVOLTS + 150` mV (with hysteresis), sounds the built-in
+`warning` tune, prints a serial notice, and DMs the `target` (if set) roughly every
+5 minutes with the real mV + true %, until the cell recovers.
+
+---
+
+## 8. RXPS — opt-in, default OFF
+
+RX power-saving duty-cycles the receiver to save battery, at the cost of possibly
+sleeping through an incoming alert DM. Because this device is a **carried pager**,
+RXPS is **default OFF (continuous RX)**. It can be enabled with `!rxps
+conservative|balanced` (DM/serial) or menu §6, and turned back to `off` at any time.
+Levels reuse the PowerSaving-v17 mechanism (`CONSERVATIVE_LEVEL=1`,
+`BALANCED_LEVEL=5`, preamble profile); the level is persisted in `/mu_cfg.dat` and
+re-applied on boot and whenever the radio SF/BW changes. **Reliability-vs-battery:
+`off` = never miss an alert; `conservative`/`balanced` = longer runtime, small risk
+of missed DMs.**
+
+---
+
+## 9. Built-in tune library
+
+`MuTunes.h` ships a named RTTTL library (`!tunes` to list). Names are matched
+case-insensitively; commands also accept the 1-based number.
+
+| # | Name | Feel |
+|---|---|---|
+| 1 | `mario-main` | Mario main theme (find beacon; loops) |
+| 2 | `mario-die`  | Mario death jingle (default **H**) |
+| 3 | `mario-1up`  | Mario 1-up / good news (default **L**) |
+| 4 | `mario-warn` | Mario power-down motif (default **M**) |
+| 5 | `coin`       | Mario coin tick (default **msg**) |
+| 6 | `powerup`    | Mario power-up run |
+| 7 | `warning`    | Urgent triple-beep (low-battery) |
+| 8 | `chime`      | Neutral 3-note chime |
+| 9 | `alert`      | Neutral repeated alert |
+| 10 | `beep`      | Single short beep |
+
+Defaults per severity slot stay Mario-themed and are drawn from this library
+(`H`=mario-die, `M`=mario-warn, `L`=mario-1up, `find`=mario-main, `msg`=coin).
+Use `!play <name|nr>` to preview and `!tune <slot> preset <name|nr>` to assign.
+
+---
+
+## 10. Interactive ASCII serial menu
+
+On the USB serial console, a bare **Enter** or typing **`menu`** opens an
+ASCII-art menu (`MuMenu.cpp`). It is a line-based, non-blocking UX layer over the
+same `!`/CLI commands (so DM + scripting behaviour is identical); the mesh loop
+keeps running between keystrokes. Navigation: a **number** picks an item, **`b`** =
+back, **`q`** = quit.
+
+Categories:
+
+1. **Geluiden & deuntjes** — list/play library, assign preset to slot, global &
+   per-slot volume, mute, quieter-period.
+2. **Alerts & ernst-mapping** — show slot→tune, assign preset per slot, msg-tune.
+3. **Knop & presets** — presets 1/2/3, target, sos.
+4. **Find-me** — start/stop.
+5. **Val-detectie** — arm/disarm, dead-man minutes (labelled *not certified*).
+6. **Radio & Power** — show radio params; GPS mode; **RXPS** (with a missed-alert
+   warning); **change radio params** and **restore the mesh preset**
+   (869.618 / BW 62.5 / SF 8 / CR 8) — both behind an explicit **warning +
+   `JA` confirmation**, because wrong freq/BW/SF/CR/TX drops the node off the mesh.
+7. **Allowlist & beveiliging** — list/add/del pubkeys.
+8. **Info / status / batterij / pubkey** — full cfg, real battery mV + %, pubkey,
+   location.
+9. **Opslaan & herstart** — force-save, reboot (confirmed).
+
+The individual `!`/CLI commands keep working independently for DM use and
+scripting; the menu is purely an extra serial UX on top.

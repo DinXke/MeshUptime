@@ -1,5 +1,6 @@
 #include "MeshUptime.h"
 #include "MuBattery.h"
+#include "MuTunes.h"                // built-in tune library
 #include "MyMesh.h"                 // the_mesh, board, sensors, rtc_clock
 #include <stdarg.h>
 #include <string.h>
@@ -57,16 +58,25 @@ static void cmd_cfg(const MuCmdCtx& ctx) {
 
   const char* gps = mu_cfg.gps_mode == MU_GPS_ON ? "on"
                   : mu_cfg.gps_mode == MU_GPS_ONDEMAND ? "ondemand" : "off";
+  const char* rxps = mu_cfg.rxps_level == 1 ? "conservative"
+                   : mu_cfg.rxps_level == 2 ? "balanced" : "off";
 
+  // NOTE: our OWN output reports the REAL voltage + TRUE curve %. Only the app's
+  // standard battery frame gets the encoded value (see PROTOCOL.md §7).
   mu_reply(ctx, "cfg: mute=%d vol=%d msgtune=%d batt=%dmV(%d%%)",
            mu_cfg.mute, mu_cfg.vol, mu_cfg.msg_tune_enabled, mv, pct);
+  mu_reply(ctx, "slotvol H=%d M=%d L=%d find=%d msg=%d (255=default)",
+           mu_cfg.tune_vol[MU_TUNE_HIGH], mu_cfg.tune_vol[MU_TUNE_MED],
+           mu_cfg.tune_vol[MU_TUNE_LOW], mu_cfg.tune_vol[MU_TUNE_FIND],
+           mu_cfg.tune_vol[MU_TUNE_MSG]);
   if (mu_cfg.quiet_start == 0xFF)
-    mu_reply(ctx, "quiet=off gps=%s fall=%d nomotion=%dmin",
-             gps, mu_cfg.fall_enabled, mu_cfg.fall_nomotion_min);
+    mu_reply(ctx, "quiet=off gps=%s rxps=%s fall=%d nomotion=%dmin",
+             gps, rxps, mu_cfg.fall_enabled, mu_cfg.fall_nomotion_min);
   else
-    mu_reply(ctx, "quiet=%02d-%02d gps=%s fall=%d nomotion=%dmin",
-             mu_cfg.quiet_start, mu_cfg.quiet_end, gps,
-             mu_cfg.fall_enabled, mu_cfg.fall_nomotion_min);
+    mu_reply(ctx, "quiet=%02d-%02d(%s) gps=%s rxps=%s fall=%d nomotion=%dmin",
+             mu_cfg.quiet_start, mu_cfg.quiet_end,
+             mu_cfg.quiet_level == 0 ? "mute" : "reduced",
+             gps, rxps, mu_cfg.fall_enabled, mu_cfg.fall_nomotion_min);
   mu_reply(ctx, "allow=%d target=%d sos=%d loc=%.5f,%.5f",
            allow_n, mu_cfg.has_target, mu_cfg.has_sos,
            (double)sensors.node_lat, (double)sensors.node_lon);
@@ -122,27 +132,82 @@ static void cmd_allow(const MuCmdCtx& ctx, const char* args) {
   mu_reply(ctx, "allow add|list|del");
 }
 
-static void cmd_tune(const MuCmdCtx& ctx, const char* args) {
-  char slotname[16];
-  const char* p = next_tok(args, slotname, sizeof(slotname), true);
-  int slot = tune_slot_from_name(slotname);
-  if (slot < 0) { mu_reply(ctx, "tune <H|M|L|find|msg> [RTTTL]"); return; }
-  p = skip_ws(p);
-  if (*p == 0) {                    // report current
-    mu_reply(ctx, "tune %s: %s", tune_name(slot), mu_cfg.tunes[slot]);
-    return;
+static void assign_slot_rtttl(const MuCmdCtx& ctx, int slot, const char* rtttl) {
+  if ((int)strlen(rtttl) >= MU_RTTTL_MAX) {
+    mu_reply(ctx, "tune: te lang (max %d)", MU_RTTTL_MAX - 1); return;
   }
-  if ((int)strlen(p) >= MU_RTTTL_MAX) { mu_reply(ctx, "tune: te lang (max %d)", MU_RTTTL_MAX - 1); return; }
-  strncpy(mu_cfg.tunes[slot], p, MU_RTTTL_MAX - 1);
+  strncpy(mu_cfg.tunes[slot], rtttl, MU_RTTTL_MAX - 1);
   mu_cfg.tunes[slot][MU_RTTTL_MAX - 1] = 0;
   mu_config_save();
   mu_reply(ctx, "tune %s opgeslagen", tune_name(slot));
   mu_play_tune(slot);               // preview
 }
 
-static void cmd_quiet(const MuCmdCtx& ctx, const char* args) {
-  char a[24];
+static void cmd_tune(const MuCmdCtx& ctx, const char* args) {
+  char slotname[16];
+  const char* p = next_tok(args, slotname, sizeof(slotname), true);
+  int slot = tune_slot_from_name(slotname);
+  if (slot < 0) { mu_reply(ctx, "tune <H|M|L|find|msg> [preset <naam>|RTTTL]"); return; }
+  p = skip_ws(p);
+  if (*p == 0) {                    // report current
+    mu_reply(ctx, "tune %s: %s", tune_name(slot), mu_cfg.tunes[slot]);
+    return;
+  }
+  // `tune <slot> preset <name|nr>` -> assign a built-in library tune.
+  char kw[12];
+  const char* after = next_tok(p, kw, sizeof(kw), true);
+  if (!strcmp(kw, "preset")) {
+    char name[24];
+    next_tok(after, name, sizeof(name), false);
+    int idx = mu_tune_resolve(name);
+    if (idx < 0) { mu_reply(ctx, "onbekende preset (zie !tunes)"); return; }
+    assign_slot_rtttl(ctx, slot, MU_TUNES[idx].rtttl);
+    return;
+  }
+  // Otherwise treat the remainder as a raw RTTTL string (paste).
+  assign_slot_rtttl(ctx, slot, p);
+}
+
+static void cmd_tunes(const MuCmdCtx& ctx) {
+  mu_reply(ctx, "deuntjes-bibliotheek (%d):", MU_TUNES_COUNT);
+  for (int i = 0; i < MU_TUNES_COUNT; i++)
+    mu_reply(ctx, "%d %s", i + 1, MU_TUNES[i].name);
+}
+
+static void cmd_play(const MuCmdCtx& ctx, const char* args) {
+  char name[24];
+  next_tok(args, name, sizeof(name), false);
+  if (name[0] == 0) { mu_reply(ctx, "play <naam|nr> (zie !tunes)"); return; }
+  int idx = mu_tune_resolve(name);
+  if (idx < 0) { mu_reply(ctx, "onbekend deuntje (zie !tunes)"); return; }
+  uint8_t vol = mu_cfg.vol ? mu_cfg.vol : 2;   // preview at global vol (or normal)
+  mu_play_rtttl(MU_TUNES[idx].rtttl, vol);
+  mu_reply(ctx, "play: %s", MU_TUNES[idx].name);
+}
+
+static void cmd_rxps(const MuCmdCtx& ctx, const char* args) {
+  char a[16];
   next_tok(args, a, sizeof(a), true);
+  uint8_t lvl;
+  if      (!strcmp(a, "off"))          lvl = 0;
+  else if (!strcmp(a, "conservative")) lvl = 1;
+  else if (!strcmp(a, "balanced"))     lvl = 2;
+  else { mu_reply(ctx, "rxps off|conservative|balanced (off=continu RX)"); return; }
+  mu_cfg.rxps_level = lvl;
+  mu_config_save();
+  mu_rxps_apply(lvl);
+  if (lvl == 0) mu_reply(ctx, "rxps: off (continu RX)");
+  else mu_reply(ctx, "rxps: %s - LET OP: kan alert-DM's missen", a);
+}
+
+static void cmd_quiet(const MuCmdCtx& ctx, const char* args) {
+  // Forms:
+  //   quiet off
+  //   quiet <sH>-<eH>            (full mute inside window)
+  //   quiet <sH>-<eH> mute       (full mute)
+  //   quiet <sH>-<eH> <0-3>      (reduced-volume "quieter period"; 0 = mute)
+  char a[24];
+  const char* p = next_tok(args, a, sizeof(a), true);
   if (!strcmp(a, "off") || a[0] == 0) {
     mu_cfg.quiet_start = mu_cfg.quiet_end = 0xFF;
     mu_config_save();
@@ -151,12 +216,24 @@ static void cmd_quiet(const MuCmdCtx& ctx, const char* args) {
   }
   int s, e;
   if (sscanf(a, "%d-%d", &s, &e) == 2 && s >= 0 && s < 24 && e >= 0 && e < 24) {
+    char mode[8];
+    next_tok(p, mode, sizeof(mode), true);
+    uint8_t level = 0;               // default = full mute
+    if (mode[0] == 0 || !strcmp(mode, "mute")) {
+      level = 0;
+    } else if (mode[0] >= '0' && mode[0] <= '3' && mode[1] == 0) {
+      level = (uint8_t)(mode[0] - '0');
+    } else {
+      mu_reply(ctx, "quiet <sH>-<eH> [mute|0..3]"); return;
+    }
     mu_cfg.quiet_start = (uint8_t)s;
-    mu_cfg.quiet_end = (uint8_t)e;
+    mu_cfg.quiet_end   = (uint8_t)e;
+    mu_cfg.quiet_level = level;
     mu_config_save();
-    mu_reply(ctx, "quiet: %02d-%02d (UTC)", s, e);
+    if (level == 0) mu_reply(ctx, "quiet: %02d-%02d mute (UTC)", s, e);
+    else            mu_reply(ctx, "quiet: %02d-%02d vol<=%d (UTC)", s, e, level);
   } else {
-    mu_reply(ctx, "quiet <startH>-<endH> | off");
+    mu_reply(ctx, "quiet <startH>-<endH> [mute|0..3] | off");
   }
 }
 
@@ -241,9 +318,23 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
     mu_config_save(); mu_reply(ctx, "mute: %s", mu_cfg.mute ? "on" : "off"); return true;
   }
   if (!strcmp(cmd, "vol")) {
-    char a[8]; next_tok(args, a, sizeof(a), false);
+    // `vol <0-3>` = global default; `vol <slot> <0-3>` = per-slot.
+    char a[10]; const char* p = next_tok(args, a, sizeof(a), true);
+    int slot = tune_slot_from_name(a);
+    if (slot >= 0) {                 // per-slot form
+      char b[8]; next_tok(p, b, sizeof(b), false);
+      if (b[0] == 0) {               // report
+        mu_reply(ctx, "vol %s: %d (255=default)", tune_name(slot), mu_cfg.tune_vol[slot]);
+        return true;
+      }
+      int v = atoi(b);
+      if (v < 0 || v > 3) { mu_reply(ctx, "vol <slot> 0..3"); return true; }
+      mu_cfg.tune_vol[slot] = (uint8_t)v; mu_config_save();
+      mu_reply(ctx, "vol %s: %d", tune_name(slot), v); return true;
+    }
+    if (a[0] == 0) { mu_reply(ctx, "vol 0..3 | vol <H|M|L|find|msg> 0..3"); return true; }
     int v = atoi(a);
-    if (a[0] == 0 || v < 0 || v > 3) { mu_reply(ctx, "vol 0..3 (0=stil; HW kent geen echt volume)"); return true; }
+    if (v < 0 || v > 3) { mu_reply(ctx, "vol 0..3 (0=stil; magnetische buzzer dimt grof)"); return true; }
     mu_cfg.vol = (uint8_t)v; mu_config_save();
     mu_reply(ctx, "vol: %d%s", v, v == 0 ? " (stil)" : " (best-effort)"); return true;
   }
@@ -255,6 +346,9 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
     mu_config_save(); mu_reply(ctx, "msgtune: %s", mu_cfg.msg_tune_enabled ? "on" : "off"); return true;
   }
   if (!strcmp(cmd, "tune"))   { cmd_tune(ctx, args); return true; }
+  if (!strcmp(cmd, "tunes"))  { cmd_tunes(ctx); return true; }
+  if (!strcmp(cmd, "play"))   { cmd_play(ctx, args); return true; }
+  if (!strcmp(cmd, "rxps"))   { cmd_rxps(ctx, args); return true; }
   if (!strcmp(cmd, "quiet"))  { cmd_quiet(ctx, args); return true; }
   if (!strcmp(cmd, "gps"))    { cmd_gps(ctx, args); return true; }
   if (!strcmp(cmd, "loc"))    { cmd_loc(ctx); return true; }
@@ -265,8 +359,8 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
   if (!strcmp(cmd, "sos"))    { cmd_setkey(ctx, args, true); return true; }
   if (!strcmp(cmd, "fall"))   { cmd_fall(ctx, args); return true; }
   if (!strcmp(cmd, "help")) {
-    mu_reply(ctx, "cmds: find findstop mute vol tune quiet gps loc cfg");
-    mu_reply(ctx, "  allow preset target sos fall msgtune ping");
+    mu_reply(ctx, "cmds: find findstop mute vol tune tunes play quiet gps loc cfg");
+    mu_reply(ctx, "  rxps allow preset target sos fall msgtune ping (serieel: menu)");
     return true;
   }
   mu_reply(ctx, "onbekend: %s (!help)", cmd);
