@@ -124,11 +124,25 @@
  *            rol) zodat MeshManager de MGMT-pubkey oppikt. Web-GUI "Bots"-beheer:
  *            lijst + selecteren, toevoegen (genereert sleutel), hernoemen, aan/uit,
  *            wissen (niet de laatste/alert-bot) en de alert-rol zetten.
+ *   v2.5.1 = INSTANT companion-push + volledige companion-command-GUI + radio-GUI.
+ *            (1) Een ontvangen companion-#LOC/val gaat nu METEEN naar MeshManager
+ *            (POST {push.url}/api/companion via dezelfde PushTask: host/token/DNS/
+ *            socket hergebruikt, eigen retry-ring) i.p.v. te wachten op de poll van
+ *            /companions.json (die blijft als terugval). Body:
+ *            {"companions":[{"pubkey","lat","lon","seen","fall_ts","fall_kind"}]}.
+ *            (2) Het companion-commandopaneel dekt nu de VOLLEDIGE set (parity met
+ *            CLI/menu): status/tunes/rxps/gps/preset(1-3)/vol per-slot/allow
+ *            add|del|list, naast de bestaande find/findstop/loc/ping/cfg/mute/vol/
+ *            play/tune/quiet en de volledige !fall-groep. Alles via de MGMT-bot.
+ *            (3) Radio-instellingen in de GUI (freq/bw/sf/cr/tx-power) ACHTER een
+ *            expliciete confirm + rode waarschuwing ("kan de companion van de mesh
+ *            doen vallen; fysieke seriële recovery nodig"), plus een 'radio show'
+ *            leesknop. Stuurt '!radio <veld> <waarde> confirm'.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.5.0"
+  #define MESHUPTIME_VERSION   "v2.5.1"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

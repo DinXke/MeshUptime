@@ -1940,9 +1940,22 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <button type="button" onclick="cmCmd('!cfg')">Config</button>
 <button type="button" onclick="cmCmd('!mute on')">Mute aan</button>
 <button type="button" onclick="cmCmd('!mute off')">Mute uit</button></div>
+<div class="quick" style="margin-top:.4rem">
+<button type="button" onclick="cmCmd('!status')">Status</button>
+<button type="button" onclick="cmCmd('!tunes')">Tunes</button>
+<button type="button" onclick="cmCmd('!rxps')">Rx-stats</button>
+<button type="button" onclick="cmCmd('!gps on')">GPS aan</button>
+<button type="button" onclick="cmCmd('!gps off')">GPS uit</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Config-preset<select id="cm-preset" style="width:auto;margin-left:.3rem"><option>1</option><option>2</option><option>3</option></select></label>
+<button type="button" onclick="cmCmd('!preset '+document.getElementById('cm-preset').value)">stuur preset</button></div>
 <div class="frow" style="margin-top:.5rem">
 <label style="align-self:center">Volume<select id="cm-vol" style="width:auto;margin-left:.3rem"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
 <button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vol').value)">stuur vol</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Vol per slot<select id="cm-vslot" style="width:auto;margin-left:.3rem"><option value="H">H (hoog)</option><option value="M">M (midden)</option><option value="L">L (laag)</option></select></label>
+<select id="cm-vslotval" style="width:auto"><option>0</option><option>1</option><option>2</option><option>3</option></select>
+<button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vslot').value+' '+document.getElementById('cm-vslotval').value)">stuur slot-vol</button></div>
 <div class="frow" style="margin-top:.4rem">
 <label style="align-self:center">Play<input id="cm-play" placeholder="preset" maxlength="20" style="width:8rem;margin-left:.3rem"></label>
 <button type="button" onclick="cmCmd('!play '+document.getElementById('cm-play').value.trim())">stuur play</button></div>
@@ -1953,6 +1966,12 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <div class="frow" style="margin-top:.4rem">
 <input id="cm-quiet" placeholder="quiet-argument (bv. 22:00-07:00)" maxlength="30" style="flex:1;min-width:10rem">
 <button type="button" onclick="cmCmd('!quiet '+document.getElementById('cm-quiet').value.trim())">stuur quiet</button></div>
+<div class="frow" style="margin-top:.4rem">
+<select id="cm-allow-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
+<input id="cm-allow" placeholder="allow-pubkey (64 hex; prefix &ge;12 voor verwijderen)" maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
+<button type="button" onclick="cmAllowAdd()">allow +</button>
+<button type="button" onclick="cmAllowDel()">allow &minus;</button>
+<button type="button" onclick="cmCmd('!allow list')">allow-lijst</button></div>
 
 <h3 style="margin:.7rem 0 .2rem">Valdetectie</h3>
 <div class="quick">
@@ -2004,6 +2023,39 @@ terugmelden als DM. Een <code>#LOC</code>-rapport met <code>(val)</code>,
 <code>fall_ts</code>/<code>fall_kind</code>, voor de MeshManager-escalatie). Wat de
 companion precies begrijpt hangt van z'n eigen firmware af &mdash; de node stuurt
 het commando alleen door.</p>
+
+<h3 style="margin:.9rem 0 .2rem">Radio &mdash; alleen als je weet wat je doet</h3>
+<div class="rw"><b>Let op:</b> een radio-instelling <b>kan de companion van de mesh
+doen vallen (fysieke seriële recovery nodig)</b>. Freq/BW/SF/CR/tx-power moeten aan
+BEIDE kanten gelijk zijn; één verkeerd getal en de companion hoort niemand meer over
+LoRa. Elke knop hieronder vraagt eerst een expliciete bevestiging en stuurt dan
+<code>!radio &lt;veld&gt; &lt;waarde&gt; confirm</code>. <b>radio show</b> leest alleen.</div>
+<div class="quick" style="margin-top:.2rem">
+<button type="button" onclick="cmCmd('!radio show')">radio show (lezen)</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Freq (MHz)<input id="cm-rf-freq" placeholder="bv. 869.525" maxlength="12" style="width:7rem;margin-left:.3rem"></label>
+<button type="button" class="dng" onclick="cmRadio('freq','cm-rf-freq')">zet freq</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Bandbreedte (kHz)<input id="cm-rf-bw" placeholder="bv. 250" maxlength="8" style="width:6rem;margin-left:.3rem"></label>
+<button type="button" class="dng" onclick="cmRadio('bw','cm-rf-bw')">zet bw</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Spreading factor<input id="cm-rf-sf" placeholder="7&ndash;12" maxlength="4" style="width:4rem;margin-left:.3rem"></label>
+<button type="button" class="dng" onclick="cmRadio('sf','cm-rf-sf')">zet sf</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Coding rate<input id="cm-rf-cr" placeholder="5&ndash;8" maxlength="4" style="width:4rem;margin-left:.3rem"></label>
+<button type="button" class="dng" onclick="cmRadio('cr','cm-rf-cr')">zet cr</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Tx-power (dBm)<input id="cm-rf-tx" placeholder="bv. 22" maxlength="4" style="width:4rem;margin-left:.3rem"></label>
+<button type="button" class="dng" onclick="cmRadio('tx','cm-rf-tx')">zet tx-power</button></div>
+<div id="cmradiomsg"></div>
+<p class="note"><b>Parity-commando's</b> (naast de knoppen hierboven): <b>Status</b>
+(<code>!status</code>), <b>Tunes</b> (<code>!tunes</code>, lijst), <b>Rx-stats</b>
+(<code>!rxps</code>), <b>GPS aan/uit</b> (<code>!gps on|off</code>),
+<b>Config-preset</b> (<code>!preset 1|2|3</code>), <b>Vol per slot</b>
+(<code>!vol H|M|L &lt;0-3&gt;</code> naast de globale <code>!vol &lt;0-3&gt;</code>),
+en <b>allow</b> (<code>!allow add &lt;64hex&gt;</code> / <code>!allow del &lt;prefix&gt;</code>,
+&ge;12 hex / <code>!allow list</code>). Alle companion-management-DM's gaan via de
+<b>MGMT-bot</b> (<code>BE-HSS-DinX-MGMT</code>) als die bestaat, anders via de alert-bot.</p>
 
 <h2>Kaart &mdash; laatst bekende posities</h2>
 <div id="cm-map" style="height:18rem;border-radius:8px;overflow:hidden;display:none"></div>
@@ -3577,10 +3629,11 @@ o.textContent=nm+" · "+c.k.slice(0,6)+"… ("+c.t+","+c.h+"h)";sel.appendChild(
 function bindPicker(pickId,inId){var sel=document.getElementById(pickId);if(!sel)return;
 sel.onchange=function(){var v=sel.value;if(v){var i=document.getElementById(inId);if(i)i.value=v}}}
 function refreshPickers(){contactsGet().then(function(){
-["racl-pick","sacl-pick","bot-pick","bot-sto-pick","cm-pick","cm-ftarget-pick"].forEach(fillPicker)})}
+["racl-pick","sacl-pick","bot-pick","bot-sto-pick","cm-pick","cm-ftarget-pick","cm-allow-pick"].forEach(fillPicker)})}
 bindPicker("racl-pick","racl-pub");bindPicker("sacl-pick","sacl-pub");
 bindPicker("bot-pick","bot-pub-in");bindPicker("bot-sto-pick","bot-sto-key");
 bindPicker("cm-pick","cm-pub");bindPicker("cm-ftarget-pick","cm-ftarget");
+bindPicker("cm-allow-pick","cm-allow");
 
 /* ============================== bot (chat/notifier) =========================
    Alles praat met /bot.json en de /bot/* endpoints. Zichtbaar op room-nodes. */
@@ -3950,6 +4003,26 @@ cmCmd('!fall target add '+t)}
 function cmFallTargetDel(){var t=document.getElementById("cm-ftarget").value.trim();
 if(t.length<12||t.length%2){cmMsg("cmcmdmsg","doel verwijderen: prefix van min. 12 hex (even) nodig",0);return}
 cmCmd('!fall target del '+t)}
+/* allow-lijst (wie de companion mag aansturen): add op volledige pubkey,
+   del op een prefix (>=12 hex). Zelfde validatie als de fall-doellijst. */
+function cmAllowAdd(){var t=document.getElementById("cm-allow").value.trim();
+if(t.length!=64){cmMsg("cmcmdmsg","allow toevoegen: volledige pubkey (64 hex) nodig",0);return}
+cmCmd('!allow add '+t)}
+function cmAllowDel(){var t=document.getElementById("cm-allow").value.trim();
+if(t.length<12||t.length%2){cmMsg("cmcmdmsg","allow verwijderen: prefix van min. 12 hex (even) nodig",0);return}
+cmCmd('!allow del '+t)}
+/* RADIO: elk veld apart, ACHTER een expliciete confirm met de waarschuwing dat
+   dit de companion van de mesh kan halen. Stuurt '!radio <veld> <waarde> confirm'
+   (de companion-firmware eist de confirm-staart). Leeg veld -> niets sturen. */
+function cmRadio(field,inId){var el=document.getElementById(inId);
+var v=el?el.value.trim():"";
+if(!v){cmMsg("cmradiomsg","radio "+field+": vul eerst een waarde in",0);return}
+if(!confirm("RADIO "+field.toUpperCase()+" = "+v+" naar de companion sturen?\n\n"+
+"WAARSCHUWING: dit kan de companion van de mesh doen vallen (fysieke seriële "+
+"recovery nodig). Freq/BW/SF/CR/tx-power moeten aan beide kanten gelijk zijn.\n\n"+
+"Doorgaan?"))return;
+cmMsg("cmradiomsg","radio "+field+" "+v+" verzonden (confirm) — effect volgt async",1);
+cmCmd('!radio '+field+' '+v+' confirm')}
 document.getElementById("cm-add").onclick=cmAdd;
 /* Lichte auto-verversing: alleen als het tabblad openstaat (p7 zichtbaar), zelfde
    stijl als u2/u3 maar we slaan de fetch over als niemand kijkt. Locatie/seen/val

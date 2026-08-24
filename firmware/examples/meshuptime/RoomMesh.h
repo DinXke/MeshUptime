@@ -63,6 +63,11 @@
 
 #include "IWebNode.h"
 
+/* v2.5.1: RoomMesh duwt companion-locatie/val METEEN naar MeshManager via
+ * PushTask (setPushTask). Alleen een pointer + aanroepen in RoomMesh.cpp, dus
+ * een vooruit-declaratie volstaat -- geen PushTask.h in deze header. */
+class PushTask;
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef FIRMWARE_BUILD_DATE
@@ -382,6 +387,11 @@ public:
    * store.load("_main", ...) en geeft haar hier door VOOR begin(). Zo blijft de
    * pubkey (48d7aade232b) behouden en wordt er geen nieuwe sleutel gemaakt. */
   void setRoom0Identity(const mesh::LocalIdentity& id) { rooms[0].id = id; }
+
+  /* v2.5.1: de PushTask meegeven zodat een ontvangen companion-#LOC/val METEEN
+   * naar MeshManager gaat (POST /api/companion) i.p.v. te wachten op de poll van
+   * /companions.json. Alleen een pointer; NULL = terugval op de poll. */
+  void setPushTask(PushTask* p) { _push = p; }
 
   /* ---- Publieke room-API (alerts, commando-antwoorden, web/CLI) ---- */
 
@@ -720,6 +730,10 @@ private:
    * #LOC-locatierapporten. Persistent in /companions.cfg (zie Companion). */
   Companion     _companions[MAX_COMPANIONS];
 
+  /* v2.5.1: de PushTask voor de INSTANT companion-push (kan NULL zijn: dan valt
+   * MeshManager terug op de poll van /companions.json). */
+  PushTask*     _push = nullptr;
+
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
   RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
@@ -802,6 +816,10 @@ private:
   void          companionUpdateLoc(int idx, float lat, float lon, uint32_t seen);
   /* Val-event van een companion vastleggen (uit een #LOC-DM met val-merkteken). */
   void          companionRecordFall(int idx, uint8_t kind, uint32_t ts);
+  /* v2.5.1: de huidige stand van companion `idx` (loc + val) METEEN naar
+   * MeshManager duwen via PushTask (POST /api/companion). No-op als er geen
+   * PushTask gezet is of de push uit staat. */
+  void          pushCompanionNow(int idx);
   void          saveCompanions();
   void          loadCompanions();
   /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.

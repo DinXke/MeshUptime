@@ -92,6 +92,21 @@ public:
   /* De haak van MonitorSensors (zie setEventSink). Loopt in de hoofdtaak. */
   void onMonitorEvent(const MonitorEvent& ev) override;
 
+  /* v2.5.1 -- INSTANT-PUSH van een companion-locatie/val naar MeshManager.
+   * RoomMesh roept dit aan zodra een companion-#LOC/val ontvangen ÉN bewaard is
+   * (companionUpdateLoc / companionRecordFall): de companion-stand gaat DAN
+   * METEEN de deur uit i.p.v. te wachten tot MeshManager /companions.json polt
+   * (tot ~1 min oud). Hergebruikt dezelfde host/token/DNS-cache/socket-machine
+   * als de sensorpush, maar met een NIEUW pad (POST {push.url}/api/companion) en
+   * een eigen kleine ring, zodat een val een transiënte netwerk-/serverfout
+   * overleeft (retry/queue, net als de sensorpush). Body:
+   *   {"companions":[{"pubkey":"<64hex>","lat":<f>,"lon":<f>,"seen":<u>,
+   *                   "fall_ts":<u>,"fall_kind":"val|nomotion|sos|"}]}
+   * has_loc=false -> lat/lon worden WEGGELATEN; fall_ts=0/fall_kind=0 -> geen val
+   * (fall_ts:0, fall_kind:""). Push uit (geen url) -> stil laten vallen. */
+  void queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, float lon,
+                      uint32_t seen, uint32_t fall_ts, uint8_t fall_kind);
+
   /* Voor de statuspagina en het rapport. lostCount() is de belangrijkste:
    * gebeurtenissen die uit de ring gevallen zijn zonder afgeleverd te worden. */
   bool     enabled() const;              /* url gezet? */
@@ -111,6 +126,30 @@ private:
     PUSH_SENDING,      /* verzoek gaat de socket in, mogelijk in stukken */
     PUSH_RECEIVING     /* antwoord komt binnen tot de server sluit */
   };
+
+  /* Welk SOORT de LOPENDE poging is. De socket-machine (DNS/connect/send/recv)
+   * is voor beide identiek; alleen het pad en de body-opbouw verschillen, en
+   * finishOk()/failXxx() ruimen de bijhorende ring op. Companion-pushes gaan
+   * VOOR (een val mag niet achter een heartbeat aansluiten). */
+  enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION };
+  PushKind _kind = KIND_SENSOR;
+
+  /* De companion-ring. Klein: val/loc-events zijn zeldzaam en de ring leegt zich
+   * zodra de server bereikbaar is. Loopt hij toch over, dan valt de OUDSTE eruit
+   * (geteld in _lost, net als de sensorring). */
+  static const uint8_t COMP_RING_SIZE = 4;
+  struct CompanionPush {
+    uint8_t  pub_key[PUB_KEY_SIZE];
+    float    lat, lon;
+    bool     has_loc;
+    uint32_t seen;
+    uint32_t fall_ts;
+    uint8_t  fall_kind;
+  };
+  CompanionPush _cring[COMP_RING_SIZE];
+  uint8_t _cring_tail    = 0;
+  uint8_t _cring_count   = 0;
+  uint8_t _comp_inflight = 0;   /* hoeveel companion-plaatsen in de lopende POST */
 
   WifiTask*       _wifi    = NULL;
   MonitorSensors* _sensors = NULL;
@@ -158,6 +197,8 @@ private:
   void startAttempt();                 /* url ontleden, DNS of connect starten */
   void startConnect(uint32_t addr_v4, uint16_t port);
   bool buildRequest(const char* host, const char* path);
+  bool buildSensorBody(char* body, size_t cap, size_t& blen);
+  bool buildCompanionBody(char* body, size_t cap, size_t& blen);
   void stepConnect();
   void stepSend();
   void stepRecv();

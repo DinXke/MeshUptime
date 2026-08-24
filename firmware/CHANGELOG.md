@@ -7,6 +7,47 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.5.1 — instant companion-push + volledige companion-command-GUI + radio-GUI
+
+Drie additieve uitbreidingen op de companion-hub; alleen de room-server-variant
+(`env:meshuptime_room`). De multi-bot-kern, de companion-store en de `#LOC`-afhandeling
+blijven ongewijzigd.
+
+**1. INSTANT-PUSH van companion-locatie/val naar MeshManager.** Tot nu toe *pollde*
+MeshManager `/companions.json` (tot ~1 min oud). Nu **duwt** de node: zodra een
+companion-`#LOC`/val ontvangen én bewaard is (`handleBotDm` → `companionUpdateLoc` /
+`companionRecordFall`), roept `RoomMesh::pushCompanionNow(idx)` de **bestaande**
+`PushTask` aan met de volledige stand. `PushTask::queueCompanion(...)` zet die in een
+eigen kleine ring en post hem — via **dezelfde** host/token/DNS-cache/socket-machine als
+de sensorpush, maar naar een **nieuw pad** **`POST {push.url}/api/companion`**:
+
+```
+{"companions":[{"pubkey":"<64hex>","lat":<float>,"lon":<float>,
+                "seen":<uint>,"fall_ts":<uint>,"fall_kind":"val|nomotion|sos|"}]}
+```
+
+`lat`/`lon` worden **weggelaten** als er geen locatie bekend is; `fall_ts:0` +
+`fall_kind:""` als er geen val-event is. Companion-pushes gaan **vóór** de heartbeat en
+verzetten de heartbeat-klok niet; ze delen de retry/queue (overloop → oudste valt eruit,
+geteld in `lostCount()`). Fire-moment: **precies bij het opslaan** van een companion-#LOC.
+Het poll-endpoint `/companions.json` blijft bestaan als **terugval**.
+
+**2. Volledige companion-command-parity in de web-GUI.** Het companion-commandopaneel
+dekt nu de **complete** set (parity met CLI/menu): `!status`, `!tunes`, `!rxps`,
+`!gps on|off`, `!preset 1|2|3`, **volume per slot** (`!vol H|M|L <0-3>`, naast de globale
+`!vol <0-3>`) en **allow** (`!allow add <64hex>` / `!allow del <prefix≥12hex>` /
+`!allow list`) — naast de bestaande `!find`/`!findstop`/`!loc`/`!ping`/`!cfg`/`!mute`/
+`!play`/`!tune`/`!quiet` en de volledige `!fall`-groep (on|off / sens / nomotion /
+prealarm / target add|del|list / mm on|off / test / status). Alle companion-**management**-
+commando's gaan via de **MGMT-bot** (`bot=BE-HSS-DinX-MGMT`, via `cmCmd` → `/bot/sendto`).
+
+**3. Radio-instellingen in de GUI, achter bevestiging + waarschuwing.** Nieuwe knoppen
+voor **freq / bw / sf / cr / tx-power** die `!radio <veld> <waarde> confirm` sturen —
+**elk** achter een expliciete JS-`confirm()` met de waarschuwing dat dit *"de companion
+van de mesh kan doen vallen (fysieke seriële recovery nodig)"*, plus een rood
+`.rw`-waarschuwingskader. Ook een **`radio show`**-leesknop. (De companion-firmware
+implementeert `radio … confirm` al.)
+
 ## v2.5.0 — meerdere bot-identiteiten (alert-bot + companion-MANAGEMENT-bot)
 
 De enkele notifier-bot is veralgemeend naar **N onafhankelijke bots** (`MAX_BOTS = 4`),

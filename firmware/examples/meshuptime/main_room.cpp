@@ -654,6 +654,9 @@ void setup() {
     web_task.setAcl(&the_mesh);
     push_task.begin(&wifi_task, &sensors, the_mesh.getSelfPubKey());
     sensors.setEventSink(&push_task);
+    /* v2.5.1: de room-mesh mag companion-#LOC/val METEEN pushen (POST
+     * /api/companion) via dezelfde PushTask -- geen wachten op de poll. */
+    the_mesh.setPushTask(&push_task);
   }
   #ifdef HAS_MONITOR_SENSORS
     sensors.setWifiTask(&wifi_task);

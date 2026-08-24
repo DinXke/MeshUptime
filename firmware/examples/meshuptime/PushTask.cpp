@@ -162,12 +162,40 @@ void PushTask::onMonitorEvent(const MonitorEvent& ev) {
   _ring_count++;
 }
 
+/* v2.5.1 -- een companion-locatie/val in de eigen ring zetten. Zelfde overloop-
+ * regel als de sensorring: vol -> de OUDSTE valt eruit en wordt geteld (_lost),
+ * niet stil. dueNow() wordt hierdoor waar en de loop() pikt het op; hetzelfde
+ * niet-blokkerende pad, alleen naar /api/companion. */
+void PushTask::queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, float lon,
+                              uint32_t seen, uint32_t fall_ts, uint8_t fall_kind) {
+  if (!enabled() || pub_key == NULL) return;
+
+  if (_cring_count >= COMP_RING_SIZE) {
+    _cring_tail = (uint8_t)((_cring_tail + 1) % COMP_RING_SIZE);
+    _cring_count--;
+    if (_comp_inflight > 0) _comp_inflight--;
+    _lost++;
+    MESH_DEBUG_PRINTLN("PushTask: companion-ring vol, oudste vervallen (verloren: %lu)",
+                       (unsigned long)_lost);
+  }
+  CompanionPush& c = _cring[(_cring_tail + _cring_count) % COMP_RING_SIZE];
+  memcpy(c.pub_key, pub_key, PUB_KEY_SIZE);
+  c.has_loc   = has_loc;
+  c.lat       = lat;
+  c.lon       = lon;
+  c.seen      = seen;
+  c.fall_ts   = fall_ts;
+  c.fall_kind = fall_kind;
+  _cring_count++;
+}
+
 /* Wanneer moet er een POST uit? Zodra er iets te melden is (gebeurtenissen of
  * node-bevestigingen), en anders op de heartbeat-klok. De retry-rem gaat voor:
  * na een fout wordt er even niet geprobeerd, wat er ook klaarstaat. */
 bool PushTask::dueNow(unsigned long now) const {
   if (_wifi == NULL || !_wifi->isOnline()) return false;
   if (_retry_at != 0 && (long)(now - _retry_at) < 0) return false;
+  if (_cring_count > 0) return true;   /* companion-push: meteen (val/loc) */
   if (_ring_count > 0 || _acked_pending != 0) return true;
   return (long)(now - _next_hb) >= 0;
 }
@@ -183,9 +211,10 @@ void PushTask::loop() {
   if (!enabled()) {
     /* Push staat uit. Een lopende poging afbreken en de wachtrij legen: wat er
      * ligt was voor een server die er nu niet meer is. */
-    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; }
+    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; _comp_inflight = 0; }
     _ring_count = 0;
     _acked_pending = 0;
+    _cring_count = 0;
     return;
   }
 
@@ -229,6 +258,11 @@ void PushTask::loop() {
  * bij ELKE poging opnieuw ontleed: de instelling kan veranderd zijn, en de
  * adrescache (op hostnaam) vangt de gewone herhaling af. */
 void PushTask::startAttempt() {
+  /* Companion-pushes gaan VOOR: een val/loc mag niet achter de heartbeat
+   * aansluiten. Staat er niets in de companion-ring, dan is dit een sensorpush.
+   * De rest van het pad (DNS/connect/send/recv) is voor beide identiek. */
+  _kind = (_cring_count > 0) ? KIND_COMPANION : KIND_SENSOR;
+
   const char* url = _sensors->pushUrl();
 
   /* "http://host[:poort][/voorvoegsel]" -- het schema is door de zeef in
@@ -248,8 +282,10 @@ void PushTask::startAttempt() {
     s_port = (uint16_t)v;
     p = endp;
   }
-  /* Wat er nog staat is het padvoorvoegsel (of niets). */
-  snprintf(s_path, sizeof(s_path), "%s/api/sensorpush", *p ? p : "");
+  /* Wat er nog staat is het padvoorvoegsel (of niets). Het contract-pad hangt af
+   * van het soort push -- zelfde host/token, ander endpoint. */
+  snprintf(s_path, sizeof(s_path), "%s%s", *p ? p : "",
+           _kind == KIND_COMPANION ? "/api/companion" : "/api/sensorpush");
 
   if (s_host[0] == 0) { failNet("url: geen host"); return; }
 
@@ -294,6 +330,77 @@ bool PushTask::buildRequest(const char* host, const char* path) {
   static char body[PUSH_BODY_MAX];
   size_t blen = 0;
 
+  if (_kind == KIND_COMPANION) {
+    if (!buildCompanionBody(body, sizeof(body), blen)) return false;
+  } else {
+    if (!buildSensorBody(body, sizeof(body), blen)) return false;
+  }
+
+  /* De koppen erbij. Connection: close is de afspraak waarmee het EINDE van het
+   * antwoord herkenbaar is zonder chunked-parser: de server sluit, recv geeft
+   * 0, klaar. Zelfde koppen voor beide soorten; alleen pad + body verschillen. */
+  s_req_len = 0;
+  s_req_off = 0;
+  if (!appendf(s_req, sizeof(s_req), s_req_len,
+               "POST %s HTTP/1.1\r\n"
+               "Host: %s\r\n"
+               "Authorization: Bearer %s\r\n"
+               "Content-Type: application/json\r\n"
+               "Content-Length: %u\r\n"
+               "Connection: close\r\n\r\n",
+               path, host, _sensors->pushToken(), (unsigned)blen)) return false;
+  if (s_req_len + blen >= sizeof(s_req)) return false;
+  memcpy(s_req + s_req_len, body, blen + 1);
+  s_req_len += blen;
+  return true;
+}
+
+/* v2.5.1 -- de companion-body. Alle wachtende companion-plaatsen gaan in één
+ * POST (ze delen host/token); _comp_inflight legt vast hoeveel, zodat finishOk()
+ * precies dat opruimt. lat/lon worden WEGGELATEN als has_loc onwaar is; fall
+ * krijgt fall_ts:0 en een lege fall_kind als er geen val-event is. */
+bool PushTask::buildCompanionBody(char* body, size_t cap, size_t& blen) {
+  blen = 0;
+  if (!appendf(body, cap, blen, "{\"companions\":[")) return false;
+
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  _comp_inflight = 0;
+  for (uint8_t i = 0; i < _cring_count; i++) {
+    const CompanionPush& c = _cring[(_cring_tail + i) % COMP_RING_SIZE];
+
+    /* Eerst apart opbouwen: past dit stuk niet meer, dan blijft de body geldig
+     * en gaat de rest met de VOLGENDE post mee (de ring is dan nog niet leeg). */
+    char piece[220];
+    size_t plen = 0;
+    for (int j = 0; j < PUB_KEY_SIZE; j++) snprintf(&hex[j * 2], 3, "%02x", (unsigned)c.pub_key[j]);
+    const char* fk = c.fall_kind == 1 ? "val" :
+                     c.fall_kind == 2 ? "nomotion" :
+                     c.fall_kind == 3 ? "sos" : "";
+    if (!appendf(piece, sizeof(piece), plen, "%s{\"pubkey\":\"%s\"",
+                 _comp_inflight == 0 ? "" : ",", hex)) return false;
+    if (c.has_loc) {
+      if (!appendf(piece, sizeof(piece), plen, ",\"lat\":%.6f,\"lon\":%.6f",
+                   c.lat, c.lon)) return false;
+    }
+    if (!appendf(piece, sizeof(piece), plen,
+                 ",\"seen\":%lu,\"fall_ts\":%lu,\"fall_kind\":\"%s\"}",
+                 (unsigned long)c.seen, (unsigned long)c.fall_ts, fk)) return false;
+
+    if (blen + plen + 2 >= cap) break;   /* rest in de volgende post ("]}" past nog) */
+    memcpy(body + blen, piece, plen + 1);
+    blen += plen;
+    _comp_inflight++;
+  }
+
+  if (!appendf(body, cap, blen, "]}")) return false;
+  return true;
+}
+
+/* De sensorpush-body (ongewijzigd t.o.v. v2.5.0; enkel losgemaakt van de koppen
+ * zodat companion en sensor dezelfde headerbouw delen). */
+bool PushTask::buildSensorBody(char* body, size_t cap, size_t& blen) {
+  blen = 0;
+
   /* De staart eerst (de acked-lijst en de sluithaken): dan is bij elke
    * gebeurtenis exact bekend hoeveel ruimte er gereserveerd moet blijven. */
   char tail[200];
@@ -312,7 +419,7 @@ bool PushTask::buildRequest(const char* host, const char* path) {
    * gebeurtenissen: zo ziet de server elk gat. */
   _seq++;
 
-  if (!appendf(body, sizeof(body), blen,
+  if (!appendf(body, cap, blen,
                "{\"node\":\"%s\",\"seq\":%lu,\"boot\":%lu,\"hb_s\":%u,\"events\":[",
                _node_id, (unsigned long)_seq, (unsigned long)_boot,
                (unsigned)_sensors->pushHbSecs())) return false;
@@ -331,34 +438,17 @@ bool PushTask::buildRequest(const char* host, const char* path) {
     if (!appendf(piece, sizeof(piece), plen, "\",\"sev\":\"%s\",\"sim\":%u}",
                  ev.sev_high ? "hoog" : "laag", (unsigned)ev.sim)) return false;
 
-    if (blen + plen + tlen >= sizeof(body)) break;   /* rest in de volgende post */
+    if (blen + plen + tlen >= cap) break;   /* rest in de volgende post */
     memcpy(body + blen, piece, plen + 1);
     blen += plen;
     _inflight++;
   }
 
-  if (blen + tlen >= sizeof(body)) return false;   /* kan niet: staart is gereserveerd */
+  if (blen + tlen >= cap) return false;   /* kan niet: staart is gereserveerd */
   memcpy(body + blen, tail, tlen + 1);
   blen += tlen;
 
   _acked_sent = _acked_pending;
-
-  /* De koppen erbij. Connection: close is de afspraak waarmee het EINDE van het
-   * antwoord herkenbaar is zonder chunked-parser: de server sluit, recv geeft
-   * 0, klaar. */
-  s_req_len = 0;
-  s_req_off = 0;
-  if (!appendf(s_req, sizeof(s_req), s_req_len,
-               "POST %s HTTP/1.1\r\n"
-               "Host: %s\r\n"
-               "Authorization: Bearer %s\r\n"
-               "Content-Type: application/json\r\n"
-               "Content-Length: %u\r\n"
-               "Connection: close\r\n\r\n",
-               path, host, _sensors->pushToken(), (unsigned)blen)) return false;
-  if (s_req_len + blen >= sizeof(s_req)) return false;
-  memcpy(s_req + s_req_len, body, blen + 1);
-  s_req_len += blen;
   return true;
 }
 
@@ -485,10 +575,11 @@ void PushTask::stepRecv() {
   if (status != 200) { failHttp(status); return; }
 
   /* De server-bevestigingen: "ack":[kanaal,...] -> per kanaal het herhalen
-   * stoppen, hetzelfde effect als een ok-DM maar dan gericht. */
+   * stoppen, hetzelfde effect als een ok-DM maar dan gericht. Alleen zinvol op
+   * de sensorpush; /api/companion kent geen ack-lijst. */
   const char* hdr_end = strstr(s_resp, "\r\n\r\n");
   const char* body    = hdr_end ? hdr_end + 4 : s_resp;
-  const char* ap      = strstr(body, "\"ack\"");
+  const char* ap      = (_kind == KIND_SENSOR) ? strstr(body, "\"ack\"") : NULL;
   if (ap != NULL) {
     ap = strchr(ap, '[');
     if (ap != NULL) {
@@ -511,30 +602,42 @@ void PushTask::stepRecv() {
 void PushTask::finishOk() {
   closeSock();
 
-  /* Precies opruimen wat deze post droeg: _inflight plaatsen vanaf de staart
-   * (onMonitorEvent heeft _inflight al verlaagd als de overloop er een van
-   * opat) en de bevestigingen uit de momentopname. Wat er ondertussen bij
-   * kwam blijft staan en maakt dueNow() meteen weer waar. */
-  _ring_tail   = (uint8_t)((_ring_tail + _inflight) % PUSH_RING_SIZE);
-  _ring_count  = (uint8_t)(_ring_count - _inflight);
-  _inflight    = 0;
-  _acked_pending &= ~_acked_sent;
-  _acked_sent  = 0;
+  if (_kind == KIND_COMPANION) {
+    /* Alleen de companion-ring opruimen; de sensorring, het acked-masker en de
+     * heartbeat-klok blijven met rust. Bleef er iets in de ring (overloop of
+     * body vol), dan houdt dueNow() de volgende post meteen waar. */
+    _cring_tail    = (uint8_t)((_cring_tail + _comp_inflight) % COMP_RING_SIZE);
+    _cring_count   = (uint8_t)(_cring_count - _comp_inflight);
+    _comp_inflight = 0;
+  } else {
+    /* Precies opruimen wat deze post droeg: _inflight plaatsen vanaf de staart
+     * (onMonitorEvent heeft _inflight al verlaagd als de overloop er een van
+     * opat) en de bevestigingen uit de momentopname. Wat er ondertussen bij
+     * kwam blijft staan en maakt dueNow() meteen weer waar. */
+    _ring_tail   = (uint8_t)((_ring_tail + _inflight) % PUSH_RING_SIZE);
+    _ring_count  = (uint8_t)(_ring_count - _inflight);
+    _inflight    = 0;
+    _acked_pending &= ~_acked_sent;
+    _acked_sent  = 0;
+    /* De heartbeat-klok alleen na een SENSORpush verzetten: een companion-push
+     * is buiten de cadans om en mag de belofte niet vooruitschuiven. */
+    _next_hb     = millis() + (unsigned long)_sensors->pushHbSecs() * 1000UL;
+  }
 
   _sent_ok++;
   _last_ok     = millis();
   _last_status = 200;
   _last_logged_status = -1;   /* een volgende fout is weer een nieuwe melding waard */
   _retry_at    = 0;
-  _next_hb     = millis() + (unsigned long)_sensors->pushHbSecs() * 1000UL;
   _state       = PUSH_IDLE;
 }
 
 void PushTask::failNet(const char* why) {
   closeSock();
   _fail_net++;
-  _inflight   = 0;
-  _acked_sent = 0;
+  _inflight      = 0;
+  _comp_inflight = 0;
+  _acked_sent    = 0;
   /* Niet hameren: even wachten en dan gewoon opnieuw -- de gebeurtenissen staan
    * veilig in de ring en de bevestigingen in het masker. */
   _retry_at = millis() + PUSH_RETRY_MS;
@@ -546,8 +649,9 @@ void PushTask::failNet(const char* why) {
 void PushTask::failHttp(int status) {
   closeSock();
   _fail_http++;
-  _inflight    = 0;
-  _acked_sent  = 0;
+  _inflight      = 0;
+  _comp_inflight = 0;
+  _acked_sent    = 0;
   _last_status = status;
 
   /* Loggen, niet spammen: één regel per nieuwe status, en dan wachten tot de
@@ -562,7 +666,10 @@ void PushTask::failHttp(int status) {
   }
   const unsigned long wait = (unsigned long)_sensors->pushHbSecs() * 1000UL;
   _retry_at = millis() + wait;
-  _next_hb  = millis() + wait;
+  /* De heartbeat-klok alleen bij een SENSORpush vooruitzetten. Een geweigerde
+   * companion-push mag de sensor-heartbeatbelofte niet uitstellen; _retry_at
+   * remt het hameren al af. */
+  if (_kind == KIND_SENSOR) _next_hb = millis() + wait;
   _state    = PUSH_IDLE;
 }
 

@@ -1,5 +1,6 @@
 #include "RoomMesh.h"
 #include "TimeFmt.h"
+#include "PushTask.h"   /* v2.5.1: instant companion-push via _push->queueCompanion() */
 
 /* === KANAAL-COMMANDO-DIAGNOSE (v2.3.7) ======================================
  * ALTIJD-AAN seriële logging (MESH_DEBUG staat uit), prefix "[chan]" -- net als
@@ -2067,6 +2068,19 @@ void RoomMesh::companionRecordFall(int idx, uint8_t kind, uint32_t ts) {
   saveCompanions();
 }
 
+/* v2.5.1 -- INSTANT-PUSH. De huidige stand van companion `idx` (laatst bekende
+ * locatie + eventueel val-event) meteen naar MeshManager duwen, zodat die niet
+ * op de /companions.json-poll (tot ~1 min oud) hoeft te wachten. PushTask draagt
+ * de betrouwbaarheid (retry/queue); hier alleen de momentopname doorgeven. */
+void RoomMesh::pushCompanionNow(int idx) {
+  if (_push == nullptr) return;
+  if (idx < 0 || idx >= MAX_COMPANIONS || !_companions[idx].used) return;
+  const Companion& c = _companions[idx];
+  bool has_loc = !isnan(c.last_lat) && !isnan(c.last_lon);
+  _push->queueCompanion(c.pub_key, has_loc, c.last_lat, c.last_lon,
+                        c.last_seen, c.fall_ts, c.fall_kind);
+}
+
 /* Formaat: header, dan per companion:
  *   c <pubkeyhex> <lat> <lon> <seen> <naam...>   (lat/lon "nan" = geen locatie)
  *   f <pubkeyhex> <fall_ts> <fall_kind>          (ALLEEN als er een val-event is)
@@ -2426,6 +2440,7 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
   int comp_idx = companionFindByPub(sender_pub);
   if (comp_idx >= 0) {
     if (strncmp(text, "#LOC ", 5) == 0) {
+      bool stored = false;   /* v2.5.1: is er iets bewaard dat we mogen pushen? */
       const char* q = text + 5; while (*q == ' ') q++;
       char* endp = NULL;
       float lat = strtof(q, &endp);
@@ -2436,6 +2451,7 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
         if (endp2 && endp2 != endp && lat >= -90.0f && lat <= 90.0f &&
             lon >= -180.0f && lon <= 180.0f) {
           companionUpdateLoc(comp_idx, lat, lon, now_s);
+          stored = true;
           Serial.printf("[loc] companion %02X%02X%02X%02X -> %.6f,%.6f\n",
                         sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], lat, lon);
         }
@@ -2447,10 +2463,16 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
       else if (containsCI(text, "(geen beweging)")) fk = FALL_KIND_NOMOTION;
       if (fk != FALL_KIND_NONE) {
         companionRecordFall(comp_idx, fk, now_s);
+        stored = true;
         Serial.printf("[fall] companion %02X%02X%02X%02X kind=%u ts=%u\n",
                       sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3],
                       (unsigned)fk, (unsigned)now_s);
       }
+      /* v2.5.1: locatie en/of val zijn nu opgeslagen -> DUW de stand meteen naar
+       * MeshManager (POST /api/companion). Eén push per #LOC-DM, met de volledige
+       * stand (loc + eventueel val); de poll van /companions.json blijft de
+       * terugval. */
+      if (stored) pushCompanionNow(comp_idx);
     } else {
       Serial.printf("[comp] reply van companion %02X%02X%02X%02X stil aanvaard\n",
                     sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3]);
