@@ -26,11 +26,22 @@ knoppen die het bijbehorende `!`-commando als **bot-DM** naar de gekozen compani
 sturen (via het bestaande `/bot/sendto`-pad): **Find** (`!find`), **Stop-find**
 (`!findstop`), **Locate** (`!loc`), **Mute** (`!mute on|off`), **Volume**
 (`!vol <0-3>`), **Tune-per-ernst** (`!tune <H|M|L> preset <naam>`), **Quiet**
-(`!quiet …`), **Fall** (`!fall on|off`), **Config** (`!cfg`), **Ping** (`!ping`),
-**Play** (`!play <naam>`). Een **kaartje** (Leaflet + OSM-tiles van de CDN
-`unpkg.com`) tekent de posities zodra er coördinaten zijn; **zonder internet** valt
-de GUI terug op `lat,lon`-tekst + een OpenStreetMap-link per companion. Alle uitleg
-zit achter de bestaande "?"-declutter.
+(`!quiet …`), **Config** (`!cfg`), **Ping** (`!ping`), **Play** (`!play <naam>`).
+Een **kaartje** (Leaflet + OSM-tiles van de CDN `unpkg.com`) tekent de posities
+zodra er coördinaten zijn; **zonder internet** valt de GUI terug op `lat,lon`-tekst
++ een OpenStreetMap-link per companion. Alle uitleg zit achter de bestaande
+"?"-declutter.
+
+**Valdetectie als eigen instelgroep.** De companion draait valdetectie op hardware
+en houdt het AAN; de node-GUI stelt het nu volledig bij via `!fall`-subcommando's
+(alle via `/bot/sendto`, geen node-firmware erbij): aan/uit (`!fall on|off`),
+gevoeligheid (`!fall sens low|med|high`), geen-beweging/dead-man
+(`!fall nomotion <min>`, 0=uit), doel waar de val/SOS-melding heen gaat
+(`!fall target <64hex>`; kiezer uit gehoorde contacten of plakken, 64-hex-check),
+pre-alarm/annuleervenster (`!fall prealarm <sec>`), **test** (`!fall test` — start
+de pre-alarm nu, annuleerbaar, achter een bevestiging, zonder echt te vallen) en
+**status** (`!fall status` — de companion rapporteert z'n huidige val-config terug
+als DM).
 
 **#LOC-locatierapporten + geen "onbekend"-bounce meer (firmware).** Een companion is
 een apparaat dat wij aansturen; z'n inkomende DM's zijn **antwoorden/rapporten**

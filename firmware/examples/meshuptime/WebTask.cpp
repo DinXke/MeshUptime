@@ -1922,9 +1922,7 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <button type="button" onclick="cmCmd('!ping')">Ping</button>
 <button type="button" onclick="cmCmd('!cfg')">Config</button>
 <button type="button" onclick="cmCmd('!mute on')">Mute aan</button>
-<button type="button" onclick="cmCmd('!mute off')">Mute uit</button>
-<button type="button" onclick="cmCmd('!fall on')">Fall aan</button>
-<button type="button" onclick="cmCmd('!fall off')">Fall uit</button></div>
+<button type="button" onclick="cmCmd('!mute off')">Mute uit</button></div>
 <div class="frow" style="margin-top:.5rem">
 <label style="align-self:center">Volume<select id="cm-vol" style="width:auto;margin-left:.3rem"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
 <button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vol').value)">stuur vol</button></div>
@@ -1938,13 +1936,43 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <div class="frow" style="margin-top:.4rem">
 <input id="cm-quiet" placeholder="quiet-argument (bv. 22:00-07:00)" maxlength="30" style="flex:1;min-width:10rem">
 <button type="button" onclick="cmCmd('!quiet '+document.getElementById('cm-quiet').value.trim())">stuur quiet</button></div>
+
+<h3 style="margin:.7rem 0 .2rem">Valdetectie</h3>
+<div class="quick">
+<button type="button" onclick="cmCmd('!fall on')">Fall aan</button>
+<button type="button" onclick="cmCmd('!fall off')">Fall uit</button>
+<button type="button" onclick="cmCmd('!fall status')">status</button>
+<button type="button" onclick="cmFallTest()">test (pre-alarm)</button></div>
+<div class="frow" style="margin-top:.45rem">
+<label style="align-self:center">Gevoeligheid<select id="cm-fsens" style="width:auto;margin-left:.3rem"><option value="low">laag</option><option value="med" selected>midden</option><option value="high">hoog</option></select></label>
+<button type="button" onclick="cmCmd('!fall sens '+document.getElementById('cm-fsens').value)">stuur gevoeligheid</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Geen-beweging<input id="cm-fnomotion" type="number" min="0" max="1440" value="0" style="width:5rem;margin-left:.3rem" title="minuten; 0 = uit"> min</label>
+<button type="button" onclick="cmCmd('!fall nomotion '+(parseInt(document.getElementById('cm-fnomotion').value,10)||0))">stuur dead-man</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Pre-alarm<input id="cm-fprealarm" type="number" min="0" max="300" value="30" style="width:5rem;margin-left:.3rem"> s</label>
+<button type="button" onclick="cmCmd('!fall prealarm '+(parseInt(document.getElementById('cm-fprealarm').value,10)||0))">stuur pre-alarm</button></div>
+<div class="frow" style="margin-top:.4rem">
+<select id="cm-ftarget-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
+<input id="cm-ftarget" placeholder="doel-pubkey (64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
+<button type="button" onclick="cmFallTarget()">stuur doel</button></div>
 <div id="cmcmdmsg"></div>
 <p class="note">Elke knop stuurt het <code>!</code>-commando als bot-DM naar de
 gekozen companion. <b>Find</b>/<b>Stop-find</b> laten de companion piepen/knipperen,
 <b>Locate</b> vraagt een <code>#LOC</code>-antwoord (dat hierboven de locatie
 bijwerkt), <b>Vol</b> 0&ndash;3, <b>Tune</b> koppelt een buzzer-preset aan een
-ernst (H/M/L), <b>Play</b> speelt een preset af. Wat de companion precies begrijpt
-hangt van z'n eigen firmware af &mdash; de node stuurt het commando alleen door.</p>
+ernst (H/M/L), <b>Play</b> speelt een preset af.</p>
+<p class="note"><b>Valdetectie</b> stuurt de <code>!fall</code>-subcommando's:
+<b>aan</b>/<b>uit</b> (<code>!fall on|off</code>), <b>gevoeligheid</b>
+(<code>!fall sens low|med|high</code>), <b>geen-beweging</b> (dead-man,
+<code>!fall nomotion &lt;min&gt;</code>, 0 = uit), <b>pre-alarm</b> (annuleervenster
+vóór de SOS gaat, <code>!fall prealarm &lt;sec&gt;</code>), <b>doel</b> waar de
+val/SOS-melding heen gaat (<code>!fall target &lt;64hex&gt;</code>; kies uit de
+gehoorde contacten of plak de sleutel), <b>test</b> (<code>!fall test</code> &mdash;
+start de pre-alarm nu, annuleerbaar, zonder echt te vallen) en <b>status</b>
+(<code>!fall status</code> &mdash; de companion rapporteert z'n huidige
+val-instellingen terug als DM). Wat de companion precies begrijpt hangt van z'n
+eigen firmware af &mdash; de node stuurt het commando alleen door.</p>
 
 <h2>Kaart &mdash; laatst bekende posities</h2>
 <div id="cm-map" style="height:18rem;border-radius:8px;overflow:hidden;display:none"></div>
@@ -3518,10 +3546,10 @@ o.textContent=nm+" · "+c.k.slice(0,6)+"… ("+c.t+","+c.h+"h)";sel.appendChild(
 function bindPicker(pickId,inId){var sel=document.getElementById(pickId);if(!sel)return;
 sel.onchange=function(){var v=sel.value;if(v){var i=document.getElementById(inId);if(i)i.value=v}}}
 function refreshPickers(){contactsGet().then(function(){
-["racl-pick","sacl-pick","bot-pick","bot-sto-pick","cm-pick"].forEach(fillPicker)})}
+["racl-pick","sacl-pick","bot-pick","bot-sto-pick","cm-pick","cm-ftarget-pick"].forEach(fillPicker)})}
 bindPicker("racl-pick","racl-pub");bindPicker("sacl-pick","sacl-pub");
 bindPicker("bot-pick","bot-pub-in");bindPicker("bot-sto-pick","bot-sto-key");
-bindPicker("cm-pick","cm-pub");
+bindPicker("cm-pick","cm-pub");bindPicker("cm-ftarget-pick","cm-ftarget");
 
 /* ============================== bot (chat/notifier) =========================
    Alles praat met /bot.json en de /bot/* endpoints. Zichtbaar op room-nodes. */
@@ -3822,6 +3850,12 @@ body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)})
 .then(function(r){return r.json()}).then(function(j){
 cmMsg("cmcmdmsg",j.ok?("verstuurd: "+cmd):("mislukt: "+(j.error||"")),j.ok?1:0)})
 .catch(function(){cmMsg("cmcmdmsg","mislukt",0)})}
+function cmFallTest(){if(!confirm("Val-TEST sturen?\n\nDe companion start nu z'n "+
+"pre-alarm (aftellen). Dat is annuleerbaar op het toestel en stuurt geen echte "+
+"SOS zolang niemand valt — maar hij gaat wel piepen."))return;cmCmd('!fall test')}
+function cmFallTarget(){var t=document.getElementById("cm-ftarget").value.trim();
+if(t.length!=64){cmMsg("cmcmdmsg","doel: volledige pubkey (64 hex) nodig",0);return}
+cmCmd('!fall target '+t)}
 document.getElementById("cm-add").onclick=cmAdd;
 /* Leaflet lui laden van de CDN; faalt dat (offline), dan blijft de tekstlijst. */
 function cmLoadLeaflet(cb){if(window.L){cb(true);return}

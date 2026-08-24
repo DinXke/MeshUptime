@@ -96,9 +96,11 @@
  *   v2.4.0 = COMPANION-HUB OP DE NODE: een persistente companion-lijst
  *            (/companions.cfg, cap 16: pubkey+naam+laatste lat/lon+last_seen).
  *            Web-GUI-tab "companions" (beheer add/edit/del, commandoknoppen die
- *            !find/!findstop/!loc/!mute/!vol/!tune/!quiet/!fall/!cfg/!ping/!play
- *            als bot-DM sturen, en een Leaflet/OSM-kaartje met terugval naar
- *            lat,lon-tekst). De node ontvangt #LOC-locatierapporten: een DM van
+ *            !find/!findstop/!loc/!mute/!vol/!tune/!quiet/!cfg/!ping/!play als
+ *            bot-DM sturen + een eigen valdetectie-groep met de !fall-subcommando's
+ *            on|off/sens/nomotion/target/prealarm/test/status, en een Leaflet/OSM-
+ *            kaartje met terugval naar lat,lon-tekst). De node ontvangt
+ *            #LOC-locatierapporten: een DM van
  *            een BEKENDE companion is altijd een antwoord/rapport, nooit een
  *            commando -> begint hij met "#LOC <lat>,<lon>" dan wordt de locatie
  *            bewaard, anders stil aanvaard (geen "onbekend commando"-bounce meer
