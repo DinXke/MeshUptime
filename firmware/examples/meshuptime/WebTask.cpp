@@ -4006,8 +4006,13 @@ else cmMsg("cmaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){cmMsg("cma
 function cmCmd(cmd){var pub=document.getElementById("cm-cmd-pick").value;
 if(!pub){cmMsg("cmcmdmsg","kies eerst een companion",0);return}
 if(!cmd||!cmd.trim()){cmMsg("cmcmdmsg","leeg commando",0);return}
-/* Companion-MANAGEMENT gaat via de MGMT-bot (indien aanwezig; anders de alert-bot). */
-var mgb=(typeof MGMTBOT!=="undefined"&&MGMTBOT!=="")?("&bot="+encodeURIComponent(MGMTBOT)):"";
+/* Companion-commando's gaan via de ALERT-bot (de standaard): de companion (T1000-E)
+   heeft die als CONTACT (advert-uitwisseling bij opzet) en kan er dus van ontvangen
+   EN naar antwoorden. De MGMT-bot is later toegevoegd en staat op de companion enkel
+   op de allowlist, niet als contact -> DM's van MGMT kunnen niet ontsleuteld/beantwoord
+   worden (loc/status/find deden "niks"). Zodra de companion de MGMT-bot als contact
+   heeft (advert horen of handmatig toevoegen) kan dit terug naar MGMT. */
+var mgb="";
 return fetch("bot/sendto",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)+mgb})
