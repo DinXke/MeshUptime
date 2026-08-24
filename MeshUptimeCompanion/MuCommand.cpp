@@ -5,6 +5,8 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdlib.h>
+#include <math.h>
 
 // ---- reply -----------------------------------------------------------------
 void mu_reply(const MuCmdCtx& ctx, const char* fmt, ...) {
@@ -407,6 +409,153 @@ static void cmd_fall(const MuCmdCtx& ctx, const char* args) {
   mu_reply(ctx, "  fall target add|del|list <64hex>");
 }
 
+// ---- radio parameters ------------------------------------------------------
+// Remote RADIO-parameter control for full CLI/DM/menu parity. EACH mutating
+// subcommand requires a trailing `confirm` token; without it we WARN and change
+// nothing (an over-the-air freq/BW/SF/CR change can drop the companion off the
+// mesh — recoverable only over the physical serial port). Applied values are
+// mirrored into mu_cfg as an additive override so they survive reboot
+// (mu_radio_apply_persisted, called from mu_begin). The COMPILED mesh defaults
+// (869.618/BW62.5/SF8/CR8) are never changed and are used whenever no override
+// is persisted.
+
+// Mesh-default reference (compiled build defaults for this node).
+#define MU_RADIO_DEF_FREQ 869.618
+#define MU_RADIO_DEF_BW   62.5
+#define MU_RADIO_DEF_SF   8
+#define MU_RADIO_DEF_CR   8
+
+// Accepted ranges (validated; out-of-range is rejected with NO change).
+#define MU_RADIO_FREQ_MIN 100.0    // MHz (LR1110 sub-GHz; conservative bounds)
+#define MU_RADIO_FREQ_MAX 1000.0
+#define MU_RADIO_TX_MIN   (-9)     // dBm
+#define MU_RADIO_TX_MAX   22       // dBm (T1000-E LR1110 high-power PA ceiling)
+
+static const char* MU_RADIO_WARN =
+  "WAARSCHUWING: radio wijzigen kan companion v/d mesh halen (fysiek serieel herstel nodig). Voeg 'confirm' toe om toch toe te passen.";
+
+// Standard LoRa bandwidths (kHz). A change is only accepted for one of these.
+static bool radio_bw_valid(double bw) {
+  static const double S[] = {7.8,10.4,15.6,20.8,31.25,41.7,62.5,125.0,250.0,500.0};
+  for (unsigned i = 0; i < sizeof(S)/sizeof(S[0]); i++)
+    if (fabs(bw - S[i]) < 0.05) return true;
+  return false;
+}
+
+// The next token (lowercased) equals "confirm"?
+static bool radio_confirmed(const char* p) {
+  char t[12]; next_tok(p, t, sizeof(t), true);
+  return !strcmp(t, "confirm");
+}
+
+// Apply the CURRENT NodePrefs radio set to the driver, mirror into mu_cfg as a
+// persisted override, save, and re-arm RXPS for the new SF/BW. Shared by every
+// mutating `radio` path (CLI/DM/menu) so they never drift.
+static void radio_commit() {
+  NodePrefs* pr = the_mesh.getNodePrefs();
+  // setParams -> RadioLib setFrequency/setBandwidth/setSpreadingFactor/setCodingRate
+  radio_driver.setParams(pr->freq, pr->bw, pr->sf, pr->cr);
+  radio_driver.setTxPower(pr->tx_power_dbm);   // -> RadioLib setOutputPower
+  mu_cfg.radio_override = 1;
+  mu_cfg.radio_freq   = pr->freq;
+  mu_cfg.radio_bw     = pr->bw;
+  mu_cfg.radio_sf     = pr->sf;
+  mu_cfg.radio_cr     = pr->cr;
+  mu_cfg.radio_tx_dbm = pr->tx_power_dbm;
+  mu_config_save();
+  mu_rxps_apply(mu_cfg.rxps_level);   // re-arm RX duty-cycle with the new SF/BW
+}
+
+static void cmd_radio(const MuCmdCtx& ctx, const char* args) {
+  char sub[12];
+  const char* p = next_tok(args, sub, sizeof(sub), true);
+  NodePrefs* pr = the_mesh.getNodePrefs();
+
+  if (sub[0] == 0 || !strcmp(sub, "show") || !strcmp(sub, "status")) {
+    mu_reply(ctx, "radio: freq=%.3fMHz BW=%.1f SF=%u CR=%u TX=%ddBm%s",
+             (double)pr->freq, (double)pr->bw, (unsigned)pr->sf, (unsigned)pr->cr,
+             (int)pr->tx_power_dbm, mu_cfg.radio_override ? " (override)" : " (default)");
+    mu_reply(ctx, "mesh-default: 869.618/BW62.5/SF8/CR8 (%s)",
+             mu_cfg.radio_override ? "persisted override actief" : "in gebruik");
+    return;
+  }
+
+  // All remaining subcommands are MUTATING: <value> [confirm].
+  char valtok[24];
+  const char* after = next_tok(p, valtok, sizeof(valtok), false);
+  if (valtok[0] == 0) {
+    mu_reply(ctx, "radio %s <waarde> confirm", sub);
+    return;
+  }
+
+  if (!strcmp(sub, "freq")) {
+    double f = atof(valtok);
+    if (!(f > MU_RADIO_FREQ_MIN && f < MU_RADIO_FREQ_MAX)) {
+      mu_reply(ctx, "radio freq: %.0f..%.0f MHz", MU_RADIO_FREQ_MIN, MU_RADIO_FREQ_MAX); return;
+    }
+    if (!radio_confirmed(after)) { mu_reply(ctx, MU_RADIO_WARN); return; }
+    pr->freq = (float)f; radio_commit();
+    mu_reply(ctx, "radio freq -> %.3f MHz toegepast+bewaard", (double)pr->freq);
+    return;
+  }
+  if (!strcmp(sub, "bw")) {
+    double bw = atof(valtok);
+    if (!radio_bw_valid(bw)) {
+      mu_reply(ctx, "radio bw: 7.8/10.4/15.6/20.8/31.25/41.7/62.5/125/250/500 kHz"); return;
+    }
+    if (!radio_confirmed(after)) { mu_reply(ctx, MU_RADIO_WARN); return; }
+    pr->bw = (float)bw; radio_commit();
+    mu_reply(ctx, "radio bw -> %.1f kHz toegepast+bewaard", (double)pr->bw);
+    return;
+  }
+  if (!strcmp(sub, "sf")) {
+    int sf = atoi(valtok);
+    if (sf < 7 || sf > 12) { mu_reply(ctx, "radio sf: 7..12"); return; }
+    if (!radio_confirmed(after)) { mu_reply(ctx, MU_RADIO_WARN); return; }
+    pr->sf = (uint8_t)sf; radio_commit();
+    mu_reply(ctx, "radio sf -> %u toegepast+bewaard", (unsigned)pr->sf);
+    return;
+  }
+  if (!strcmp(sub, "cr")) {
+    int cr = atoi(valtok);
+    if (cr < 5 || cr > 8) { mu_reply(ctx, "radio cr: 5..8"); return; }
+    if (!radio_confirmed(after)) { mu_reply(ctx, MU_RADIO_WARN); return; }
+    pr->cr = (uint8_t)cr; radio_commit();
+    mu_reply(ctx, "radio cr -> %u toegepast+bewaard", (unsigned)pr->cr);
+    return;
+  }
+  if (!strcmp(sub, "txpower") || !strcmp(sub, "tx")) {
+    int tx = atoi(valtok);
+    if (tx < MU_RADIO_TX_MIN || tx > MU_RADIO_TX_MAX) {
+      mu_reply(ctx, "radio txpower: %d..%d dBm", MU_RADIO_TX_MIN, MU_RADIO_TX_MAX); return;
+    }
+    if (!radio_confirmed(after)) { mu_reply(ctx, MU_RADIO_WARN); return; }
+    pr->tx_power_dbm = (int8_t)tx; radio_commit();
+    mu_reply(ctx, "radio txpower -> %d dBm toegepast+bewaard", (int)pr->tx_power_dbm);
+    return;
+  }
+  mu_reply(ctx, "radio show|freq <MHz>|bw <kHz>|sf 7-12|cr 5-8|txpower <dBm>");
+  mu_reply(ctx, "  mutaties vereisen 'confirm' (bv: radio freq 869.000 confirm)");
+}
+
+// Called from mu_begin() AFTER radio init: if a radio override is persisted,
+// push it into the live NodePrefs and the LR1110 driver so it survives reboot.
+// No-op (compiled mesh defaults kept) when nothing is persisted.
+void mu_radio_apply_persisted() {
+  if (!mu_cfg.radio_override) return;
+  NodePrefs* pr = the_mesh.getNodePrefs();
+  pr->freq         = mu_cfg.radio_freq;
+  pr->bw           = mu_cfg.radio_bw;
+  pr->sf           = mu_cfg.radio_sf;
+  pr->cr           = mu_cfg.radio_cr;
+  pr->tx_power_dbm = mu_cfg.radio_tx_dbm;
+  radio_driver.setParams(pr->freq, pr->bw, pr->sf, pr->cr);
+  radio_driver.setTxPower(pr->tx_power_dbm);
+  Serial.printf("radio override toegepast: %.3f/BW%.1f/SF%u/CR%u/TX%ddBm\r\n",
+                (double)pr->freq, (double)pr->bw, (unsigned)pr->sf,
+                (unsigned)pr->cr, (int)pr->tx_power_dbm);
+}
+
 // ---- dispatcher ------------------------------------------------------------
 bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
   const char* s = skip_ws(line);
@@ -472,15 +621,17 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
   if (!strcmp(cmd, "quiet"))  { cmd_quiet(ctx, args); return true; }
   if (!strcmp(cmd, "gps"))    { cmd_gps(ctx, args); return true; }
   if (!strcmp(cmd, "loc"))    { cmd_loc(ctx); return true; }
-  if (!strcmp(cmd, "cfg"))    { cmd_cfg(ctx); return true; }
+  if (!strcmp(cmd, "radio"))  { cmd_radio(ctx, args); return true; }
+  if (!strcmp(cmd, "cfg") || !strcmp(cmd, "status")) { cmd_cfg(ctx); return true; }
   if (!strcmp(cmd, "allow"))  { cmd_allow(ctx, args); return true; }
   if (!strcmp(cmd, "preset")) { cmd_preset(ctx, args); return true; }
   if (!strcmp(cmd, "target")) { cmd_setkey(ctx, args, false); return true; }
   if (!strcmp(cmd, "sos"))    { cmd_setkey(ctx, args, true); return true; }
   if (!strcmp(cmd, "fall"))   { cmd_fall(ctx, args); return true; }
   if (!strcmp(cmd, "help")) {
-    mu_reply(ctx, "cmds: find findstop mute vol tune tunes play quiet gps loc cfg");
-    mu_reply(ctx, "  rxps allow preset target sos fall msgtune ping (serieel: menu)");
+    mu_reply(ctx, "cmds: find findstop mute vol tune tunes play quiet gps loc cfg status");
+    mu_reply(ctx, "  rxps radio allow preset target sos fall msgtune ping (serieel: menu)");
+    mu_reply(ctx, "  radio show|freq|bw|sf|cr|txpower <v> confirm  (mutatie vereist 'confirm')");
     return true;
   }
   mu_reply(ctx, "onbekend: %s (!help)", cmd);

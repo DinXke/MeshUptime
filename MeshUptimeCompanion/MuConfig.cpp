@@ -233,6 +233,15 @@ void mu_config_begin() {
         memset(mu_cfg.fall_target_pub, 0, sizeof(mu_cfg.fall_target_pub));
         migrated = true;
       }
+      if (tmp.version < 4) {
+        // v3 -> v4: no persisted radio override -> boot on the compiled mesh
+        // defaults (tmp was zeroed, so these are already 0; set explicitly).
+        mu_cfg.radio_override = 0;
+        mu_cfg.radio_sf = mu_cfg.radio_cr = 0;
+        mu_cfg.radio_tx_dbm = 0;
+        mu_cfg.radio_freq = mu_cfg.radio_bw = 0.0f;
+        migrated = true;
+      }
       if (migrated) {
         mu_cfg.version = MU_CFG_VERSION;
         mu_cfg.size    = (uint16_t)sizeof(MuConfig);

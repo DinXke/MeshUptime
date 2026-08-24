@@ -127,6 +127,7 @@ static void draw_cat(int c) {
       P(" 3) RXPS (off|conservative|balanced)");
       P(" 4) wijzig radio-parameters (!! valt v/d mesh)");
       P(" 5) herstel mesh-preset 869.618/BW62.5/SF8/CR8");
+      P(" 6) enkel radio-veld (freq|bw|sf|cr|txpower ..)");
       break;
     case 7:
       P("== 7 Allowlist & beveiliging ==");
@@ -191,9 +192,18 @@ static void apply_radio() {
   pr->tx_power_dbm = (int8_t)rq_tx;
   radio_driver.setParams(pr->freq, pr->bw, pr->sf, pr->cr);
   radio_driver.setTxPower(pr->tx_power_dbm);
-  the_mesh.savePrefs();
+  // Persist as an additive mu_cfg override — the SAME store the `radio` CLI/DM
+  // path uses — so a menu-driven change survives reboot via
+  // mu_radio_apply_persisted() and both paths stay consistent.
+  mu_cfg.radio_override = 1;
+  mu_cfg.radio_freq   = pr->freq;
+  mu_cfg.radio_bw     = pr->bw;
+  mu_cfg.radio_sf     = pr->sf;
+  mu_cfg.radio_cr     = pr->cr;
+  mu_cfg.radio_tx_dbm = pr->tx_power_dbm;
+  mu_config_save();
   mu_rxps_apply(mu_cfg.rxps_level);   // re-apply RXPS with the new SF/BW
-  P("radio toegepast + bewaard.");
+  P("radio toegepast + bewaard (mu_cfg override).");
 }
 
 // ---- category numeric handlers ---------------------------------------------
@@ -242,7 +252,7 @@ static void handle_cat_item(int c, int n) {
       else P(" ?");
       break;
     case 6:
-      if (n == 1) show_radio();
+      if (n == 1) run_cli("radio show");
       else if (n == 2) begin_input(" gps on|off|ondemand:", "gps ");
       else if (n == 3) {
         P(" WAARSCHUWING: RXPS spaart accu maar kan alert-DM's");
@@ -261,6 +271,10 @@ static void handle_cat_item(int c, int n) {
         P(" Herstel mesh-preset 869.618/BW62.5/SF8/CR8 (TX blijft).");
         P(" Typ JA om toe te passen, b=annuleer.");
         menu_mode = MODE_CONFIRM; pending_act = ACT_MESHPRESET;
+      } else if (n == 6) {
+        P(" Enkel radio-veld via het `radio`-commando.");
+        P(" Mutatie vereist 'confirm' (bv: freq 869.000 confirm).");
+        begin_input(" veld+waarde: freq|bw|sf|cr|txpower <v> [confirm]:", "radio ");
       } else P(" ?");
       break;
     case 7:

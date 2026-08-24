@@ -374,12 +374,19 @@ void mu_begin() {
 
   mu_config_begin();
 
+  // Re-apply a persisted radio override (if any) to the LR1110 + live NodePrefs.
+  // Runs AFTER radio_init()/the_mesh.begin() (both done in setup() before us), so
+  // an over-the-air/serial `radio` change survives reboot. No-op when nothing is
+  // persisted -> the device keeps the COMPILED mesh defaults (never altered).
+  mu_radio_apply_persisted();
+
   // Apply persisted GPS mode. ON = continuous, ONDEMAND/OFF = leave asleep.
   if (mu_cfg.gps_mode == MU_GPS_ON) sensors.setSettingValue("gps", "1");
   else                             sensors.setSettingValue("gps", "0");
 
   // Apply persisted RXPS level (default 0 = off/continuous RX). The_mesh.begin()
-  // already ran with the default OFF; re-apply now that our config is loaded.
+  // already ran with the default OFF; re-apply now that our config is loaded
+  // (and after any radio override, so RXPS re-arms with the effective SF/BW).
   mu_rxps_apply(mu_cfg.rxps_level);
 
   mu_button_begin();

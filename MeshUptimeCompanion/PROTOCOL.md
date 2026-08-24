@@ -42,8 +42,11 @@ the official app/EasySkyMesh keep working unchanged. Concretely, and verified:
   the stock T1000-E companion (no display build).
 - **(d) Identity + FS layout unchanged.** We persist only `/mu_cfg.dat` on the same
   InternalFS. Identity keys, `NodePrefs`, contacts and channels are never rewritten
-  by our code. (The menu's radio-param change calls the stock `savePrefs()` — the
-  same prefs file the stock `CMD_SET_RADIO_PARAMS` writes — never the identity.)
+  by our code. The `!radio` param change (CLI/DM/menu, §2/§6) applies to the live
+  LR1110 + in-RAM `NodePrefs` and persists **only** as an additive `mu_cfg` override,
+  re-applied on boot by `mu_radio_apply_persisted()` — it does **not** rewrite the
+  stock `NodePrefs` file, so with no override the node still boots on the compiled
+  mesh defaults (869.618/BW62.5/SF8/CR8).
 
 **RXPS is opt-in and default-OFF** (continuous RX) so a carried pager never sleeps
 through an alert DM — see §8.
@@ -115,7 +118,13 @@ printed line on the serial console.
 | `!quiet off` | Disable the quieter period. |
 | `!gps on\|off\|ondemand` | GPS power policy. `on` = continuous, `off` = never, `ondemand` = normally off, woken by `!loc`. |
 | `!loc` | Reply a machine-readable location report starting with the token `#LOC <lat>,<lon>` (decimal degrees, 5 decimals, e.g. `#LOC 51.23456,5.45678`) so the MeshUptime node can parse & plot it. If there is no fix and GPS is not `on`, it wakes the GPS and asks you to retry shortly. |
-| `!cfg` | Report the full configuration (mute, vol, msgtune, battery mV + %, quiet, gps, fall, no-motion, allowlist count, target/sos set, last known location) as a few reply lines. |
+| `!cfg` / `!status` | Report the full configuration (mute, vol, msgtune, battery mV + %, quiet, gps, fall, no-motion, allowlist count, target/sos set, last known location) as a few reply lines. `!status` is an alias. |
+| `!radio show` / `!radio status` | Report the live radio parameters (`freq`/`BW`/`SF`/`CR`/`TX`), whether a persisted override is active, and the compiled mesh default `869.618/BW62.5/SF8/CR8` for reference. Read-only, no `confirm`. |
+| `!radio freq <MHz> confirm` | Set the LoRa frequency (range `100..1000` MHz). **Mutating** — requires the trailing `confirm` token; without it, replies with a WARNING (a mismatch drops the companion off the mesh, needing physical serial recovery) and changes nothing. Applied via RadioLib and persisted as an additive `mu_cfg` override (survives reboot). |
+| `!radio bw <kHz> confirm` | Set the bandwidth. Accepted values `7.8/10.4/15.6/20.8/31.25/41.7/62.5/125/250/500` kHz. Same `confirm` requirement + persistence. |
+| `!radio sf <7-12> confirm` | Set the spreading factor. Same `confirm` requirement + persistence. |
+| `!radio cr <5-8> confirm` | Set the coding rate. Same `confirm` requirement + persistence. |
+| `!radio txpower <dBm> confirm` | Set the TX power (range `-9..22` dBm). Same `confirm` requirement + persistence. |
 | `!allow list` | List allowlist entries (index, 8-byte prefix, admin flag). |
 | `!allow add <64hex>` | Add a pubkey (non-admin). Serial always; DM only from an admin. |
 | `!allow del <hexprefix>` | Remove every entry matching the hex prefix. Serial always; DM only from an admin. |
@@ -248,9 +257,12 @@ touched, so an app-region reflash (nRF52 UF2) leaves identity **and** this
 config intact. See `README.md` for the key-safe flashing procedure.
 
 v2 of `/mu_cfg.dat` appends per-slot volumes, the quieter-period level and the
-RXPS level at the end of the record; an older v1 file is migrated forward on load
-(new fields back-filled with defaults, then rewritten) — it is never discarded, so
-the allowlist/target/tunes survive the upgrade.
+RXPS level at the end of the record; v3 appends the fall-detection config; **v4
+appends the radio override** (`radio_override` flag + persisted freq/bw/sf/cr/tx).
+An older file is migrated forward on load (new fields back-filled with defaults,
+then rewritten) — it is never discarded, so the allowlist/target/tunes survive the
+upgrade. The radio override defaults to **off**, so an upgraded node keeps booting
+on the compiled mesh defaults until a `!radio … confirm` is issued.
 
 ---
 
@@ -344,10 +356,13 @@ Categories:
 5. **Val-detectie** — arm/disarm, sensitivity (low/med/high), dead-man minutes,
    pre-alarm seconds, add/remove/list direct alert targets, MeshManager toggle
    (`mm`), test the pre-alarm, status (labelled *not certified*).
-6. **Radio & Power** — show radio params; GPS mode; **RXPS** (with a missed-alert
-   warning); **change radio params** and **restore the mesh preset**
-   (869.618 / BW 62.5 / SF 8 / CR 8) — both behind an explicit **warning +
-   `JA` confirmation**, because wrong freq/BW/SF/CR/TX drops the node off the mesh.
+6. **Radio & Power** — show radio params (`radio show`); GPS mode; **RXPS** (with a
+   missed-alert warning); **change all radio params at once** and **restore the mesh
+   preset** (869.618 / BW 62.5 / SF 8 / CR 8) — both behind an explicit **warning +
+   `JA` confirmation**; and a **single-field** item that feeds the `radio <field>
+   <value> confirm` CLI command directly (so the menu and the DM/CLI `!radio`
+   commands share one code path and one `mu_cfg` override). Wrong freq/BW/SF/CR/TX
+   drops the node off the mesh — hence the confirm gate on every mutation.
 7. **Allowlist & beveiliging** — list/add/del pubkeys.
 8. **Info / status / batterij / pubkey** — full cfg, real battery mV + %, pubkey,
    location.

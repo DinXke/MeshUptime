@@ -42,6 +42,13 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx);
 // Reply helper: DM back to sender (if !from_serial) or print to Serial.
 void mu_reply(const MuCmdCtx& ctx, const char* fmt, ...);
 
+// ---- Remote radio-parameter override (MuCommand.cpp) -----------------------
+// If mu_cfg.radio_override is set, re-apply the persisted freq/bw/sf/cr/tx to the
+// LR1110 driver AND the live NodePrefs. Called from mu_begin() AFTER radio init so
+// an over-the-air/serial `radio` change survives reboot. No-op when not overridden
+// (the device then keeps the COMPILED mesh defaults — never altered).
+void mu_radio_apply_persisted();
+
 // Send a plain DM to an arbitrary pubkey (used by button/fall). Returns false
 // if no matching contact is known. `also_gps` appends " @lat,lon" when a fix
 // is available.

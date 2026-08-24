@@ -35,7 +35,7 @@
 #define MU_FALL_TARGET_MAX 4  // direct-alert target pubkeys for fall/no-motion
 
 #define MU_CFG_MAGIC   0x3143554DUL   // "MUC1"
-#define MU_CFG_VERSION 3              // v2: per-slot volume + quiet level; v3: fall config
+#define MU_CFG_VERSION 4              // v2: per-slot volume + quiet level; v3: fall config; v4: radio override
 
 struct MuConfig {
   uint32_t magic;
@@ -77,6 +77,18 @@ struct MuConfig {
   uint16_t fall_prealarm_sec;   // buzzer pre-alarm / button-cancel window before alert (s)
   uint8_t  fall_target_used[MU_FALL_TARGET_MAX];         // slot occupied flags
   uint8_t  fall_target_pub[MU_FALL_TARGET_MAX][MU_PUB_LEN]; // direct fall/SOS alert dests
+
+  // --- v4 additive fields (remote radio-parameter override) -------------------
+  // When radio_override==1 the five params below are re-applied to the LR1110 on
+  // boot (mu_radio_apply_persisted), so an over-the-air/serial `radio` change
+  // survives reboot. When 0 the device boots on the COMPILED mesh defaults
+  // (869.618/BW62.5/SF8/CR8) — the compiled defaults are never altered.
+  uint8_t  radio_override;      // 1 = radio_* below are active and applied on boot
+  uint8_t  radio_sf;            // spreading factor 7..12
+  uint8_t  radio_cr;            // coding rate 5..8
+  int8_t   radio_tx_dbm;        // TX power in dBm
+  float    radio_freq;          // frequency in MHz
+  float    radio_bw;            // bandwidth in kHz
 };
 
 extern MuConfig mu_cfg;
