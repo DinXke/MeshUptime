@@ -98,13 +98,15 @@
  *            Web-GUI-tab "companions" (beheer add/edit/del, commandoknoppen die
  *            !find/!findstop/!loc/!mute/!vol/!tune/!quiet/!cfg/!ping/!play als
  *            bot-DM sturen + een eigen valdetectie-groep met de !fall-subcommando's
- *            on|off/sens/nomotion/target/prealarm/test/status, en een Leaflet/OSM-
- *            kaartje met terugval naar lat,lon-tekst). De node ontvangt
- *            #LOC-locatierapporten: een DM van
- *            een BEKENDE companion is altijd een antwoord/rapport, nooit een
- *            commando -> begint hij met "#LOC <lat>,<lon>" dan wordt de locatie
- *            bewaard, anders stil aanvaard (geen "onbekend commando"-bounce meer
- *            op companion-replies). /companions.json (auth) voor MeshManager.
+ *            on|off/mm on|off/sens/nomotion/prealarm/target add|del|list/test/
+ *            status, en een Leaflet/OSM-kaartje met terugval naar lat,lon-tekst).
+ *            De node ontvangt #LOC-locatierapporten: een DM van een BEKENDE
+ *            companion is altijd een antwoord/rapport, nooit een commando ->
+ *            begint hij met "#LOC <lat>,<lon>" dan wordt de locatie bewaard, en
+ *            draagt hij een val-merkteken ((val)/(geen beweging)/(SOS)) dan ook een
+ *            val-event (fall_ts/fall_kind); anders stil aanvaard (geen "onbekend
+ *            commando"-bounce meer op companion-replies). /companions.json (auth)
+ *            geeft lat/lon + fall_ts/fall_kind voor MeshManager-escalatie.
  *            Werkt ook als MeshManager plat ligt.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/

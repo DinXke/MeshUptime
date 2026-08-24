@@ -1943,6 +1943,10 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <button type="button" onclick="cmCmd('!fall off')">Fall uit</button>
 <button type="button" onclick="cmCmd('!fall status')">status</button>
 <button type="button" onclick="cmFallTest()">test (pre-alarm)</button></div>
+<div class="quick" style="margin-top:.4rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">MeshManager-koppeling:</span>
+<button type="button" onclick="cmCmd('!fall mm on')">mm aan</button>
+<button type="button" onclick="cmCmd('!fall mm off')">mm uit</button></div>
 <div class="frow" style="margin-top:.45rem">
 <label style="align-self:center">Gevoeligheid<select id="cm-fsens" style="width:auto;margin-left:.3rem"><option value="low">laag</option><option value="med" selected>midden</option><option value="high">hoog</option></select></label>
 <button type="button" onclick="cmCmd('!fall sens '+document.getElementById('cm-fsens').value)">stuur gevoeligheid</button></div>
@@ -1954,8 +1958,10 @@ locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.<
 <button type="button" onclick="cmCmd('!fall prealarm '+(parseInt(document.getElementById('cm-fprealarm').value,10)||0))">stuur pre-alarm</button></div>
 <div class="frow" style="margin-top:.4rem">
 <select id="cm-ftarget-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; gehoorde contacten &mdash;</option></select>
-<input id="cm-ftarget" placeholder="doel-pubkey (64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
-<button type="button" onclick="cmFallTarget()">stuur doel</button></div>
+<input id="cm-ftarget" placeholder="doel-pubkey (64 hex; prefix &ge;12 voor verwijderen)" maxlength="64" spellcheck="false" style="flex:1;min-width:10rem">
+<button type="button" onclick="cmFallTargetAdd()">doel +</button>
+<button type="button" onclick="cmFallTargetDel()">doel &minus;</button>
+<button type="button" onclick="cmCmd('!fall target list')">doel-lijst</button></div>
 <div id="cmcmdmsg"></div>
 <p class="note">Elke knop stuurt het <code>!</code>-commando als bot-DM naar de
 gekozen companion. <b>Find</b>/<b>Stop-find</b> laten de companion piepen/knipperen,
@@ -1963,16 +1969,24 @@ gekozen companion. <b>Find</b>/<b>Stop-find</b> laten de companion piepen/knippe
 bijwerkt), <b>Vol</b> 0&ndash;3, <b>Tune</b> koppelt een buzzer-preset aan een
 ernst (H/M/L), <b>Play</b> speelt een preset af.</p>
 <p class="note"><b>Valdetectie</b> stuurt de <code>!fall</code>-subcommando's:
-<b>aan</b>/<b>uit</b> (<code>!fall on|off</code>), <b>gevoeligheid</b>
-(<code>!fall sens low|med|high</code>), <b>geen-beweging</b> (dead-man,
-<code>!fall nomotion &lt;min&gt;</code>, 0 = uit), <b>pre-alarm</b> (annuleervenster
-vóór de SOS gaat, <code>!fall prealarm &lt;sec&gt;</code>), <b>doel</b> waar de
-val/SOS-melding heen gaat (<code>!fall target &lt;64hex&gt;</code>; kies uit de
-gehoorde contacten of plak de sleutel), <b>test</b> (<code>!fall test</code> &mdash;
-start de pre-alarm nu, annuleerbaar, zonder echt te vallen) en <b>status</b>
-(<code>!fall status</code> &mdash; de companion rapporteert z'n huidige
-val-instellingen terug als DM). Wat de companion precies begrijpt hangt van z'n
-eigen firmware af &mdash; de node stuurt het commando alleen door.</p>
+<b>aan</b>/<b>uit</b> (<code>!fall on|off</code>), <b>MeshManager-koppeling</b>
+(<code>!fall mm on|off</code> &mdash; laat de companion z'n val/SOS ook naar de
+MeshManager-server melden), <b>gevoeligheid</b> (<code>!fall sens low|med|high</code>),
+<b>geen-beweging</b> (dead-man, <code>!fall nomotion &lt;min&gt;</code>, 0 = uit),
+<b>pre-alarm</b> (annuleervenster vóór de SOS gaat, <code>!fall prealarm &lt;sec&gt;</code>).
+De <b>doel-lijst</b> is waar de val/SOS-melding heen gaat: <b>doel +</b>
+(<code>!fall target add &lt;64hex&gt;</code>) voegt toe, <b>doel &minus;</b>
+(<code>!fall target del &lt;prefix&gt;</code>, &ge;12 hex) verwijdert,
+<b>doel-lijst</b> (<code>!fall target list</code>) laat de companion z'n huidige
+lijst terugmelden; kies uit de gehoorde contacten of plak de sleutel. <b>test</b>
+(<code>!fall test</code>) start de pre-alarm nu (annuleerbaar, zonder echt te vallen)
+en <b>status</b> (<code>!fall status</code>) laat de companion z'n val-config
+terugmelden als DM. Een <code>#LOC</code>-rapport met <code>(val)</code>,
+<code>(geen beweging)</code> of <code>(SOS)</code> erin legt bovendien een
+<b>val-event</b> vast (zichtbaar in <code>/companions.json</code> als
+<code>fall_ts</code>/<code>fall_kind</code>, voor de MeshManager-escalatie). Wat de
+companion precies begrijpt hangt van z'n eigen firmware af &mdash; de node stuurt
+het commando alleen door.</p>
 
 <h2>Kaart &mdash; laatst bekende posities</h2>
 <div id="cm-map" style="height:18rem;border-radius:8px;overflow:hidden;display:none"></div>
@@ -3853,9 +3867,12 @@ cmMsg("cmcmdmsg",j.ok?("verstuurd: "+cmd):("mislukt: "+(j.error||"")),j.ok?1:0)}
 function cmFallTest(){if(!confirm("Val-TEST sturen?\n\nDe companion start nu z'n "+
 "pre-alarm (aftellen). Dat is annuleerbaar op het toestel en stuurt geen echte "+
 "SOS zolang niemand valt — maar hij gaat wel piepen."))return;cmCmd('!fall test')}
-function cmFallTarget(){var t=document.getElementById("cm-ftarget").value.trim();
-if(t.length!=64){cmMsg("cmcmdmsg","doel: volledige pubkey (64 hex) nodig",0);return}
-cmCmd('!fall target '+t)}
+function cmFallTargetAdd(){var t=document.getElementById("cm-ftarget").value.trim();
+if(t.length!=64){cmMsg("cmcmdmsg","doel toevoegen: volledige pubkey (64 hex) nodig",0);return}
+cmCmd('!fall target add '+t)}
+function cmFallTargetDel(){var t=document.getElementById("cm-ftarget").value.trim();
+if(t.length<12||t.length%2){cmMsg("cmcmdmsg","doel verwijderen: prefix van min. 12 hex (even) nodig",0);return}
+cmCmd('!fall target del '+t)}
 document.getElementById("cm-add").onclick=cmAdd;
 /* Leaflet lui laden van de CDN; faalt dat (offline), dan blijft de tekstlijst. */
 function cmLoadLeaflet(cb){if(window.L){cb(true);return}
@@ -5767,15 +5784,22 @@ void WebTask::handleCompanionsJson() {
   char pub[PUB_KEY_SIZE * 2 + 1];
   char nm[24], esc[64];
   float lat = NAN, lon = NAN; uint32_t seen = 0; bool hasloc = false;
+  uint32_t fall_ts = 0; int fall_kind = 0;
+  static const char* kFallKind[] = { "", "val", "nomotion", "sos" };
   bool first = true;
   for (int i = 0; i < cnt; i++) {
-    if ((size_t)n > sizeof(g_json) - 160) break;
-    if (!_acl->webCompanionGet(i, nm, sizeof(nm), pub, sizeof(pub), &lat, &lon, &seen, &hasloc)) continue;
+    if ((size_t)n > sizeof(g_json) - 200) break;
+    if (!_acl->webCompanionGet(i, nm, sizeof(nm), pub, sizeof(pub), &lat, &lon, &seen, &hasloc,
+                               &fall_ts, &fall_kind)) continue;
     jsonEscape(nm, esc, sizeof(esc));
     n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"name\":\"%s\",\"pubkey\":\"%s\",\"seen\":%u",
                   first ? "" : ",", esc, pub, (unsigned)seen);
     if (hasloc)
       n += snprintf(g_json + n, sizeof(g_json) - n, ",\"lat\":%.6f,\"lon\":%.6f", lat, lon);
+    /* Val-event alleen als er een is (fall_ts != 0). fall_kind 1..3 -> tekst. */
+    if (fall_ts != 0 && fall_kind >= 1 && fall_kind <= 3)
+      n += snprintf(g_json + n, sizeof(g_json) - n, ",\"fall_ts\":%u,\"fall_kind\":\"%s\"",
+                    (unsigned)fall_ts, kFallKind[fall_kind]);
     n += snprintf(g_json + n, sizeof(g_json) - n, "}");
     first = false;
   }

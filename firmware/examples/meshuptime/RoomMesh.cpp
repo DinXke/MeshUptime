@@ -1799,6 +1799,8 @@ int RoomMesh::companionSet(const uint8_t* pubkey, const char* name) {
     _companions[idx].last_lat = NAN;
     _companions[idx].last_lon = NAN;
     _companions[idx].last_seen = 0;
+    _companions[idx].fall_ts = 0;
+    _companions[idx].fall_kind = FALL_KIND_NONE;
     _companions[idx].used = true;
   }
   if (name && name[0]) StrHelper::strncpy(_companions[idx].name, name, sizeof(_companions[idx].name));
@@ -1834,9 +1836,21 @@ void RoomMesh::companionUpdateLoc(int idx, float lat, float lon, uint32_t seen) 
   saveCompanions();
 }
 
-/* Formaat: header, dan één regel per companion:
- *   c <pubkeyhex> <lat> <lon> <seen> <naam...>
- * lat/lon "nan" zolang er geen locatie is. De naam staat achteraan (mag spaties). */
+/* Val-event vastleggen (uit een #LOC-DM met val-merkteken). Overschrijft het
+ * vorige event: MeshManager ziet aan de oplopende fall_ts dat er een NIEUWE val is. */
+void RoomMesh::companionRecordFall(int idx, uint8_t kind, uint32_t ts) {
+  if (idx < 0 || idx >= MAX_COMPANIONS || !_companions[idx].used) return;
+  _companions[idx].fall_kind = kind;
+  _companions[idx].fall_ts = ts;
+  saveCompanions();
+}
+
+/* Formaat: header, dan per companion:
+ *   c <pubkeyhex> <lat> <lon> <seen> <naam...>   (lat/lon "nan" = geen locatie)
+ *   f <pubkeyhex> <fall_ts> <fall_kind>          (ALLEEN als er een val-event is)
+ * De naam staat achteraan de c-regel (mag spaties). De f-regel is ADDITIEF: een
+ * oudere parser die alleen 'c' kent slaat 'm gewoon over; een bestand zonder
+ * f-regels (van vóór deze versie) laadt zonder val-events. */
 void RoomMesh::saveCompanions() {
   if (_fs == NULL) return;
   File f = _fs->open(COMPANIONS_PATH, "w", true);
@@ -1852,6 +1866,8 @@ void RoomMesh::saveCompanions() {
                _companions[i].last_lon, (unsigned)_companions[i].last_seen, _companions[i].name);
     else
       f.printf("c %s nan nan %u %s\n", hex, (unsigned)_companions[i].last_seen, _companions[i].name);
+    if (_companions[i].fall_ts != 0)
+      f.printf("f %s %u %u\n", hex, (unsigned)_companions[i].fall_ts, (unsigned)_companions[i].fall_kind);
   }
   f.printf(".\n");
   f.close();
@@ -1876,6 +1892,27 @@ void RoomMesh::loadCompanions() {
     }
     line[len] = 0;
     if (first) { first = false; continue; }
+    /* f-regel: val-event, gekoppeld aan een al ingelezen companion (op pubkey).
+     * Wordt door saveCompanions() direct NA z'n c-regel geschreven, dus de match
+     * op pubkey lukt in deze enkele leesgang. Additief: een oudere parser die
+     * alleen 'c' kent slaat 'm over. */
+    if (line[0] == 'f' && line[1] == ' ') {
+      char* p = line + 2; while (*p == ' ') p++;
+      char* hex = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+      if (strlen(hex) != PUB_KEY_SIZE * 2) continue;
+      uint8_t pubkey[PUB_KEY_SIZE];
+      if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) continue;
+      while (*p == ' ') p++;
+      char* sts = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+      while (*p == ' ') p++;
+      char* skind = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+      int fidx = companionFindByPub(pubkey);
+      if (fidx >= 0) {
+        _companions[fidx].fall_ts = (uint32_t)strtoul(sts, NULL, 10);
+        _companions[fidx].fall_kind = (uint8_t)atoi(skind);
+      }
+      continue;
+    }
     if (line[0] != 'c' || line[1] != ' ') continue;
     char* p = line + 2; while (*p == ' ') p++;
     char* hex = p; while (*p && *p != ' ') p++;
@@ -1904,7 +1941,8 @@ void RoomMesh::loadCompanions() {
 
 /* ---- IWebNode: companions ---- */
 bool RoomMesh::webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
-                               float* lat, float* lon, uint32_t* seen, bool* has_loc) {
+                               float* lat, float* lon, uint32_t* seen, bool* has_loc,
+                               uint32_t* fall_ts, int* fall_kind) {
   int n = 0;
   for (int k = 0; k < MAX_COMPANIONS; k++) {
     if (!_companions[k].used) continue;
@@ -1917,6 +1955,8 @@ bool RoomMesh::webCompanionGet(int i, char* name, size_t name_len, char* pub64, 
       if (lon) *lon = _companions[k].last_lon;
       if (seen) *seen = _companions[k].last_seen;
       if (has_loc) *has_loc = hl;
+      if (fall_ts) *fall_ts = _companions[k].fall_ts;
+      if (fall_kind) *fall_kind = _companions[k].fall_kind;
       return true;
     }
     n++;
@@ -2095,6 +2135,15 @@ size_t RoomMesh::buildTxDiag(char* out, size_t cap, size_t budget,
   return o;
 }
 
+/* Hoofdletterongevoelige substring-zoek (strcasestr is niet overal aanwezig). */
+static bool containsCI(const char* hay, const char* needle) {
+  if (!hay || !needle || !*needle) return false;
+  size_t nl = strlen(needle);
+  for (const char* p = hay; *p; p++)
+    if (strncasecmp(p, needle, nl) == 0) return true;
+  return false;
+}
+
 /* De bot is GEEN monitoring-console: hij is een mesh-diagnose-responder met een
  * klein eigen setje. self_id is hier al _bot_id (in onRecvPacket gezet), en het
  * gedeelde geheim is al berekend, dus we antwoorden rechtstreeks als schone DM
@@ -2135,7 +2184,10 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
    * Dus: staat de afzender in de companion-store, dan draaien we NOOIT het
    * commando-/"onbekend"-pad -- dat gaf een spammy "onbekend commando"-bounce op
    * elke companion-reply.
-   *   - Begint de DM met "#LOC <lat>,<lon>" -> parse + bewaar de locatie.
+   *   - Begint de DM met "#LOC <lat>,<lon>" -> parse + bewaar de locatie. Draagt
+   *     de tekst óók een val-merkteken ("(val)" / "(geen beweging)" / "(SOS)") dan
+   *     leggen we bovendien een VAL-EVENT vast (fall_ts=nu, fall_kind), zodat de
+   *     MeshManager-poller aan de oplopende fall_ts een nieuwe val ziet en escaleert.
    *   - Anders -> STIL aanvaarden (geen tekstantwoord).
    * We ACK'en wel op transportniveau zodat de companion niet blijft herzenden.
    * `text` is hierboven al over spaties heen gezet; "#LOC" begint met '#', dus de
@@ -2156,6 +2208,17 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
           Serial.printf("[loc] companion %02X%02X%02X%02X -> %.6f,%.6f\n",
                         sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], lat, lon);
         }
+      }
+      /* Val-merkteken? SOS wint van val wint van geen-beweging. */
+      uint8_t fk = FALL_KIND_NONE;
+      if (containsCI(text, "(SOS)")) fk = FALL_KIND_SOS;
+      else if (containsCI(text, "(val)")) fk = FALL_KIND_FALL;
+      else if (containsCI(text, "(geen beweging)")) fk = FALL_KIND_NOMOTION;
+      if (fk != FALL_KIND_NONE) {
+        companionRecordFall(comp_idx, fk, now_s);
+        Serial.printf("[fall] companion %02X%02X%02X%02X kind=%u ts=%u\n",
+                      sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3],
+                      (unsigned)fk, (unsigned)now_s);
       }
     } else {
       Serial.printf("[comp] reply van companion %02X%02X%02X%02X stil aanvaard\n",

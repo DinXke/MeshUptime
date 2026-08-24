@@ -305,12 +305,23 @@ struct BotRecip {
  * geheim bij het versturen van commando's). last_lat/last_lon = de laatst
  * ontvangen locatie (uit een #LOC-DM), NAN als er nog geen is; last_seen = de
  * RTC-tijd (s) van dat rapport. used=false is een vrije ingang. */
+/* fall_kind-codes: 0 = geen val-event, 1 = "val" (impact), 2 = "nomotion"
+ * (dead-man / geen beweging), 3 = "sos" (handmatige SOS). fall_ts = RTC-tijd (s)
+ * van het LAATSTE val-event (0 = nooit). Zo kan MeshManager een NIEUWE val
+ * detecteren (ts nam toe) en escaleren. */
+#define FALL_KIND_NONE     0
+#define FALL_KIND_FALL     1
+#define FALL_KIND_NOMOTION 2
+#define FALL_KIND_SOS      3
+
 struct Companion {
   uint8_t  pub_key[PUB_KEY_SIZE];
   char     name[24];
   float    last_lat;
   float    last_lon;
   uint32_t last_seen;
+  uint32_t fall_ts;        // RTC-s van het laatste val-event; 0 = nooit
+  uint8_t  fall_kind;      // FALL_KIND_*
   bool     used;
 };
 
@@ -482,7 +493,8 @@ public:
   int  webCompanionMax() override   { return MAX_COMPANIONS; }
   int  webCompanionCount() override { return companionCount(); }
   bool webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
-                       float* lat, float* lon, uint32_t* seen, bool* has_loc) override;
+                       float* lat, float* lon, uint32_t* seen, bool* has_loc,
+                       uint32_t* fall_ts, int* fall_kind) override;
   int  webCompanionSet(const char* pub_hex, const char* name) override;
   int  webCompanionDel(const char* prefix_hex) override;
 
@@ -738,6 +750,8 @@ private:
   int           companionDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet, -3 dubbel
   /* Locatie van een companion bijwerken (uit een #LOC-DM). */
   void          companionUpdateLoc(int idx, float lat, float lon, uint32_t seen);
+  /* Val-event van een companion vastleggen (uit een #LOC-DM met val-merkteken). */
+  void          companionRecordFall(int idx, uint8_t kind, uint32_t ts);
   void          saveCompanions();
   void          loadCompanions();
   /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.

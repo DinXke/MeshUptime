@@ -35,31 +35,41 @@ zodra er coördinaten zijn; **zonder internet** valt de GUI terug op `lat,lon`-t
 **Valdetectie als eigen instelgroep.** De companion draait valdetectie op hardware
 en houdt het AAN; de node-GUI stelt het nu volledig bij via `!fall`-subcommando's
 (alle via `/bot/sendto`, geen node-firmware erbij): aan/uit (`!fall on|off`),
-gevoeligheid (`!fall sens low|med|high`), geen-beweging/dead-man
-(`!fall nomotion <min>`, 0=uit), doel waar de val/SOS-melding heen gaat
-(`!fall target <64hex>`; kiezer uit gehoorde contacten of plakken, 64-hex-check),
-pre-alarm/annuleervenster (`!fall prealarm <sec>`), **test** (`!fall test` — start
-de pre-alarm nu, annuleerbaar, achter een bevestiging, zonder echt te vallen) en
-**status** (`!fall status` — de companion rapporteert z'n huidige val-config terug
-als DM).
+MeshManager-koppeling (`!fall mm on|off` — de companion meldt z'n val/SOS ook naar de
+MeshManager-server), gevoeligheid (`!fall sens low|med|high`), geen-beweging/dead-man
+(`!fall nomotion <min>`, 0=uit), pre-alarm/annuleervenster (`!fall prealarm <sec>`).
+De companion-firmware gebruikt een **doel-LIJST**, dus de GUI stuurt
+`!fall target add <64hex>` / `!fall target del <prefix>` (≥12 hex) /
+`!fall target list` (kiezer uit gehoorde contacten of plakken, met hex-check).
+Verder **test** (`!fall test` — start de pre-alarm nu, annuleerbaar, achter een
+bevestiging, zonder echt te vallen) en **status** (`!fall status` — de companion
+rapporteert z'n huidige val-config terug als DM).
 
-**#LOC-locatierapporten + geen "onbekend"-bounce meer (firmware).** Een companion is
-een apparaat dat wij aansturen; z'n inkomende DM's zijn **antwoorden/rapporten**
-("play: coin", "Pong", een `#LOC`-rapport), nooit commando's aan ons. In
-`handleBotDm` (RoomMesh.cpp) draait een DM van een **bekende companion** daarom nooit
-het commando-/"onbekend"-pad meer:
+**#LOC-locatierapporten + val-events + geen "onbekend"-bounce meer (firmware).** Een
+companion is een apparaat dat wij aansturen; z'n inkomende DM's zijn
+**antwoorden/rapporten** ("play: coin", "Pong", een `#LOC`-rapport), nooit commando's
+aan ons. In `handleBotDm` (RoomMesh.cpp) draait een DM van een **bekende companion**
+daarom nooit het commando-/"onbekend"-pad meer:
 
 - begint de DM met **`#LOC <lat>,<lon>`** (decimale graden) → parse en werk
-  `last_lat`/`last_lon`/`last_seen` van die companion bij;
+  `last_lat`/`last_lon`/`last_seen` van die companion bij. Draagt de tekst óók een
+  **val-merkteken** — `(val)`, `(geen beweging)` of `(SOS)` (hoofdletterongevoelig) —
+  dan wordt bovendien een **val-event** vastgelegd: `fall_ts` (= nu) en `fall_kind`
+  (`val` / `nomotion` / `sos`). SOS wint van val wint van geen-beweging. Zo ziet de
+  MeshManager-poller aan de oplopende `fall_ts` een NIEUWE val en kan hij escaleren;
 - **elk ander** companion-antwoord → **stil aanvaard** (geen tekstantwoord).
 
 In beide gevallen wordt wel op transportniveau ge-ACK't zodat de companion niet blijft
 herzenden. Dit stopt meteen de spammy "onbekend commando"-bounce op companion-replies.
+Het val-event wordt persistent bewaard (een `f`-regel in `/companions.cfg`, ADDITIEF
+achter de `c`-regel; een oudere parser slaat 'm over).
 
 **HTTP `/companions.json` (auth).** `{ "max": N, "companions": [ { name, pubkey, lat,
-lon, seen } … ] }` (lat/lon ontbreken zolang er geen locatie is), zodat MeshManager de
-companion-lijst + laatste posities kan pollen. Auth zoals de andere endpoints; alleen
-publieke pubkeys, nooit geheimen.
+lon, seen, fall_ts, fall_kind } … ] }` — `lat`/`lon` ontbreken zolang er geen locatie
+is, en `fall_ts`/`fall_kind` (`"val"`/`"nomotion"`/`"sos"`) alleen als er een val-event
+is; zo kan MeshManager de companion-lijst + laatste posities + val-events pollen en op
+een nieuw val-event escaleren. Auth zoals de andere endpoints; alleen publieke pubkeys,
+nooit geheimen.
 
 Alleen de room-variant heeft companions; de sensor-variant laat de IWebNode-standaarden
 staan (`webCompanionMax()==0`) en `/companions.json` geeft een lege lijst, `/companion`
