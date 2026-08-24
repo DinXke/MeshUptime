@@ -299,9 +299,9 @@ static void cmd_fall_status(const MuCmdCtx& ctx) {
   mu_reply(ctx, "fall: %s sens=%s nomotion=%dmin prealarm=%ds",
            mu_cfg.fall_enabled ? "on" : "off", fall_sens_name(mu_cfg.fall_sens),
            mu_cfg.fall_nomotion_min, mu_cfg.fall_prealarm_sec);
-  mu_reply(ctx, "  targets=%d mm=%s fallback=%s accel=%s",
+  mu_reply(ctx, "  targets=%d mm=%s fallback=%s accel=%s mode=%s",
            nt, mu_cfg.fall_mm ? "on" : "off", dest,
-           mu_fall_accel_present() ? "aanwezig" : "afwezig");
+           mu_fall_accel_present() ? "aanwezig" : "afwezig", mu_fall_mode_str());
   for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
     if (!mu_cfg.fall_target_used[i]) continue;
     char hex[2 * MU_PUB_LEN + 1];

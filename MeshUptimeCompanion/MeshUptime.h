@@ -7,6 +7,10 @@
 #include "MuConfig.h"
 #include "MuBuzzer.h"     // MuBuzzer mu_buzzer (custom PWM-duty player, extern)
 
+// Firmware (companion-layer) version. Shown on the serial banner so a running
+// device / serial capture is traceable to a build. Bump the patch for fixes.
+#define MU_FW_VERSION "1.0.1"
+
 // Lifecycle (called from app_main.cpp)
 void mu_begin();
 void mu_loop();
@@ -80,7 +84,9 @@ void mu_fall_loop();
 bool mu_fall_prealarm_active();
 void mu_fall_cancel();       // button-cancel during the pre-alarm window
 void mu_fall_test();         // trigger the pre-alarm sequence now (desk test)
-bool mu_fall_accel_present();// QMA6100P detected on the I2C bus
+bool mu_fall_accel_present();// QMA6100P detected AND not auto-disabled by faults
+bool mu_fall_sampling_active();// true during a motion-triggered fine-sample burst
+const char* mu_fall_mode_str();// "int" | "poll" | "fault" (diagnostics)
 
 // ---- Serial CLI (MuAlert.cpp drives it) ------------------------------------
 void mu_serial_loop();

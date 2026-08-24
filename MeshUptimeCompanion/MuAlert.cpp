@@ -299,7 +299,7 @@ void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const 
 // shows a black screen (the old code only reacted to a received newline).
 static void mu_serial_banner() {
   Serial.println();
-  Serial.println("=== MeshUptimeCompanion ===");
+  Serial.println("=== MeshUptimeCompanion v" MU_FW_VERSION " ===");
   Serial.println("typ 'menu' of Enter voor het menu, 'help' voor commando's");
 }
 
@@ -392,7 +392,7 @@ void mu_begin() {
   mu_button_begin();
   mu_fall_begin();
 
-  Serial.println("MeshUptimeCompanion ready. Type !help for commands.");
+  Serial.println("MeshUptimeCompanion v" MU_FW_VERSION " ready. Type !help for commands.");
 }
 
 // ---- low-battery warning ---------------------------------------------------
@@ -449,5 +449,5 @@ void mu_loop() {
 
 bool mu_wants_cpu() {
   return mu_buzzer.isPlaying() || find_active || led_steps != nullptr ||
-         mu_fall_prealarm_active();
+         mu_fall_prealarm_active() || mu_fall_sampling_active();
 }
