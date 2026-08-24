@@ -476,6 +476,7 @@ void web_route_channeldel()   { if (g_self) g_self->handleChannelDel(); }
 void web_route_channeltoggle(){ if (g_self) g_self->handleChannelToggle(); }
 void web_route_companionsjson(){ if (g_self) g_self->handleCompanionsJson(); }
 void web_route_companion()    { if (g_self) g_self->handleCompanion(); }
+void web_route_messagesjson() { if (g_self) g_self->handleMessagesJson(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -1927,6 +1928,13 @@ op, werkt de laatst bekende locatie bij en bounced niet meer met
 geheim wordt eruit berekend) en een naam; kies uit de <b>gehoorde contacten</b> of
 plak de sleutel. Een bestaande companion (zelfde pubkey) wordt bijgewerkt, de
 locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.</p>
+
+<h2>Inkomende berichten &mdash; antwoorden van companions</h2>
+<div class="card pad0"><table id="cmmsgs"></table></div>
+<p class="note">Álle inkomende companion-DM's (antwoorden op commando's zoals
+<code>!status</code>/<code>!ping</code>/<code>!cfg</code> en <code>#LOC</code>-rapporten),
+nieuwste eerst. Leest <code>/messages.json</code> (RAM-ringbuffer, laatste 24 &mdash;
+overleeft geen herstart). Ook opvraagbaar door MeshManager.</p>
 
 <h2>Commando's &mdash; naar de gekozen companion</h2>
 <div class="card">
@@ -3926,8 +3934,22 @@ function companionsGet(){return fetch("companions.json",{credentials:"include"})
    elke actie en door de lichte poll onderaan. companionsLoad() doet dit PLUS de
    pickers en draait bij het openen van het tabblad. */
 function companionsRefresh(){return companionsGet().then(function(d){
-if(!d)return;CMP=d.companions||[];cmRender();cmFillCmdPick();cmMap()})
+if(!d)return;CMP=d.companions||[];cmRender();cmFillCmdPick();cmMap();cmMsgsRefresh()})
 .catch(function(){cmMsg("cmaddmsg","kon companions niet laden",0)})}
+/* Inkomende-berichten-inbox: /messages.json ophalen + tekenen (nieuwste eerst). */
+function cmMsgsRefresh(){fetch("messages.json",{credentials:"include"})
+.then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(d){
+var e=document.getElementById("cmmsgs");if(!e)return;e.innerHTML="";
+var h=e.insertRow();["tijd","companion","bericht"].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+var M=d.messages||[];
+M.forEach(function(m){var r=e.insertRow();
+var c=r.insertCell();c.textContent=cmAge(m.ts);c.style.whiteSpace="nowrap";c.style.color="var(--muted)";c.title=m.ts?new Date(m.ts*1000).toLocaleString():"";
+c=r.insertCell();c.textContent=m.name||(m.pubkey||"").slice(0,8);c.title=m.pubkey||"";
+c=r.insertCell();c.textContent=m.text||"";c.style.wordBreak="break-word"});
+if(!M.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=3;
+c.textContent="(nog geen berichten ontvangen)";c.style.color="var(--muted)"}})
+.catch(function(){})}
 function companionsLoad(){refreshPickers();botsLoad();return companionsRefresh()}
 function cmAge(s){if(!s)return"—";var now=Math.floor(Date.now()/1000);var a=now-s;if(a<0)a=0;
 if(a<90)return a+"s";if(a<5400)return Math.round(a/60)+"m";if(a<172800)return Math.round(a/3600)+"u";return Math.round(a/86400)+"d"}
@@ -4312,6 +4334,7 @@ void WebTask::routes() {
    * mutaties via /companion (POST: key+name toevoegen/wijzigen, of del=prefix). */
   _server->on("/companions.json", HTTP_GET, web_route_companionsjson);
   _server->on("/companion", HTTP_POST, web_route_companion);
+  _server->on("/messages.json", HTTP_GET, web_route_messagesjson);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -5963,6 +5986,33 @@ void WebTask::handleCompanionsJson() {
       n += snprintf(g_json + n, sizeof(g_json) - n, ",\"fall_ts\":%u,\"fall_kind\":\"%s\"",
                     (unsigned)fall_ts, kFallKind[fall_kind]);
     n += snprintf(g_json + n, sizeof(g_json) - n, "}");
+    first = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* GET /messages.json -- inkomende-berichten-inbox: alle inkomende companion-DM's
+ * (commando-antwoorden, #LOC-rapporten, enz.), nieuwste eerst. Leesbaar in de
+ * node-GUI en opvraagbaar door MeshManager. */
+void WebTask::handleMessagesJson() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return; }
+  int cnt = _acl->webMsgCount();
+  int n = snprintf(g_json, sizeof(g_json), "{\"messages\":[");
+  char pub[PUB_KEY_SIZE * 2 + 1];
+  char nm[24], txt[140], esc_nm[64], esc_tx[300];
+  uint32_t ts = 0;
+  bool first = true;
+  for (int i = 0; i < cnt; i++) {
+    if ((size_t)n > sizeof(g_json) - 420) break;   // laat ruimte voor deze entry + "]}"
+    if (!_acl->webMsgGet(i, nm, sizeof(nm), pub, sizeof(pub), txt, sizeof(txt), &ts)) continue;
+    jsonEscape(nm, esc_nm, sizeof(esc_nm));
+    jsonEscape(txt, esc_tx, sizeof(esc_tx));
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+                  "%s{\"name\":\"%s\",\"pubkey\":\"%s\",\"ts\":%u,\"text\":\"%s\"}",
+                  first ? "" : ",", esc_nm, pub, (unsigned)ts, esc_tx);
     first = false;
   }
   strlcat(g_json, "]}", sizeof(g_json));

@@ -361,6 +361,20 @@ struct Companion {
   bool     used;
 };
 
+/* Inkomende-berichten-inbox (ringbuffer). Elk inkomend companion-DM (een antwoord
+ * op een commando, een #LOC-rapport, enz.) wordt hier bewaard zodat het in de
+ * node-GUI (/messages.json) én in MeshManager te lezen is — nodig om meerdere
+ * companions te beheren. Puur RAM (transient): overleeft geen herstart. */
+#ifndef MAX_COMP_MSGS
+  #define MAX_COMP_MSGS  24
+#endif
+#define COMP_MSG_TEXT_LEN 132
+struct CompMsg {
+  uint8_t  pub_key[PUB_KEY_SIZE];  // afzender-companion
+  char     text[COMP_MSG_TEXT_LEN];
+  uint32_t ts;                     // RTC-s van ontvangst (0 = leeg slot)
+};
+
 /* Eén hashtag-/publiek kanaal dat de bot meeleest. secret = het gedeelde
  * kanaalgeheim (16 of 32 byte); hash = eerste byte van sha256(secret, secret_len)
  * (het MeshCore group-channel-formaat). used=false is een vrije ingang. */
@@ -557,6 +571,12 @@ public:
   int  webCompanionSet(const char* pub_hex, const char* name) override;
   int  webCompanionDel(const char* prefix_hex) override;
 
+  /* ---- IWebNode: inkomende-berichten-inbox ---- */
+  int  webMsgCount() override { return compMsgCount(); }
+  bool webMsgGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
+                 char* text, size_t text_len, uint32_t* ts) override
+                { return compMsgGet(i, pub64, pub_len, name, name_len, text, text_len, ts); }
+
   /* ---- Bots: publieke API (CLI + intern). Alle bewerkingen zijn index-adresseerbaar
    * (b = slot 0..MAX_BOTS-1). ---- */
   bool botActive() const { return _bots[0].used; }
@@ -730,6 +750,12 @@ private:
    * #LOC-locatierapporten. Persistent in /companions.cfg (zie Companion). */
   Companion     _companions[MAX_COMPANIONS];
 
+  /* Inkomende companion-berichten (ringbuffer, RAM). _cmsg_head = volgende
+   * schrijfindex; _cmsg_count = aantal geldige entries (<= MAX_COMP_MSGS). */
+  CompMsg       _comp_msgs[MAX_COMP_MSGS];
+  uint16_t      _cmsg_head = 0;
+  uint16_t      _cmsg_count = 0;
+
   /* v2.5.1: de PushTask voor de INSTANT companion-push (kan NULL zijn: dan valt
    * MeshManager terug op de poll van /companions.json). */
   PushTask*     _push = nullptr;
@@ -822,6 +848,13 @@ private:
   void          pushCompanionNow(int idx);
   void          saveCompanions();
   void          loadCompanions();
+  /* Berichten-inbox: bewaar een inkomend companion-DM (afzender + tekst + tijd). */
+  void          companionLogMsg(const uint8_t* pub, const char* text, uint32_t ts);
+  int           compMsgCount() const { return _cmsg_count; }
+  /* Lees bericht i (0 = NIEUWSTE). Vult pub64 (hex), naam (uit de companion-store,
+   * anders de hex-prefix), tekst en ts. false als i buiten bereik. */
+  bool          compMsgGet(int i, char* pub64, size_t pub_len, char* name, size_t name_len,
+                           char* text, size_t text_len, uint32_t* ts) const;
   /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.
    * `kind`: 0=ping, 1=test, 2=path (bepaalt of het masker dit type toelaat). */
   size_t        buildTxDiag(int b, char* out, size_t cap, size_t budget,

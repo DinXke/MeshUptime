@@ -306,6 +306,7 @@ private:
    * Commando's naar een companion lopen via het bestaande /bot/sendto-endpoint. */
   void handleCompanionsJson();
   void handleCompanion();
+  void handleMessagesJson();   // GET /messages.json: inkomende-berichten-inbox (companion-antwoorden)
 
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
@@ -369,6 +370,7 @@ private:
   friend void web_route_channeltoggle();
   friend void web_route_companionsjson();
   friend void web_route_companion();
+  friend void web_route_messagesjson();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

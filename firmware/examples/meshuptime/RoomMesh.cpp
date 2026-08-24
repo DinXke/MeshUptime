@@ -2068,6 +2068,40 @@ void RoomMesh::companionRecordFall(int idx, uint8_t kind, uint32_t ts) {
   saveCompanions();
 }
 
+/* Berichten-inbox: bewaar een inkomend companion-DM in de ringbuffer (RAM). Zo is
+ * elk antwoord/rapport leesbaar in de node-GUI (/messages.json) en in MeshManager. */
+void RoomMesh::companionLogMsg(const uint8_t* pub, const char* text, uint32_t ts) {
+  if (!pub || !text) return;
+  CompMsg& m = _comp_msgs[_cmsg_head];
+  memcpy(m.pub_key, pub, PUB_KEY_SIZE);
+  StrHelper::strncpy(m.text, text, sizeof(m.text));
+  m.ts = ts;
+  _cmsg_head = (_cmsg_head + 1) % MAX_COMP_MSGS;
+  if (_cmsg_count < MAX_COMP_MSGS) _cmsg_count++;
+}
+
+/* Lees bericht i (0 = NIEUWSTE, dan aflopend in tijd). false als i buiten bereik. */
+bool RoomMesh::compMsgGet(int i, char* pub64, size_t pub_len, char* name, size_t name_len,
+                          char* text, size_t text_len, uint32_t* ts) const {
+  if (i < 0 || i >= (int)_cmsg_count) return false;
+  int slot = ((int)_cmsg_head - 1 - i + MAX_COMP_MSGS * 2) % MAX_COMP_MSGS;
+  const CompMsg& m = _comp_msgs[slot];
+  if (pub64 && pub_len >= PUB_KEY_SIZE * 2 + 1) {
+    mesh::Utils::toHex(pub64, m.pub_key, PUB_KEY_SIZE);
+    pub64[PUB_KEY_SIZE * 2] = 0;
+  } else if (pub64 && pub_len) {
+    pub64[0] = 0;
+  }
+  if (name && name_len) {
+    int ci = companionFindByPub(m.pub_key);
+    if (ci >= 0 && _companions[ci].name[0]) StrHelper::strncpy(name, _companions[ci].name, name_len);
+    else { char hx[13]; mesh::Utils::toHex(hx, m.pub_key, 6); hx[12] = 0; StrHelper::strncpy(name, hx, name_len); }
+  }
+  if (text && text_len) StrHelper::strncpy(text, m.text, text_len);
+  if (ts) *ts = m.ts;
+  return true;
+}
+
 /* v2.5.1 -- INSTANT-PUSH. De huidige stand van companion `idx` (laatst bekende
  * locatie + eventueel val-event) meteen naar MeshManager duwen, zodat die niet
  * op de /companions.json-poll (tot ~1 min oud) hoeft te wachten. PushTask draagt
@@ -2439,6 +2473,9 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
    * '!'/'/'-strip raakt het niet. */
   int comp_idx = companionFindByPub(sender_pub);
   if (comp_idx >= 0) {
+    /* Inbox: bewaar ELK inkomend companion-bericht (antwoord/rapport) zodat het in
+     * de node-GUI (/messages.json) en in MeshManager leesbaar is. */
+    companionLogMsg(sender_pub, text, now_s);
     if (strncmp(text, "#LOC ", 5) == 0) {
       bool stored = false;   /* v2.5.1: is er iets bewaard dat we mogen pushen? */
       const char* q = text + 5; while (*q == ' ') q++;
@@ -2474,8 +2511,8 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
        * terugval. */
       if (stored) pushCompanionNow(comp_idx);
     } else {
-      Serial.printf("[comp] reply van companion %02X%02X%02X%02X stil aanvaard\n",
-                    sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3]);
+      Serial.printf("[comp] reply van companion %02X%02X%02X%02X -> inbox: %.60s\n",
+                    sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], text);
     }
     /* ACK het inkomende bericht (zoals het gewone DM-pad), dan STIL klaar: geen
      * tekstantwoord, geen "onbekend commando". */

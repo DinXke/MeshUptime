@@ -219,4 +219,15 @@ public:
                                { (void)pub_hex; (void)name; return -1; }
   /* Verwijderen op prefix (>= 12 hex). 1 ok, <0 fout. */
   virtual int  webCompanionDel(const char* prefix_hex) { (void)prefix_hex; return -1; }
+
+  /* ---- INKOMENDE-BERICHTEN-INBOX --------------------------------------------
+   * Alle inkomende companion-DM's (commando-antwoorden, #LOC-rapporten, enz.) in
+   * een ringbuffer, zodat ze in de node-GUI (/messages.json) en in MeshManager te
+   * lezen zijn. Alleen RoomMesh implementeert dit (SensorMesh: count == 0). */
+  virtual int  webMsgCount() { return 0; }
+  /* Leest bericht i (0 = NIEUWSTE): afzendernaam, pubkey (64 hex), tekst, ts (RTC-s). */
+  virtual bool webMsgGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
+                         char* text, size_t text_len, uint32_t* ts)
+                        { (void)i; (void)name; (void)name_len; (void)pub64; (void)pub_len;
+                          (void)text; (void)text_len; (void)ts; return false; }
 };
