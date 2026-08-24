@@ -250,7 +250,9 @@ static void cmd_gps(const MuCmdCtx& ctx, const char* args) {
 
 static void cmd_loc(const MuCmdCtx& ctx) {
   if (sensors.node_lat != 0.0 || sensors.node_lon != 0.0) {
-    mu_reply(ctx, "loc %.5f,%.5f", (double)sensors.node_lat, (double)sensors.node_lon);
+    // Machine-readable "#LOC" contract: the reply STARTS with `#LOC <lat>,<lon>`
+    // (5 decimals) so the receiving MeshUptime node can parse & map it.
+    mu_reply(ctx, "#LOC %.5f,%.5f", (double)sensors.node_lat, (double)sensors.node_lon);
   } else {
     if (mu_cfg.gps_mode != MU_GPS_ON) sensors.setSettingValue("gps", "1"); // wake for a fix
     mu_reply(ctx, "loc: geen fix (GPS wakker, probeer straks opnieuw)");

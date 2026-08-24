@@ -31,6 +31,8 @@ static unsigned long find_deadline = 0;
 // ---- serial CLI line buffer ------------------------------------------------
 static char     ser_line[160];
 static uint8_t  ser_len = 0;
+static bool     ser_connected = false;   // last-seen USB-CDC connect state (edge detect)
+static bool     ser_last_cr   = false;   // previous char was CR (to fold CRLF into one)
 
 static void led_write(bool on) {
   digitalWrite(LED_PIN, on ? LED_STATE_ON : (LED_STATE_ON == HIGH ? LOW : HIGH));
@@ -214,6 +216,31 @@ bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps) {
   return r != MSG_SEND_FAILED;
 }
 
+// ---- machine-readable location report ("#LOC" contract) --------------------
+// Builds a DM that STARTS with `#LOC <lat>,<lon>` (5 decimals) so the receiving
+// MeshUptime node can parse & plot it, with an optional human `note` appended.
+// Used by !loc, the SOS button long-press and the fall/no-motion alert, so those
+// reports all become mappable. With no fix we wake GPS and still send an alert
+// carrying `note` (no token) — an SOS/fall must never be silently dropped.
+bool mu_send_loc_dm(const uint8_t* pub, const char* note) {
+  char buf[160];
+  if (sensors.node_lat != 0.0 || sensors.node_lon != 0.0) {
+    if (note && note[0])
+      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f %s",
+               (double)sensors.node_lat, (double)sensors.node_lon, note);
+    else
+      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f",
+               (double)sensors.node_lat, (double)sensors.node_lon);
+  } else {
+    if (mu_cfg.gps_mode != MU_GPS_ON) sensors.setSettingValue("gps", "1"); // wake for a fix
+    if (note && note[0])
+      snprintf(buf, sizeof(buf), "%s (geen GPS-fix)", note);
+    else
+      snprintf(buf, sizeof(buf), "(geen GPS-fix)");
+  }
+  return mu_send_dm(pub, buf, false);
+}
+
 // ---- incoming DM hook (from MyMesh::onMessageRecv) -------------------------
 void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const char* text) {
   (void)sender_timestamp;
@@ -247,28 +274,72 @@ void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const 
 }
 
 // ---- serial CLI ------------------------------------------------------------
+// Short banner + hint printed on serial connect / first activity so no terminal
+// shows a black screen (the old code only reacted to a received newline).
+static void mu_serial_banner() {
+  Serial.println();
+  Serial.println("=== MeshUptimeCompanion ===");
+  Serial.println("typ 'menu' of Enter voor het menu, 'help' voor commando's");
+}
+
+// Process one completed input line (menu first, then the CLI parser).
+static void mu_serial_dispatch() {
+  ser_line[ser_len] = 0;
+  // The interactive ASCII menu gets first refusal on each line: it opens on a
+  // bare Enter or the word "menu", and while open it owns navigation input.
+  // Anything it does not consume falls through to the normal CLI parser, so
+  // the individual `!`/CLI commands keep working for scripting.
+  if (!mu_menu_handle_line(ser_line)) {
+    if (ser_len > 0) {
+      MuCmdCtx ctx;
+      ctx.from_serial = true;
+      ctx.sender_admin = true;              // serial is always trusted
+      memset(ctx.sender_pub, 0, MU_PUB_LEN);
+      mu_handle_command(ser_line, ctx);
+    }
+  }
+  ser_len = 0;
+}
+
 void mu_serial_loop() {
+  // Banner on the USB-CDC connect edge (DTR asserted). Non-blocking.
+  bool conn = (bool)Serial;
+  if (conn && !ser_connected) {
+    ser_connected = true;
+    ser_len = 0; ser_last_cr = false;
+    mu_serial_banner();
+  } else if (!conn && ser_connected) {
+    ser_connected = false;
+  }
+
   while (Serial.available()) {
+    // Fallback: a terminal that never asserts DTR still gets a banner as soon as
+    // it sends its first byte.
+    if (!ser_connected) { ser_connected = true; mu_serial_banner(); }
+
     char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      ser_line[ser_len] = 0;
-      // The interactive ASCII menu gets first refusal on each line: it opens on a
-      // bare Enter or the word "menu", and while open it owns navigation input.
-      // Anything it does not consume falls through to the normal CLI parser, so
-      // the individual `!`/CLI commands keep working for scripting.
-      if (!mu_menu_handle_line(ser_line)) {
-        if (ser_len > 0) {
-          MuCmdCtx ctx;
-          ctx.from_serial = true;
-          ctx.sender_admin = true;              // serial is always trusted
-          memset(ctx.sender_pub, 0, MU_PUB_LEN);
-          mu_handle_command(ser_line, ctx);
-        }
-      }
-      ser_len = 0;
-    } else if (ser_len < sizeof(ser_line) - 1) {
+
+    // Accept CR, LF and CRLF as ONE line terminator: a CR ends the line, and a
+    // LF immediately following that CR is folded away so CRLF is not two lines.
+    if (c == '\n' && ser_last_cr) { ser_last_cr = false; continue; }
+    ser_last_cr = (c == '\r');
+
+    if (c == '\r' || c == '\n') {
+      Serial.println();                       // echo the newline
+      mu_serial_dispatch();
+      continue;
+    }
+
+    // Backspace / DEL: erase the last char and update the echo.
+    if (c == 0x08 || c == 0x7F) {
+      if (ser_len > 0) { ser_len--; Serial.print("\b \b"); }
+      continue;
+    }
+
+    // Printable character: buffer it and echo it back so the user sees typing.
+    if (ser_len < sizeof(ser_line) - 1) {
       ser_line[ser_len++] = c;
+      Serial.write((uint8_t)c);
     }
   }
 }

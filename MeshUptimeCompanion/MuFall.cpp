@@ -52,7 +52,10 @@ static void fire_alert() {
   const uint8_t* dest = mu_cfg.has_sos ? mu_cfg.sos_pub
                       : (mu_cfg.has_target ? mu_cfg.target_pub : nullptr);
   if (dest) {
-    mu_send_dm(dest, trigger_was_fall ? "VAL gedetecteerd" : "GEEN BEWEGING", true);
+    // Machine-readable "#LOC" report so the MeshUptime node can map the alert:
+    // `#LOC <lat>,<lon> (val) VAL gedetecteerd` / `... (geen beweging) ...`.
+    mu_send_loc_dm(dest, trigger_was_fall ? "(val) VAL gedetecteerd"
+                                          : "(geen beweging) GEEN BEWEGING");
   }
   prealarm = false;
   mu_stop_all();

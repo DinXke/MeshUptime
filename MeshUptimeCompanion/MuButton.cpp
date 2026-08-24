@@ -19,9 +19,12 @@ static void do_short_press() {
 }
 
 static void do_long_press() {
-  // Long press (>2s) -> SOS: preset #2 + current GPS location to the SOS recipient.
+  // Long press (>2s) -> SOS. Sends the machine-readable "#LOC" report so the
+  // MeshUptime node can map the SOS: `#LOC <lat>,<lon> (SOS) <preset #2>`.
   if (mu_cfg.has_sos) {
-    mu_send_dm(mu_cfg.sos_pub, mu_cfg.presets[1], true);
+    char note[MU_PRESET_LEN + 8];
+    snprintf(note, sizeof(note), "(SOS) %s", mu_cfg.presets[1]);
+    mu_send_loc_dm(mu_cfg.sos_pub, note);
   }
 }
 

@@ -84,7 +84,12 @@ The same parser serves two transports:
   allowlisted pubkeys**. Allowlist-management subcommands additionally require
   the sender to be an **admin** entry.
 - **Serial console** — plain text lines over USB serial (115200). Always
-  allowed and always treated as admin. The leading `!` is optional here.
+  allowed and always treated as admin. The leading `!` is optional here. On
+  connect (or first byte on terminals that never assert DTR) a short banner +
+  hint is printed, typed characters are **echoed** (with backspace/DEL editing),
+  and **`\r`, `\n` and `\r\n` are all accepted** as the line terminator, so it
+  works on any terminal (no more black screen on LF-only clients). Reading stays
+  non-blocking — only the bytes already available are drained each loop.
 
 Replies go back the same way they arrived: a DM reply to the sender, or a
 printed line on the serial console.
@@ -109,7 +114,7 @@ printed line on the serial console.
 | `!quiet <startH>-<endH> [mute\|0..3]` | Quieter-period window in whole hours, UTC (e.g. `!quiet 22-7`). Trailing arg: `mute` (default, full silence) or a volume cap `0..3` (reduced-volume "quieter period"). Audio is capped/suppressed inside the window; LED still shows. Applied only when the RTC looks set. |
 | `!quiet off` | Disable the quieter period. |
 | `!gps on\|off\|ondemand` | GPS power policy. `on` = continuous, `off` = never, `ondemand` = normally off, woken by `!loc`. |
-| `!loc` | Reply the current GPS `lat,lon`. If there is no fix and GPS is not `on`, it wakes the GPS and asks you to retry shortly. |
+| `!loc` | Reply a machine-readable location report starting with the token `#LOC <lat>,<lon>` (decimal degrees, 5 decimals, e.g. `#LOC 51.23456,5.45678`) so the MeshUptime node can parse & plot it. If there is no fix and GPS is not `on`, it wakes the GPS and asks you to retry shortly. |
 | `!cfg` | Report the full configuration (mute, vol, msgtune, battery mV + %, quiet, gps, fall, no-motion, allowlist count, target/sos set, last known location) as a few reply lines. |
 | `!allow list` | List allowlist entries (index, 8-byte prefix, admin flag). |
 | `!allow add <64hex>` | Add a pubkey (non-admin). Serial always; DM only from an admin. |
@@ -175,7 +180,7 @@ board's `buttonStateChanged()` edge helper.
 | Any press **while a tune/find is playing** | **Stops it immediately** (highest priority). If it was a DM-initiated `find`, a `gevonden` DM is sent back. Nothing else fires on release. |
 | Any press **during a fall pre-alarm** | **Cancels** the pending fall alert. Nothing else fires. |
 | **Short press** (idle) | Send preset **#1** ("ok/ack") to the `target` recipient. |
-| **Long press** (≥ 2 s, idle) | **SOS**: send preset **#2** + current GPS location to the `sos` recipient. |
+| **Long press** (≥ 2 s, idle) | **SOS**: send a `#LOC <lat>,<lon> (SOS) <preset #2>` DM to the `sos` recipient — the `#LOC` token lets the MeshUptime node map the SOS. With no fix it wakes GPS and still sends `(SOS) <preset #2> (geen GPS-fix)` so the alert is never lost. |
 
 Preset cycling on short press is intentionally not implemented (documented
 deviation — kept simple; use `!preset`/`!target` to configure).
@@ -193,9 +198,12 @@ behind the `PIN_3V3_ACC_EN` rail). Two triggers:
   for `fall nomotion <minutes>`.
 
 On a trigger the firmware enters a **30 s pre-alarm** (buzzer `H` + LED). A
-button press during that window cancels it. If not cancelled, it sends an alert
-DM (`VAL gedetecteerd` or `GEEN BEWEGING`) **plus GPS location** to the `sos`
-recipient (falling back to `target`).
+button press during that window cancels it. If not cancelled, it sends a
+machine-readable alert DM that starts with the `#LOC <lat>,<lon>` token followed
+by `(val) VAL gedetecteerd` or `(geen beweging) GEEN BEWEGING`, so the MeshUptime
+node can map it, to the `sos` recipient (falling back to `target`). With no GPS
+fix it wakes GPS and still sends the human alert (without the token) so it is
+never lost.
 
 The detection thresholds are **conservative placeholders and need on-device
 tuning**; the whole module ships **disabled** (`!fall on` to arm).

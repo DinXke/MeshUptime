@@ -47,6 +47,15 @@ void mu_reply(const MuCmdCtx& ctx, const char* fmt, ...);
 // is available.
 bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps);
 
+// Send a machine-readable location report DM (the "#LOC" contract). The DM
+// ALWAYS starts with the token `#LOC <lat>,<lon>` (decimal degrees, 5 decimals)
+// so the receiving MeshUptime node can parse and map it; an optional human
+// `note` (e.g. "(SOS)" / "(val)") is appended after the token. When there is no
+// GPS fix yet it wakes the GPS on-demand and still sends a human alert carrying
+// `note` (without the token) so an SOS/fall alert is never lost. Returns false
+// if no matching contact is known. Used by `!loc`, the SOS button and fall.
+bool mu_send_loc_dm(const uint8_t* pub, const char* note);
+
 // ---- Button (MuButton.cpp) -------------------------------------------------
 void mu_button_begin();
 void mu_button_loop();
