@@ -138,37 +138,49 @@ public:
    * Alleen de room-server (RoomMesh) implementeert dit; SensorMesh laat de
    * standaarden staan (webBotActive()==false). De pubkey is publiek; de
    * ontvangerslijst bevat ALLEEN publieke sleutels (nooit een geheim). */
-  virtual bool webBotActive()               { return false; }
-  virtual const char* webBotName()          { return ""; }
-  virtual bool webBotPubHex(char* out, size_t out_len)  { (void)out; (void)out_len; return false; }
-  virtual bool webBotJoinUri(char* out, size_t out_len) { (void)out; (void)out_len; return false; }
+  /* v2.5.0: N bot-identiteiten. `i` is een absoluut slot (0..webBotSlotMax()-1);
+   * webBotResolve() zet een `bot=<idx-of-naam>` uit de web-laag om naar een slot
+   * (leeg/NULL -> de alert-bot). De pubkey is publiek; ontvangerslijsten bevatten
+   * ALLEEN publieke sleutels (nooit een geheim). */
+  virtual bool webBotActive()               { return false; }   // is er minstens één bot?
+  virtual int  webBotSlotMax()              { return 0; }        // MAX_BOTS
+  virtual int  webBotAlertIdx()             { return -1; }       // slot met de alert-rol
+  virtual int  webBotResolve(const char* sel) { (void)sel; return -1; }
   virtual int  webBotRecipMax()             { return 0; }
-  virtual int  webBotRecipCount()           { return 0; }
-  virtual bool webBotRecipGet(int i, char* pub64, size_t out_len, int* level)
-                                            { (void)i; (void)pub64; (void)out_len; (void)level; return false; }
-  /* Toevoegen/wijzigen: VOLLEDIGE pubkey (64 hex) vereist -- het gedeelde geheim
-   * wordt eruit berekend. Retour 0 ok, <0 fout. */
-  virtual int  webBotRecipSet(const char* pub_hex, int level) { (void)pub_hex; (void)level; return -1; }
+  virtual int  webBotDiagUrlMax()           { return 0; }
+
+  virtual bool webBotSlotUsed(int i)        { (void)i; return false; }
+  virtual bool webBotSlotEnabled(int i)     { (void)i; return false; }
+  virtual const char* webBotSlotName(int i) { (void)i; return ""; }
+  virtual bool webBotSlotIsAlert(int i)     { (void)i; return false; }
+  virtual bool webBotSlotPubHex(int i, char* out, size_t out_len)  { (void)i; (void)out; (void)out_len; return false; }
+  virtual bool webBotSlotJoinUri(int i, char* out, size_t out_len) { (void)i; (void)out; (void)out_len; return false; }
+  virtual int  webBotSlotRecipCount(int i)  { (void)i; return 0; }
+  virtual bool webBotSlotRecipGet(int i, int j, char* pub64, size_t out_len, int* level)
+                                            { (void)i; (void)j; (void)pub64; (void)out_len; (void)level; return false; }
+  /* Toevoegen/wijzigen: VOLLEDIGE pubkey (64 hex) vereist. Retour 0 ok, <0 fout. */
+  virtual int  webBotSlotRecipSet(int i, const char* pub_hex, int level) { (void)i; (void)pub_hex; (void)level; return -1; }
   /* Verwijderen: prefix >= 12 hex. Retour 1 ok, <0 fout. */
-  virtual int  webBotRecipDel(const char* prefix_hex)  { (void)prefix_hex; return -1; }
-  virtual bool webBotAdvert(bool flood)     { (void)flood; return false; }
-  /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Retour 0 ok. */
-  virtual int  webBotSendTo(const char* pub_hex, const char* text) { (void)pub_hex; (void)text; return -1; }
-  /* DM de HELE ontvangerslijst. Retour = aantal ontvangers aangeschreven, <0 fout. */
-  virtual int  webBotPost(const char* text) { (void)text; return -1; }
-  /* Verklikker in ping/test/path-antwoorden ("1-byte"/"geen scope" + droevige
-   * smiley) aan/uit. Persistent op de node. */
-  /* Masker: bit0 ping, bit1 test, bit2 path. 0 = zend-diagnose helemaal uit. */
-  virtual int  webBotDiagMask()          { return 0; }
-  virtual bool webBotSetDiagMask(int m)  { (void)m; return false; }
-  /* Uitleg-URL bij "geen scope": 0=uit, 1=inline tussen haakjes, 2=apart bericht. */
-  virtual int  webBotDiagUrlMode()    { return 0; }
-  virtual const char* webBotDiagUrl() { return ""; }
-  virtual bool webBotSetDiagUrl(int mode, const char* url) { (void)mode; (void)url; return false; }
-  /* Max. URL-lengte die nog in een antwoord past (0=ping, 1=test, 2=path), en de
-   * harde veldlimiet. De GUI toont daarmee live of een (verkorte) URL past. */
-  virtual int  webBotDiagUrlBudget(int kind) { (void)kind; return 0; }
-  virtual int  webBotDiagUrlMax()            { return 0; }
+  virtual int  webBotSlotRecipDel(int i, const char* prefix_hex)  { (void)i; (void)prefix_hex; return -1; }
+  virtual bool webBotSlotAdvert(int i, bool flood)     { (void)i; (void)flood; return false; }
+  /* Ad-hoc schone DM vanaf bot i naar één pubkey. Retour 0 ok. */
+  virtual int  webBotSlotSendTo(int i, const char* pub_hex, const char* text) { (void)i; (void)pub_hex; (void)text; return -1; }
+  /* DM de HELE ontvangerslijst van bot i. Retour = aantal, <0 fout. */
+  virtual int  webBotSlotPost(int i, const char* text) { (void)i; (void)text; return -1; }
+  /* Zend-diagnose per bot. Masker: bit0 ping, bit1 test, bit2 path. */
+  virtual int  webBotSlotDiagMask(int i)          { (void)i; return 0; }
+  virtual bool webBotSlotSetDiagMask(int i, int m) { (void)i; (void)m; return false; }
+  virtual int  webBotSlotDiagUrlMode(int i)    { (void)i; return 0; }
+  virtual const char* webBotSlotDiagUrl(int i) { (void)i; return ""; }
+  virtual bool webBotSlotSetDiagUrl(int i, int mode, const char* url) { (void)i; (void)mode; (void)url; return false; }
+  virtual int  webBotSlotDiagUrlBudget(int i, int kind) { (void)i; (void)kind; return 0; }
+
+  /* Beheer. webBotAdd genereert een nieuw sleutelpaar; retour = nieuw slot of <0. */
+  virtual int  webBotAdd(const char* name)   { (void)name; return -1; }
+  virtual bool webBotRename(int i, const char* name) { (void)i; (void)name; return false; }
+  virtual bool webBotEnable(int i, int en)   { (void)i; (void)en; return false; }
+  virtual bool webBotDel(int i)              { (void)i; return false; }
+  virtual bool webBotSetAlert(int i)         { (void)i; return false; }
 
   /* ---- HASHTAG-/PUBLIEKE KANALEN (web-GUI) ----------------------------------
    * De bot leest de ingeschakelde kanalen mee en antwoordt IN het kanaal op

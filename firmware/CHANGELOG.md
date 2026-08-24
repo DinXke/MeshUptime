@@ -7,6 +7,45 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.5.0 — meerdere bot-identiteiten (alert-bot + companion-MANAGEMENT-bot)
+
+De enkele notifier-bot is veralgemeend naar **N onafhankelijke bots** (`MAX_BOTS = 4`),
+zodat één bot het alarmverkeer draagt en een tweede het companion-**MANAGEMENT**-verkeer.
+Alleen de room-server-variant (`env:meshuptime_room`).
+
+**Multi-bot-kern (firmware).** Elke bot is een eigen `BotSlot` met een eigen persistent
+**sleutelpaar**, **naam**, **aan/uit-vlag**, eigen **ontvangerslijst** + **zend-diagnose**
+en de rol-vlag **`is_alert`** (precies één bot draagt de alert-rol). `onRecvPacket`
+matcht de bestemmings-hash tegen **alle actieve bots**; `handleBotDm(bot, …)` weet welke
+bot de DM ontving en ontsleutelt/antwoordt als díe bot (eigen `self_id`, recips en diag).
+De companion-`#LOC`-afhandeling, de silent-accept van companion-replies en de
+self-loopback-guard (tegen álle eigen node-identiteiten) gelden **per bot**. `dispatchAlert`
+gebruikt de **alert-bot**.
+
+**Bot #0 blijft ONGEWIJZIGD.** De bestaande alert-bot (`BE-HSS-DinX-Bot`, pubkey
+`E0841BF7…AE177146`) laadt exact dezelfde sleutel (`/bot_id`) en ontvangerslijst
+(`/bot_recips`) en houdt de alert-rol. Bij een upgrade van v2.4.0 (nog geen `/bots.cfg`)
+wordt automatisch een **tweede** bot **`BE-HSS-DinX-MGMT`** aangemaakt in slot #1 met een
+**nieuw** sleutelpaar (bedoeld voor companion-MANAGEMENT).
+
+**Additieve persistentie.** Bot #0 → `/bot_id` + `/bot_recips` (formaat `#MUBOT1`,
+onveranderd). Bot #i>0 → `/bot_id_i` + `/bot_recips_i`. De per-slot config
+(bezet/rol/actief/naam) staat los in **`/bots.cfg`** (`#MUBOTS1`). De identiteitsopslag
+en `/companions.cfg` worden niet aangeraakt.
+
+**Endpoints.** `/bot/sendto`, `/bot/post`, `/bot/recipient`, `/bot/advert`, `/bot/diag`
+en `/bot.json` nemen nu een optionele **`bot=<idx-of-naam>`** (default: de alert-bot, zodat
+bestaand gedrag behouden blijft); de **companion-GUI** stuurt haar `!`-commando's via de
+**MGMT-bot**. Nieuw **`/bots.json`** geeft álle bots (idx, naam, **pubkey**, rol, #ontvangers)
+zodat MeshManager de MGMT-pubkey kan oppikken. Nieuw **`/bot/manage`** (add/rename/enable/
+del/setalert).
+
+**Web-GUI "Bots".** Het Bot-tabblad toont nu een **botlijst** (naam, pubkey-prefix,
+#ontvangers, rol/aan-uit) met **selecteren**; een nieuwe bot **toevoegen** (genereert een
+sleutel), **hernoemen**, **aan/uit**, **wissen** (nooit de laatste/alert-bot) en de
+**alert-rol** zetten. De ontvangers-, zend-diagnose- en handmatige-DM-secties werken op de
+**gekozen** bot. Zelfde decluttered "?"-stijl.
+
 ## v2.4.0 — companion-hub op de node (beheer + locatie), werkt ook zonder MeshManager
 
 Companions (T1000-E e.d.) worden nu **rechtstreeks op de node** beheerd en gevolgd,

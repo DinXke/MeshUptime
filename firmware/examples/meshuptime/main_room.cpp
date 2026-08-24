@@ -522,7 +522,7 @@ int MonitorDmSource::dmNodeCommand(const char* line, uint8_t role, char* out, si
     const char* msg = sp + 1;
     while (*msg == ' ') msg++;
     if (!*msg) { snprintf(out, out_len, "sendto: leeg bericht"); return (int)strlen(out); }
-    int r = the_mesh.webBotSendTo(hex, msg);
+    int r = the_mesh.webBotSlotSendTo(the_mesh.webBotResolve(""), hex, msg);  // alert-bot
     snprintf(out, out_len, r == 0 ? "DM verstuurd vanaf de bot" : "sendto mislukt (pubkey/bot?)");
     return (int)strlen(out);
   }

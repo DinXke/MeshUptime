@@ -463,6 +463,8 @@ void web_route_snodeadvert()  { if (g_self) g_self->handleSNodeAdvert(); }
 void web_route_monsnmp()      { if (g_self) g_self->handleMonSnmp(); }
 void web_route_contactsjson() { if (g_self) g_self->handleContactsJson(); }
 void web_route_botjson()      { if (g_self) g_self->handleBotJson(); }
+void web_route_botsjson()     { if (g_self) g_self->handleBotsJson(); }
+void web_route_botmanage()    { if (g_self) g_self->handleBotManage(); }
 void web_route_botrecip()     { if (g_self) g_self->handleBotRecip(); }
 void web_route_botdiag()      { if (g_self) g_self->handleBotDiag(); }
 void web_route_botadvert()    { if (g_self) g_self->handleBotAdvert(); }
@@ -1794,12 +1796,27 @@ Globaal verwijderen: tabblad bewaking.</p></div>
 </section>
 
 <section id="p6" hidden>
-<h2>Bot &mdash; meldingen als een gewoon chatcontact</h2>
-<p class="why"><b>Waarom een aparte bot:</b> een DM vanaf een <i>room</i>-identiteit
-toont rommelig in de MeshCore-app. De bot is een eigen <b>chat</b>-contact
-(type&nbsp;1) dat <b>schone DM's</b> stuurt: voor flash-meldingen en voor de
-per-sensor <i>dm</i>/<i>both</i>-alerts. Voeg de bot als contact toe (QR/join-link)
-en zet jezelf op de ontvangerslijst.</p>
+<h2>Bots &mdash; meerdere chat-identiteiten</h2>
+<p class="why"><b>Waarom meerdere bots:</b> de node draagt N onafhankelijke
+<b>chat</b>-contacten (type&nbsp;1), elk met een eigen sleutel, naam en
+ontvangerslijst. Eén bot draagt de <b>alert-rol</b> (de per-sensor
+<i>dm</i>/<i>both</i>-alerts en flash-meldingen); een tweede kan bv.
+<b>companion-MANAGEMENT</b>-verkeer dragen. Kies hieronder welke bot je beheert;
+de <b>*</b> markeert de alert-bot.</p>
+
+<div class="card pad0"><table id="botsl"></table></div>
+<div class="frow" style="margin-top:.4rem">
+<input id="bot-new-name" placeholder="naam van een nieuwe bot" maxlength="23" spellcheck="false" style="flex:1;min-width:10rem">
+<button type="button" id="bot-new">+ bot (genereert sleutel)</button></div>
+<div id="botsmsg"></div>
+<p class="note">De <b>alert-bot</b> is de zendweg voor alarmen; hem uitzetten of wissen
+kan niet. Een nieuwe bot krijgt een <b>nieuw sleutelpaar</b> en adverteert meteen.
+Wissen laat de sleutel op de node staan (heraanmaak van hetzelfde slot geeft dezelfde
+identiteit terug). MeshManager leest alle bots via <code>/bots.json</code>.</p>
+
+<h2>Beheer van: <span id="bot-cur-name" style="color:var(--accent)">&hellip;</span></h2>
+<p class="why">Alle onderstaande instellingen (join-link, ontvangers, zend-diagnose,
+handmatige DM's) gelden voor de <b>gekozen</b> bot. Klik een bot in de tabel hierboven.</p>
 
 <div class="card" id="botcard">
 <div class="row"><b id="bot-name">&hellip;</b>
@@ -3574,11 +3591,56 @@ cv.width=cv.height=(n+q*2)*s;var g=cv.getContext("2d");
 g.fillStyle="#fff";g.fillRect(0,0,cv.width,cv.height);g.fillStyle="#000";
 for(var y=0;y<n;y+=1)for(var x=0;x<n;x+=1)if(qr.isDark(y,x))g.fillRect((x+q)*s,(y+q)*s,s,s)}
 var BOT=null;
-function botGet(){return fetch("bot.json",{credentials:"include"})
+/* v2.5.0: welke bot beheren we? "" = de alert-bot (default). MGMTBOT = de eerste
+   niet-alert-bot (companion-MANAGEMENT); ALERTBOT = index van de alert-bot. */
+var BOTSEL="",MGMTBOT="",ALERTBOT=0;
+function botSelQ(pre){return (BOTSEL!==""?pre+"bot="+encodeURIComponent(BOTSEL):"")}
+function botGet(){var q=BOTSEL!==""?("?bot="+encodeURIComponent(BOTSEL)):"";
+return fetch("bot.json"+q,{credentials:"include"})
 .then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
-function botLoad(){refreshPickers();botGet().then(function(d){
+/* Overzichtstabel van alle bots + selectie + beheerknoppen. */
+function botsLoad(){return fetch("bots.json",{credentials:"include"})
+.then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})
+.then(function(d){if(!d)return;ALERTBOT=d.alert;var bots=d.bots||[];
+MGMTBOT="";for(var i=0;i<bots.length;i++){if(!bots[i].alert){MGMTBOT=String(bots[i].idx);break}}
+botsRender(bots)}).catch(function(){bmsg("botsmsg","kon botlijst niet laden",0)})}
+function botsRender(bots){var e=document.getElementById("botsl");if(!e)return;e.innerHTML="";
+var h=e.insertRow();["bot","pubkey","#ontv.","rol",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+bots.forEach(function(b){var r=e.insertRow();
+if(String(b.idx)===String(BOTSEL)||(BOTSEL===""&&b.idx===ALERTBOT))r.style.background="var(--sel,rgba(127,127,127,.15))";
+var c=r.insertCell();var a=document.createElement("a");a.href="#";a.textContent=b.name;
+a.onclick=function(ev){ev.preventDefault();BOTSEL=String(b.idx);botLoad()};c.appendChild(a);
+c=r.insertCell();c.className="key";c.textContent=b.pub.slice(0,8)+"…"+b.pub.slice(-4);
+c=r.insertCell();c.textContent=b.nrecips;
+c=r.insertCell();c.textContent=(b.alert?"alert *":"")+(b.enabled?"":" (uit)");
+c=r.insertCell();c.className="acts";
+var mk=function(lbl,fn){var x=document.createElement("button");x.textContent=lbl;x.onclick=fn;x.style.marginLeft=".2rem";return x};
+c.appendChild(mk("naam",function(){botRename(b.idx,b.name)}));
+if(!b.alert)c.appendChild(mk(b.enabled?"uit":"aan",function(){botEnable(b.idx,!b.enabled)}));
+if(!b.alert)c.appendChild(mk("alert",function(){botSetAlert(b.idx)}));
+if(!b.alert&&b.idx!==0)c.appendChild(mk("wis",function(){botDelSlot(b.idx,b.name)}))});
+if(!bots.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=5;c.textContent="(geen bots)";c.style.color="var(--muted)"}}
+function botManage(body,okmsg){return fetch("bot/manage",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("botsmsg",j.ok?okmsg:("mislukt: "+(j.error||"")),j.ok?1:0);
+if(j.ok){if(j.idx!==undefined)BOTSEL=String(j.idx);botLoad()}return j})
+.catch(function(){bmsg("botsmsg","mislukt",0)})}
+function botNew(){var n=document.getElementById("bot-new-name").value.trim();
+botManage("op=add&name="+encodeURIComponent(n),"bot toegevoegd").then(function(){
+document.getElementById("bot-new-name").value=""})}
+function botRename(idx,cur){var n=prompt("Nieuwe naam voor bot:",cur);if(n===null)return;n=n.trim();
+if(!n)return;botManage("op=rename&bot="+idx+"&name="+encodeURIComponent(n),"hernoemd")}
+function botSetAlert(idx){if(!confirm("Deze bot de alert-rol geven?\n\nAlarmen gaan dan via deze bot."))return;
+botManage("op=setalert&bot="+idx,"alert-bot gewijzigd")}
+function botEnable(idx,en){botManage("op=enable&bot="+idx+"&en="+(en?1:0),en?"bot aangezet":"bot uitgezet")}
+function botDelSlot(idx,name){if(!confirm("Bot '"+name+"' wissen?\n\nDe ontvangerslijst gaat weg (de sleutel blijft)."))return;
+botManage("op=del&bot="+idx,"bot gewist").then(function(j){if(j&&j.ok){BOTSEL="";botLoad()}})}
+function botLoad(){refreshPickers();botsLoad();botGet().then(function(d){
 if(!d){document.getElementById("bot-name").textContent="geen bot op deze node";return}
 BOT=d;
+var cn=document.getElementById("bot-cur-name");if(cn)cn.textContent=d.name+(d.alert?" (alert-bot)":"");
 document.getElementById("bot-name").textContent=d.name;
 var kp=document.getElementById("bot-pub");kp.textContent=d.pub.slice(0,8)+"…"+d.pub.slice(-4);
 kp.title=d.pub+"  (klik om te kopiëren)";kp.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(d.pub)};
@@ -3608,7 +3670,7 @@ c.textContent="(nog geen ontvangers — voeg jezelf toe)";c.style.color="var(--m
 function botAdd(){var pub=document.getElementById("bot-pub-in").value.trim();
 if(!pub)return;
 fetch("bot/recipient",{method:"POST",credentials:"include",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"key="+encodeURIComponent(pub)})
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"key="+encodeURIComponent(pub)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("bot-pub-in").value="";
 var pk=document.getElementById("bot-pick");if(pk)pk.value="";
@@ -3616,16 +3678,17 @@ bmsg("botaddmsg","ontvanger toegevoegd",1);botLoad()}
 else bmsg("botaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botaddmsg","mislukt",0)})}
 function botDel(pub){if(!confirm("Ontvanger "+pub.slice(0,8)+"… verwijderen?"))return;
 fetch("bot/recipient",{method:"POST",credentials:"include",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"del="+encodeURIComponent(pub)})
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"del="+encodeURIComponent(pub)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){bmsg("botaddmsg","ontvanger weg",1);botLoad()}
 else bmsg("botaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botaddmsg","mislukt",0)})}
 function botAdvert(flood){fetch("bot/advert",{method:"POST",credentials:"include",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"flood="+(flood?1:0)})
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"flood="+(flood?1:0)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 bmsg("botmsg",j.ok?("bot-advert verstuurd ("+(flood?"flood":"zero-hop")+")"):"mislukt",j.ok?1:0)})
 .catch(function(){bmsg("botmsg","mislukt",0)})}
 document.getElementById("bot-add").onclick=botAdd;
+document.getElementById("bot-new").onclick=botNew;
 
 /* ---- zend-diagnose: vinkjes, URL-modus en het live ruimte-tellertje ---- */
 var DFIT=[0,0,0],DURLMAX=0;
@@ -3654,7 +3717,7 @@ var u=document.getElementById("dg-url").value.trim();
 if(u.length>DURLMAX){bmsg("dgmsg","URL te lang (max "+DURLMAX+" tekens)",0);return}
 fetch("bot/diag",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"mask="+m+"&urlmode="+mode+"&url="+encodeURIComponent(u)})
+body:"mask="+m+"&urlmode="+mode+"&url="+encodeURIComponent(u)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){DFIT=j.dfit||DFIT;dgFit();bmsg("dgmsg","bewaard",1)}
 else bmsg("dgmsg","mislukt: "+(j.error||""),0)})
@@ -3669,7 +3732,7 @@ var k=document.getElementById("bot-sto-key").value.trim(),m=document.getElementB
 if(!k||!m){bmsg("botsendmsg","pubkey en bericht nodig",0);return}
 fetch("bot/sendto",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"key="+encodeURIComponent(k)+"&msg="+encodeURIComponent(m)})
+body:"key="+encodeURIComponent(k)+"&msg="+encodeURIComponent(m)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("bot-sto-msg").value="";bmsg("botsendmsg","DM verstuurd",1)}
 else bmsg("botsendmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botsendmsg","mislukt",0)})};
@@ -3677,7 +3740,7 @@ document.getElementById("bot-post-go").onclick=function(){
 var m=document.getElementById("bot-post-msg").value;
 if(!m){bmsg("botsendmsg","bericht nodig",0);return}
 fetch("bot/post",{method:"POST",credentials:"include",
-headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"msg="+encodeURIComponent(m)})
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"msg="+encodeURIComponent(m)+botSelQ("&")})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){document.getElementById("bot-post-msg").value="";bmsg("botsendmsg","gepost naar "+j.sent+" ontvanger(s)",1)}
 else bmsg("botsendmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("botsendmsg","mislukt",0)})};
@@ -3812,7 +3875,7 @@ function companionsGet(){return fetch("companions.json",{credentials:"include"})
 function companionsRefresh(){return companionsGet().then(function(d){
 if(!d)return;CMP=d.companions||[];cmRender();cmFillCmdPick();cmMap()})
 .catch(function(){cmMsg("cmaddmsg","kon companions niet laden",0)})}
-function companionsLoad(){refreshPickers();return companionsRefresh()}
+function companionsLoad(){refreshPickers();botsLoad();return companionsRefresh()}
 function cmAge(s){if(!s)return"—";var now=Math.floor(Date.now()/1000);var a=now-s;if(a<0)a=0;
 if(a<90)return a+"s";if(a<5400)return Math.round(a/60)+"m";if(a<172800)return Math.round(a/3600)+"u";return Math.round(a/86400)+"d"}
 function cmRender(){var e=document.getElementById("cml");e.innerHTML="";
@@ -3868,9 +3931,11 @@ else cmMsg("cmaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){cmMsg("cma
 function cmCmd(cmd){var pub=document.getElementById("cm-cmd-pick").value;
 if(!pub){cmMsg("cmcmdmsg","kies eerst een companion",0);return}
 if(!cmd||!cmd.trim()){cmMsg("cmcmdmsg","leeg commando",0);return}
+/* Companion-MANAGEMENT gaat via de MGMT-bot (indien aanwezig; anders de alert-bot). */
+var mgb=(typeof MGMTBOT!=="undefined"&&MGMTBOT!=="")?("&bot="+encodeURIComponent(MGMTBOT)):"";
 return fetch("bot/sendto",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)})
+body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)+mgb})
 .then(function(r){return r.json()}).then(function(j){
 if(j.ok){cmMsg("cmcmdmsg","verzonden over de mesh: "+cmd+" — antwoord/effect volgt async",1);
 companionsRefresh()}
@@ -4156,8 +4221,11 @@ void WebTask::routes() {
   /* Ontdekte contacten (buurtlijst met VOLLEDIGE pubkey) -- de kiezer voor de
    * bot-ontvangers en de ACL-grants leest deze lijst. GET, alleen publieke sleutels. */
   _server->on("/contacts.json", HTTP_GET, web_route_contactsjson);
-  /* Bot (CHAT/notifier): leeskant /bot.json (GET), mutaties POST. */
+  /* Bots (CHAT/notifier): leeskant /bot.json + /bots.json (GET), mutaties POST.
+   * De POST-endpoints nemen een optionele `bot=<idx-of-naam>` (default: alert-bot). */
   _server->on("/bot.json", HTTP_GET, web_route_botjson);
+  _server->on("/bots.json", HTTP_GET, web_route_botsjson);
+  _server->on("/bot/manage", HTTP_POST, web_route_botmanage);
   _server->on("/bot/recipient", HTTP_POST, web_route_botrecip);
   _server->on("/bot/advert", HTTP_POST, web_route_botadvert);
   _server->on("/bot/sendto", HTTP_POST, web_route_botsendto);
@@ -5874,47 +5942,132 @@ bool WebTask::botAvailable() {
   return true;
 }
 
-/* GET /bot.json -- botstatus + join-uri + ontvangerslijst. NOOIT geheimen. */
+/* De `bot=`-selector (idx of naam) uit de request oplossen naar een slot; leeg
+ * -> de alert-bot. -1 als onbekend. */
+int WebTask::botArgIndex() {
+  char sel[24]; sel[0] = 0;
+  getArg(*_server, "bot", sel, sizeof(sel));
+  return _acl->webBotResolve(sel);   // "" -> alert-bot
+}
+
+/* Eén bot-slot als JSON-VELDEN (zonder omhullende { }) naar buf; retour = lengte.
+ * De aanroeper zet zelf de accolades eromheen. NOOIT geheimen. */
+static int botSlotJson(IWebNode* acl, int i, char* buf, size_t cap, bool with_recips) {
+  char name[48]; jsonEscape(acl->webBotSlotName(i), name, sizeof(name));
+  char pub[PUB_KEY_SIZE * 2 + 1] = {0}; acl->webBotSlotPubHex(i, pub, sizeof(pub));
+  char uri[200] = {0}; acl->webBotSlotJoinUri(i, uri, sizeof(uri));
+  char euri[300]; jsonEscape(uri, euri, sizeof(euri));
+  char durl[220]; jsonEscape(acl->webBotSlotDiagUrl(i), durl, sizeof(durl));
+  int n = snprintf(buf, cap,
+      "\"idx\":%d,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\","
+      "\"alert\":%s,\"enabled\":%s,\"nrecips\":%d,\"max\":%d,"
+      "\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"durlmax\":%d,\"dfit\":[%d,%d,%d]",
+      i, name, pub, euri,
+      acl->webBotSlotIsAlert(i) ? "true" : "false",
+      acl->webBotSlotEnabled(i) ? "true" : "false",
+      acl->webBotSlotRecipCount(i), acl->webBotRecipMax(),
+      acl->webBotSlotDiagMask(i), acl->webBotSlotDiagUrlMode(i), durl,
+      acl->webBotDiagUrlMax(),
+      acl->webBotSlotDiagUrlBudget(i, 0), acl->webBotSlotDiagUrlBudget(i, 1), acl->webBotSlotDiagUrlBudget(i, 2));
+  if (with_recips && (size_t)n < cap - 12) {
+    n += snprintf(buf + n, cap - n, ",\"recips\":[");
+    int cnt = acl->webBotSlotRecipCount(i);
+    char rk[PUB_KEY_SIZE * 2 + 1];
+    int emitted = 0;
+    for (int j = 0; j < cnt; j++) {
+      if ((size_t)n > cap - 90) break;
+      int lvl = 1;
+      if (!acl->webBotSlotRecipGet(i, j, rk, sizeof(rk), &lvl)) continue;
+      n += snprintf(buf + n, cap - n, "%s{\"k\":\"%s\",\"l\":%d}", emitted ? "," : "", rk, lvl);
+      emitted++;
+    }
+    n += snprintf(buf + n, cap - n, "]");
+  }
+  return n;
+}
+
+/* GET /bot.json[?bot=<idx-of-naam>] -- botstatus + join-uri + ontvangerslijst van
+ * ÉÉN bot (default: de alert-bot). Vorm compatibel met v2.4.0 (bestaande GUI +
+ * MeshManager blijven werken), met extra velden idx/alert erbij. NOOIT geheimen. */
 void WebTask::handleBotJson() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"active\":false,\"error\":\"onbekende bot\"}"); return; }
+  int n = snprintf(g_json, sizeof(g_json), "{\"active\":true,");
+  n += botSlotJson(_acl, i, g_json + n, sizeof(g_json) - n, true);
+  strlcat(g_json, "}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
 
-  char name[24]; jsonEscape(_acl->webBotName(), name, sizeof(name));
-  char pub[PUB_KEY_SIZE * 2 + 1] = {0}; _acl->webBotPubHex(pub, sizeof(pub));
-  char uri[200] = {0}; _acl->webBotJoinUri(uri, sizeof(uri));
-  char euri[300]; jsonEscape(uri, euri, sizeof(euri));
-  char durl[220]; jsonEscape(_acl->webBotDiagUrl(), durl, sizeof(durl));
-
+/* GET /bots.json -- overzicht van ALLE bot-slots (naam/pub/rol/#recips), zodat
+ * MeshManager de MGMT-bot z'n pubkey kan oppikken. NOOIT geheimen. */
+void WebTask::handleBotsJson() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
   int n = snprintf(g_json, sizeof(g_json),
-      "{\"active\":true,\"name\":\"%s\",\"pub\":\"%s\",\"uri\":\"%s\",\"max\":%d,"
-      "\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"durlmax\":%d,\"dfit\":[%d,%d,%d],"
-      "\"recips\":[",
-      name, pub, euri, _acl->webBotRecipMax(),
-      _acl->webBotDiagMask(), _acl->webBotDiagUrlMode(), durl,
-      _acl->webBotDiagUrlMax(),
-      _acl->webBotDiagUrlBudget(0), _acl->webBotDiagUrlBudget(1), _acl->webBotDiagUrlBudget(2));
-  int cnt = _acl->webBotRecipCount();
-  char rk[PUB_KEY_SIZE * 2 + 1];
-  for (int i = 0; i < cnt; i++) {
-    if ((size_t)n > sizeof(g_json) - 90) break;
-    int lvl = 1;
-    if (!_acl->webBotRecipGet(i, rk, sizeof(rk), &lvl)) continue;
-    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"k\":\"%s\",\"l\":%d}",
-                  i == 0 ? "" : ",", rk, lvl);
+      "{\"max\":%d,\"alert\":%d,\"bots\":[", _acl->webBotSlotMax(), _acl->webBotAlertIdx());
+  bool first = true;
+  for (int i = 0; i < _acl->webBotSlotMax(); i++) {
+    if (!_acl->webBotSlotUsed(i)) continue;
+    if ((size_t)n > sizeof(g_json) - 420) break;
+    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{", first ? "" : ",");
+    n += botSlotJson(_acl, i, g_json + n, sizeof(g_json) - n, false);
+    n += snprintf(g_json + n, sizeof(g_json) - n, "}");
+    first = false;
   }
   strlcat(g_json, "]}", sizeof(g_json));
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
 }
 
-/* POST /bot/recipient -- toevoegen (key=64hex) of verwijderen (del=prefix>=12hex). */
+/* POST /bot/manage -- add | rename | enable | del | setalert.
+ *   op=add     name=<naam>              -> nieuwe bot (genereert sleutel)
+ *   op=rename  bot=<sel> name=<naam>
+ *   op=enable  bot=<sel> en=0/1
+ *   op=del     bot=<sel>
+ *   op=setalert bot=<sel> */
+void WebTask::handleBotManage() {
+  if (!requireAuth()) return;
+  if (!botAvailable()) return;
+  char op[16]; if (!getArg(*_server, "op", op, sizeof(op)) || op[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"op ontbreekt\"}"); return;
+  }
+  char name[24]; bool have_name = getArg(*_server, "name", name, sizeof(name));
+
+  if (strcmp(op, "add") == 0) {
+    int idx = _acl->webBotAdd(have_name && name[0] ? name : NULL);
+    if (idx >= 0) { char out[48]; snprintf(out, sizeof(out), "{\"ok\":true,\"idx\":%d}", idx);
+                    _server->send(200, "application/json", out); return; }
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"geen vrij slot\"}");
+    return;
+  }
+
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
+
+  bool ok = false;
+  if (strcmp(op, "rename") == 0)        ok = have_name && _acl->webBotRename(i, name);
+  else if (strcmp(op, "enable") == 0)   { char e[4]; getArg(*_server, "en", e, sizeof(e)); ok = _acl->webBotEnable(i, e[0] == '1'); }
+  else if (strcmp(op, "del") == 0)      ok = _acl->webBotDel(i);
+  else if (strcmp(op, "setalert") == 0) ok = _acl->webBotSetAlert(i);
+  else { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende op\"}"); return; }
+
+  _server->send(ok ? 200 : 400, "application/json",
+      ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"actie geweigerd (laatste/alert-bot?)\"}");
+}
+
+/* POST /bot/recipient[?bot=] -- toevoegen (key=64hex) of verwijderen (del=prefix>=12hex). */
 void WebTask::handleBotRecip() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
 
   char del[PUB_KEY_SIZE * 2 + 1];
   if (getArg(*_server, "del", del, sizeof(del)) && del[0]) {
-    int r = _acl->webBotRecipDel(del);
+    int r = _acl->webBotSlotRecipDel(i, del);
     if (r == 1) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
     _server->send(400, "application/json",
         r == -3 ? "{\"ok\":false,\"error\":\"prefix past op meerdere\"}"
@@ -5926,19 +6079,21 @@ void WebTask::handleBotRecip() {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"key ontbreekt\"}");
     return;
   }
-  int r = _acl->webBotRecipSet(key, 1);
+  int r = _acl->webBotSlotRecipSet(i, key, 1);
   if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
   _server->send(400, "application/json",
       r == -3 ? "{\"ok\":false,\"error\":\"ontvangerslijst vol\"}"
               : "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
 }
 
-/* POST /bot/advert  (flood=0/1). */
+/* POST /bot/advert[?bot=]  (flood=0/1). */
 void WebTask::handleBotAdvert() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
   char fl[4]; bool flood = getArg(*_server, "flood", fl, sizeof(fl)) && fl[0] == '1';
-  if (!_acl->webBotAdvert(flood)) {
+  if (!_acl->webBotSlotAdvert(i, flood)) {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bot niet actief\"}");
     return;
   }
@@ -5946,10 +6101,13 @@ void WebTask::handleBotAdvert() {
   _server->send(200, "application/json", msg);
 }
 
-/* POST /bot/sendto  (key=64hex, msg) -- ad-hoc schone DM (flash-melding). */
+/* POST /bot/sendto[?bot=]  (key=64hex, msg) -- ad-hoc schone DM (flash-melding).
+ * De companion-MANAGEMENT-GUI geeft hier de MGMT-bot mee. */
 void WebTask::handleBotSendto() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
   char key[PUB_KEY_SIZE * 2 + 1];
   if (!getArg(*_server, "key", key, sizeof(key)) || strlen(key) != PUB_KEY_SIZE * 2) {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
@@ -5960,21 +6118,23 @@ void WebTask::handleBotSendto() {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bericht ontbreekt\"}");
     return;
   }
-  int r = _acl->webBotSendTo(key, msg);
+  int r = _acl->webBotSlotSendTo(i, key, msg);
   if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
   _server->send(400, "application/json", "{\"ok\":false,\"error\":\"versturen mislukt\"}");
 }
 
-/* POST /bot/post  (msg) -- DM de hele ontvangerslijst. */
+/* POST /bot/post[?bot=]  (msg) -- DM de hele ontvangerslijst van die bot. */
 void WebTask::handleBotPost() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
   char msg[200];
   if (!getArg(*_server, "msg", msg, sizeof(msg)) || msg[0] == 0) {
     _server->send(400, "application/json", "{\"ok\":false,\"error\":\"bericht ontbreekt\"}");
     return;
   }
-  int r = _acl->webBotPost(msg);
+  int r = _acl->webBotSlotPost(i, msg);
   if (r >= 0) {
     char out[64]; snprintf(out, sizeof(out), "{\"ok\":true,\"sent\":%d}", r);
     _server->send(200, "application/json", out);
@@ -5983,7 +6143,7 @@ void WebTask::handleBotPost() {
   _server->send(400, "application/json", "{\"ok\":false,\"error\":\"wachtrij vol of geen ontvangers\"}");
 }
 
-/* POST /bot/diag -- zend-diagnose instellen; persistent op de node.
+/* POST /bot/diag[?bot=] -- zend-diagnose instellen; persistent op de node.
  *   mask=<0-7>    bit0 ping, bit1 test, bit2 path (0 = helemaal uit)
  *   urlmode=0..2  0=geen URL, 1=inline tussen haakjes, 2=apart kanaalbericht
  *   url=<tekst>   de URL zelf (leeg = ongewijzigd laten)
@@ -5991,20 +6151,22 @@ void WebTask::handleBotPost() {
 void WebTask::handleBotDiag() {
   if (!requireAuth()) return;
   if (!botAvailable()) return;
+  int i = botArgIndex();
+  if (i < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende bot\"}"); return; }
 
   bool any = false;
   char buf[8];
   if (getArg(*_server, "mask", buf, sizeof(buf)) && buf[0]) {
-    _acl->webBotSetDiagMask(atoi(buf));
+    _acl->webBotSlotSetDiagMask(i, atoi(buf));
     any = true;
   }
   char url[256];
   bool have_url = getArg(*_server, "url", url, sizeof(url));
   if (getArg(*_server, "urlmode", buf, sizeof(buf)) && buf[0]) {
-    _acl->webBotSetDiagUrl(atoi(buf), have_url && url[0] ? url : NULL);
+    _acl->webBotSlotSetDiagUrl(i, atoi(buf), have_url && url[0] ? url : NULL);
     any = true;
   } else if (have_url && url[0]) {
-    _acl->webBotSetDiagUrl(_acl->webBotDiagUrlMode(), url);
+    _acl->webBotSlotSetDiagUrl(i, _acl->webBotSlotDiagUrlMode(i), url);
     any = true;
   }
   if (!any) {
@@ -6012,12 +6174,12 @@ void WebTask::handleBotDiag() {
     return;
   }
 
-  char eurl[220]; jsonEscape(_acl->webBotDiagUrl(), eurl, sizeof(eurl));
+  char eurl[220]; jsonEscape(_acl->webBotSlotDiagUrl(i), eurl, sizeof(eurl));
   char out[320];
   snprintf(out, sizeof(out),
       "{\"ok\":true,\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"dfit\":[%d,%d,%d]}",
-      _acl->webBotDiagMask(), _acl->webBotDiagUrlMode(), eurl,
-      _acl->webBotDiagUrlBudget(0), _acl->webBotDiagUrlBudget(1), _acl->webBotDiagUrlBudget(2));
+      _acl->webBotSlotDiagMask(i), _acl->webBotSlotDiagUrlMode(i), eurl,
+      _acl->webBotSlotDiagUrlBudget(i, 0), _acl->webBotSlotDiagUrlBudget(i, 1), _acl->webBotSlotDiagUrlBudget(i, 2));
   _server->send(200, "application/json", out);
 }
 

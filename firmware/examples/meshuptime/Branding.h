@@ -108,11 +108,27 @@
  *            commando"-bounce meer op companion-replies). /companions.json (auth)
  *            geeft lat/lon + fall_ts/fall_kind voor MeshManager-escalatie.
  *            Werkt ook als MeshManager plat ligt.
+ *   v2.5.0 = MEERDERE BOT-IDENTITEITEN op de node (MAX_BOTS=4). De enkele notifier-
+ *            bot is veralgemeend naar N onafhankelijke bots, elk met een eigen
+ *            persistent sleutelpaar, naam, aan/uit-vlag, ontvangerslijst en zend-
+ *            diagnose. Bot #0 blijft de BESTAANDE alert-bot ("BE-HSS-DinX-Bot",
+ *            /bot_id + /bot_recips ONGEWIJZIGD) en draagt de alert-rol (dispatchAlert);
+ *            bot #1 is een NIEUWE "BE-HSS-DinX-MGMT"-bot (nieuw sleutelpaar) voor
+ *            companion-MANAGEMENT-verkeer. onRecvPacket matcht alle actieve bots en
+ *            handleBotDm antwoordt/ontsleutelt als de bot die de DM ontving (per-bot
+ *            recips/diag; companion-#LOC + self-loopback-guard per bot). Additieve
+ *            persistentie: bot #i>0 in /bot_id_i + /bot_recips_i, per-slot config
+ *            (bezet/rol/actief/naam) in /bots.cfg. /bot/* endpoints nemen een
+ *            optionele bot=<idx-of-naam> (default: de alert-bot); de companion-GUI
+ *            stuurt via de MGMT-bot. Nieuw /bots.json geeft alle bots (naam+pubkey+
+ *            rol) zodat MeshManager de MGMT-pubkey oppikt. Web-GUI "Bots"-beheer:
+ *            lijst + selecteren, toevoegen (genereert sleutel), hernoemen, aan/uit,
+ *            wissen (niet de laatste/alert-bot) en de alert-rol zetten.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.4.0"
+  #define MESHUPTIME_VERSION   "v2.5.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

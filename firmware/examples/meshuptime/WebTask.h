@@ -282,11 +282,16 @@ private:
    *  /bot/diag (POST)     : enabled=0/1 -- verklikker (1-byte/geen scope) aan/uit.
    * De v2c-community en gedeelde geheimen komen NOOIT in deze endpoints voor. */
   void handleBotJson();
+  void handleBotsJson();     // v2.5.0: overzicht van alle bot-slots
+  void handleBotManage();    // v2.5.0: add/rename/enable/del/setalert
   void handleBotRecip();
   void handleBotAdvert();
   void handleBotSendto();
   void handleBotPost();
   void handleBotDiag();
+  /* De `bot=`-selector (idx of naam) uit de request oplossen naar een slot; leeg
+   * -> de alert-bot. -1 als onbekend (dan stuurt de aanroeper zelf een 400). */
+  int  botArgIndex();
 
   /* Hashtag-/publieke kanalen: /channels.json (GET), /channel/add|del|toggle (POST). */
   void handleChannelsJson();
@@ -351,6 +356,8 @@ private:
   friend void web_route_monsnmp();
   friend void web_route_contactsjson();
   friend void web_route_botjson();
+  friend void web_route_botsjson();
+  friend void web_route_botmanage();
   friend void web_route_botrecip();
   friend void web_route_botadvert();
   friend void web_route_botsendto();

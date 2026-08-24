@@ -144,6 +144,17 @@
 #ifndef BOT_NAME_DEFAULT
   #define BOT_NAME_DEFAULT   "BE-HSS-DinX-Bot"
 #endif
+/* MEERDERE BOT-IDENTITEITEN (v2.5.0). De node draagt N onafhankelijke bots, elk met
+ * een eigen sleutelpaar, naam, ontvangerslijst en zend-diagnose. Bot #0 is de
+ * bestaande alert-bot (BE-HSS-DinX-Bot, /bot_id + /bot_recips, ONGEWIJZIGD); bot #1
+ * is de companion-MANAGEMENT-bot. Precies één bot draagt de "alert"-rol (die gebruikt
+ * dispatchAlert). Zie de bot-uitleg in RoomMesh.cpp. */
+#ifndef MAX_BOTS
+  #define MAX_BOTS  4
+#endif
+#ifndef BOT_MGMT_NAME_DEFAULT
+  #define BOT_MGMT_NAME_DEFAULT   "BE-HSS-DinX-MGMT"
+#endif
 
 /* COMPANIONS (v2.4.0). Een persistente lijst van companion-apparaten (T1000-E
  * e.d.): de bot stuurt hen `!`-commando's (find/loc/mute/...) als DM en de node
@@ -282,14 +293,15 @@ struct AclGrant {
 struct AlertTask {
   uint32_t timestamp;
   bool     high_pri;
-  bool     from_bot;           // true = DM vanaf de bot naar de ontvangerslijst
+  bool     from_bot;           // true = DM vanaf een bot naar zijn ontvangerslijst
+  uint8_t  bot_idx;            // welke bot verstuurt (alleen zinvol als from_bot)
   uint32_t expected_acks[4];
   int8_t   curr_contact_idx;
   uint8_t  attempt;
   unsigned long send_expiry;
   char     text[MAX_PACKET_PAYLOAD];
 
-  AlertTask() { text[0] = 0; from_bot = false; }
+  AlertTask() { text[0] = 0; from_bot = false; bot_idx = 0; }
   bool isTriggered() const { return text[0] != 0; }
 };
 
@@ -299,6 +311,25 @@ struct AlertTask {
 struct BotRecip {
   uint8_t pub_key[PUB_KEY_SIZE];
   uint8_t level;               // 0 = vrije ingang; >=1 = actief
+};
+
+/* Eén bot-identiteit (v2.5.0). Elk slot heeft een eigen persistent sleutelpaar
+ * (bot #0 in "/bot_id", bot #i in "/bot_id_i"), een naam, een aan/uit-vlag, een
+ * eigen ontvangerslijst + zend-diagnose (bot #0 in "/bot_recips", bot #i in
+ * "/bot_recips_i") en de rol-vlag is_alert (precies één bot). used=false is een
+ * vrije ingang. De alert-bot (is_alert) is de zendweg voor dispatchAlert; de andere
+ * bots dragen bv. companion-MANAGEMENT-verkeer. */
+struct BotSlot {
+  bool                used;          // slot bezet (draagt een sleutelpaar)
+  bool                enabled;       // doet mee (adverteert + beantwoordt DM's); uit = stil
+  bool                is_alert;      // rol: dispatchAlert gebruikt deze bot
+  mesh::LocalIdentity id;
+  char                name[24];
+  uint8_t             diag_mask;     // bit0 ping, bit1 test, bit2 path
+  uint8_t             diag_url_mode; // DIAG_URL_OFF / _INLINE / _SEPARATE
+  char                diag_url[MAX_DIAG_URL_LEN + 1];
+  BotRecip            recips[MAX_BOT_RECIPS];
+  unsigned long       next_local_advert, next_flood_advert;
 };
 
 /* Eén companion (v2.4.0). pub_key = de VOLLEDIGE pubkey (nodig voor het ECDH-
@@ -451,33 +482,51 @@ public:
     sendSensorNodeAdvertisement(snodes[idx], 0, flood); return true;
   }
 
-  /* ---- IWebNode: bot (CHAT/notifier-identiteit + DM-ontvangerslijst) ---- */
-  bool        webBotActive() override { return _bot_active; }
-  const char* webBotName() override   { return _bot_name; }
-  bool        webBotPubHex(char* out, size_t out_len) override;
-  bool        webBotJoinUri(char* out, size_t out_len) override;
+  /* ---- IWebNode: bots (N CHAT/notifier-identiteiten) ----
+   * Alle mutaties zijn index-adresseerbaar (i = absoluut slot 0..MAX_BOTS-1). De
+   * web-laag lost een `bot=<idx-of-naam>` op via webBotResolve() (leeg -> alert-bot). */
+  bool        webBotActive() override { return _bots[0].used; }   // is er een bot? (guard)
+  int         webBotSlotMax() override    { return MAX_BOTS; }
+  int         webBotAlertIdx() override   { return alertBotIndex(); }
+  int         webBotResolve(const char* sel) override { return botResolve(sel); }
   int         webBotRecipMax() override   { return MAX_BOT_RECIPS; }
-  int         webBotRecipCount() override { return botRecipCount(); }
-  bool        webBotRecipGet(int i, char* pub64, size_t out_len, int* level) override;
-  int         webBotRecipSet(const char* pub_hex, int level) override;
-  int         webBotRecipDel(const char* prefix_hex) override;
-  bool        webBotAdvert(bool flood) override {
-    if (!_bot_active) return false;
-    sendBotAdvertisement(0, flood); return true;
-  }
-  int         webBotSendTo(const char* pub_hex, const char* text) override;
-  int         webBotPost(const char* text) override { return botPost(text); }
-  int         webBotDiagMask() override { return _bot_diag_mask; }
-  bool        webBotSetDiagMask(int mask) override {
-    setBotDiagMask((uint8_t)(mask & DIAG_ALL)); return true;
-  }
-  int         webBotDiagUrlMode() override { return _bot_diag_url_mode; }
-  const char* webBotDiagUrl() override     { return _bot_diag_url; }
-  bool        webBotSetDiagUrl(int mode, const char* url) override {
-    setBotDiagUrl((uint8_t)mode, url); return true;
-  }
-  int         webBotDiagUrlBudget(int kind) override { return diagUrlBudget(kind); }
   int         webBotDiagUrlMax() override { return MAX_DIAG_URL_LEN; }
+
+  bool        webBotSlotUsed(int i) override    { return i >= 0 && i < MAX_BOTS && _bots[i].used; }
+  bool        webBotSlotEnabled(int i) override { return i >= 0 && i < MAX_BOTS && _bots[i].used && _bots[i].enabled; }
+  const char* webBotSlotName(int i) override    { return (i >= 0 && i < MAX_BOTS) ? _bots[i].name : ""; }
+  bool        webBotSlotIsAlert(int i) override { return i >= 0 && i < MAX_BOTS && _bots[i].used && _bots[i].is_alert; }
+  bool        webBotSlotPubHex(int i, char* out, size_t out_len) override;
+  bool        webBotSlotJoinUri(int i, char* out, size_t out_len) override;
+  int         webBotSlotRecipCount(int i) override { return botRecipCount(i); }
+  bool        webBotSlotRecipGet(int i, int j, char* pub64, size_t out_len, int* level) override;
+  int         webBotSlotRecipSet(int i, const char* pub_hex, int level) override;
+  int         webBotSlotRecipDel(int i, const char* prefix_hex) override;
+  bool        webBotSlotAdvert(int i, bool flood) override {
+    if (i < 0 || i >= MAX_BOTS || !_bots[i].used) return false;
+    sendBotAdvertisement(i, 0, flood); return true;
+  }
+  int         webBotSlotSendTo(int i, const char* pub_hex, const char* text) override;
+  int         webBotSlotPost(int i, const char* text) override;
+  int         webBotSlotDiagMask(int i) override { return (i >= 0 && i < MAX_BOTS) ? _bots[i].diag_mask : 0; }
+  bool        webBotSlotSetDiagMask(int i, int mask) override {
+    if (i < 0 || i >= MAX_BOTS || !_bots[i].used) return false;
+    setBotDiagMask(i, (uint8_t)(mask & DIAG_ALL)); return true;
+  }
+  int         webBotSlotDiagUrlMode(int i) override { return (i >= 0 && i < MAX_BOTS) ? _bots[i].diag_url_mode : 0; }
+  const char* webBotSlotDiagUrl(int i) override     { return (i >= 0 && i < MAX_BOTS) ? _bots[i].diag_url : ""; }
+  bool        webBotSlotSetDiagUrl(int i, int mode, const char* url) override {
+    if (i < 0 || i >= MAX_BOTS || !_bots[i].used) return false;
+    setBotDiagUrl(i, (uint8_t)mode, url); return true;
+  }
+  int         webBotSlotDiagUrlBudget(int i, int kind) override { return diagUrlBudget(i, kind); }
+
+  /* Beheer: nieuwe bot (genereert sleutel), hernoemen, aan/uit, wissen, alert-rol. */
+  int         webBotAdd(const char* name) override;
+  bool        webBotRename(int i, const char* name) override;
+  bool        webBotEnable(int i, int en) override;
+  bool        webBotDel(int i) override;
+  bool        webBotSetAlert(int i) override;
 
   /* ---- IWebNode: hashtag-/publieke kanalen ---- */
   int  webChannelMax() override   { return channelMax(); }
@@ -498,24 +547,24 @@ public:
   int  webCompanionSet(const char* pub_hex, const char* name) override;
   int  webCompanionDel(const char* prefix_hex) override;
 
-  /* ---- Bot: publieke API (CLI + intern) ---- */
-  bool botActive() const { return _bot_active; }
-  uint8_t botDiagMask() const { return _bot_diag_mask; }
-  void setBotDiagMask(uint8_t mask);   // persistent (bij de ontvangerslijst)
-  uint8_t botDiagUrlMode() const { return _bot_diag_url_mode; }
-  const char* botDiagUrl() const { return _bot_diag_url; }
-  void setBotDiagUrl(uint8_t mode, const char* url);  // url==NULL laat de huidige staan
+  /* ---- Bots: publieke API (CLI + intern). Alle bewerkingen zijn index-adresseerbaar
+   * (b = slot 0..MAX_BOTS-1). ---- */
+  bool botActive() const { return _bots[0].used; }
+  int  alertBotIndex() const;              // slot van de bot met de alert-rol; -1 als geen
+  int  botResolve(const char* sel) const;  // "" / NULL -> alert-bot; anders index of naam; -1 = onbekend
+  void setBotDiagMask(int b, uint8_t mask);           // persistent (bij de ontvangerslijst)
+  void setBotDiagUrl(int b, uint8_t mode, const char* url);  // url==NULL laat de huidige staan
   /* Max. URL-lengte die INLINE nog past. kind: 0=ping, 1=test, 2=path. */
-  int  diagUrlBudget(int kind) const;
-  int  botRecipCount() const;
-  bool botRecipGetByIdx(int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
-  int  botRecipAdd(const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
-  int  botRecipDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet gevonden, -3 dubbelzinnig
-  /* Staat deze VOLLEDIGE pubkey (actief) in de ontvangerslijst? Bepaalt of de bot
-   * de volledige monitoring/admin-commandoset over DM voor deze afzender uitvoert. */
-  bool botRecipHas(const uint8_t* pubkey) const;
-  int  botSendTo(const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
-  int  botPost(const char* text);                              // aantal aangeschreven, <0 fout
+  int  diagUrlBudget(int b, int kind) const;
+  int  botRecipCount(int b) const;
+  bool botRecipGetByIdx(int b, int i, uint8_t* pub_out) const;   // pub_out >= PUB_KEY_SIZE
+  int  botRecipAdd(int b, const uint8_t* pubkey);                // 0 ok, -2 dup(ok), -3 vol
+  int  botRecipDelPrefix(int b, const uint8_t* prefix, int key_len);  // 1 ok, -2 niet gevonden, -3 dubbelzinnig
+  /* Staat deze VOLLEDIGE pubkey (actief) in de ontvangerslijst van bot b? Bepaalt of
+   * de bot de volledige monitoring/admin-commandoset over DM voor deze afzender uitvoert. */
+  bool botRecipHas(int b, const uint8_t* pubkey) const;
+  int  botSendTo(int b, const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
+  int  botPost(int b, const char* text);                              // aantal aangeschreven, <0 fout
 
   /* ---- Hashtag-/publieke kanalen: publieke API (CLI + web) ---- */
   int  channelMax() const { return MAX_CHANNELS; }
@@ -638,23 +687,19 @@ private:
   /* Persistente per-sleutel toegangsgrants (wachtwoordloos). Zie MAX_ACL_GRANTS. */
   AclGrant      _grants[MAX_ACL_GRANTS];
 
-  /* ---- BOT: virtuele CHAT/notifier-identiteit ----
-   * Eén CHAT-contact met eigen persistent sleutelpaar (/bot_id). Stuurt schone
-   * DM's naar de ontvangerslijst (_bot_recips). Adverteert als ADV_TYPE_CHAT op de
-   * gewone advert-timers, zichtbaar in de MeshCore-app als gewoon chatcontact. */
-  mesh::LocalIdentity _bot_id;
-  bool          _bot_active;
-  uint8_t       _bot_diag_mask;   // zend-diagnose per commando: bit0 ping, 1 test, 2 path
-  uint8_t       _bot_diag_url_mode;  // DIAG_URL_OFF / _INLINE / _SEPARATE
-  char          _bot_diag_url[MAX_DIAG_URL_LEN + 1];
-  char          _bot_name[24];
-  unsigned long _bot_next_local_advert, _bot_next_flood_advert;
-  BotRecip      _bot_recips[MAX_BOT_RECIPS];
+  /* ---- BOTS: N virtuele CHAT/notifier-identiteiten (v2.5.0) ----
+   * Elk CHAT-contact heeft een eigen persistent sleutelpaar (bot #0 in "/bot_id",
+   * bot #i in "/bot_id_i"), naam, ontvangerslijst en zend-diagnose. Ze adverteren
+   * als ADV_TYPE_CHAT op de gewone advert-timers, zichtbaar in de MeshCore-app als
+   * gewone chatcontacten. Bot #0 = de bestaande alert-bot (BE-HSS-DinX-Bot). */
+  BotSlot       _bots[MAX_BOTS];
 
   /* TWEERICHTING. true tijdens onRecvPacket-dispatch als het geadresseerde pakket
-   * voor de bot-identiteit was (naast _active_slot/_active_snode). Dan ontsleutelt
-   * de basisklasse met _bot_id en gaat inkomende data naar het bot-diagnosepad. */
+   * voor een bot-identiteit was (naast _active_slot/_active_snode). _active_bot is
+   * dan het bot-slot dat matchte; de basisklasse ontsleutelt met _bots[_active_bot].id
+   * en de inkomende data gaat naar het bot-diagnosepad van die bot. */
   bool          _active_is_bot;
+  int           _active_bot;
   /* De afzenders die op de src-hash van een inkomend bot-pakket passen (volledige
    * pubkeys; uit de buurtlijst én de ontvangerslijst). searchPeersByHash vult dit,
    * getPeerSharedSecret/onPeerDataRecv lezen het. MEMBER, niet op de stapel. */
@@ -666,6 +711,7 @@ private:
    * opgehaald en met botSendTo() naar deze pubkey teruggestuurd. */
   bool          _bot_cmd_wait = false;
   uint8_t       _bot_cmd_wait_pub[PUB_KEY_SIZE];
+  int           _bot_cmd_wait_bot = 0;   // welke bot de uitgestelde uitslag terugstuurt
 
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
   BotChannel    _channels[MAX_CHANNELS];
@@ -731,14 +777,18 @@ private:
 
   /* ---- DM-alarmpad ---- */
   void          sendAlertDM(const ClientInfo* c, AlertTask* t);
-  /* Schone DM vanaf de bot naar een losse pubkey (niet in een ACL): berekent het
+  /* Schone DM vanaf bot b naar een losse pubkey (niet in een ACL): berekent het
    * gedeelde geheim zelf. Deelt de AlertTask-ACK-boekhouding met sendAlertDM. */
-  void          sendBotAlertDM(const uint8_t* pubkey, AlertTask* t);
+  void          sendBotAlertDM(int b, const uint8_t* pubkey, AlertTask* t);
 
-  /* ---- bot: identiteit, advert, ontvangerslijst ---- */
-  void          loadOrCreateBotIdentity();
-  void          saveBotRecips();
-  void          loadBotRecips();
+  /* ---- bots: identiteit, advert, ontvangerslijst, beheer ---- */
+  void          loadOrCreateBotIdentity(int b);   // bot #0 -> "/bot_id"; bot #i -> "/bot_id_i"
+  void          saveBotRecips(int b);             // bot #0 -> "/bot_recips"; bot #i -> "/bot_recips_i"
+  void          loadBotRecips(int b);
+  void          saveBotsConfig();                 // "/bots.cfg": actief/rol/naam per slot
+  void          loadBotsConfig();
+  int           botRecipFindFree(int b) const;
+  int           botFindFreeSlot() const;          // eerste ongebruikt slot; -1 = vol
 
   /* ---- companions (v2.4.0) ---- */
   int           companionCount() const;
@@ -756,21 +806,20 @@ private:
   void          loadCompanions();
   /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.
    * `kind`: 0=ping, 1=test, 2=path (bepaalt of het masker dit type toelaat). */
-  size_t        buildTxDiag(char* out, size_t cap, size_t budget,
+  size_t        buildTxDiag(int b, char* out, size_t cap, size_t budget,
                             const mesh::Packet* packet, int kind) const;
   /* Los uitleg-bericht ("Meer info ...: <url>") als DIAG_URL_SEPARATE aan staat
    * en dit pakket ongescoped was. Retour = lengte, 0 = niets sturen. */
-  size_t        buildDiagUrlMsg(char* out, size_t cap,
+  size_t        buildDiagUrlMsg(int b, char* out, size_t cap,
                                 const mesh::Packet* packet, int kind) const;
-  mesh::Packet* createBotAdvert();
-  void          sendBotAdvertisement(int delay_millis, bool flood);
-  int           botRecipFindFree() const;
+  mesh::Packet* createBotAdvert(int b);
+  void          sendBotAdvertisement(int b, int delay_millis, bool flood);
   void          handleBotCommand(char* args, char* reply);
   void          handleChannelCommand(char* args, char* reply);   // CLI: channel ...
   /* Inkomende DM op de bot-identiteit: het kleine mesh-diagnose-commandoset
    * (ping/path/help). Antwoordt als schone DM VANAF de bot naar de afzender. De
    * antwoordbuffer is static (niet op de loopTask-stapel). */
-  void          handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
+  void          handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pub,
                             const uint8_t* secret, uint8_t* data, size_t len);
 
   /* ---- kanalen: persistentie + diagnose-antwoord ---- */
