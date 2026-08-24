@@ -10,6 +10,12 @@
 
 MuConfig mu_cfg;
 
+// RX power-saving is unavailable on the standard MeshCore base: the radio stays
+// in continuous RX so the pager never misses an alert DM. Kept as a no-op so the
+// rxps command/menu still compile. (RXPS existed only in the PowerSaving-v17
+// fork, which we intentionally no longer build on.)
+void mu_rxps_apply(uint8_t /*level*/) {}
+
 static const char* MU_CFG_PATH = "/mu_cfg.dat";
 
 // Seed identities (from the project spec).

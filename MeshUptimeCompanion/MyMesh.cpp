@@ -2,8 +2,7 @@
 
 #include <Arduino.h> // needed for PlatformIO
 #include <Mesh.h>
-#include "helpers/radiolib/RXPowerSaving.h"
-#include "MuHooks.h"    // MeshUptimeCompanion: standalone DM hook
+#include "MuHooks.h"    // MeshUptimeCompanion: standalone DM hook (severity tunes + '!' commands)
 #include "MuBattery.h"  // MeshUptimeCompanion: app-facing battery-mV encoder
 
 #define CMD_APP_START                 1
@@ -268,56 +267,6 @@ bool MyMesh::getCADEnabled() const {
   return false; // hardware CAD before TX (disabled by default, until configurable)
 }
 
-// MeshUptimeCompanion: RXPS is OPT-IN and DEFAULT OFF. This is a carried alert
-// pager, so out of the box it stays in CONTINUOUS RX (a slept RX window could
-// miss an incoming alert DM). The stock PowerSaving-v17 companion always enabled
-// RXPS here; we gate it on a persisted level the user can raise to trade battery
-// for a small risk of missed alerts. 0 = off/continuous, 1 = conservative,
-// 2 = balanced. The desired level + last radio params are cached so the setting
-// can be re-applied after the config loads or when the user changes it live.
-static uint8_t g_mu_rxps_level = 0;      // default OFF
-static uint8_t g_mu_last_sf    = 0;
-static float   g_mu_last_bw    = 0;
-
-static void applyCompanionRxPowerSaving(uint8_t sf, float bw) {
-  g_mu_last_sf = sf;
-  g_mu_last_bw = bw;
-#ifdef WRAPPER_CLASS
-  RxPowerSavingControl* control = &radio_driver;
-  if (g_mu_rxps_level == 0) {
-    control->setRxPowerSaving(false, RX_POWERSAVING_DEFAULT_RX_US,
-                              RX_POWERSAVING_DEFAULT_SLEEP_US);
-    MESH_DEBUG_PRINTLN("RX Power Saving: OFF (continuous RX)");
-    return;
-  }
-  uint8_t level = (g_mu_rxps_level == 1) ? RX_POWERSAVING_CONSERVATIVE_LEVEL
-                                         : RX_POWERSAVING_BALANCED_LEVEL;
-  uint32_t rx_us = 0, sleep_us = 0;
-  bool ok = calcRxPowerSavingLevel(level, sf, bw, RX_POWERSAVING_PROFILE_PREAMBLE,
-                                   &rx_us, &sleep_us) &&
-            control->setRxPowerSaving(true, rx_us, sleep_us);
-  if (!ok) {
-    // Bad params for this SF/BW -> fall back to continuous RX rather than leave
-    // the duty cycle armed with stale timings that would sleep through preambles.
-    control->setRxPowerSaving(false, RX_POWERSAVING_DEFAULT_RX_US,
-                              RX_POWERSAVING_DEFAULT_SLEEP_US);
-  }
-  MESH_DEBUG_PRINTLN("RX Power Saving: level=%u rx=%lu sleep=%lu %s",
-                     (unsigned)level, (unsigned long)rx_us, (unsigned long)sleep_us,
-                     ok ? "accepted" : "unavailable - continuous RX");
-#else
-  (void)sf; (void)bw;
-#endif
-}
-
-// Bridge for MuCommand/MuMenu (declared in MeshUptime.h). Sets the desired level
-// and re-applies it to the radio with the last-known SF/BW.
-void mu_rxps_apply(uint8_t level) {
-  if (level > 2) level = 2;
-  g_mu_rxps_level = level;
-  applyCompanionRxPowerSaving(g_mu_last_sf, g_mu_last_bw);
-}
-
 int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
   if (_prefs.rx_delay_base <= 0.0f) return 0;
   return (int)((pow(_prefs.rx_delay_base, 0.85f - score) - 1.0) * air_time);
@@ -578,10 +527,10 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
-  queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
   // MeshUptimeCompanion: standalone hook — severity tunes + '!' command protocol.
   // Runs regardless of whether a phone app is connected over BLE.
   mu_on_direct_msg(from, sender_timestamp, text);
+  queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
 
 void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
@@ -1036,7 +985,6 @@ void MyMesh::begin(bool has_display) {
   board.setLoRaFemPaGainEnabled(_prefs.radio_fem_txgain);
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
-  applyCompanionRxPowerSaving(_prefs.sf, _prefs.bw);
 }
 
 const char *MyMesh::getNodeName() {
@@ -1460,7 +1408,6 @@ void MyMesh::handleCmdFrame(size_t len) {
       savePrefs();
 
       radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
-      applyCompanionRxPowerSaving(_prefs.sf, _prefs.bw);
       MESH_DEBUG_PRINTLN("OK: CMD_SET_RADIO_PARAMS: f=%d, bw=%d, sf=%d, cr=%d", freq, bw, (uint32_t)sf,
                          (uint32_t)cr);
 
@@ -2326,10 +2273,5 @@ bool MyMesh::advert() {
 
 // To check if there is pending work
 bool MyMesh::hasPendingWork() const {
-  bool calibration_active = false;
-#ifdef WRAPPER_CLASS
-  const RxPowerSavingControl* rxps_control = &radio_driver;
-  calibration_active = rxps_control->isRxPowerSavingCalibrationActive();
-#endif
-  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0 || calibration_active;
+  return _mgr->getOutboundTotal() > 0 || dirty_contacts_expiry != 0;
 }

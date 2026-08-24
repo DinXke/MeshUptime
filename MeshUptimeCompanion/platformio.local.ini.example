@@ -5,13 +5,16 @@
 ; on top of an unmodified MeshCore checkout. Nothing in MeshCore is edited.
 ;
 ; To build:
-;   1. Check out MeshCore on branch iotthinks/PowerSaving-v17 (v1.17.1, has RXPS
-;      + the T1000-E power profile). A git worktree is the non-destructive way:
-;         git worktree add --detach ../MeshCore-ps17 iotthinks/PowerSaving-v17
+;   1. Check out the STANDARD MeshCore at v1.17.1 (commit d929643) — the same
+;      official companion_radio base as the stock t1000e_companion_radio_ble
+;      build. NOT the PowerSaving-v17 fork: this pager must stay in continuous RX
+;      (no duty-cycling), which is exactly the standard base's behaviour.
+;         git clone https://github.com/meshcore-dev/MeshCore.git ../MeshCore-std
+;         cd ../MeshCore-std && git checkout d929643
 ;   2. Copy THIS file to the MeshCore checkout root as `platformio.local.ini`
 ;      (MeshCore's root platformio.ini already pulls it in via `extra_configs`).
 ;   3. Make sure this repo (MU-companion) sits next to the MeshCore checkout, i.e.
-;         <parent>/MeshCore-ps17     (or MeshCore)
+;         <parent>/MeshCore-std     (or MeshCore)
 ;         <parent>/MU-companion/MeshUptimeCompanion
 ;      The relative paths below assume that sibling layout.
 ;   4. python -m platformio run -e t1000e_meshuptime_companion

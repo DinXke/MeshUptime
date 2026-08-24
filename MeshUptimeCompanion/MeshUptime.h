@@ -9,7 +9,7 @@
 
 // Firmware (companion-layer) version. Shown on the serial banner so a running
 // device / serial capture is traceable to a build. Bump the patch for fixes.
-#define MU_FW_VERSION "1.0.1"
+#define MU_FW_VERSION "2.0.0"
 
 // Lifecycle (called from app_main.cpp)
 void mu_begin();
@@ -27,9 +27,12 @@ bool mu_in_quiet_hours();
 // Quiet-period volume cap: 0..3 while inside the window, or -1 when not (no cap).
 int  mu_quiet_cap();
 
-// ---- RXPS opt-in (default OFF = continuous RX) — bridge into MyMesh.cpp ------
-// level: 0 = off (continuous RX), 1 = conservative, 2 = balanced. Sets the
-// desired level and re-applies it to the radio immediately.
+// ---- RX power-saving bridge (no-op on the standard MeshCore base) -----------
+// The standard v1.17.1 companion base has NO RX duty-cycling: the receiver is
+// ALWAYS on (continuous RX) so a carried pager never sleeps through an alert.
+// This stub is kept only so the callers (rxps command/menu) still compile; it
+// does nothing. RXPS lived only in the PowerSaving-v17 fork we deliberately
+// left behind — see PROTOCOL.md / README.
 void mu_rxps_apply(uint8_t level);
 
 // ---- Command context + shared parser (MuCommand.cpp) -----------------------
