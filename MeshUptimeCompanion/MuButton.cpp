@@ -21,11 +21,11 @@ static void do_short_press() {
 static void do_long_press() {
   // Long press (>2s) -> SOS. Sends the machine-readable "#LOC" report so the
   // MeshUptime node can map the SOS: `#LOC <lat>,<lon> (SOS) <preset #2>`.
-  if (mu_cfg.has_sos) {
-    char note[MU_PRESET_LEN + 8];
-    snprintf(note, sizeof(note), "(SOS) %s", mu_cfg.presets[1]);
-    mu_send_loc_dm(mu_cfg.sos_pub, note);
-  }
+  // Goes to the fall-target list (+MeshManager if `!fall mm on`), falling back
+  // to the sos/target recipient — same routing as the fall alert.
+  char note[MU_PRESET_LEN + 8];
+  snprintf(note, sizeof(note), "(SOS) %s", mu_cfg.presets[1]);
+  mu_send_alert_report(note);
 }
 
 void mu_button_loop() {

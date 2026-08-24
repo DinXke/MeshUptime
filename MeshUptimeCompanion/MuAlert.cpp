@@ -241,6 +241,27 @@ bool mu_send_loc_dm(const uint8_t* pub, const char* note) {
   return mu_send_dm(pub, buf, false);
 }
 
+// Broadcast an alert "#LOC" report to all configured direct fall-targets, plus
+// the node bot when `!fall mm on` (node -> MeshManager). Falls back to the single
+// sos/target recipient only when there are NO direct targets AND mm is off, so an
+// SOS/fall alert is never silently dropped. Returns the number of DMs sent.
+int mu_send_alert_report(const char* note) {
+  int sent = 0;
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
+    if (!mu_cfg.fall_target_used[i]) continue;
+    if (mu_send_loc_dm(mu_cfg.fall_target_pub[i], note)) sent++;
+  }
+  if (mu_cfg.fall_mm) {
+    if (mu_send_loc_dm(mu_node_bot_pubkey(), note)) sent++;
+  }
+  if (mu_fall_target_count() == 0 && !mu_cfg.fall_mm) {
+    const uint8_t* dest = mu_cfg.has_sos ? mu_cfg.sos_pub
+                        : (mu_cfg.has_target ? mu_cfg.target_pub : nullptr);
+    if (dest && mu_send_loc_dm(dest, note)) sent++;
+  }
+  return sent;
+}
+
 // ---- incoming DM hook (from MyMesh::onMessageRecv) -------------------------
 void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const char* text) {
   (void)sender_timestamp;

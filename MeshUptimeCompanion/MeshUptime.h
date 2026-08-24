@@ -56,6 +56,13 @@ bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps);
 // if no matching contact is known. Used by `!loc`, the SOS button and fall.
 bool mu_send_loc_dm(const uint8_t* pub, const char* note);
 
+// Broadcast a machine-readable "#LOC <lat>,<lon> <note>" alert to every configured
+// direct fall-target, plus the MeshUptime node bot when `!fall mm on` (the node
+// forwards it to MeshManager). With no direct targets AND mm off, falls back to
+// the single sos/target recipient so an alert is never silently dropped. Used by
+// the SOS button and the fall/no-motion alert. Returns the number of DMs sent.
+int mu_send_alert_report(const char* note);
+
 // ---- Button (MuButton.cpp) -------------------------------------------------
 void mu_button_begin();
 void mu_button_loop();
@@ -65,6 +72,8 @@ void mu_fall_begin();
 void mu_fall_loop();
 bool mu_fall_prealarm_active();
 void mu_fall_cancel();       // button-cancel during the pre-alarm window
+void mu_fall_test();         // trigger the pre-alarm sequence now (desk test)
+bool mu_fall_accel_present();// QMA6100P detected on the I2C bus
 
 // ---- Serial CLI (MuAlert.cpp drives it) ------------------------------------
 void mu_serial_loop();

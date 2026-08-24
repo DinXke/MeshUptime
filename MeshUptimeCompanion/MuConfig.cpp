@@ -91,6 +91,49 @@ int mu_allow_del_prefix(const uint8_t* prefix, int prefix_len) {
   return removed;
 }
 
+// ---- fall-target list ------------------------------------------------------
+int mu_fall_target_count() {
+  int n = 0;
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++) if (mu_cfg.fall_target_used[i]) n++;
+  return n;
+}
+
+bool mu_fall_target_add(const uint8_t* pub) {
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++)   // dedup
+    if (mu_cfg.fall_target_used[i] &&
+        memcmp(mu_cfg.fall_target_pub[i], pub, MU_PUB_LEN) == 0) return true;
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
+    if (!mu_cfg.fall_target_used[i]) {
+      mu_cfg.fall_target_used[i] = 1;
+      memcpy(mu_cfg.fall_target_pub[i], pub, MU_PUB_LEN);
+      return true;
+    }
+  }
+  return false;   // list full
+}
+
+int mu_fall_target_del_prefix(const uint8_t* prefix, int prefix_len) {
+  if (prefix_len <= 0 || prefix_len > MU_PUB_LEN) return 0;
+  int removed = 0;
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
+    if (mu_cfg.fall_target_used[i] &&
+        memcmp(mu_cfg.fall_target_pub[i], prefix, prefix_len) == 0) {
+      mu_cfg.fall_target_used[i] = 0;
+      memset(mu_cfg.fall_target_pub[i], 0, MU_PUB_LEN);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+// ---- node bot pubkey -------------------------------------------------------
+const uint8_t* mu_node_bot_pubkey() {
+  static uint8_t bot[MU_PUB_LEN];
+  static bool ready = false;
+  if (!ready) { mu_hex_to_bytes(MU_BOT_HEX, bot, MU_PUB_LEN); ready = true; }
+  return bot;
+}
+
 // ---- defaults --------------------------------------------------------------
 static void set_defaults() {
   memset(&mu_cfg, 0, sizeof(mu_cfg));
@@ -109,6 +152,11 @@ static void set_defaults() {
   mu_cfg.quiet_level     = 0;      // quiet-hours = full mute by default
   mu_cfg.rxps_level      = 0;      // RXPS OFF by default (continuous RX, never miss an alert)
   mu_cfg.mute_follow_app = 0;      // default: our alerts are INDEPENDENT of the app's buzzer_quiet
+  mu_cfg.fall_sens         = MU_FALL_SENS_MED;   // medium sensitivity by default
+  mu_cfg.fall_mm           = 0;    // do NOT auto-forward to MeshManager unless enabled
+  mu_cfg.fall_prealarm_sec = 20;   // 20 s buzzer/cancel window before the alert is sent
+  // fall_target_used[]/fall_target_pub[] cleared by the memset above (no direct
+  // targets -> fall alert falls back to the sos/target recipient).
   for (int i = 0; i < MU_TUNE_COUNT; i++)
     mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;   // follow the global default
 
@@ -164,18 +212,31 @@ void mu_config_begin() {
     if (n > 0 && n <= (int)sizeof(tmp) && tmp.magic == MU_CFG_MAGIC &&
         tmp.version >= 1 && tmp.version <= MU_CFG_VERSION) {
       memcpy(&mu_cfg, &tmp, sizeof(mu_cfg));
+      // Forward migration: fields appended in newer versions arrived as zero (tmp
+      // was zeroed before the short read); back-fill them with documented defaults.
+      bool migrated = false;
       if (tmp.version < 2) {
-        // Migrate v1 -> v2: the appended fields came in as zero; give them the
-        // documented defaults instead (quiet = full mute, slots follow global).
+        // v1 -> v2: quiet = full mute, per-slot volume follows the global default.
         mu_cfg.quiet_level = 0;
         mu_cfg.rxps_level  = 0;
         mu_cfg.mute_follow_app = 0;
         for (int i = 0; i < MU_TUNE_COUNT; i++) mu_cfg.tune_vol[i] = MU_VOL_DEFAULT;
+        migrated = true;
+      }
+      if (tmp.version < 3) {
+        // v2 -> v3: fall-detection config defaults (medium sensitivity, 20 s
+        // pre-alarm, no direct targets/mm -> falls back to sos/target).
+        mu_cfg.fall_sens         = MU_FALL_SENS_MED;
+        mu_cfg.fall_mm           = 0;
+        mu_cfg.fall_prealarm_sec = 20;
+        memset(mu_cfg.fall_target_used, 0, sizeof(mu_cfg.fall_target_used));
+        memset(mu_cfg.fall_target_pub, 0, sizeof(mu_cfg.fall_target_pub));
+        migrated = true;
+      }
+      if (migrated) {
         mu_cfg.version = MU_CFG_VERSION;
         mu_cfg.size    = (uint16_t)sizeof(MuConfig);
-        loaded = true;
         mu_config_save();   // rewrite in the new layout
-        return;
       }
       loaded = true;
     }

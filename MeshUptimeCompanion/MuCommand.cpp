@@ -283,21 +283,128 @@ static void cmd_setkey(const MuCmdCtx& ctx, const char* args, bool is_sos) {
   mu_reply(ctx, "%s ingesteld", is_sos ? "sos" : "target");
 }
 
+static const char* fall_sens_name(uint8_t s) {
+  return s == MU_FALL_SENS_LOW ? "low" : s == MU_FALL_SENS_HIGH ? "high" : "med";
+}
+
+static void cmd_fall_status(const MuCmdCtx& ctx) {
+  const char* dest;
+  int nt = mu_fall_target_count();
+  if (nt > 0)                    dest = "lijst";
+  else if (mu_cfg.has_sos)       dest = "sos";
+  else if (mu_cfg.has_target)    dest = "target";
+  else                           dest = "geen";
+  mu_reply(ctx, "fall: %s sens=%s nomotion=%dmin prealarm=%ds",
+           mu_cfg.fall_enabled ? "on" : "off", fall_sens_name(mu_cfg.fall_sens),
+           mu_cfg.fall_nomotion_min, mu_cfg.fall_prealarm_sec);
+  mu_reply(ctx, "  targets=%d mm=%s fallback=%s accel=%s",
+           nt, mu_cfg.fall_mm ? "on" : "off", dest,
+           mu_fall_accel_present() ? "aanwezig" : "afwezig");
+  for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
+    if (!mu_cfg.fall_target_used[i]) continue;
+    char hex[2 * MU_PUB_LEN + 1];
+    mu_bytes_to_hex(mu_cfg.fall_target_pub[i], MU_PUB_LEN, hex);
+    hex[16] = 0;   // 8-byte prefix
+    mu_reply(ctx, "  t%d %s..", i, hex);
+  }
+}
+
+static void cmd_fall_target(const MuCmdCtx& ctx, const char* args) {
+  char sub[16];
+  const char* p = next_tok(args, sub, sizeof(sub), true);
+  if (!strcmp(sub, "list") || sub[0] == 0) {
+    int shown = 0;
+    for (int i = 0; i < MU_FALL_TARGET_MAX; i++) {
+      if (!mu_cfg.fall_target_used[i]) continue;
+      char hex[2 * MU_PUB_LEN + 1];
+      mu_bytes_to_hex(mu_cfg.fall_target_pub[i], MU_PUB_LEN, hex);
+      hex[16] = 0;
+      mu_reply(ctx, "t%d %s..", i, hex);
+      shown++;
+    }
+    if (!shown) mu_reply(ctx, "fall target: leeg (val valt terug op sos/target)");
+    return;
+  }
+  if (!strcmp(sub, "add")) {
+    char hex[80];
+    next_tok(p, hex, sizeof(hex), false);
+    uint8_t pub[MU_PUB_LEN];
+    if (!mu_hex_to_bytes(hex, pub, MU_PUB_LEN)) { mu_reply(ctx, "fall target add: 64 hex nodig"); return; }
+    if (mu_fall_target_add(pub)) { mu_config_save(); mu_reply(ctx, "fall target add: ok (%d/%d)", mu_fall_target_count(), MU_FALL_TARGET_MAX); }
+    else mu_reply(ctx, "fall target add: vol (max %d)", MU_FALL_TARGET_MAX);
+    return;
+  }
+  if (!strcmp(sub, "del")) {
+    char hex[80];
+    next_tok(p, hex, sizeof(hex), false);
+    int hl = strlen(hex);
+    if (hl < 2 || (hl & 1)) { mu_reply(ctx, "fall target del: hex-prefix nodig"); return; }
+    uint8_t pre[MU_PUB_LEN];
+    int plen = hl / 2;
+    if (plen > MU_PUB_LEN) plen = MU_PUB_LEN;
+    char tmp[2 * MU_PUB_LEN + 1];
+    strncpy(tmp, hex, plen * 2); tmp[plen * 2] = 0;
+    if (!mu_hex_to_bytes(tmp, pre, plen)) { mu_reply(ctx, "fall target del: bad hex"); return; }
+    int n = mu_fall_target_del_prefix(pre, plen);
+    mu_config_save();
+    mu_reply(ctx, "fall target del: %d verwijderd", n);
+    return;
+  }
+  mu_reply(ctx, "fall target add|list|del <64hex|prefix>");
+}
+
 static void cmd_fall(const MuCmdCtx& ctx, const char* args) {
   char a[16];
   const char* p = next_tok(args, a, sizeof(a), true);
-  if (!strcmp(a, "on"))  { mu_cfg.fall_enabled = 1; mu_config_save(); mu_reply(ctx, "fall: on"); }
-  else if (!strcmp(a, "off")) { mu_cfg.fall_enabled = 0; mu_config_save(); mu_reply(ctx, "fall: off"); }
-  else if (!strcmp(a, "nomotion")) {
+  if (a[0] == 0 || !strcmp(a, "status")) { cmd_fall_status(ctx); return; }
+  if (!strcmp(a, "on"))  { mu_cfg.fall_enabled = 1; mu_config_save(); mu_reply(ctx, "fall: on"); return; }
+  if (!strcmp(a, "off")) { mu_cfg.fall_enabled = 0; mu_config_save(); mu_reply(ctx, "fall: off"); return; }
+  if (!strcmp(a, "sens")) {
+    char b[8]; next_tok(p, b, sizeof(b), true);
+    uint8_t s;
+    if      (!strcmp(b, "low"))  s = MU_FALL_SENS_LOW;
+    else if (!strcmp(b, "med"))  s = MU_FALL_SENS_MED;
+    else if (!strcmp(b, "high")) s = MU_FALL_SENS_HIGH;
+    else { mu_reply(ctx, "fall sens low|med|high"); return; }
+    mu_cfg.fall_sens = s; mu_config_save();
+    mu_reply(ctx, "fall sens: %s", fall_sens_name(s));
+    return;
+  }
+  if (!strcmp(a, "nomotion")) {
     char m[8]; next_tok(p, m, sizeof(m), false);
     int mins = atoi(m);
     if (mins < 0 || mins > 1440) { mu_reply(ctx, "nomotion 0..1440 (0=uit)"); return; }
     mu_cfg.fall_nomotion_min = (uint16_t)mins;
     mu_config_save();
     mu_reply(ctx, "fall nomotion: %d min", mins);
-  } else {
-    mu_reply(ctx, "fall on|off | fall nomotion <min>");
+    return;
   }
+  if (!strcmp(a, "prealarm")) {
+    char s[8]; next_tok(p, s, sizeof(s), false);
+    int sec = atoi(s);
+    if (sec < 5 || sec > 120) { mu_reply(ctx, "prealarm 5..120 sec"); return; }
+    mu_cfg.fall_prealarm_sec = (uint16_t)sec;
+    mu_config_save();
+    mu_reply(ctx, "fall prealarm: %d sec", sec);
+    return;
+  }
+  if (!strcmp(a, "target")) { cmd_fall_target(ctx, p); return; }
+  if (!strcmp(a, "mm")) {
+    char b[8]; next_tok(p, b, sizeof(b), true);
+    if (!strcmp(b, "on"))  mu_cfg.fall_mm = 1;
+    else if (!strcmp(b, "off")) mu_cfg.fall_mm = 0;
+    else { mu_reply(ctx, "fall mm on|off (ook naar MeshManager)"); return; }
+    mu_config_save();
+    mu_reply(ctx, "fall mm: %s", mu_cfg.fall_mm ? "on" : "off");
+    return;
+  }
+  if (!strcmp(a, "test")) {
+    mu_fall_test();
+    mu_reply(ctx, "fall test: pre-alarm actief (%ds), knop annuleert", mu_cfg.fall_prealarm_sec);
+    return;
+  }
+  mu_reply(ctx, "fall on|off|status|sens|nomotion|prealarm|test|mm on|off");
+  mu_reply(ctx, "  fall target add|del|list <64hex>");
 }
 
 // ---- dispatcher ------------------------------------------------------------

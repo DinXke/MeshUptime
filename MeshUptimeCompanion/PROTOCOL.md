@@ -124,7 +124,15 @@ printed line on the serial console.
 | `!target <64hex>` | Set the recipient for button short-press (preset #1). |
 | `!sos <64hex>` | Set the recipient for button long-press SOS and fall alerts. |
 | `!fall on\|off` | Arm/disarm fall + no-motion detection. |
+| `!fall` / `!fall status` | Report fall config: enabled, sensitivity preset, no-motion minutes, pre-alarm seconds, target count + list (8-byte prefixes), `mm` state, the active fallback recipient, and whether the QMA6100P `accel` is present. |
+| `!fall sens low\|med\|high` | Sensitivity preset. Sets the free-fall + impact thresholds (see §5). `high` = easier to trigger, `low` = harder, `med` = the original defaults. |
 | `!fall nomotion <minutes>` | Dead-man no-motion timeout in minutes (`0` = off). |
+| `!fall prealarm <sec>` | Buzzer pre-alarm / button-cancel window before the alert is actually sent. Range `5..120`, default `20`. |
+| `!fall target add <64hex>` | Add a direct fall/SOS alert recipient (list, max 4). |
+| `!fall target del <hexprefix>` | Remove list entries matching the hex prefix. |
+| `!fall target list` | List the direct alert recipients (8-byte prefixes). |
+| `!fall mm on\|off` | Also send the fall/SOS `#LOC` report to the MeshUptime **node bot** (which forwards it to MeshManager). Separate toggle, **default off**. |
+| `!fall test` | Trigger the pre-alarm sequence now (buzzer + cancel window) without a real drop — a button press cancels it, exactly like a real detection. |
 | `!msgtune on\|off` | Enable/disable the subtle tune on plain (non-severity) DMs. **Default OFF.** When on it still respects `buzzer_quiet` (silent while the app is connected), unlike our severity alerts. |
 | `!help` | List commands. |
 
@@ -180,7 +188,7 @@ board's `buttonStateChanged()` edge helper.
 | Any press **while a tune/find is playing** | **Stops it immediately** (highest priority). If it was a DM-initiated `find`, a `gevonden` DM is sent back. Nothing else fires on release. |
 | Any press **during a fall pre-alarm** | **Cancels** the pending fall alert. Nothing else fires. |
 | **Short press** (idle) | Send preset **#1** ("ok/ack") to the `target` recipient. |
-| **Long press** (≥ 2 s, idle) | **SOS**: send a `#LOC <lat>,<lon> (SOS) <preset #2>` DM to the `sos` recipient — the `#LOC` token lets the MeshUptime node map the SOS. With no fix it wakes GPS and still sends `(SOS) <preset #2> (geen GPS-fix)` so the alert is never lost. |
+| **Long press** (≥ 2 s, idle) | **SOS**: send a `#LOC <lat>,<lon> (SOS) <preset #2>` DM (the `#LOC` token lets the MeshUptime node map the SOS) using the same routing as the fall alert — every `!fall target` (+ node bot when `!fall mm on`), falling back to the `sos`/`target` recipient. With no fix it wakes GPS and still sends `(SOS) <preset #2> (geen GPS-fix)` so the alert is never lost. |
 
 Preset cycling on short press is intentionally not implemented (documented
 deviation — kept simple; use `!preset`/`!target` to configure).
@@ -190,23 +198,39 @@ deviation — kept simple; use `!preset`/`!target` to configure).
 ## 5. Fall / no-motion detection (default OFF)
 
 Uses the on-board **QMA6100P** accelerometer (I2C, address probed 0x12/0x13,
-behind the `PIN_3V3_ACC_EN` rail). Two triggers:
+behind the `PIN_3V3_ACC_EN` rail; confirmed detected + firing on hardware). Two
+triggers:
 
-- **Fall**: a free-fall signature (magnitude < 0.5 g sustained ≥ 70 ms) followed
-  within ~1.2 s by an impact spike (> 2.5 g).
+- **Fall**: a free-fall signature (magnitude below the free-fall gate, sustained)
+  followed within ~1.2 s by an impact spike.
 - **No-motion / dead-man**: no significant motion (|magnitude − 1 g| > 0.20 g)
   for `fall nomotion <minutes>`.
 
-On a trigger the firmware enters a **30 s pre-alarm** (buzzer `H` + LED). A
-button press during that window cancels it. If not cancelled, it sends a
-machine-readable alert DM that starts with the `#LOC <lat>,<lon>` token followed
-by `(val) VAL gedetecteerd` or `(geen beweging) GEEN BEWEGING`, so the MeshUptime
-node can map it, to the `sos` recipient (falling back to `target`). With no GPS
-fix it wakes GPS and still sends the human alert (without the token) so it is
-never lost.
+The free-fall + impact thresholds come from the **sensitivity preset**
+(`!fall sens`), read at runtime from `mu_cfg`:
 
-The detection thresholds are **conservative placeholders and need on-device
-tuning**; the whole module ships **disabled** (`!fall on` to arm).
+| Preset | Free-fall gate | Sustained | Impact spike |
+|---|---|---|---|
+| `high` (easier) | < 0.60 g | ≥ 50 ms | > 2.0 g |
+| `med` (default) | < 0.50 g | ≥ 70 ms | > 2.5 g |
+| `low` (harder) | < 0.40 g | ≥ 90 ms | > 3.0 g |
+
+On a trigger the firmware enters a **pre-alarm** (buzzer `H` + LED) whose length
+is `!fall prealarm <sec>` (default 20 s, range 5–120). A button press during that
+window cancels it. `!fall test` starts the same pre-alarm on demand for a desk
+test. If not cancelled, it sends a machine-readable alert DM that starts with the
+`#LOC <lat>,<lon>` token followed by `(val) VAL gedetecteerd` or
+`(geen beweging) GEEN BEWEGING`, so the MeshUptime node can map it. It goes to
+**every configured direct target** (`!fall target add`, max 4) and — when
+`!fall mm on` — **also to the node bot** (which forwards to MeshManager). With no
+direct targets and `mm` off it falls back to the `sos` recipient (then `target`),
+so an alert is never silently dropped. With no GPS fix it wakes GPS and still
+sends the human alert (without the token). The manual **SOS** button (§4) uses the
+same target-list + `mm` routing.
+
+The detection thresholds are **placeholders and want on-device tuning** (per
+preset). The module still ships **disabled by default** (`!fall on` to arm); the
+user keeps it armed at runtime.
 
 This feature is a **backup of the backup**: it is **not certified**, best-effort,
 and **not a replacement for any internal/professional alarm system**. The reliable
@@ -317,7 +341,9 @@ Categories:
 2. **Alerts & ernst-mapping** — show slot→tune, assign preset per slot, msg-tune.
 3. **Knop & presets** — presets 1/2/3, target, sos.
 4. **Find-me** — start/stop.
-5. **Val-detectie** — arm/disarm, dead-man minutes (labelled *not certified*).
+5. **Val-detectie** — arm/disarm, sensitivity (low/med/high), dead-man minutes,
+   pre-alarm seconds, add/remove/list direct alert targets, MeshManager toggle
+   (`mm`), test the pre-alarm, status (labelled *not certified*).
 6. **Radio & Power** — show radio params; GPS mode; **RXPS** (with a missed-alert
    warning); **change radio params** and **restore the mesh preset**
    (869.618 / BW 62.5 / SF 8 / CR 8) — both behind an explicit **warning +

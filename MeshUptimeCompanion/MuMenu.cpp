@@ -110,7 +110,15 @@ static void draw_cat(int c) {
       P(" LET OP: niet-gecertificeerd, best-effort,");
       P(" geen vervanging voor een intern alarmsysteem.");
       P(" 1) val-detectie aan/uit");
-      P(" 2) geen-beweging (dead-man) minuten");
+      P(" 2) gevoeligheid (low|med|high)");
+      P(" 3) geen-beweging (dead-man) minuten");
+      P(" 4) pre-alarm/annuleer-venster (sec)");
+      P(" 5) alarm-doel toevoegen (64 hex)");
+      P(" 6) alarm-doel verwijderen (hex-prefix)");
+      P(" 7) toon alarm-doelen");
+      P(" 8) ook naar MeshManager (mm on|off)");
+      P(" 9) TEST pre-alarm nu (knop annuleert)");
+      P(" 0) status");
       break;
     case 6:
       P("== 6 Radio & Power ==");
@@ -222,7 +230,15 @@ static void handle_cat_item(int c, int n) {
       break;
     case 5:
       if (n == 1) begin_input(" fall on|off:", "fall ");
-      else if (n == 2) begin_input(" minuten (0=uit):", "fall nomotion ");
+      else if (n == 2) begin_input(" gevoeligheid low|med|high:", "fall sens ");
+      else if (n == 3) begin_input(" minuten (0=uit):", "fall nomotion ");
+      else if (n == 4) begin_input(" seconden 5-120:", "fall prealarm ");
+      else if (n == 5) begin_input(" pubkey 64 hex:", "fall target add ");
+      else if (n == 6) begin_input(" hex-prefix:", "fall target del ");
+      else if (n == 7) run_cli("fall target list");
+      else if (n == 8) begin_input(" mm on|off (ook naar MeshManager):", "fall mm ");
+      else if (n == 9) run_cli("fall test");
+      else if (n == 0) run_cli("fall status");
       else P(" ?");
       break;
     case 6:

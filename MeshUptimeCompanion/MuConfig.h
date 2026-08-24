@@ -27,8 +27,15 @@
 
 #define MU_VOL_DEFAULT 0xFF   // per-slot sentinel: "follow the global default vol"
 
+// Fall-detection sensitivity presets (see MuFall.cpp for the threshold tuples).
+#define MU_FALL_SENS_LOW  0   // harder to trigger
+#define MU_FALL_SENS_MED  1   // current/default thresholds
+#define MU_FALL_SENS_HIGH 2   // easier to trigger
+
+#define MU_FALL_TARGET_MAX 4  // direct-alert target pubkeys for fall/no-motion
+
 #define MU_CFG_MAGIC   0x3143554DUL   // "MUC1"
-#define MU_CFG_VERSION 2              // v2: per-slot volume + quiet-period level
+#define MU_CFG_VERSION 3              // v2: per-slot volume + quiet level; v3: fall config
 
 struct MuConfig {
   uint32_t magic;
@@ -63,6 +70,13 @@ struct MuConfig {
   uint8_t  tune_vol[MU_TUNE_COUNT];  // per-slot volume 0..3, or MU_VOL_DEFAULT
   uint8_t  rxps_level;      // RX power-saving: 0=off/continuous, 1=conservative, 2=balanced
   uint8_t  mute_follow_app; // 1 = our audio ALSO follows the app's buzzer_quiet; 0 (default) = independent
+
+  // --- v3 additive fields (fall-detection configurability) --------------------
+  uint8_t  fall_sens;           // MU_FALL_SENS_* sensitivity preset (default MED)
+  uint8_t  fall_mm;             // 1 = ALSO send fall alert to the node bot (-> MeshManager)
+  uint16_t fall_prealarm_sec;   // buzzer pre-alarm / button-cancel window before alert (s)
+  uint8_t  fall_target_used[MU_FALL_TARGET_MAX];         // slot occupied flags
+  uint8_t  fall_target_pub[MU_FALL_TARGET_MAX][MU_PUB_LEN]; // direct fall/SOS alert dests
 };
 
 extern MuConfig mu_cfg;
@@ -83,6 +97,14 @@ int    mu_allow_find(const uint8_t* pub);           // index or -1
 bool   mu_allow_is_admin(const uint8_t* pub);
 bool   mu_allow_add(const uint8_t* pub, bool admin); // false if full
 int    mu_allow_del_prefix(const uint8_t* prefix, int prefix_len); // count removed
+
+// Fall-target list helpers (direct fall/no-motion/SOS alert recipients).
+int    mu_fall_target_count();
+bool   mu_fall_target_add(const uint8_t* pub);      // false if full; dup = ok/no-op
+int    mu_fall_target_del_prefix(const uint8_t* prefix, int prefix_len); // count removed
+
+// The MeshUptime node bot pubkey (fall alert forwarding when `!fall mm on`).
+const uint8_t* mu_node_bot_pubkey();                // static MU_PUB_LEN bytes
 
 // hex helpers
 bool   mu_hex_to_bytes(const char* hex, uint8_t* out, int out_len);
