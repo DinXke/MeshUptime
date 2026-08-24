@@ -294,6 +294,14 @@ private:
   void handleChannelDel();
   void handleChannelToggle();
 
+  /* Companions (v2.4.0):
+   *  /companions.json (GET) : {companions:[{name,pubkey,lat,lon,seen}...]} -- ook
+   *                           bedoeld voor MeshManager om te pollen.
+   *  /companion (POST)      : key (64hex) + name toevoegen/wijzigen, of del=<prefix>=>12hex.
+   * Commando's naar een companion lopen via het bestaande /bot/sendto-endpoint. */
+  void handleCompanionsJson();
+  void handleCompanion();
+
   /* POST /mon/alarm -- per-sensor alarmroute (am) + room-set (rm) zetten. De
    * MeshManager-server stuurt hier de alarminstelling van een monitor naartoe.
    * Loopt via de bestaande CLI ('sensor set mon.<ch>.alert/rooms') zodat er geen
@@ -352,6 +360,8 @@ private:
   friend void web_route_channeladd();
   friend void web_route_channeldel();
   friend void web_route_channeltoggle();
+  friend void web_route_companionsjson();
+  friend void web_route_companion();
 };
 
 /* WiFi-instellingen uit SPIFFS (/wifi.cfg, twee regels: SSID en wachtwoord).

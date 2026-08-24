@@ -93,11 +93,22 @@
  *            (rood/oranje/groen) nu OOK vooraan de room-post-alerts, niet enkel de DM.
  *   v2.3.14 = bot-DM strípt nu een leidende '!'/'/' vóór het parsen -> "!play"/"!ping 1.1.1.1"
  *            worden correct herkend (verb "play"/"ping"), niet meer als "!play" genegeerd.
+ *   v2.4.0 = COMPANION-HUB OP DE NODE: een persistente companion-lijst
+ *            (/companions.cfg, cap 16: pubkey+naam+laatste lat/lon+last_seen).
+ *            Web-GUI-tab "companions" (beheer add/edit/del, commandoknoppen die
+ *            !find/!findstop/!loc/!mute/!vol/!tune/!quiet/!fall/!cfg/!ping/!play
+ *            als bot-DM sturen, en een Leaflet/OSM-kaartje met terugval naar
+ *            lat,lon-tekst). De node ontvangt #LOC-locatierapporten: een DM van
+ *            een BEKENDE companion is altijd een antwoord/rapport, nooit een
+ *            commando -> begint hij met "#LOC <lat>,<lon>" dan wordt de locatie
+ *            bewaard, anders stil aanvaard (geen "onbekend commando"-bounce meer
+ *            op companion-replies). /companions.json (auth) voor MeshManager.
+ *            Werkt ook als MeshManager plat ligt.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.14"
+  #define MESHUPTIME_VERSION   "v2.4.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

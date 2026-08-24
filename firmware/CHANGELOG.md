@@ -7,6 +7,53 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.4.0 — companion-hub op de node (beheer + locatie), werkt ook zonder MeshManager
+
+Companions (T1000-E e.d.) worden nu **rechtstreeks op de node** beheerd en gevolgd,
+zodat aansturen en locatie-opvolging blijven werken **ook als MeshManager plat ligt**.
+De bestaande notifier-bot ("BE-HSS-DinX-Bot") is de zendweg.
+
+**Companion-store (firmware).** Een persistente lijst in **`/companions.cfg`** (cap
+**16**), elk `{ pubkey[32], naam[24], last_lat, last_lon, last_seen }`. Additief
+opgeslagen (regelformaat `c <pubkeyhex> <lat> <lon> <seen> <naam>`, header `#MUCOMP1`);
+de identiteitsopslag wordt niet aangeraakt. Er wordt niets voorgeseeded. Add/edit
+(zelfde pubkey → naam bijwerken, locatie blijft) / delete-op-prefix.
+
+**Web-GUI-tab "companions".** Zichtbaar op room-nodes. Toont per companion naam,
+pubkey-prefix en laatst bekende locatie + ouderdom. Toevoegen/wijzigen met naam +
+64-hex pubkey (kiezer uit gehoorde contacten of plakken). Een **commandopaneel** met
+knoppen die het bijbehorende `!`-commando als **bot-DM** naar de gekozen companion
+sturen (via het bestaande `/bot/sendto`-pad): **Find** (`!find`), **Stop-find**
+(`!findstop`), **Locate** (`!loc`), **Mute** (`!mute on|off`), **Volume**
+(`!vol <0-3>`), **Tune-per-ernst** (`!tune <H|M|L> preset <naam>`), **Quiet**
+(`!quiet …`), **Fall** (`!fall on|off`), **Config** (`!cfg`), **Ping** (`!ping`),
+**Play** (`!play <naam>`). Een **kaartje** (Leaflet + OSM-tiles van de CDN
+`unpkg.com`) tekent de posities zodra er coördinaten zijn; **zonder internet** valt
+de GUI terug op `lat,lon`-tekst + een OpenStreetMap-link per companion. Alle uitleg
+zit achter de bestaande "?"-declutter.
+
+**#LOC-locatierapporten + geen "onbekend"-bounce meer (firmware).** Een companion is
+een apparaat dat wij aansturen; z'n inkomende DM's zijn **antwoorden/rapporten**
+("play: coin", "Pong", een `#LOC`-rapport), nooit commando's aan ons. In
+`handleBotDm` (RoomMesh.cpp) draait een DM van een **bekende companion** daarom nooit
+het commando-/"onbekend"-pad meer:
+
+- begint de DM met **`#LOC <lat>,<lon>`** (decimale graden) → parse en werk
+  `last_lat`/`last_lon`/`last_seen` van die companion bij;
+- **elk ander** companion-antwoord → **stil aanvaard** (geen tekstantwoord).
+
+In beide gevallen wordt wel op transportniveau ge-ACK't zodat de companion niet blijft
+herzenden. Dit stopt meteen de spammy "onbekend commando"-bounce op companion-replies.
+
+**HTTP `/companions.json` (auth).** `{ "max": N, "companions": [ { name, pubkey, lat,
+lon, seen } … ] }` (lat/lon ontbreken zolang er geen locatie is), zodat MeshManager de
+companion-lijst + laatste posities kan pollen. Auth zoals de andere endpoints; alleen
+publieke pubkeys, nooit geheimen.
+
+Alleen de room-variant heeft companions; de sensor-variant laat de IWebNode-standaarden
+staan (`webCompanionMax()==0`) en `/companions.json` geeft een lege lijst, `/companion`
+antwoordt `501`.
+
 ## v2.3.11 — per-monitor ernst + ernst-emoji vooraan de alert-DM (companion-buzzer)
 
 Een companion (T1000-E) die naast de node hangt, moet aan een **binnenkomende

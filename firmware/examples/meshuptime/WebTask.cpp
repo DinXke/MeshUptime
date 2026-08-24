@@ -472,6 +472,8 @@ void web_route_channelsjson() { if (g_self) g_self->handleChannelsJson(); }
 void web_route_channeladd()   { if (g_self) g_self->handleChannelAdd(); }
 void web_route_channeldel()   { if (g_self) g_self->handleChannelDel(); }
 void web_route_channeltoggle(){ if (g_self) g_self->handleChannelToggle(); }
+void web_route_companionsjson(){ if (g_self) g_self->handleCompanionsJson(); }
+void web_route_companion()    { if (g_self) g_self->handleCompanion(); }
 
 /* ------------------------------ hulpmiddelen ------------------------------ */
 
@@ -965,6 +967,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button id="tabrooms" data-p="4" hidden>rooms</button>
 <button id="tabsnodes" data-p="5" hidden>sensor-nodes</button>
 <button id="tabbot" data-p="6" hidden>bot</button>
+<button id="tabcomp" data-p="7" hidden>companions</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -1885,6 +1888,73 @@ secret wordt hier niet teruggetoond. Zet een kanaal op <b>uit</b> om te stoppen 
 meelezen zonder het te wissen.</p>
 </section>
 
+<section id="p7" hidden>
+<h2>Companions &mdash; beheer + laatst bekende locatie</h2>
+<p class="why"><b>Waarom op de node:</b> companions (T1000-E e.d.) worden hier
+rechtstreeks op de node beheerd, zodat aansturen en locatie-opvolging blijven
+werken <i>ook als MeshManager plat ligt</i>. De knoppen sturen het bijhorende
+<code>!</code>-commando als schone bot-DM naar de companion (via dezelfde weg als
+&lsquo;stuur DM&rsquo;). De companion antwoordt op <code>!loc</code>/SOS/val met een
+DM die begint met <code>#LOC&nbsp;&lt;lat&gt;,&lt;lon&gt;</code>; de node vangt dat
+op, werkt de laatst bekende locatie bij en bounced niet meer met
+&lsquo;onbekend commando&rsquo;.</p>
+
+<div class="card pad0"><table id="cml"></table></div>
+<div class="frow" style="margin-top:.4rem">
+<select id="cm-pick" style="width:auto" title="kies uit gehoorde contacten"><option value="">&mdash; uit gehoorde contacten &mdash;</option></select>
+<input id="cm-name" placeholder="naam" maxlength="23" spellcheck="false" style="width:9rem">
+<input id="cm-pub" placeholder="volledige pubkey (64 hex)" maxlength="64" spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="cm-add">opslaan</button></div>
+<div id="cmaddmsg"></div>
+<p class="note">Toevoegen/wijzigen vraagt de <b>volledige</b> pubkey (het gedeelde
+geheim wordt eruit berekend) en een naam; kies uit de <b>gehoorde contacten</b> of
+plak de sleutel. Een bestaande companion (zelfde pubkey) wordt bijgewerkt, de
+locatie blijft. Verwijderen mag op een prefix (&ge;12 hex). Cap: 16 companions.</p>
+
+<h2>Commando's &mdash; naar de gekozen companion</h2>
+<div class="card">
+<div class="frow"><label style="align-self:center;color:var(--muted);font-size:.85rem">Companion:</label>
+<select id="cm-cmd-pick" style="flex:1;min-width:12rem"><option value="">&mdash; kies een companion &mdash;</option></select></div>
+<div class="quick" style="margin-top:.5rem">
+<button type="button" onclick="cmCmd('!find')">Find</button>
+<button type="button" onclick="cmCmd('!findstop')">Stop-find</button>
+<button type="button" onclick="cmCmd('!loc')">Locate</button>
+<button type="button" onclick="cmCmd('!ping')">Ping</button>
+<button type="button" onclick="cmCmd('!cfg')">Config</button>
+<button type="button" onclick="cmCmd('!mute on')">Mute aan</button>
+<button type="button" onclick="cmCmd('!mute off')">Mute uit</button>
+<button type="button" onclick="cmCmd('!fall on')">Fall aan</button>
+<button type="button" onclick="cmCmd('!fall off')">Fall uit</button></div>
+<div class="frow" style="margin-top:.5rem">
+<label style="align-self:center">Volume<select id="cm-vol" style="width:auto;margin-left:.3rem"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
+<button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vol').value)">stuur vol</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Play<input id="cm-play" placeholder="preset" maxlength="20" style="width:8rem;margin-left:.3rem"></label>
+<button type="button" onclick="cmCmd('!play '+document.getElementById('cm-play').value.trim())">stuur play</button></div>
+<div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Tune<select id="cm-tsev" style="width:auto;margin-left:.3rem"><option value="H">H (hoog)</option><option value="M">M (midden)</option><option value="L">L (laag)</option></select></label>
+<input id="cm-tpreset" placeholder="preset-naam" maxlength="20" style="width:8rem">
+<button type="button" onclick="cmCmd('!tune '+document.getElementById('cm-tsev').value+' preset '+document.getElementById('cm-tpreset').value.trim())">stuur tune</button></div>
+<div class="frow" style="margin-top:.4rem">
+<input id="cm-quiet" placeholder="quiet-argument (bv. 22:00-07:00)" maxlength="30" style="flex:1;min-width:10rem">
+<button type="button" onclick="cmCmd('!quiet '+document.getElementById('cm-quiet').value.trim())">stuur quiet</button></div>
+<div id="cmcmdmsg"></div>
+<p class="note">Elke knop stuurt het <code>!</code>-commando als bot-DM naar de
+gekozen companion. <b>Find</b>/<b>Stop-find</b> laten de companion piepen/knipperen,
+<b>Locate</b> vraagt een <code>#LOC</code>-antwoord (dat hierboven de locatie
+bijwerkt), <b>Vol</b> 0&ndash;3, <b>Tune</b> koppelt een buzzer-preset aan een
+ernst (H/M/L), <b>Play</b> speelt een preset af. Wat de companion precies begrijpt
+hangt van z'n eigen firmware af &mdash; de node stuurt het commando alleen door.</p>
+
+<h2>Kaart &mdash; laatst bekende posities</h2>
+<div id="cm-map" style="height:18rem;border-radius:8px;overflow:hidden;display:none"></div>
+<div id="cm-maptext"></div>
+<p class="note">De kaart (OpenStreetMap via Leaflet) verschijnt zodra minstens één
+companion een locatie heeft. Leaflet komt van een CDN en werkt dus alleen als de
+browser internet heeft; zonder internet valt dit terug op <code>lat,lon</code> als
+tekst met een OpenStreetMap-link per companion.</p>
+</section>
+
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
      encoder-kern en geminifieerd. Client-side, geen externe asset, geen C-lib in de
      flash. De matrix is byte-identiek geverifieerd t.o.v. de volledige lib. -->
@@ -2615,11 +2685,12 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=6;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+for(var k=1;k<=7;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
 if(p=="3"){cfg()}
 if(p=="4"){roomsLoad();refreshPickers()}
 if(p=="5"){snodesLoad();refreshPickers()}
-if(p=="6"){botLoad()}}}
+if(p=="6"){botLoad()}
+if(p=="7"){companionsLoad()}}}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -3201,7 +3272,8 @@ if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
 function roomsProbe(){roomsGet().then(function(d){
 var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0);
 var ts=document.getElementById("tabsnodes");if(ts)ts.hidden=!(d&&d.snode_max>0);
-var tb=document.getElementById("tabbot");if(tb)tb.hidden=!(d&&d.max>0)})
+var tb=document.getElementById("tabbot");if(tb)tb.hidden=!(d&&d.max>0);
+var tc=document.getElementById("tabcomp");if(tc)tc.hidden=!(d&&d.max>0)})
 .catch(function(){})}
 
 function roomsLoad(){roomsGet().then(function(d){
@@ -3446,9 +3518,10 @@ o.textContent=nm+" · "+c.k.slice(0,6)+"… ("+c.t+","+c.h+"h)";sel.appendChild(
 function bindPicker(pickId,inId){var sel=document.getElementById(pickId);if(!sel)return;
 sel.onchange=function(){var v=sel.value;if(v){var i=document.getElementById(inId);if(i)i.value=v}}}
 function refreshPickers(){contactsGet().then(function(){
-["racl-pick","sacl-pick","bot-pick","bot-sto-pick"].forEach(fillPicker)})}
+["racl-pick","sacl-pick","bot-pick","bot-sto-pick","cm-pick"].forEach(fillPicker)})}
 bindPicker("racl-pick","racl-pub");bindPicker("sacl-pick","sacl-pub");
 bindPicker("bot-pick","bot-pub-in");bindPicker("bot-sto-pick","bot-sto-key");
+bindPicker("cm-pick","cm-pub");
 
 /* ============================== bot (chat/notifier) =========================
    Alles praat met /bot.json en de /bot/* endpoints. Zichtbaar op room-nodes. */
@@ -3683,6 +3756,103 @@ u2();setInterval(u2,5000);
 u3();setInterval(u3,20000);
 cfg();
 roomsProbe();
+
+/* ============================== companions (v2.4.0) =======================
+   Beheer + laatst bekende locatie. Praat met /companions.json en /companion;
+   commando's gaan via /bot/sendto (dezelfde weg als de bot-DM). Room-nodes. */
+var CMP=[],CMMAP=null,CMLAYER=null,CMLEAFLET=0;
+function cmMsg(id,t,ok){rmsg(id,t,ok)}
+function companionsGet(){return fetch("companions.json",{credentials:"include"})
+.then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
+function companionsLoad(){refreshPickers();companionsGet().then(function(d){
+if(!d)return;CMP=d.companions||[];cmRender();cmFillCmdPick();cmMap()})
+.catch(function(){cmMsg("cmaddmsg","kon companions niet laden",0)})}
+function cmAge(s){if(!s)return"—";var now=Math.floor(Date.now()/1000);var a=now-s;if(a<0)a=0;
+if(a<90)return a+"s";if(a<5400)return Math.round(a/60)+"m";if(a<172800)return Math.round(a/3600)+"u";return Math.round(a/86400)+"d"}
+function cmRender(){var e=document.getElementById("cml");e.innerHTML="";
+var h=e.insertRow();["naam","pubkey","locatie","",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+CMP.forEach(function(g){var r=e.insertRow();
+r.insertCell().textContent=g.name||"—";
+var c=r.insertCell();c.className="key";c.textContent=g.pubkey.slice(0,8)+"…"+g.pubkey.slice(-4);
+c.title=g.pubkey+"  (klik om te kopiëren)";
+c.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(g.pubkey)};
+c=r.insertCell();
+if(g.lat!=null&&g.lon!=null){var a=document.createElement("a");
+a.href="https://www.openstreetmap.org/?mlat="+g.lat+"&mlon="+g.lon+"#map=16/"+g.lat+"/"+g.lon;
+a.target="_blank";a.rel="noopener";a.textContent=g.lat.toFixed(5)+","+g.lon.toFixed(5);
+c.appendChild(a);c.appendChild(document.createTextNode(" · "+cmAge(g.seen)))}
+else{c.textContent="(geen)";c.style.color="var(--muted)"}
+c=r.insertCell();c.className="acts";var b=document.createElement("button");b.textContent="cmd";
+b.title="kies in het commandopaneel";b.onclick=function(){
+var p=document.getElementById("cm-cmd-pick");p.value=g.pubkey;
+cmMsg("cmcmdmsg","companion gekozen: "+(g.name||g.pubkey.slice(0,8)),1)};c.appendChild(b);
+c=r.insertCell();c.className="acts";var d2=document.createElement("button");d2.textContent="wis";
+d2.onclick=function(){cmDel(g.pubkey)};c.appendChild(d2)});
+if(!CMP.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=5;
+c.textContent="(nog geen companions — voeg er een toe)";c.style.color="var(--muted)"}}
+function cmFillCmdPick(){var s=document.getElementById("cm-cmd-pick");if(!s)return;
+var cur=s.value;while(s.options.length>1)s.remove(1);
+CMP.forEach(function(g){var o=document.createElement("option");o.value=g.pubkey;
+o.textContent=(g.name||g.pubkey.slice(0,8))+" · "+g.pubkey.slice(0,6)+"…";s.appendChild(o)});
+s.value=cur}
+function cmAdd(){var pub=document.getElementById("cm-pub").value.trim();
+var nm=document.getElementById("cm-name").value.trim();
+if(pub.length!=64){cmMsg("cmaddmsg","volledige pubkey (64 hex) nodig",0);return}
+fetch("companion",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"key="+encodeURIComponent(pub)+"&name="+encodeURIComponent(nm)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){document.getElementById("cm-pub").value="";document.getElementById("cm-name").value="";
+var pk=document.getElementById("cm-pick");if(pk)pk.value="";
+cmMsg("cmaddmsg","opgeslagen",1);companionsLoad()}
+else cmMsg("cmaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){cmMsg("cmaddmsg","mislukt",0)})}
+function cmDel(pub){if(!confirm("Companion "+pub.slice(0,8)+"… verwijderen?"))return;
+fetch("companion",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"del="+encodeURIComponent(pub)})
+.then(function(r){return r.json()}).then(function(j){
+if(j.ok){cmMsg("cmaddmsg","companion weg",1);companionsLoad()}
+else cmMsg("cmaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){cmMsg("cmaddmsg","mislukt",0)})}
+function cmCmd(cmd){var pub=document.getElementById("cm-cmd-pick").value;
+if(!pub){cmMsg("cmcmdmsg","kies eerst een companion",0);return}
+if(!cmd||!cmd.trim()){cmMsg("cmcmdmsg","leeg commando",0);return}
+fetch("bot/sendto",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)})
+.then(function(r){return r.json()}).then(function(j){
+cmMsg("cmcmdmsg",j.ok?("verstuurd: "+cmd):("mislukt: "+(j.error||"")),j.ok?1:0)})
+.catch(function(){cmMsg("cmcmdmsg","mislukt",0)})}
+document.getElementById("cm-add").onclick=cmAdd;
+/* Leaflet lui laden van de CDN; faalt dat (offline), dan blijft de tekstlijst. */
+function cmLoadLeaflet(cb){if(window.L){cb(true);return}
+if(CMLEAFLET==2){cb(false);return}
+if(CMLEAFLET==1){setTimeout(function(){cmLoadLeaflet(cb)},300);return}
+CMLEAFLET=1;
+var css=document.createElement("link");css.rel="stylesheet";
+css.href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";document.head.appendChild(css);
+var s=document.createElement("script");s.src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+s.onload=function(){CMLEAFLET=0;cb(!!window.L)};
+s.onerror=function(){CMLEAFLET=2;cb(false)};document.head.appendChild(s)}
+function cmMap(){var locs=CMP.filter(function(g){return g.lat!=null&&g.lon!=null});
+var md=document.getElementById("cm-map"),mt=document.getElementById("cm-maptext");
+if(!locs.length){md.style.display="none";mt.textContent="(nog geen locaties)";mt.style.color="var(--muted)";return}
+mt.textContent="";mt.style.color="";
+cmLoadLeaflet(function(ok){
+if(!ok||!window.L){md.style.display="none";var html="";
+locs.forEach(function(g){html+='<div style="margin:.15rem 0">'+(g.name||g.pubkey.slice(0,8))+
+': <a target="_blank" rel="noopener" href="https://www.openstreetmap.org/?mlat='+g.lat+'&mlon='+g.lon+
+'#map=16/'+g.lat+'/'+g.lon+'">'+g.lat.toFixed(5)+','+g.lon.toFixed(5)+'</a> · '+cmAge(g.seen)+'</div>'});
+mt.innerHTML=html;return}
+md.style.display="block";
+if(!CMMAP){CMMAP=L.map("cm-map");L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+{maxZoom:19,attribution:"© OpenStreetMap"}).addTo(CMMAP)}
+if(CMLAYER)CMMAP.removeLayer(CMLAYER);
+CMLAYER=L.layerGroup().addTo(CMMAP);var pts=[];
+locs.forEach(function(g){var m=L.marker([g.lat,g.lon]).addTo(CMLAYER);
+m.bindPopup((g.name||g.pubkey.slice(0,8))+"<br>"+g.lat.toFixed(5)+","+g.lon.toFixed(5)+" · "+cmAge(g.seen));
+pts.push([g.lat,g.lon])});
+if(pts.length==1)CMMAP.setView(pts[0],15);else CMMAP.fitBounds(pts,{padding:[30,30]});
+setTimeout(function(){CMMAP.invalidateSize()},120)})}
 
 /* ===================== declutter: uitleg achter een "?" =====================
    CONSISTENT over ALLE panelen: elke .why/.note-uitleg wordt bij het laden in
@@ -3925,6 +4095,10 @@ void WebTask::routes() {
   _server->on("/channel/add", HTTP_POST, web_route_channeladd);
   _server->on("/channel/del", HTTP_POST, web_route_channeldel);
   _server->on("/channel/toggle", HTTP_POST, web_route_channeltoggle);
+  /* Companions (v2.4.0): leeskant /companions.json (GET, ook voor MeshManager),
+   * mutaties via /companion (POST: key+name toevoegen/wijzigen, of del=prefix). */
+  _server->on("/companions.json", HTTP_GET, web_route_companionsjson);
+  _server->on("/companion", HTTP_POST, web_route_companion);
   _server->onNotFound([]() { g_server.send(404, "text/plain", "niet gevonden"); });
 }
 
@@ -5543,6 +5717,71 @@ void WebTask::handleContactsJson() {
   strlcat(g_json, "]}", sizeof(g_json));
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
+}
+
+/* GET /companions.json -- {max, companions:[{name,pubkey,lat,lon,seen}...]}.
+ * seen = RTC-tijd (s) van het laatste #LOC-rapport (0 = nooit); lat/lon ontbreken
+ * zolang er geen locatie is. Bedoeld voor de GUI én voor MeshManager om te pollen.
+ * Auth zoals de andere endpoints; alleen publieke pubkeys, nooit geheimen. */
+void WebTask::handleCompanionsJson() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return; }
+
+  int max = _acl->webCompanionMax();
+  int n = snprintf(g_json, sizeof(g_json), "{\"max\":%d,\"companions\":[", max);
+  int cnt = _acl->webCompanionCount();
+  char pub[PUB_KEY_SIZE * 2 + 1];
+  char nm[24], esc[64];
+  float lat = NAN, lon = NAN; uint32_t seen = 0; bool hasloc = false;
+  bool first = true;
+  for (int i = 0; i < cnt; i++) {
+    if ((size_t)n > sizeof(g_json) - 160) break;
+    if (!_acl->webCompanionGet(i, nm, sizeof(nm), pub, sizeof(pub), &lat, &lon, &seen, &hasloc)) continue;
+    jsonEscape(nm, esc, sizeof(esc));
+    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"name\":\"%s\",\"pubkey\":\"%s\",\"seen\":%u",
+                  first ? "" : ",", esc, pub, (unsigned)seen);
+    if (hasloc)
+      n += snprintf(g_json + n, sizeof(g_json) - n, ",\"lat\":%.6f,\"lon\":%.6f", lat, lon);
+    n += snprintf(g_json + n, sizeof(g_json) - n, "}");
+    first = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /companion -- toevoegen/wijzigen (key=64hex + name) of verwijderen
+ * (del=prefix>=12hex). Companions leven alleen op de room-server. */
+void WebTask::handleCompanion() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return; }
+  if (_acl->webCompanionMax() == 0) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"deze node kent geen companions (sensor-variant)\"}");
+    return;
+  }
+
+  char del[PUB_KEY_SIZE * 2 + 1];
+  if (getArg(*_server, "del", del, sizeof(del)) && del[0]) {
+    int r = _acl->webCompanionDel(del);
+    if (r == 1) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+    _server->send(400, "application/json",
+        r == -3 ? "{\"ok\":false,\"error\":\"prefix past op meerdere\"}"
+                : "{\"ok\":false,\"error\":\"niet gevonden of ongeldige prefix\"}");
+    return;
+  }
+  char key[PUB_KEY_SIZE * 2 + 1];
+  if (!getArg(*_server, "key", key, sizeof(key)) || strlen(key) != PUB_KEY_SIZE * 2) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
+    return;
+  }
+  char name[24];
+  if (!getArg(*_server, "name", name, sizeof(name))) name[0] = 0;
+  int r = _acl->webCompanionSet(key, name);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  _server->send(400, "application/json",
+      r == -3 ? "{\"ok\":false,\"error\":\"companionlijst vol\"}"
+              : "{\"ok\":false,\"error\":\"volledige pubkey (64 hex) nodig\"}");
 }
 
 /* Kleine guard: bestaat er een bot op deze node? (SensorMesh: nee.) */

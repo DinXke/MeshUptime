@@ -145,6 +145,13 @@
   #define BOT_NAME_DEFAULT   "BE-HSS-DinX-Bot"
 #endif
 
+/* COMPANIONS (v2.4.0). Een persistente lijst van companion-apparaten (T1000-E
+ * e.d.): de bot stuurt hen `!`-commando's (find/loc/mute/...) als DM en de node
+ * ontvangt hun #LOC-locatierapporten terug. 16 ingangen, elk ~72 byte. */
+#ifndef MAX_COMPANIONS
+  #define MAX_COMPANIONS  16
+#endif
+
 /* HASHTAG-/PUBLIEKE KANALEN die de bot meeleest. Een MeshCore group-channel is een
  * gedeeld geheim (16 of 32 byte); de kanaal-hash = eerste byte van sha256(secret).
  * De bot antwoordt IN het kanaal op ping/test/path. Bescheiden aantal i.v.m. RAM. */
@@ -292,6 +299,19 @@ struct AlertTask {
 struct BotRecip {
   uint8_t pub_key[PUB_KEY_SIZE];
   uint8_t level;               // 0 = vrije ingang; >=1 = actief
+};
+
+/* Eén companion (v2.4.0). pub_key = de VOLLEDIGE pubkey (nodig voor het ECDH-
+ * geheim bij het versturen van commando's). last_lat/last_lon = de laatst
+ * ontvangen locatie (uit een #LOC-DM), NAN als er nog geen is; last_seen = de
+ * RTC-tijd (s) van dat rapport. used=false is een vrije ingang. */
+struct Companion {
+  uint8_t  pub_key[PUB_KEY_SIZE];
+  char     name[24];
+  float    last_lat;
+  float    last_lon;
+  uint32_t last_seen;
+  bool     used;
 };
 
 /* Eén hashtag-/publiek kanaal dat de bot meeleest. secret = het gedeelde
@@ -457,6 +477,14 @@ public:
   }
   int  webChannelDel(const char* name) override    { return channelDel(name); }
   int  webChannelToggle(const char* name, int enabled) override { return channelSetEnabled(name, enabled != 0); }
+
+  /* ---- IWebNode: companions (v2.4.0) ---- */
+  int  webCompanionMax() override   { return MAX_COMPANIONS; }
+  int  webCompanionCount() override { return companionCount(); }
+  bool webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
+                       float* lat, float* lon, uint32_t* seen, bool* has_loc) override;
+  int  webCompanionSet(const char* pub_hex, const char* name) override;
+  int  webCompanionDel(const char* prefix_hex) override;
 
   /* ---- Bot: publieke API (CLI + intern) ---- */
   bool botActive() const { return _bot_active; }
@@ -630,6 +658,10 @@ private:
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
   BotChannel    _channels[MAX_CHANNELS];
 
+  /* Companions (v2.4.0): de bot stuurt hen `!`-commando's, de node ontvangt hun
+   * #LOC-locatierapporten. Persistent in /companions.cfg (zie Companion). */
+  Companion     _companions[MAX_COMPANIONS];
+
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
   RoomSlot&     activeSlot()          { return _active_snode >= 0 ? snodes[_active_snode] : rooms[_active_slot]; }
@@ -695,6 +727,19 @@ private:
   void          loadOrCreateBotIdentity();
   void          saveBotRecips();
   void          loadBotRecips();
+
+  /* ---- companions (v2.4.0) ---- */
+  int           companionCount() const;
+  int           companionFindByPub(const uint8_t* pubkey) const;   // -1 = niet gevonden
+  int           companionFindFree() const;                         // -1 = vol
+  /* Toevoegen/bijwerken: VOLLEDIGE pubkey + naam. Bestaat de pubkey al -> naam
+   * bijwerken (locatie blijft). 0 ok, -3 vol. */
+  int           companionSet(const uint8_t* pubkey, const char* name);
+  int           companionDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet, -3 dubbel
+  /* Locatie van een companion bijwerken (uit een #LOC-DM). */
+  void          companionUpdateLoc(int idx, float lat, float lon, uint32_t seen);
+  void          saveCompanions();
+  void          loadCompanions();
   /* Zend-diagnose-achtervoegsel opbouwen binnen `budget` bytes; retour = lengte.
    * `kind`: 0=ping, 1=test, 2=path (bepaalt of het masker dit type toelaat). */
   size_t        buildTxDiag(char* out, size_t cap, size_t budget,

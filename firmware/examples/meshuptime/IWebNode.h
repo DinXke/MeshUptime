@@ -184,4 +184,25 @@ public:
                                  { (void)name; (void)secret_hex; (void)enabled; return -1; }
   virtual int  webChannelDel(const char* name)          { (void)name; return -1; }
   virtual int  webChannelToggle(const char* name, int enabled) { (void)name; (void)enabled; return -1; }
+
+  /* ---- COMPANIONS (web-GUI, v2.4.0) -----------------------------------------
+   * Companion-apparaten (T1000-E e.d.) die de bot aanstuurt en waarvan de node
+   * #LOC-locatierapporten ontvangt. Alleen de room-server (RoomMesh) implementeert
+   * dit; SensorMesh laat de standaarden staan (webCompanionMax()==0). De pubkey is
+   * publiek; commando's gaan via het bestaande botSendTo-pad (/bot/sendto). */
+  virtual int  webCompanionMax()   { return 0; }   // 0 = geen companions op deze node
+  virtual int  webCompanionCount() { return 0; }
+  /* Leest companion i: naam, pubkey (64 hex), lat/lon (NAN als onbekend), seen (RTC
+   * s, 0 = nooit). has_loc=true als er een geldige locatie is. */
+  virtual bool webCompanionGet(int i, char* name, size_t name_len, char* pub64,
+                               size_t pub_len, float* lat, float* lon,
+                               uint32_t* seen, bool* has_loc)
+                               { (void)i; (void)name; (void)name_len; (void)pub64;
+                                 (void)pub_len; (void)lat; (void)lon; (void)seen;
+                                 (void)has_loc; return false; }
+  /* Toevoegen/bijwerken op VOLLEDIGE pubkey (64 hex) + naam. 0 ok, <0 fout. */
+  virtual int  webCompanionSet(const char* pub_hex, const char* name)
+                               { (void)pub_hex; (void)name; return -1; }
+  /* Verwijderen op prefix (>= 12 hex). 1 ok, <0 fout. */
+  virtual int  webCompanionDel(const char* prefix_hex) { (void)prefix_hex; return -1; }
 };

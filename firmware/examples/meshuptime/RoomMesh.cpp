@@ -56,6 +56,9 @@
 #define BOT_ID_NAME      "/bot_id"
 #define BOT_RECIPS_PATH  "/bot_recips"
 #define CHANNELS_CFG_PATH "/channels.cfg"
+/* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
+ * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
+#define COMPANIONS_PATH  "/companions.cfg"
 /* De vaste, publiek bekende sleutel van het MeshCore-standaardkanaal "Public"
  * (docs/faq.md + qr_codes.md). Een naam-only kanaal "public" krijgt DEZE sleutel
  * (niet sha256("public")), zodat de node op het ECHTE publieke kanaal uitkomt. */
@@ -248,6 +251,9 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   /* Hashtag-/publieke kanalen die de bot meeleest (persistent, /channels.cfg). */
   loadChannels();
+
+  /* Companions (v2.4.0): persistente lijst in /companions.cfg. Seed niets. */
+  loadCompanions();
 
   /* Alleen room 0's ACL wordt bewaard (in het bestaande contacts-bestand); de
    * ACL's van de extra rooms en de sensor-nodes leven in RAM en worden opnieuw
@@ -1759,6 +1765,181 @@ void RoomMesh::loadBotRecips() {
   f.close();
 }
 
+/* ================================================================== */
+/*  Companions (v2.4.0): lijst, locatie-updates en persistentie        */
+/* ================================================================== */
+
+int RoomMesh::companionCount() const {
+  int n = 0;
+  for (int i = 0; i < MAX_COMPANIONS; i++) if (_companions[i].used) n++;
+  return n;
+}
+
+int RoomMesh::companionFindByPub(const uint8_t* pubkey) const {
+  if (!pubkey) return -1;
+  for (int i = 0; i < MAX_COMPANIONS; i++)
+    if (_companions[i].used && memcmp(_companions[i].pub_key, pubkey, PUB_KEY_SIZE) == 0)
+      return i;
+  return -1;
+}
+
+int RoomMesh::companionFindFree() const {
+  for (int i = 0; i < MAX_COMPANIONS; i++) if (!_companions[i].used) return i;
+  return -1;
+}
+
+/* Toevoegen of bijwerken. Bestaat de pubkey al -> alleen de naam bijwerken; de
+ * laatst bekende locatie blijft dan staan. 0 ok, -3 vol. */
+int RoomMesh::companionSet(const uint8_t* pubkey, const char* name) {
+  int idx = companionFindByPub(pubkey);
+  if (idx < 0) {
+    idx = companionFindFree();
+    if (idx < 0) return -3;
+    memcpy(_companions[idx].pub_key, pubkey, PUB_KEY_SIZE);
+    _companions[idx].last_lat = NAN;
+    _companions[idx].last_lon = NAN;
+    _companions[idx].last_seen = 0;
+    _companions[idx].used = true;
+  }
+  if (name && name[0]) StrHelper::strncpy(_companions[idx].name, name, sizeof(_companions[idx].name));
+  else if (!_companions[idx].name[0]) {
+    char hx[13]; mesh::Utils::toHex(hx, pubkey, 6); hx[12] = 0;
+    StrHelper::strncpy(_companions[idx].name, hx, sizeof(_companions[idx].name));
+  }
+  saveCompanions();
+  return 0;
+}
+
+/* Verwijderen op prefix (>= 6 byte). 1 ok, -2 niet gevonden, -3 dubbelzinnig. */
+int RoomMesh::companionDelPrefix(const uint8_t* prefix, int key_len) {
+  if (key_len < 6 || key_len > PUB_KEY_SIZE) return -2;
+  int hit = -1, hits = 0;
+  for (int i = 0; i < MAX_COMPANIONS; i++) {
+    if (!_companions[i].used) continue;
+    if (memcmp(_companions[i].pub_key, prefix, key_len) == 0) { hit = i; hits++; }
+  }
+  if (hits == 0) return -2;
+  if (hits > 1) return -3;
+  memset(&_companions[hit], 0, sizeof(_companions[hit]));
+  _companions[hit].used = false;
+  saveCompanions();
+  return 1;
+}
+
+void RoomMesh::companionUpdateLoc(int idx, float lat, float lon, uint32_t seen) {
+  if (idx < 0 || idx >= MAX_COMPANIONS || !_companions[idx].used) return;
+  _companions[idx].last_lat = lat;
+  _companions[idx].last_lon = lon;
+  _companions[idx].last_seen = seen;
+  saveCompanions();
+}
+
+/* Formaat: header, dan één regel per companion:
+ *   c <pubkeyhex> <lat> <lon> <seen> <naam...>
+ * lat/lon "nan" zolang er geen locatie is. De naam staat achteraan (mag spaties). */
+void RoomMesh::saveCompanions() {
+  if (_fs == NULL) return;
+  File f = _fs->open(COMPANIONS_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUCOMP1\n");
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < MAX_COMPANIONS; i++) {
+    if (!_companions[i].used) continue;
+    mesh::Utils::toHex(hex, _companions[i].pub_key, PUB_KEY_SIZE);
+    bool hasloc = !isnan(_companions[i].last_lat) && !isnan(_companions[i].last_lon);
+    if (hasloc)
+      f.printf("c %s %.6f %.6f %u %s\n", hex, _companions[i].last_lat,
+               _companions[i].last_lon, (unsigned)_companions[i].last_seen, _companions[i].name);
+    else
+      f.printf("c %s nan nan %u %s\n", hex, (unsigned)_companions[i].last_seen, _companions[i].name);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadCompanions() {
+  memset(_companions, 0, sizeof(_companions));
+  for (int i = 0; i < MAX_COMPANIONS; i++) { _companions[i].last_lat = NAN; _companions[i].last_lon = NAN; }
+  if (_fs == NULL || !_fs->exists(COMPANIONS_PATH)) return;
+  File f = _fs->open(COMPANIONS_PATH, "r");
+  if (!f) return;
+  char line[160];
+  bool first = true;
+  int ci = 0;
+  while (f.available() && ci < MAX_COMPANIONS) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int c = f.read();
+      if (c < 0 || c == '\n') break;
+      if (c == '\r') continue;
+      line[len++] = (char)c;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'c' || line[1] != ' ') continue;
+    char* p = line + 2; while (*p == ' ') p++;
+    char* hex = p; while (*p && *p != ' ') p++;
+    if (*p) *p++ = 0;
+    if (strlen(hex) != PUB_KEY_SIZE * 2) continue;
+    uint8_t pubkey[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) continue;
+    while (*p == ' ') p++;
+    char* slat = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+    while (*p == ' ') p++;
+    char* slon = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+    while (*p == ' ') p++;
+    char* sseen = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+    while (*p == ' ') p++;
+    char* name = p;   // rest van de regel = naam
+    memcpy(_companions[ci].pub_key, pubkey, PUB_KEY_SIZE);
+    _companions[ci].last_lat = (strcasecmp(slat, "nan") == 0) ? NAN : (float)atof(slat);
+    _companions[ci].last_lon = (strcasecmp(slon, "nan") == 0) ? NAN : (float)atof(slon);
+    _companions[ci].last_seen = (uint32_t)strtoul(sseen, NULL, 10);
+    StrHelper::strncpy(_companions[ci].name, name, sizeof(_companions[ci].name));
+    _companions[ci].used = true;
+    ci++;
+  }
+  f.close();
+}
+
+/* ---- IWebNode: companions ---- */
+bool RoomMesh::webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
+                               float* lat, float* lon, uint32_t* seen, bool* has_loc) {
+  int n = 0;
+  for (int k = 0; k < MAX_COMPANIONS; k++) {
+    if (!_companions[k].used) continue;
+    if (n == i) {
+      if (name) StrHelper::strncpy(name, _companions[k].name, name_len);
+      if (pub64 && pub_len >= (size_t)(PUB_KEY_SIZE * 2 + 1))
+        mesh::Utils::toHex(pub64, _companions[k].pub_key, PUB_KEY_SIZE);
+      bool hl = !isnan(_companions[k].last_lat) && !isnan(_companions[k].last_lon);
+      if (lat) *lat = _companions[k].last_lat;
+      if (lon) *lon = _companions[k].last_lon;
+      if (seen) *seen = _companions[k].last_seen;
+      if (has_loc) *has_loc = hl;
+      return true;
+    }
+    n++;
+  }
+  return false;
+}
+
+int RoomMesh::webCompanionSet(const char* pub_hex, const char* name) {
+  if (!pub_hex || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -2;
+  uint8_t pubkey[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, pub_hex)) return -2;
+  return companionSet(pubkey, name);
+}
+
+int RoomMesh::webCompanionDel(const char* prefix_hex) {
+  if (!prefix_hex) return -2;
+  int hexlen = (int)strlen(prefix_hex);
+  if (hexlen < 12 || (hexlen & 1) || hexlen > PUB_KEY_SIZE * 2) return -2;
+  uint8_t prefix[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(prefix, hexlen / 2, prefix_hex)) return -2;
+  return companionDelPrefix(prefix, hexlen / 2);
+}
+
 void RoomMesh::setBotDiagMask(uint8_t mask) {
   _bot_diag_mask = mask & DIAG_ALL;
   saveBotRecips();
@@ -1947,6 +2128,47 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
    * zone-afkorting (CET/CEST). Onder TIME_FLOOR: "niet gesynct". */
   uint32_t now_s = getRTCClock()->getCurrentTime();
   char rxt[40]; fmtLocalHMS(now_s, rxt, sizeof(rxt));
+
+  /* DM VAN EEN BEKENDE COMPANION (v2.4.0). Een companion (T1000-E e.d.) is een
+   * apparaat dat WIJ aansturen; z'n inkomende DM's zijn ANTWOORDEN/RAPPORTEN
+   * ("play: coin", "loc=...", "Pong", een #LOC-rapport), nooit commando's aan ons.
+   * Dus: staat de afzender in de companion-store, dan draaien we NOOIT het
+   * commando-/"onbekend"-pad -- dat gaf een spammy "onbekend commando"-bounce op
+   * elke companion-reply.
+   *   - Begint de DM met "#LOC <lat>,<lon>" -> parse + bewaar de locatie.
+   *   - Anders -> STIL aanvaarden (geen tekstantwoord).
+   * We ACK'en wel op transportniveau zodat de companion niet blijft herzenden.
+   * `text` is hierboven al over spaties heen gezet; "#LOC" begint met '#', dus de
+   * '!'/'/'-strip raakt het niet. */
+  int comp_idx = companionFindByPub(sender_pub);
+  if (comp_idx >= 0) {
+    if (strncmp(text, "#LOC ", 5) == 0) {
+      const char* q = text + 5; while (*q == ' ') q++;
+      char* endp = NULL;
+      float lat = strtof(q, &endp);
+      if (endp && endp != q) {
+        while (*endp == ' ' || *endp == ',' || *endp == ';') endp++;
+        char* endp2 = NULL;
+        float lon = strtof(endp, &endp2);
+        if (endp2 && endp2 != endp && lat >= -90.0f && lat <= 90.0f &&
+            lon >= -180.0f && lon <= 180.0f) {
+          companionUpdateLoc(comp_idx, lat, lon, now_s);
+          Serial.printf("[loc] companion %02X%02X%02X%02X -> %.6f,%.6f\n",
+                        sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], lat, lon);
+        }
+      }
+    } else {
+      Serial.printf("[comp] reply van companion %02X%02X%02X%02X stil aanvaard\n",
+                    sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3]);
+    }
+    /* ACK het inkomende bericht (zoals het gewone DM-pad), dan STIL klaar: geen
+     * tekstantwoord, geen "onbekend commando". */
+    uint32_t ack_hash;
+    mesh::Utils::sha256((uint8_t*)&ack_hash, 4, data, 5 + strlen((char*)&data[5]), sender_pub, PUB_KEY_SIZE);
+    mesh::Packet* ack = createAck(ack_hash);
+    if (ack) sendFloodReply(ack, TXT_ACK_DELAY, packet->getPathHashSize());
+    return;
+  }
 
   static char reply[280];
   reply[0] = 0;
