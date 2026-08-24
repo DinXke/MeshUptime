@@ -1924,6 +1924,9 @@ void RoomMesh::handleBotDm(mesh::Packet* packet, const uint8_t* sender_pub,
   (void)len;
   const char* text = (const char*)&data[5];
   while (*text == ' ') text++;
+  /* v2.3.14: strip een leidende '!' of '/' die apps/companions voor DM-commando's
+   * zetten -> anders wordt de verb "!play" i.p.v. "play" en matcht niets. */
+  if (*text == '!' || *text == '/') { text++; while (*text == ' ') text++; }
   char verb[12]; int vi = 0;
   while (text[vi] && text[vi] != ' ' && vi < (int)sizeof(verb) - 1) { verb[vi] = text[vi]; vi++; }
   verb[vi] = 0;

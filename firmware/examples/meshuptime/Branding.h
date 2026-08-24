@@ -91,11 +91,13 @@
  *            (c) companion-verbs (find/play/fall/vol/tune/mute/quiet/loc/...) -> gerichte
  *            hint "stuur naar je companion" i.p.v. de node-commandolijst; (d) ernst-emoji
  *            (rood/oranje/groen) nu OOK vooraan de room-post-alerts, niet enkel de DM.
+ *   v2.3.14 = bot-DM strípt nu een leidende '!'/'/' vóór het parsen -> "!play"/"!ping 1.1.1.1"
+ *            worden correct herkend (verb "play"/"ping"), niet meer als "!play" genegeerd.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.3.13"
+  #define MESHUPTIME_VERSION   "v2.3.14"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
