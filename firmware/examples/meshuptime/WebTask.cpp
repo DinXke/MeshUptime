@@ -3802,20 +3802,30 @@ roomsProbe();
 /* ============================== companions (v2.4.0) =======================
    Beheer + laatst bekende locatie. Praat met /companions.json en /companion;
    commando's gaan via /bot/sendto (dezelfde weg als de bot-DM). Room-nodes. */
-var CMP=[],CMMAP=null,CMLAYER=null,CMLEAFLET=0;
+var CMP=[],CMMAP=null,CMLAYER=null,CMLEAFLET=0,CMSIG="";
 function cmMsg(id,t,ok){rmsg(id,t,ok)}
 function companionsGet(){return fetch("companions.json",{credentials:"include"})
 .then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
-function companionsLoad(){refreshPickers();companionsGet().then(function(d){
+/* Alleen /companions.json opnieuw ophalen + tekenen (GEEN pickers): gebruikt na
+   elke actie en door de lichte poll onderaan. companionsLoad() doet dit PLUS de
+   pickers en draait bij het openen van het tabblad. */
+function companionsRefresh(){return companionsGet().then(function(d){
 if(!d)return;CMP=d.companions||[];cmRender();cmFillCmdPick();cmMap()})
 .catch(function(){cmMsg("cmaddmsg","kon companions niet laden",0)})}
+function companionsLoad(){refreshPickers();return companionsRefresh()}
 function cmAge(s){if(!s)return"—";var now=Math.floor(Date.now()/1000);var a=now-s;if(a<0)a=0;
 if(a<90)return a+"s";if(a<5400)return Math.round(a/60)+"m";if(a<172800)return Math.round(a/3600)+"u";return Math.round(a/86400)+"d"}
 function cmRender(){var e=document.getElementById("cml");e.innerHTML="";
 var h=e.insertRow();["naam","pubkey","locatie","",""].forEach(function(t){
 var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
 CMP.forEach(function(g){var r=e.insertRow();
-r.insertCell().textContent=g.name||"—";
+var nc=r.insertCell();nc.textContent=g.name||"—";
+/* Val-badge: alleen als er een val-event in /companions.json staat. Rood en
+   opvallend -- dit is het enige wat je hier meteen moet zien. */
+if(g.fall_ts){var bd=document.createElement("span");
+bd.textContent=" ⚠ "+g.fall_kind+" "+cmAge(g.fall_ts);
+bd.style.cssText="color:var(--red);font-weight:600";
+bd.title="val-event ontvangen ("+g.fall_kind+"), "+cmAge(g.fall_ts)+" geleden";nc.appendChild(bd)}
 var c=r.insertCell();c.className="key";c.textContent=g.pubkey.slice(0,8)+"…"+g.pubkey.slice(-4);
 c.title=g.pubkey+"  (klik om te kopiëren)";
 c.onclick=function(){if(navigator.clipboard)navigator.clipboard.writeText(g.pubkey)};
@@ -3858,11 +3868,13 @@ else cmMsg("cmaddmsg","mislukt: "+(j.error||""),0)}).catch(function(){cmMsg("cma
 function cmCmd(cmd){var pub=document.getElementById("cm-cmd-pick").value;
 if(!pub){cmMsg("cmcmdmsg","kies eerst een companion",0);return}
 if(!cmd||!cmd.trim()){cmMsg("cmcmdmsg","leeg commando",0);return}
-fetch("bot/sendto",{method:"POST",credentials:"include",
+return fetch("bot/sendto",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"key="+encodeURIComponent(pub)+"&msg="+encodeURIComponent(cmd)})
 .then(function(r){return r.json()}).then(function(j){
-cmMsg("cmcmdmsg",j.ok?("verstuurd: "+cmd):("mislukt: "+(j.error||"")),j.ok?1:0)})
+if(j.ok){cmMsg("cmcmdmsg","verzonden over de mesh: "+cmd+" — antwoord/effect volgt async",1);
+companionsRefresh()}
+else cmMsg("cmcmdmsg","mislukt: "+(j.error||""),0)})
 .catch(function(){cmMsg("cmcmdmsg","mislukt",0)})}
 function cmFallTest(){if(!confirm("Val-TEST sturen?\n\nDe companion start nu z'n "+
 "pre-alarm (aftellen). Dat is annuleerbaar op het toestel en stuurt geen echte "+
@@ -3874,6 +3886,11 @@ function cmFallTargetDel(){var t=document.getElementById("cm-ftarget").value.tri
 if(t.length<12||t.length%2){cmMsg("cmcmdmsg","doel verwijderen: prefix van min. 12 hex (even) nodig",0);return}
 cmCmd('!fall target del '+t)}
 document.getElementById("cm-add").onclick=cmAdd;
+/* Lichte auto-verversing: alleen als het tabblad openstaat (p7 zichtbaar), zelfde
+   stijl als u2/u3 maar we slaan de fetch over als niemand kijkt. Locatie/seen/val
+   komen async over de mesh binnen en de node bewaart ze -- 15s is ruim genoeg. */
+setInterval(function(){var p=document.getElementById("p7");
+if(p&&!p.hidden)companionsRefresh()},15000);
 /* Leaflet lui laden van de CDN; faalt dat (offline), dan blijft de tekstlijst. */
 function cmLoadLeaflet(cb){if(window.L){cb(true);return}
 if(CMLEAFLET==2){cb(false);return}
@@ -3885,6 +3902,7 @@ var s=document.createElement("script");s.src="https://unpkg.com/leaflet@1.9.4/di
 s.onload=function(){CMLEAFLET=0;cb(!!window.L)};
 s.onerror=function(){CMLEAFLET=2;cb(false)};document.head.appendChild(s)}
 function cmMap(){var locs=CMP.filter(function(g){return g.lat!=null&&g.lon!=null});
+var sig=locs.map(function(g){return g.lat+","+g.lon}).join("|");
 var md=document.getElementById("cm-map"),mt=document.getElementById("cm-maptext");
 if(!locs.length){md.style.display="none";mt.textContent="(nog geen locaties)";mt.style.color="var(--muted)";return}
 mt.textContent="";mt.style.color="";
@@ -3902,7 +3920,10 @@ CMLAYER=L.layerGroup().addTo(CMMAP);var pts=[];
 locs.forEach(function(g){var m=L.marker([g.lat,g.lon]).addTo(CMLAYER);
 m.bindPopup((g.name||g.pubkey.slice(0,8))+"<br>"+g.lat.toFixed(5)+","+g.lon.toFixed(5)+" · "+cmAge(g.seen));
 pts.push([g.lat,g.lon])});
-if(pts.length==1)CMMAP.setView(pts[0],15);else CMMAP.fitBounds(pts,{padding:[30,30]});
+/* Alleen bij een GEWIJZIGDE locatieset het beeld verzetten -- zo laat de 15s-poll
+   het pannen/zoomen van de gebruiker met rust. */
+if(sig!=CMSIG){CMSIG=sig;
+if(pts.length==1)CMMAP.setView(pts[0],15);else CMMAP.fitBounds(pts,{padding:[30,30]})}
 setTimeout(function(){CMMAP.invalidateSize()},120)})}
 
 /* ===================== declutter: uitleg achter een "?" =====================
