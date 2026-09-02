@@ -228,12 +228,14 @@ bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps) {
 bool mu_send_loc_dm(const uint8_t* pub, const char* note) {
   char buf[160];
   if (sensors.node_lat != 0.0 || sensors.node_lon != 0.0) {
+    // Batterij-token `B<pct>` ná lat,lon (contract): de node/kaart pikt het op.
+    int bpct = battery_percent_from_mv(board.getBattMilliVolts());
     if (note && note[0])
-      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f %s",
-               (double)sensors.node_lat, (double)sensors.node_lon, note);
+      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f B%d %s",
+               (double)sensors.node_lat, (double)sensors.node_lon, bpct, note);
     else
-      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f",
-               (double)sensors.node_lat, (double)sensors.node_lon);
+      snprintf(buf, sizeof(buf), "#LOC %.5f,%.5f B%d",
+               (double)sensors.node_lat, (double)sensors.node_lon, bpct);
   } else {
     if (mu_cfg.gps_mode != MU_GPS_ON) sensors.setSettingValue("gps", "1"); // wake for a fix
     if (note && note[0])

@@ -9,7 +9,7 @@
 
 // Firmware (companion-layer) version. Shown on the serial banner so a running
 // device / serial capture is traceable to a build. Bump the patch for fixes.
-#define MU_FW_VERSION "2.1.0"
+#define MU_FW_VERSION "2.2.0"
 
 // Lifecycle (called from app_main.cpp)
 void mu_begin();
