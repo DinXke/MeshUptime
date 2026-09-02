@@ -167,7 +167,7 @@ void PushTask::onMonitorEvent(const MonitorEvent& ev) {
  * niet stil. dueNow() wordt hierdoor waar en de loop() pikt het op; hetzelfde
  * niet-blokkerende pad, alleen naar /api/companion. */
 void PushTask::queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, float lon,
-                              uint32_t seen, uint32_t fall_ts, uint8_t fall_kind) {
+                              uint32_t seen, uint32_t fall_ts, uint8_t fall_kind, int16_t batt) {
   if (!enabled() || pub_key == NULL) return;
 
   if (_cring_count >= COMP_RING_SIZE) {
@@ -186,6 +186,7 @@ void PushTask::queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, f
   c.seen      = seen;
   c.fall_ts   = fall_ts;
   c.fall_kind = fall_kind;
+  c.batt      = batt;
   _cring_count++;
 }
 
@@ -381,6 +382,9 @@ bool PushTask::buildCompanionBody(char* body, size_t cap, size_t& blen) {
     if (c.has_loc) {
       if (!appendf(piece, sizeof(piece), plen, ",\"lat\":%.6f,\"lon\":%.6f",
                    c.lat, c.lon)) return false;
+    }
+    if (c.batt >= 0) {
+      if (!appendf(piece, sizeof(piece), plen, ",\"batt\":%d", (int)c.batt)) return false;
     }
     if (!appendf(piece, sizeof(piece), plen,
                  ",\"seen\":%lu,\"fall_ts\":%lu,\"fall_kind\":\"%s\"}",

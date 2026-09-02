@@ -358,6 +358,7 @@ struct Companion {
   uint32_t last_seen;
   uint32_t fall_ts;        // RTC-s van het laatste val-event; 0 = nooit
   uint8_t  fall_kind;      // FALL_KIND_*
+  int16_t  last_batt;      // laatst gemelde accu-% (0..100); -1 = onbekend
   bool     used;
 };
 
@@ -567,7 +568,7 @@ public:
   int  webCompanionCount() override { return companionCount(); }
   bool webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
                        float* lat, float* lon, uint32_t* seen, bool* has_loc,
-                       uint32_t* fall_ts, int* fall_kind) override;
+                       uint32_t* fall_ts, int* fall_kind, int* batt) override;
   int  webCompanionSet(const char* pub_hex, const char* name) override;
   int  webCompanionDel(const char* prefix_hex) override;
 
@@ -838,8 +839,9 @@ private:
    * bijwerken (locatie blijft). 0 ok, -3 vol. */
   int           companionSet(const uint8_t* pubkey, const char* name);
   int           companionDelPrefix(const uint8_t* prefix, int key_len);  // 1 ok, -2 niet, -3 dubbel
-  /* Locatie van een companion bijwerken (uit een #LOC-DM). */
-  void          companionUpdateLoc(int idx, float lat, float lon, uint32_t seen);
+  /* Locatie van een companion bijwerken (uit een #LOC-DM). batt = accu-% (0..100),
+   * of -1 = onbekend (laat de laatst bekende waarde staan). */
+  void          companionUpdateLoc(int idx, float lat, float lon, uint32_t seen, int16_t batt);
   /* Val-event van een companion vastleggen (uit een #LOC-DM met val-merkteken). */
   void          companionRecordFall(int idx, uint8_t kind, uint32_t ts);
   /* v2.5.1: de huidige stand van companion `idx` (loc + val) METEEN naar

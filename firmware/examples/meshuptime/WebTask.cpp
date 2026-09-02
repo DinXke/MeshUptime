@@ -5978,18 +5978,21 @@ void WebTask::handleCompanionsJson() {
   char pub[PUB_KEY_SIZE * 2 + 1];
   char nm[24], esc[64];
   float lat = NAN, lon = NAN; uint32_t seen = 0; bool hasloc = false;
-  uint32_t fall_ts = 0; int fall_kind = 0;
+  uint32_t fall_ts = 0; int fall_kind = 0; int batt = -1;
   static const char* kFallKind[] = { "", "val", "nomotion", "sos" };
   bool first = true;
   for (int i = 0; i < cnt; i++) {
     if ((size_t)n > sizeof(g_json) - 200) break;
     if (!_acl->webCompanionGet(i, nm, sizeof(nm), pub, sizeof(pub), &lat, &lon, &seen, &hasloc,
-                               &fall_ts, &fall_kind)) continue;
+                               &fall_ts, &fall_kind, &batt)) continue;
     jsonEscape(nm, esc, sizeof(esc));
     n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"name\":\"%s\",\"pubkey\":\"%s\",\"seen\":%u",
                   first ? "" : ",", esc, pub, (unsigned)seen);
     if (hasloc)
       n += snprintf(g_json + n, sizeof(g_json) - n, ",\"lat\":%.6f,\"lon\":%.6f", lat, lon);
+    /* Accu-% alleen als bekend (>= 0). */
+    if (batt >= 0)
+      n += snprintf(g_json + n, sizeof(g_json) - n, ",\"batt\":%d", batt);
     /* Val-event alleen als er een is (fall_ts != 0). fall_kind 1..3 -> tekst. */
     if (fall_ts != 0 && fall_kind >= 1 && fall_kind <= 3)
       n += snprintf(g_json + n, sizeof(g_json) - n, ",\"fall_ts\":%u,\"fall_kind\":\"%s\"",

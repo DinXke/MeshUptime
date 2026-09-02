@@ -206,14 +206,16 @@ public:
   virtual int  webCompanionCount() { return 0; }
   /* Leest companion i: naam, pubkey (64 hex), lat/lon (NAN als onbekend), seen (RTC
    * s, 0 = nooit). has_loc=true als er een geldige locatie is. fall_ts = RTC-s van
-   * het laatste val-event (0 = geen), fall_kind = FALL_KIND_* (0 = geen). */
+   * het laatste val-event (0 = geen), fall_kind = FALL_KIND_* (0 = geen). batt =
+   * laatst gemelde accu-% (0..100), of -1 = onbekend. */
   virtual bool webCompanionGet(int i, char* name, size_t name_len, char* pub64,
                                size_t pub_len, float* lat, float* lon,
                                uint32_t* seen, bool* has_loc,
-                               uint32_t* fall_ts, int* fall_kind)
+                               uint32_t* fall_ts, int* fall_kind, int* batt)
                                { (void)i; (void)name; (void)name_len; (void)pub64;
                                  (void)pub_len; (void)lat; (void)lon; (void)seen;
-                                 (void)has_loc; (void)fall_ts; (void)fall_kind; return false; }
+                                 (void)has_loc; (void)fall_ts; (void)fall_kind;
+                                 (void)batt; return false; }
   /* Toevoegen/bijwerken op VOLLEDIGE pubkey (64 hex) + naam. 0 ok, <0 fout. */
   virtual int  webCompanionSet(const char* pub_hex, const char* name)
                                { (void)pub_hex; (void)name; return -1; }

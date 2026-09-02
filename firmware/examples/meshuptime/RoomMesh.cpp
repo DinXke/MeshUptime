@@ -2024,6 +2024,7 @@ int RoomMesh::companionSet(const uint8_t* pubkey, const char* name) {
     _companions[idx].last_seen = 0;
     _companions[idx].fall_ts = 0;
     _companions[idx].fall_kind = FALL_KIND_NONE;
+    _companions[idx].last_batt = -1;
     _companions[idx].used = true;
   }
   if (name && name[0]) StrHelper::strncpy(_companions[idx].name, name, sizeof(_companions[idx].name));
@@ -2051,11 +2052,13 @@ int RoomMesh::companionDelPrefix(const uint8_t* prefix, int key_len) {
   return 1;
 }
 
-void RoomMesh::companionUpdateLoc(int idx, float lat, float lon, uint32_t seen) {
+void RoomMesh::companionUpdateLoc(int idx, float lat, float lon, uint32_t seen, int16_t batt) {
   if (idx < 0 || idx >= MAX_COMPANIONS || !_companions[idx].used) return;
   _companions[idx].last_lat = lat;
   _companions[idx].last_lon = lon;
   _companions[idx].last_seen = seen;
+  /* batt < 0 = het rapport droeg geen accu-%; laat de laatst bekende waarde staan. */
+  if (batt >= 0) _companions[idx].last_batt = (batt > 100) ? 100 : batt;
   saveCompanions();
 }
 
@@ -2112,7 +2115,7 @@ void RoomMesh::pushCompanionNow(int idx) {
   const Companion& c = _companions[idx];
   bool has_loc = !isnan(c.last_lat) && !isnan(c.last_lon);
   _push->queueCompanion(c.pub_key, has_loc, c.last_lat, c.last_lon,
-                        c.last_seen, c.fall_ts, c.fall_kind);
+                        c.last_seen, c.fall_ts, c.fall_kind, c.last_batt);
 }
 
 /* Formaat: header, dan per companion:
@@ -2138,6 +2141,10 @@ void RoomMesh::saveCompanions() {
       f.printf("c %s nan nan %u %s\n", hex, (unsigned)_companions[i].last_seen, _companions[i].name);
     if (_companions[i].fall_ts != 0)
       f.printf("f %s %u %u\n", hex, (unsigned)_companions[i].fall_ts, (unsigned)_companions[i].fall_kind);
+    /* b-regel: accu-% (ALLEEN als bekend). Additief, net als de f-regel: een oudere
+     * parser die alleen 'c'/'f' kent slaat 'm over. */
+    if (_companions[i].last_batt >= 0)
+      f.printf("b %s %d\n", hex, (int)_companions[i].last_batt);
   }
   f.printf(".\n");
   f.close();
@@ -2145,7 +2152,7 @@ void RoomMesh::saveCompanions() {
 
 void RoomMesh::loadCompanions() {
   memset(_companions, 0, sizeof(_companions));
-  for (int i = 0; i < MAX_COMPANIONS; i++) { _companions[i].last_lat = NAN; _companions[i].last_lon = NAN; }
+  for (int i = 0; i < MAX_COMPANIONS; i++) { _companions[i].last_lat = NAN; _companions[i].last_lon = NAN; _companions[i].last_batt = -1; }
   if (_fs == NULL || !_fs->exists(COMPANIONS_PATH)) return;
   File f = _fs->open(COMPANIONS_PATH, "r");
   if (!f) return;
@@ -2183,6 +2190,21 @@ void RoomMesh::loadCompanions() {
       }
       continue;
     }
+    /* b-regel: accu-% van een al ingelezen companion (op pubkey). Wordt door
+     * saveCompanions() direct NA z'n c-regel geschreven; additief (oudere parsers
+     * slaan 'm over). */
+    if (line[0] == 'b' && line[1] == ' ') {
+      char* p = line + 2; while (*p == ' ') p++;
+      char* hex = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+      if (strlen(hex) != PUB_KEY_SIZE * 2) continue;
+      uint8_t pubkey[PUB_KEY_SIZE];
+      if (!mesh::Utils::fromHex(pubkey, PUB_KEY_SIZE, hex)) continue;
+      while (*p == ' ') p++;
+      int v = atoi(p);
+      int bidx = companionFindByPub(pubkey);
+      if (bidx >= 0) _companions[bidx].last_batt = (v < 0) ? -1 : (v > 100 ? 100 : (int16_t)v);
+      continue;
+    }
     if (line[0] != 'c' || line[1] != ' ') continue;
     char* p = line + 2; while (*p == ' ') p++;
     char* hex = p; while (*p && *p != ' ') p++;
@@ -2212,7 +2234,7 @@ void RoomMesh::loadCompanions() {
 /* ---- IWebNode: companions ---- */
 bool RoomMesh::webCompanionGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
                                float* lat, float* lon, uint32_t* seen, bool* has_loc,
-                               uint32_t* fall_ts, int* fall_kind) {
+                               uint32_t* fall_ts, int* fall_kind, int* batt) {
   int n = 0;
   for (int k = 0; k < MAX_COMPANIONS; k++) {
     if (!_companions[k].used) continue;
@@ -2227,6 +2249,7 @@ bool RoomMesh::webCompanionGet(int i, char* name, size_t name_len, char* pub64, 
       if (has_loc) *has_loc = hl;
       if (fall_ts) *fall_ts = _companions[k].fall_ts;
       if (fall_kind) *fall_kind = _companions[k].fall_kind;
+      if (batt) *batt = _companions[k].last_batt;
       return true;
     }
     n++;
@@ -2478,6 +2501,19 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
     companionLogMsg(sender_pub, text, now_s);
     if (strncmp(text, "#LOC ", 5) == 0) {
       bool stored = false;   /* v2.5.1: is er iets bewaard dat we mogen pushen? */
+      /* Accu-% (contract: "#LOC <lat>,<lon> B<pct>[ <marker>]"). Zoek het eerste
+       * " B" dat door een cijfer gevolgd wordt; de val-merktekens ("(val)" e.d.)
+       * bevatten geen " B", dus dit vist eenduidig het accu-token op. Ontbreekt
+       * het (oudere companion / no-fix-pad), dan blijft batt -1 = onbekend en laat
+       * companionUpdateLoc de laatst bekende waarde staan. */
+      int16_t batt = -1;
+      for (const char* b = strstr(text, " B"); b; b = strstr(b + 1, " B")) {
+        if (b[2] >= '0' && b[2] <= '9') {
+          int v = atoi(b + 2);
+          batt = (v > 100) ? 100 : (int16_t)v;
+          break;
+        }
+      }
       const char* q = text + 5; while (*q == ' ') q++;
       char* endp = NULL;
       float lat = strtof(q, &endp);
@@ -2487,7 +2523,7 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
         float lon = strtof(endp, &endp2);
         if (endp2 && endp2 != endp && lat >= -90.0f && lat <= 90.0f &&
             lon >= -180.0f && lon <= 180.0f) {
-          companionUpdateLoc(comp_idx, lat, lon, now_s);
+          companionUpdateLoc(comp_idx, lat, lon, now_s, batt);
           stored = true;
           Serial.printf("[loc] companion %02X%02X%02X%02X -> %.6f,%.6f\n",
                         sender_pub[0], sender_pub[1], sender_pub[2], sender_pub[3], lat, lon);

@@ -100,12 +100,13 @@ public:
    * als de sensorpush, maar met een NIEUW pad (POST {push.url}/api/companion) en
    * een eigen kleine ring, zodat een val een transiënte netwerk-/serverfout
    * overleeft (retry/queue, net als de sensorpush). Body:
-   *   {"companions":[{"pubkey":"<64hex>","lat":<f>,"lon":<f>,"seen":<u>,
+   *   {"companions":[{"pubkey":"<64hex>","lat":<f>,"lon":<f>,"batt":<pct>,"seen":<u>,
    *                   "fall_ts":<u>,"fall_kind":"val|nomotion|sos|"}]}
-   * has_loc=false -> lat/lon worden WEGGELATEN; fall_ts=0/fall_kind=0 -> geen val
-   * (fall_ts:0, fall_kind:""). Push uit (geen url) -> stil laten vallen. */
+   * has_loc=false -> lat/lon worden WEGGELATEN; batt<0 (onbekend) -> batt WEGGELATEN;
+   * fall_ts=0/fall_kind=0 -> geen val (fall_ts:0, fall_kind:""). Push uit (geen url)
+   * -> stil laten vallen. */
   void queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, float lon,
-                      uint32_t seen, uint32_t fall_ts, uint8_t fall_kind);
+                      uint32_t seen, uint32_t fall_ts, uint8_t fall_kind, int16_t batt);
 
   /* Voor de statuspagina en het rapport. lostCount() is de belangrijkste:
    * gebeurtenissen die uit de ring gevallen zijn zonder afgeleverd te worden. */
@@ -145,6 +146,7 @@ private:
     uint32_t seen;
     uint32_t fall_ts;
     uint8_t  fall_kind;
+    int16_t  batt;          /* accu-% (0..100); -1 = onbekend -> weggelaten */
   };
   CompanionPush _cring[COMP_RING_SIZE];
   uint8_t _cring_tail    = 0;
