@@ -157,6 +157,8 @@ static void set_defaults() {
   mu_cfg.fall_nomotion_min = 0;    // dead-man off by default
   mu_cfg.quiet_level     = 0;      // quiet-hours = full mute by default
   mu_cfg.rxps_level      = 0;      // RXPS OFF by default (continuous RX, never miss an alert)
+  mu_cfg.loc_push_min    = 0;      // auto-locatie-push UIT by default
+  mu_cfg.loc_push_target_used = 0; // geen push-doel
   mu_cfg.mute_follow_app = 0;      // default: our alerts are INDEPENDENT of the app's buzzer_quiet
   mu_cfg.fall_sens         = MU_FALL_SENS_MED;   // medium sensitivity by default
   mu_cfg.fall_mm           = 0;    // do NOT auto-forward to MeshManager unless enabled
@@ -246,6 +248,13 @@ void mu_config_begin() {
         mu_cfg.radio_sf = mu_cfg.radio_cr = 0;
         mu_cfg.radio_tx_dbm = 0;
         mu_cfg.radio_freq = mu_cfg.radio_bw = 0.0f;
+        migrated = true;
+      }
+      if (tmp.version < 5) {
+        // v4 -> v5: auto-locatie-push uit, geen doel (tmp was genuld).
+        mu_cfg.loc_push_min = 0;
+        mu_cfg.loc_push_target_used = 0;
+        memset(mu_cfg.loc_push_target, 0, sizeof(mu_cfg.loc_push_target));
         migrated = true;
       }
       if (migrated) {

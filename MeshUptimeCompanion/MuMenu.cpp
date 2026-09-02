@@ -128,6 +128,7 @@ static void draw_cat(int c) {
       P(" 4) wijzig radio-parameters (!! valt v/d mesh)");
       P(" 5) herstel mesh-preset 869.618/BW62.5/SF8/CR8");
       P(" 6) enkel radio-veld (freq|bw|sf|cr|txpower ..)");
+      P(" 7) auto-locatie-push (elke X min #LOC naar node)");
       break;
     case 7:
       P("== 7 Allowlist & beveiliging ==");
@@ -275,6 +276,10 @@ static void handle_cat_item(int c, int n) {
         P(" Enkel radio-veld via het `radio`-commando.");
         P(" Mutatie vereist 'confirm' (bv: freq 869.000 confirm).");
         begin_input(" veld+waarde: freq|bw|sf|cr|txpower <v> [confirm]:", "radio ");
+      } else if (n == 7) {
+        P(" Auto-locatie-push: elke X min stuurt de node zelf een");
+        P(" #LOC naar het doel (kaart/track blijft vers).");
+        begin_input(" off | <min 1-1440> [pubkey64]:", "locpush ");
       } else P(" ?");
       break;
     case 7:

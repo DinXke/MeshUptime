@@ -261,6 +261,44 @@ static void cmd_loc(const MuCmdCtx& ctx) {
   }
 }
 
+// Auto-locatie-push. `locpush` = toon stand; `locpush off` = uit; `locpush <min>
+// [pubkey64]` = interval (+ optioneel doel-node). Zonder doel wordt er niets
+// verstuurd. Elke tik stuurt de companion zelf een #LOC naar het doel.
+static void cmd_locpush(const MuCmdCtx& ctx, const char* args) {
+  const char* a = skip_ws(args);
+  if (!*a) {
+    if (mu_cfg.loc_push_min == 0) { mu_reply(ctx, "locpush: uit"); return; }
+    if (!mu_cfg.loc_push_target_used) { mu_reply(ctx, "locpush: %u min - GEEN DOEL", mu_cfg.loc_push_min); return; }
+    const uint8_t* t = mu_cfg.loc_push_target;
+    mu_reply(ctx, "locpush: %u min -> %02X%02X%02X%02X..", mu_cfg.loc_push_min, t[0], t[1], t[2], t[3]);
+    return;
+  }
+  char tok[24];
+  const char* rest = next_tok(a, tok, sizeof(tok), true);
+  if (!strcmp(tok, "off")) {
+    mu_cfg.loc_push_min = 0; mu_config_save(); mu_loc_push_rearm();
+    mu_reply(ctx, "locpush: uit"); return;
+  }
+  int min = atoi(tok);
+  if (min <= 0 || min > 1440) { mu_reply(ctx, "locpush off | <min 1-1440> [pubkey64]"); return; }
+  mu_cfg.loc_push_min = (uint16_t)min;
+  rest = skip_ws(rest);
+  if (*rest) {
+    uint8_t pub[MU_PUB_LEN];
+    if (mu_hex_to_bytes(rest, pub, MU_PUB_LEN)) {
+      memcpy(mu_cfg.loc_push_target, pub, MU_PUB_LEN);
+      mu_cfg.loc_push_target_used = 1;
+    } else { mu_reply(ctx, "locpush: doel = 64 hex"); return; }
+  }
+  mu_config_save(); mu_loc_push_rearm();
+  if (!mu_cfg.loc_push_target_used)
+    mu_reply(ctx, "locpush: %d min - zet nog een doel: locpush %d <pubkey64>", min, min);
+  else {
+    const uint8_t* t = mu_cfg.loc_push_target;
+    mu_reply(ctx, "locpush: %d min -> %02X%02X%02X%02X..", min, t[0], t[1], t[2], t[3]);
+  }
+}
+
 static void cmd_preset(const MuCmdCtx& ctx, const char* args) {
   char n[8];
   const char* p = next_tok(args, n, sizeof(n), false);
@@ -621,6 +659,7 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
   if (!strcmp(cmd, "quiet"))  { cmd_quiet(ctx, args); return true; }
   if (!strcmp(cmd, "gps"))    { cmd_gps(ctx, args); return true; }
   if (!strcmp(cmd, "loc"))    { cmd_loc(ctx); return true; }
+  if (!strcmp(cmd, "locpush")){ cmd_locpush(ctx, args); return true; }
   if (!strcmp(cmd, "radio"))  { cmd_radio(ctx, args); return true; }
   if (!strcmp(cmd, "cfg") || !strcmp(cmd, "status")) { cmd_cfg(ctx); return true; }
   if (!strcmp(cmd, "allow"))  { cmd_allow(ctx, args); return true; }
@@ -629,8 +668,9 @@ bool mu_handle_command(const char* line, const MuCmdCtx& ctx) {
   if (!strcmp(cmd, "sos"))    { cmd_setkey(ctx, args, true); return true; }
   if (!strcmp(cmd, "fall"))   { cmd_fall(ctx, args); return true; }
   if (!strcmp(cmd, "help")) {
-    mu_reply(ctx, "cmds: find findstop mute vol tune tunes play quiet gps loc cfg status");
+    mu_reply(ctx, "cmds: find findstop mute vol tune tunes play quiet gps loc locpush cfg status");
     mu_reply(ctx, "  rxps radio allow preset target sos fall msgtune ping (serieel: menu)");
+    mu_reply(ctx, "  locpush off | <min> [pubkey64]  (auto-#LOC elke X min naar node)");
     mu_reply(ctx, "  radio show|freq|bw|sf|cr|txpower <v> confirm  (mutatie vereist 'confirm')");
     return true;
   }

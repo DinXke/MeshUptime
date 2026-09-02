@@ -528,8 +528,9 @@ void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t 
                            const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
   // MeshUptimeCompanion: standalone hook — severity tunes + '!' command protocol.
-  // Runs regardless of whether a phone app is connected over BLE.
-  mu_on_direct_msg(from, sender_timestamp, text);
+  // Runs regardless of whether a phone app is connected over BLE. If it consumed
+  // a '!' control command, do NOT forward it to the app (control traffic != chat).
+  if (mu_on_direct_msg(from, sender_timestamp, text)) return;
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
 

@@ -9,7 +9,7 @@
 
 // Firmware (companion-layer) version. Shown on the serial banner so a running
 // device / serial capture is traceable to a build. Bump the patch for fixes.
-#define MU_FW_VERSION "2.0.0"
+#define MU_FW_VERSION "2.1.0"
 
 // Lifecycle (called from app_main.cpp)
 void mu_begin();
@@ -69,6 +69,11 @@ bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps);
 // `note` (without the token) so an SOS/fall alert is never lost. Returns false
 // if no matching contact is known. Used by `!loc`, the SOS button and fall.
 bool mu_send_loc_dm(const uint8_t* pub, const char* note);
+
+// Auto-locatie-push: periodiek #LOC naar loc_push_target. tick() draait in mu_loop();
+// rearm() herstart het schema na een wijziging van interval/doel.
+void mu_loc_push_tick();
+void mu_loc_push_rearm();
 
 // Broadcast a machine-readable "#LOC <lat>,<lon> <note>" alert to every configured
 // direct fall-target, plus the MeshUptime node bot when `!fall mm on` (the node

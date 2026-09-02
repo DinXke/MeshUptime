@@ -199,6 +199,8 @@ static void find_loop() {
 // ---- send a DM to an arbitrary pubkey --------------------------------------
 bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps) {
   ContactInfo* c = the_mesh.lookupContactByPubKey(pub, MU_PUB_LEN);
+  Serial.printf("[dm] -> %02X%02X%02X%02X contact=%s\n",
+                pub[0], pub[1], pub[2], pub[3], c ? "FOUND" : "NULL");
   if (!c) return false;
 
   char buf[160];
@@ -213,6 +215,7 @@ bool mu_send_dm(const uint8_t* pub, const char* text, bool also_gps) {
   uint32_t expected_ack = 0, est_timeout = 0;
   uint32_t ts = rtc_clock.getCurrentTimeUnique();
   int r = the_mesh.sendMessage(*c, ts, 0, buf, expected_ack, est_timeout);
+  Serial.printf("[dm] sendMessage r=%d %s\n", r, (r != MSG_SEND_FAILED) ? "OK" : "FAILED");
   return r != MSG_SEND_FAILED;
 }
 
@@ -263,14 +266,15 @@ int mu_send_alert_report(const char* note) {
 }
 
 // ---- incoming DM hook (from MyMesh::onMessageRecv) -------------------------
-void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const char* text) {
+bool mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const char* text) {
   (void)sender_timestamp;
-  if (!text) return;
+  if (!text) return false;
 
   const char* p = text;
   while (*p == ' ') p++;
 
-  // '!' command over DM — only from allowlisted pubkeys.
+  // '!' command over DM — only from allowlisted pubkeys. A handled control
+  // command is CONSUMED (return true) so it is not shown as chat in the app.
   if (*p == '!') {
     if (mu_allow_find(from.id.pub_key) >= 0) {
       MuCmdCtx ctx;
@@ -278,20 +282,22 @@ void mu_on_direct_msg(const ContactInfo& from, uint32_t sender_timestamp, const 
       ctx.sender_admin = mu_allow_is_admin(from.id.pub_key);
       memcpy(ctx.sender_pub, from.id.pub_key, MU_PUB_LEN);
       mu_handle_command(p, ctx);
+      return true;   // consumed — do NOT forward this control command to the app
     }
-    return;
+    return false;    // '!'-text from a non-allowlisted sender = ordinary chat
   }
 
-  // Severity emoji prefix (UTF-8).
+  // Severity emoji prefix (UTF-8) — play the tune but STILL forward to the app.
   const uint8_t* b = (const uint8_t*)text;
   if (b[0] == 0xF0 && b[1] == 0x9F) {
-    if (b[2] == 0x94 && b[3] == 0xB4) { mu_play_tune(MU_TUNE_HIGH); return; }
-    if (b[2] == 0x9F && b[3] == 0xA0) { mu_play_tune(MU_TUNE_MED);  return; }
-    if (b[2] == 0x9F && b[3] == 0xA2) { mu_play_tune(MU_TUNE_LOW);  return; }
+    if (b[2] == 0x94 && b[3] == 0xB4) { mu_play_tune(MU_TUNE_HIGH); return false; }
+    if (b[2] == 0x9F && b[3] == 0xA0) { mu_play_tune(MU_TUNE_MED);  return false; }
+    if (b[2] == 0x9F && b[3] == 0xA2) { mu_play_tune(MU_TUNE_LOW);  return false; }
   }
 
-  // Plain, unmarked DM -> optional subtle message tune.
+  // Plain, unmarked DM -> optional subtle message tune (still forwarded).
   if (mu_cfg.msg_tune_enabled) mu_play_tune(MU_TUNE_MSG);
+  return false;
 }
 
 // ---- serial CLI ------------------------------------------------------------
@@ -436,6 +442,27 @@ static void lowbat_loop() {
   }
 }
 
+// ---- Auto-locatie-push (periodiek #LOC naar het ingestelde doel) -----------
+static uint32_t g_locpush_next  = 0;
+static bool     g_locpush_armed = false;
+// Herstart het schema — aanroepen na een wijziging van interval/doel.
+void mu_loc_push_rearm() { g_locpush_armed = false; }
+// Aangeroepen uit mu_loop(): stuurt elke loc_push_min minuten zelf een #LOC naar
+// loc_push_target. No-op als interval 0 of geen doel. De eerste push volgt pas ná
+// één interval (niet meteen bij boot).
+void mu_loc_push_tick() {
+  if (mu_cfg.loc_push_min == 0 || !mu_cfg.loc_push_target_used) { g_locpush_armed = false; return; }
+  uint32_t now = millis();
+  if (!g_locpush_armed) {
+    g_locpush_armed = true;
+    g_locpush_next  = now + (uint32_t)mu_cfg.loc_push_min * 60000UL;
+    return;
+  }
+  if ((int32_t)(now - g_locpush_next) < 0) return;
+  g_locpush_next = now + (uint32_t)mu_cfg.loc_push_min * 60000UL;
+  mu_send_loc_dm(mu_cfg.loc_push_target, nullptr);
+}
+
 void mu_loop() {
   mu_buzzer.loop();        // custom player advances notes + drops EN when done
   led_loop();
@@ -444,6 +471,7 @@ void mu_loop() {
   mu_button_loop();
   mu_fall_loop();
   lowbat_loop();
+  mu_loc_push_tick();      // periodieke auto-locatie-push
   mu_serial_loop();
 }
 

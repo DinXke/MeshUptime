@@ -35,7 +35,7 @@
 #define MU_FALL_TARGET_MAX 4  // direct-alert target pubkeys for fall/no-motion
 
 #define MU_CFG_MAGIC   0x3143554DUL   // "MUC1"
-#define MU_CFG_VERSION 4              // v2: per-slot volume + quiet level; v3: fall config; v4: radio override
+#define MU_CFG_VERSION 5              // v2: per-slot volume + quiet level; v3: fall config; v4: radio override; v5: auto-locatie-push
 
 struct MuConfig {
   uint32_t magic;
@@ -89,6 +89,14 @@ struct MuConfig {
   int8_t   radio_tx_dbm;        // TX power in dBm
   float    radio_freq;          // frequency in MHz
   float    radio_bw;            // bandwidth in kHz
+
+  // ---- Auto-locatie-push: periodiek #LOC-rapport naar een gekozen node -------
+  // Elke `loc_push_min` minuten (0 = uit) stuurt de companion ZELF een #LOC naar
+  // loc_push_target, zodat de kaart/track vers blijft zonder handmatige !loc.
+  uint16_t loc_push_min;             // interval in minuten (0 = uit)
+  uint8_t  loc_push_target_used;     // 1 = loc_push_target geldig
+  uint8_t  _pad2;
+  uint8_t  loc_push_target[MU_PUB_LEN];
 };
 
 extern MuConfig mu_cfg;
