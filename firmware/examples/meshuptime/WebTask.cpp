@@ -1961,6 +1961,10 @@ overleeft geen herstart). Ook opvraagbaar door MeshManager.</p>
 <label style="align-self:center">Volume<select id="cm-vol" style="width:auto;margin-left:.3rem"><option>0</option><option>1</option><option>2</option><option>3</option></select></label>
 <button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vol').value)">stuur vol</button></div>
 <div class="frow" style="margin-top:.4rem">
+<label style="align-self:center">Loc-push<select id="cm-locpush" style="width:auto;margin-left:.3rem"><option value="0">uit</option><option value="1">1 min</option><option value="5" selected>5 min</option><option value="10">10 min</option><option value="15">15 min</option><option value="30">30 min</option><option value="60">60 min</option></select></label>
+<button type="button" onclick="cmCmd('!locpush '+document.getElementById('cm-locpush').value)">stuur loc-push</button>
+<span class="note" style="align-self:center;margin:0">stelt het auto-push-interval in: de companion stuurt zelf elke X min zijn <code>#LOC</code>; het doel wordt op de companion zelf ingesteld.</span></div>
+<div class="frow" style="margin-top:.4rem">
 <label style="align-self:center">Vol per slot<select id="cm-vslot" style="width:auto;margin-left:.3rem"><option value="H">H (hoog)</option><option value="M">M (midden)</option><option value="L">L (laag)</option></select></label>
 <select id="cm-vslotval" style="width:auto"><option>0</option><option>1</option><option>2</option><option>3</option></select>
 <button type="button" onclick="cmCmd('!vol '+document.getElementById('cm-vslot').value+' '+document.getElementById('cm-vslotval').value)">stuur slot-vol</button></div>
