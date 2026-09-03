@@ -75,18 +75,21 @@ commands work standalone.
 **Requirements**: the nRF52 build needs an **ASCII path** (the xtensa/nrf
 toolchain dislikes non-ASCII), hence the `C:\Users\Public\...` locations below.
 
-1. **MeshCore on PowerSaving-v17** (v1.17.1 — has RXPS + the T1000-E power
-   profile). The non-destructive way, leaving any existing checkout untouched:
+1. **MeshCore on standard v1.17.1** (tag `companion-v1.17.1`, commit `d929643`).
+   *Not* the PowerSaving-v17 fork: its RX duty-cycling is what made the receiver
+   miss preambles, and v2.0.0 deliberately moved off it (see the changelog). The
+   non-destructive way, leaving any existing checkout untouched:
 
    ```bash
    cd /path/to/MeshCore
-   git worktree add --detach ../MeshCore-ps17 iotthinks/PowerSaving-v17
+   git worktree add --detach ../MeshCore-std d929643
    ```
 
-2. **Sibling layout** — put this repo next to the MeshCore checkout:
+2. **Sibling layout** — put this repo next to the MeshCore checkout. The env
+   refers to it by relative path, so the names matter:
 
    ```
-   <parent>/MeshCore-ps17
+   <parent>/MeshCore-std
    <parent>/MU-companion/MeshUptimeCompanion
    ```
 
@@ -94,21 +97,29 @@ toolchain dislikes non-ASCII), hence the `C:\Users\Public\...` locations below.
 
    ```bash
    cp MU-companion/MeshUptimeCompanion/platformio.local.ini.example \
-      MeshCore-ps17/platformio.local.ini
+      MeshCore-std/platformio.local.ini
    ```
 
 4. **Build**:
 
    ```bash
-   cd MeshCore-ps17
+   cd MeshCore-std
    python -m platformio run -e t1000e_meshuptime_companion
    ```
 
-   Artifacts land in
-   `MeshCore-ps17/.pio/build/t1000e_meshuptime_companion/` —
-   `firmware.hex` and `firmware.zip` (nrfutil DFU package). A `.uf2` is produced
-   by `uf2conv` if configured; otherwise convert `firmware.hex` with
-   `uf2conv.py -c -f 0xADA52840 firmware.hex -o firmware.uf2`.
+   Artifacts land in `MeshCore-std/.pio/build/t1000e_meshuptime_companion/` —
+   `firmware.hex` and `firmware.zip` (nrfutil DFU package). **No `.uf2` is
+   produced by the build**; make the drag-and-drop image yourself from the hex
+   (`uf2conv.py` ships in the MeshCore checkout under `bin/uf2conv/`):
+
+   ```bash
+   python bin/uf2conv/uf2conv.py -c -f 0xADA52840 \
+     .pio/build/t1000e_meshuptime_companion/firmware.hex \
+     -o .pio/build/t1000e_meshuptime_companion/firmware.uf2
+   ```
+
+   A correct result reports `start address: 0x27000` — the application region
+   only, which is what keeps the keys and the filesystem intact (see below).
 
 The env is BLE-based (phone app over BLE) and leaves the USB serial port free
 for the text CLI. `ADVERT_NAME='"@@MAC"'` names the node from its MAC on first
