@@ -111,6 +111,10 @@ static inline uint8_t mu_slot_base_vol(int slot) {
 void   mu_config_begin();          // load or create defaults, seed allowlist
 void   mu_config_save();           // persist current mu_cfg
 void   mu_config_reset_defaults(); // reset (keeps nothing) then save
+// Wat mu_config_begin() met het opgeslagen bestand deed ("geladen v5",
+// "gemigreerd v4 -> v5", "hersteld uit .tmp (...)", "DEFAULTS (reden)").
+// Blijft de hele uptime staan; zie MuConfig.cpp voor waarom dat nodig is.
+const char* mu_config_boot_note();
 
 // Allowlist helpers. prefix_len<MU_PUB_LEN allowed for del-by-prefix matching.
 int    mu_allow_find(const uint8_t* pub);           // index or -1

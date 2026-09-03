@@ -61,7 +61,8 @@ static const char* trim(const char* s, char* out, int out_sz) {
 static void draw_top() {
   P("");
   P(".-----------------------------------------------.");
-  P("|   MeshUptimeCompanion  (*)  serieel-menu      |");
+  // Versie in de banner: "welke build draait hier" mag geen zoektocht zijn.
+  P("|   MeshUptimeCompanion  v" MU_FW_VERSION "  serieel-menu   |");
   P("'-----------------------------------------------'");
   P(" 1) Geluiden & deuntjes");
   P(" 2) Alerts & ernst-mapping");

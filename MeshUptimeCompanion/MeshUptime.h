@@ -7,9 +7,11 @@
 #include "MuConfig.h"
 #include "MuBuzzer.h"     // MuBuzzer mu_buzzer (custom PWM-duty player, extern)
 
-// Firmware (companion-layer) version. Shown on the serial banner so a running
-// device / serial capture is traceable to a build. Bump the patch for fixes.
-#define MU_FW_VERSION "2.2.0"
+// Firmware (companion-layer) version. Shown on the serial banner AND in the
+// `cfg`/`status` output so a running device / serial capture is traceable to a
+// build -- the banner alone is lost when the host opens the port after boot.
+// Bump the patch for fixes.
+#define MU_FW_VERSION "2.3.0"
 
 // Lifecycle (called from app_main.cpp)
 void mu_begin();

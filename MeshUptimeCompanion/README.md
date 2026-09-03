@@ -147,9 +147,87 @@ Rules:
 4. If you build a `.hex`/DFU zip and flash over serial DFU (`nrfutil`/`adafruit-
    nrfutil`), use the **application** DFU package only — never a full/SoftDevice
    erase.
+5. **Never flash a build older than the one that wrote the config.** Builds
+   before 2.3.0 overwrite a newer `/mu_cfg.dat` with factory defaults; from 2.3.0
+   the file is preserved but ignored (see *Configuration file* below). Keep only
+   the **current** `.uf2` in `dist/` so a wrong drag-and-drop cannot happen.
 
 If identity is ever lost, the node comes back with a **new** public key and must
 be re-added to every contact and re-authorised on the mesh — so back up first.
+
+---
+
+## Which build is running?
+
+Three places show the companion-layer version (`MU_FW_VERSION`), so this never
+has to be reconstructed from behaviour:
+
+- the serial menu banner — `|   MeshUptimeCompanion  v2.3.0  serieel-menu   |`,
+- the first line of `cfg` / `status` — `cfg: fw=2.3.0 ...` — over serial **or**
+  as a `!cfg` DM from an allow-listed sender,
+- indirectly, the `B<pct>` battery token in `#LOC` reports (present since 2.2.0).
+
+Before 2.3.0 the banner carried no version at all; the `B<pct>` token was the
+only tell.
+
+---
+
+## Serial: menu mode vs command mode
+
+The USB serial port speaks two dialects, and mixing them looks like the device
+ignoring you:
+
+- An **empty line** opens the numbered **menu** (`1`–`9`, `b` = back, `q` =
+  close). While the menu is open, text such as `cfg` is read as a (wrong) menu
+  choice and the menu is simply redrawn.
+- With the menu **closed**, every line is a **command** without the `!` prefix:
+  `help`, `cfg`, `status`, `allow list`, `locpush`, `fall status`, … Unknown
+  text answers `onbekend: <text> (!help)`.
+
+Open the port at **115200 baud**. Never open it at **1200 baud** unless you mean
+to: that is the "touch" that drops an nRF52 into the UF2 bootloader.
+
+---
+
+## Configuration file: persistence, downgrades and the boot note
+
+All settings live in `/mu_cfg.dat` on the internal LittleFS and are written
+**immediately** by every mutating command or menu action — there is no separate
+"save" step to forget, and a plain reboot never loses anything.
+
+Since 2.3.0 the save is **atomic**: the new blob goes to `/mu_cfg.tmp` first and
+is renamed over the real file only once every byte is on flash. A reset or an
+empty battery in the middle of a save leaves the previous configuration intact.
+(Before 2.3.0 the file was removed *before* being rewritten, so one badly-timed
+reset meant factory defaults at the next boot — silently.)
+
+At boot the loader records what it did. `cfg` / `status` show it for the whole
+uptime as `cfg-bestand: …`, and it is printed once on the boot log as `[cfg] …`:
+
+| note | meaning |
+|---|---|
+| `geladen v5` | normal load |
+| `gemigreerd v4 -> v5` | older layout read, new fields defaulted, file rewritten in the new layout |
+| `hersteld uit .tmp (geen bestand)` | the real file was missing or corrupt; the last complete save was recovered from `.tmp` |
+| `DEFAULTS (geen bestand)` | first boot, or the file was gone — defaults written |
+| `DEFAULTS (van nieuwere firmware; bestand bewaard)` | **downgrade**: the file was written by a newer build. Defaults are used in RAM but the file is **left untouched**, so re-flashing the newer build finds everything again. The first setting you change on the old build overwrites it — deliberately. |
+| `DEFAULTS (bewust gereset)` | `mu_config_reset_defaults()` was called |
+
+### The downgrade pitfall (what happened on 2026-09-03)
+
+Every build has a config-layout version (`MU_CFG_VERSION`: v4 up to 2.0.0, v5
+since 2.1.0). A build **older** than the one that wrote the file cannot read it.
+Before 2.3.0 it then wrote its own defaults *over* the file, so flashing back to
+the newer build afterwards found a v4 file with everything reset: `locpush` off
+(no more `#LOC` pushes) and the allow-list back to the two seeded entries (owner
++ alert bot). That last part is why `!` commands from the MGMT bot suddenly
+arrived in the phone app as plain chat: an unknown sender's `!` text is
+deliberately passed through instead of executed. Since 2.3.0 the file survives a
+downgrade (see the table above).
+
+Practical rules: keep only the **current** `.uf2` in `dist/`, check the version
+after every flash (`status` → `fw=`), and read `cfg-bestand:` — it should say
+`geladen v5`.
 
 ---
 
@@ -177,3 +255,17 @@ be re-added to every contact and re-authorised on the mesh — so back up first.
   always report the **real** voltage.
 - The two copied companion sources are pinned to the MeshCore version they were
   copied from; re-copy + re-apply the small hooks when bumping MeshCore.
+
+---
+
+## Changelog (companion layer)
+
+- **2.3.0** — atomic config save (`.tmp` + rename) with `.tmp` recovery at boot;
+  a config written by a newer build is no longer overwritten on downgrade; boot
+  note (`cfg-bestand:`) in `cfg`/`status` and `[cfg]` on the boot log; version in
+  the menu banner and in `cfg`/`status`.
+- **2.2.0** — `B<pct>` battery token in `#LOC` reports.
+- **2.1.0** — auto location push (`locpush off|<min> [pubkey64]`); `!` commands
+  from allow-listed senders are no longer handed to the app as chat.
+- **2.0.0** — rebuilt on standard MeshCore v1.17.1 (continuous RX); the
+  PowerSaving-v17 base and its RX duty-cycling are gone.

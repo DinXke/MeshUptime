@@ -65,7 +65,7 @@ static void cmd_cfg(const MuCmdCtx& ctx) {
 
   // NOTE: our OWN output reports the REAL voltage + TRUE curve %. Only the app's
   // standard battery frame gets the encoded value (see PROTOCOL.md §7).
-  mu_reply(ctx, "cfg: mute=%d vol=%d msgtune=%d batt=%dmV(%d%%)",
+  mu_reply(ctx, "cfg: fw=" MU_FW_VERSION " mute=%d vol=%d msgtune=%d batt=%dmV(%d%%)",
            mu_cfg.mute, mu_cfg.vol, mu_cfg.msg_tune_enabled, mv, pct);
   mu_reply(ctx, "slotvol H=%d M=%d L=%d find=%d msg=%d (255=default)",
            mu_cfg.tune_vol[MU_TUNE_HIGH], mu_cfg.tune_vol[MU_TUNE_MED],
@@ -82,6 +82,10 @@ static void cmd_cfg(const MuCmdCtx& ctx) {
   mu_reply(ctx, "allow=%d target=%d sos=%d loc=%.5f,%.5f",
            allow_n, mu_cfg.has_target, mu_cfg.has_sos,
            (double)sensors.node_lat, (double)sensors.node_lon);
+  // Wat er bij het opstarten met het cfg-bestand gebeurde. "DEFAULTS (...)"
+  // hier is het antwoord op "waarom staat alles ineens uit?" -- zonder deze
+  // regel was dat een reconstructie achteraf.
+  mu_reply(ctx, "cfg-bestand: %s", mu_config_boot_note());
 }
 
 static void cmd_allow(const MuCmdCtx& ctx, const char* args) {

@@ -381,6 +381,8 @@ void mu_begin() {
   mu_buzzer.begin();       // custom PWM-duty player; EN rail idles low
 
   mu_config_begin();
+  // Ook op de bootlog, voor wie de poort al open had (bv. een DFU-sessie).
+  Serial.printf("[cfg] %s\n", mu_config_boot_note());
 
   // Re-apply a persisted radio override (if any) to the LR1110 + live NodePrefs.
   // Runs AFTER radio_init()/the_mesh.begin() (both done in setup() before us), so
