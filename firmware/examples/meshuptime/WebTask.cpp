@@ -4,6 +4,8 @@
 #include "MonitorStore.h"
 #include "SensorMesh.h"
 #include "IWebNode.h"
+#include "RepeaterCli.h"
+#include "Poller.h"
 #include "TimeFmt.h"
 
 #include <WebServer.h>
@@ -365,6 +367,20 @@ static char g_cmd[176];
  * beginindex 0. */
 static char g_reply[320];
 
+/* EIGEN ANTWOORDBUFFER VOOR /cli/remote, en niet g_reply hierboven. Ook hier
+ * nagerekend en niet geraden:
+ *
+ *   de standregel (GET):  vaste tekst (~110) + opdracht (160) + antwoord (176)
+ *                         + foutmelding (72) + doel (12)          -> ~530
+ *   de startregel (POST): vaste tekst (~190) + opdracht TWEE keer
+ *                         (de opdracht zelf en de paramnaam 'cmd:...')
+ *                         + doel (12) + de muterend-noot (39)     -> ~400
+ *
+ * 640 laat daar ruim 100 byte boven. Met g_reply (320) zou snprintf hier STIL
+ * afkappen -- precies midden in het antwoord van de repeater, wat de ergste
+ * plek is: een half filterantwoord ziet er compleet uit. */
+static char g_rcli_reply[640];
+
 /* GET /cfg.json. Eén antwoord met de hele stand van NodePrefs, hoogstens één keer
  * per keer dat iemand het beheertabblad opent -- dus geen buffer die naast
  * g_json of g_acl hoeft te passen in tempo, alleen in maat:
@@ -437,6 +453,11 @@ void web_route_aclset()    { if (g_self) g_self->handleAclSet(); }
 void web_route_acldel()    { if (g_self) g_self->handleAclDel(); }
 void web_route_aclstrict() { if (g_self) g_self->handleAclStrict(); }
 void web_route_cli()       { if (g_self) g_self->handleCli(); }
+void web_route_cliremote() { if (g_self) g_self->handleCliRemote(); }
+void web_route_pollerjson()   { if (g_self) g_self->handlePollerJson(); }
+void web_route_poller()       { if (g_self) g_self->handlePoller(); }
+void web_route_targetsjson()  { if (g_self) g_self->handleTargetsJson(); }
+void web_route_target()       { if (g_self) g_self->handleTarget(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
 void web_route_webcred()   { if (g_self) g_self->handleWebCred(); }
 void web_route_credreset() { if (g_self) g_self->handleWebCredReset(); }
@@ -1321,7 +1342,7 @@ afzender.</p>
 <h2>CLI-console</h2>
 <div class="card">
 <div class="cmdrow"><input id="ci" spellcheck="false" autocomplete="off"
-maxlength="160" placeholder="ver"><button id="cb">stuur</button></div>
+maxlength="240" placeholder="ver"><button id="cb">stuur</button></div>
 <div class="quick">
 <button data-c="ver">ver</button>
 <button data-c="clock">clock</button>
@@ -1375,6 +1396,20 @@ regel. Wat er niet in een formulier staat, typ je hier.<br>
 <code>power.sample</code> <code>power.confirm</code> <code>power.settle</code>
 <code>read.interval</code>. En
 <code>sensor list</code> voor de hele lijst.<br>
+<b>Naar een ANDERE repeater</b>, over LoRa:
+<code>@&lt;pubkey&gt;[:&lt;wachtwoord&gt;] &lt;opdracht&gt;</code> &mdash; bv.
+<code>@e3d3f4d7edd0:geheim filter count</code>. De pubkey mag een prefix van 12
+hextekens zijn als deze node ooit een advert van die repeater hoorde (anders de
+volle 64; die staat in de nodekiezer). Er loopt er <b>een tegelijk</b>: zendtijd
+is een gedeelde band. Niet-blokkerend &mdash; de console antwoordt
+&quot;gestart&quot; en het antwoord verschijnt hier tien tot zestig seconden
+later; het gaat daarna ook naar MeshManager onder de naam
+<code>cmd:&lt;opdracht&gt;</code>. Een opdracht die iets VERANDERT wordt
+<b>niet herhaald</b> (een herhaling zou hem op de tegenkant opnieuw uitvoeren),
+en <code>clkreboot</code> op afstand is de gevaarlijkste van allemaal: die zet de
+klok van die node op mei 2024 en herstart hem, waarna hij zonder een tijdig
+<code>time &lt;epoch&gt;</code> tot 2026 onzichtbaar is voor iedereen die hem al
+kende.<br>
 <b>Ad-hoc ping:</b> <code>ping &lt;adres&gt; [n]</code> pingt een vrij op te
 geven adres (n keer, standaard 3, hoogstens 5). Niet-blokkerend: de console
 antwoordt &quot;gestart&quot; en de uitslag verschijnt onder de tegels op het
@@ -1396,6 +1431,43 @@ buurtlijst staat op het tabblad <b>toegang</b>. <code>log&nbsp;&hellip;</code> e
 <code>clear stats</code> hangen aan lege callbacks, dus ze melden &quot;logging
 on&quot; en &quot;stats reset&quot; zonder dat er iets gebeurt. Dat is gedrag van
 de sensorrol en niet van deze pagina.</p>
+</div>
+
+<h2>MeshManager-poller &mdash; opdrachten ophalen zonder Home Assistant</h2>
+<div class="card">
+<p class="note">Deze node haalt zelf de opdrachtwachtrij van MeshManager op
+(<code>GET&nbsp;/api/v1/commands</code>, elke <i>interval</i> seconden) en voert de
+instellingen-opvragingen uit langs de remote-CLI hierboven &mdash; de weg die
+vroeger over Home Assistant liep. Antwoorden gaan terug naar
+<code>/api/v1/repeater_settings</code>; een parameter zonder antwoord wordt als
+<code>null</code> gemeld (&quot;gevraagd, geen antwoord&quot;), nooit als stilte.
+<b>Er loopt er één tegelijk</b> en de bewaking gaat voor. <code>refresh</code>-
+(status)verzoeken worden in deze versie <b>niet</b> uitgevoerd &mdash; ze worden
+genegeerd en geteld.</p>
+<div id="pl-status" class="note">&hellip;</div>
+<div class="quick" style="margin-top:.4rem">
+<label style="align-self:center"><input type="checkbox" id="pl-on"> poller aan</label>
+<span style="align-self:center;color:var(--muted);font-size:.8rem">interval (s):</span>
+<input id="pl-secs" type="number" min="10" max="3600" style="width:6rem">
+<button type="button" id="pl-save">opslaan</button></div>
+<p class="note" style="margin-top:.6rem"><b>Doel-wachtwoorden.</b> Om als beheerder
+op een repeater in te loggen moet deze node diens admin-wachtwoord kennen. Zet een
+wachtwoord per doel (pubkey-prefix, 12&ndash;64 hex) of één standaardwachtwoord als
+terugval. Wachtwoorden worden <b>nooit teruggetoond</b> &mdash; alleen &quot;gezet:
+ja&quot;. Dit is Basic-auth over onversleuteld HTTP: doe dit op een net waar niemand
+meeleest.</p>
+<div id="pl-targets" class="note">&hellip;</div>
+<div class="quick" style="margin-top:.4rem">
+<input id="pl-pfx" spellcheck="false" autocomplete="off" maxlength="64"
+placeholder="e3d3f4d7edd0" style="width:12rem">
+<input id="pl-pass" type="password" autocomplete="new-password" maxlength="15"
+placeholder="wachtwoord" style="width:9rem">
+<button type="button" id="pl-tset">doel zetten</button></div>
+<div class="quick" style="margin-top:.35rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">standaard:</span>
+<input id="pl-def" type="password" autocomplete="new-password" maxlength="15"
+placeholder="terugval-wachtwoord" style="width:11rem">
+<button type="button" id="pl-defset">standaard zetten</button></div>
 </div>
 
 <h2>Instellingen</h2>
@@ -2166,6 +2238,14 @@ cls(tot?(up==tot?"ok":"warn"):"unk")],
 ["uptime",hms(d.uptime),"resets "+d.resets,"unk"],
 ["vrije heap",kb(d.heap),"grootste blok "+kb(d.largest),"unk"],
 ["firmware",d.fw,"verbindingen "+d.reconnects,"unk"]];
+/* v2.6.0: een tegel voor de MeshManager-poller, alleen als er een is. "aan" is
+   groen; uit is neutraal. De ondertekst zegt hoe lang geleden er gepold is (of
+   "nog nooit") en of er iets in de wachtrij staat -- de details staan op het
+   nodebeheer-tabblad. */
+if(d.poller){var pl=d.poller;
+t.push(["poller",pl.on?"aan":"uit",
+pl.on?((pl.ever?pl.age+"s geleden":"nog niet")+(pl.pending?", "+pl.pending+" wacht":"")):"uit",
+cls(pl.on?"ok":"unk")])}
 var h="";t.forEach(function(x){h+='<div class="tile"><div class="k">'+x[0]+
 '</div><div class="v c-'+x[3]+'">'+x[1]+'</div><div class="s">'+x[2]+"</div></div>"});
 document.getElementById("t").innerHTML=h}
@@ -2839,6 +2919,11 @@ while(o.childElementCount>40){o.removeChild(o.lastChild)}}
    'sensor set' is het bovendien het enige onderscheid dat er is: die antwoordt
    "ok" of "can't find custom var" en zegt nooit waarom. */
 function isErr(t){return /^(err|error|unknown|can't|\?\?)/i.test((t||"").trim())}
+/* HTML-veilig maken van een servertekst voordat hij via innerHTML de pagina in
+   gaat (poller-note, sessie, prefix). De waarden komen van onze eigen node, maar
+   een node die iemands bewaking draait hoort geen tekst ongefilterd te injecteren. */
+function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,function(c){
+return{"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]})}
 
 /* Eén opdracht. Geeft een promise met {ok,txt} terug zodat een reeks opdrachten
    op elkaar kan wachten -- niet omdat het moet, maar omdat vijf tegelijk op een
@@ -2869,9 +2954,81 @@ step()}
 
 function send(cmd,cf){return cli(cmd,cf)}
 
+/* ---- DEZELFDE CONSOLE, MAAR NAAR EEN ANDERE REPEATER ----------------------
+ *
+ * GEEN TWEEDE INVOERVELD en geen apart paneel, en dat is een keuze: de console
+ * hierboven IS al de plek waar je een CLI-regel typt, en het enige dat er anders
+ * is aan een remote-opdracht is de BESTEMMING. Een tweede veld ernaast zou twee
+ * plaatsen maken waar dezelfde soort regel begint -- en dan is het bij de
+ * volgende wijziging de vraag welke van de twee de echte is.
+ *
+ * Vandaar een voorvoegsel: "@<pubkey>[:<wachtwoord>] <opdracht>". De rest van de
+ * regel gaat ONGEWIJZIGD de deur uit, precies zoals bij de eigen node.
+ *
+ * De bevestigingen hieronder zijn de BROWSERkant. De server vraagt ze los
+ * (confirm=...) en weigert zonder; zonder deze vragen zou intypen een sluipweg om
+ * de waarschuwing heen zijn -- dezelfde redenering als bij 'set radio' hierboven.
+ */
+function cliRemote(tgt,pw,cmd,cf){
+var lbl="@"+tgt+" "+cmd;
+var b="target="+encodeURIComponent(tgt)+"&pass="+encodeURIComponent(pw)+
+"&cmd="+encodeURIComponent(cmd);
+if(cf){b+="&confirm="+cf}
+return fetch("cli/remote",{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:b})
+.then(function(r){return r.text().then(function(t){
+var ok=r.ok&&!isErr(t);logline(lbl,t,ok);if(ok){rpoll(0)}return{ok:ok,txt:t}})})
+.catch(function(){logline(lbl,"geen verbinding met de node",0);
+return{ok:false,txt:"geen verbinding"}})}
+
+/* De stand ophalen tot de sessie klaar of mislukt is. POLLEN en niet wachten: het
+   antwoord komt over LoRa, en dat duurt tientallen seconden -- een fetch die daar
+   op blijft hangen zou de node ondertussen een open verbinding kosten.
+   Elke 5 s, hoogstens 44 keer = 220 s; dat is boven de harde bovengrens van de
+   node zelf (RCLI_SESSION_MAX_MS, 180 s), dus de lus stopt altijd op een uitslag
+   en nooit op de teller. */
+function rpoll(n){
+if(n>44){return}
+setTimeout(function(){
+fetch("cli/remote").then(function(r){return r.text()}).then(function(t){
+if(/^stand: (klaar|mislukt|vrij)/.test(t)){logline("(remote)",t,!/mislukt/.test(t))}
+else{rpoll(n+1)}}).catch(function(){})},5000)}
+
 document.getElementById("cb").onclick=function(){
 var el=document.getElementById("ci"),c=el.value.trim();
 if(!c){return}
+
+/* Een regel die met @ begint gaat naar een ANDERE repeater. Eerst afhandelen,
+   vóór alle zeven hieronder: die gaan over DEZE node en hun waarschuwingsteksten
+   zouden hier het verkeerde zeggen. */
+if(c.charAt(0)=="@"){
+var m=/^@(\S+?)(?::([^\s]*))?\s+(.+)$/.exec(c);
+if(!m){alert("Naar een andere repeater:\n\n  @<pubkey>[:<wachtwoord>] "+
+"<opdracht>\n\nBijvoorbeeld:\n  @e3d3f4d7edd0:geheim filter count");return}
+var tg=m[1],pw=m[2]||"",rc=m[3].trim(),rf2="";
+if(/^clkreboot\b/.test(rc)){
+if(!confirm("KLOK TERUGZETTEN EN HERSTARTEN op "+tg+"\n\nclkreboot zet de klok "+
+"van die node op mei 2024 en herstart hem. Komt daarna geen 'time <epoch>' aan, "+
+"dan draagt elk advert van die node een LAGERE tijdstempel dan wat iedereen al "+
+"van hem kent -- en zulke adverts worden overal weggegooid. Hij zendt dan wel, "+
+"maar is voor elke node die hem kende ONZICHTBAAR tot 2026.\n\nZet 'time "+
+"<epoch>' klaar voordat je dit doet.\n\nDoorgaan?")){return}
+rf2="clkreboot"}
+else if(/^reboot\b/.test(rc)){
+if(!confirm("Repeater "+tg+" herstarten?\n\nJe kunt niet bij die node.")){return}
+rf2="reboot"}
+else if(/^set (radio|freq) /.test(rc)){
+if(!confirm("MESH-AFSPRAAK VAN "+tg+" WIJZIGEN\n\n  "+rc+"\n\nEen verkeerd getal "+
+"en die node zit niet meer op dit mesh. LoRa was de weg waarlangs je hier praat, "+
+"dus dan is er geen tweede weg naar hem toe.\n\nDoorgaan?")){return}
+rf2="radio"}
+else if(/^erase\b/.test(rc)){
+if(!confirm("Bestandssysteem van "+tg+" WISSEN?\n\nDaarmee gaat ook zijn "+
+"toegangslijst weg, en dus onze eigen ingang -- deze weg zelf.")){return}
+rf2="erase"}
+cliRemote(tg,pw,rc,rf2);
+el.value="";return}
+
 /* De twee onomkeerbare hier ook achter een bevestiging, ook als iemand ze
    intypt. De node vraagt zelf niets -- een CLI kent geen 'weet je het zeker'. */
 if(/^erase\b/.test(c)&&!confirm("Bestandssysteem WISSEN?\n\nDit gooit de "+
@@ -2910,6 +3067,63 @@ var el=document.getElementById("rgi"),c=el.value.trim();
 if(!c){return}
 if(!/^region\b/.test(c)){c="region "+c}
 send(c).then(function(){el.value=""})}
+
+/* ---- de MeshManager-poller ----
+ * Laadt stand (/poller.json) en doelen (/repeater_targets.json), en bedient
+ * /poller (aan/uit + interval) en /repeater/target (wachtwoorden). Wachtwoorden
+ * gaan alleen HEEN; de lijst toont enkel "gezet". */
+function plLoad(){
+fetch("poller.json").then(function(r){return r.ok?r.json():null}).then(function(j){
+if(!j){document.getElementById("pl-status").textContent="poller niet beschikbaar";return}
+document.getElementById("pl-on").checked=!!j.on;
+var si=document.getElementById("pl-secs");if(document.activeElement!==si){si.value=j.poll_secs}
+var age=j.ever?(j.last_poll_age+"s geleden"):"nog nooit";
+document.getElementById("pl-status").innerHTML=
+"<b>"+(j.on?"AAN":"uit")+"</b> &middot; laatste poll: "+age+
+" &middot; verwerkt: "+j.processed+" &middot; verloren: "+j.dropped+
+" &middot; wachtrij: "+j.pending+" &middot; sessie: "+esc(j.session)+
+(j.refresh_dropped?(" &middot; "+j.refresh_dropped+" refresh genegeerd"):"")+
+"<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})
+fetch("repeater_targets.json").then(function(r){return r.ok?r.json():null}).then(function(j){
+if(!j){return}
+var h="standaardwachtwoord: <b>"+(j.default_pass?"gezet":"niet gezet")+"</b>";
+if(j.targets&&j.targets.length){h+="<br>doelen:<ul style=\"margin:.3rem 0\">";
+for(var i=0;i<j.targets.length;i++){var t=j.targets[i];
+h+="<li><code>"+esc(t.prefix)+"</code> &middot; wachtwoord "+(t.pass_set?"gezet":"nee")+
+" <button type=\"button\" data-pfx=\""+esc(t.prefix)+"\" class=\"pl-del\">wis</button></li>"}
+h+="</ul>"}else{h+="<br>nog geen doelen"}
+document.getElementById("pl-targets").innerHTML=h;
+var db=document.querySelectorAll(".pl-del");
+for(var k=0;k<db.length;k++){db[k].onclick=function(){
+var p=this.getAttribute("data-pfx");
+fetch("repeater/target",{method:"POST",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"del="+encodeURIComponent(p)}).then(function(){plLoad()})}}}).catch(function(){})}
+
+document.getElementById("pl-save").onclick=function(){
+var on=document.getElementById("pl-on").checked?"1":"0";
+var s=document.getElementById("pl-secs").value;
+fetch("poller",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"on="+on+"&poll_secs="+encodeURIComponent(s)})
+.then(function(r){return r.text()}).then(function(t){logline("poller",t,1);plLoad()})}
+
+document.getElementById("pl-tset").onclick=function(){
+var p=document.getElementById("pl-pfx").value.trim();
+var w=document.getElementById("pl-pass").value;
+if(!p){alert("pubkey-prefix (12-64 hex) invullen");return}
+fetch("repeater/target",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"prefix="+encodeURIComponent(p)+"&pass="+encodeURIComponent(w)})
+.then(function(r){return r.text()}).then(function(t){logline("doel",t,1);
+document.getElementById("pl-pass").value="";plLoad()})}
+
+document.getElementById("pl-defset").onclick=function(){
+var w=document.getElementById("pl-def").value;
+fetch("repeater/target",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"default="+encodeURIComponent(w)})
+.then(function(r){return r.text()}).then(function(t){logline("standaard",t,1);
+document.getElementById("pl-def").value="";plLoad()})}
+
+plLoad();setInterval(plLoad,15000);
 
 /* ---- de instelformulieren ----
  *
@@ -4279,6 +4493,16 @@ void WebTask::routes() {
    * browser hem voorlaadt, en dat is de ergste knop die dit apparaat heeft. */
   _server->on("/cfg.json", HTTP_GET, web_route_cfgjson);
   _server->on("/cli", HTTP_POST, web_route_cli);
+  /* De remote-variant: POST start, GET leest de stand. Zie handleCliRemote(). */
+  _server->on("/cli/remote", HTTP_POST, web_route_cliremote);
+  _server->on("/cli/remote", HTTP_GET,  web_route_cliremote);
+  /* v2.6.0: de MeshManager-poller. Stand+config via /poller.json (GET) en /poller
+   * (POST); doel-wachtwoorden via /repeater_targets.json (GET, ZONDER wachtwoord)
+   * en /repeater/target (POST). Zie de handlers. */
+  _server->on("/poller.json", HTTP_GET, web_route_pollerjson);
+  _server->on("/poller", HTTP_POST, web_route_poller);
+  _server->on("/repeater_targets.json", HTTP_GET, web_route_targetsjson);
+  _server->on("/repeater/target", HTTP_POST, web_route_target);
   /* De eigen web-login. POST-only, en achter dezelfde Basic-auth als de rest: dit
    * is de route waarmee de statsserver de credential roteert. Een GET zou een link
    * zijn die een browser of een linkchecker kan volgen, en dit verandert het
@@ -4572,11 +4796,25 @@ void WebTask::handleStatus() {
         (unsigned)MON_FDEB_MIN, (unsigned)MON_FDEB_MAX);
   }
 
+  /* v2.6.0 -- een compacte poller-regel voor de HOOFDstatuspagina (de details
+   * staan op het nodebeheer-tabblad via /poller.json). Alleen als er een poller
+   * is (room-variant met wifi); anders leeg blok, dan toont de pagina niets. */
+  char pollblk[160];
+  pollblk[0] = 0;
+  if (_poller != nullptr) {
+    snprintf(pollblk, sizeof(pollblk),
+        "\"poller\":{\"on\":%d,\"secs\":%u,\"age\":%lu,\"ever\":%d,\"pending\":%u,"
+        "\"processed\":%lu},",
+        _poller->enabled() ? 1 : 0, (unsigned)_poller->pollSecs(),
+        (unsigned long)_poller->lastPollAgeSecs(), _poller->everPolled() ? 1 : 0,
+        (unsigned)_poller->pendingCount(), (unsigned long)_poller->processedCount());
+  }
+
   int n = snprintf(g_json, sizeof(g_json),
       "{\"fw\":\"%s\",\"wifi\":\"%s\",\"ip\":\"%u.%u.%u.%u\",\"rssi\":%d,"
       "\"reason\":%u,\"reconnects\":%lu,\"resets\":%lu,\"uptime\":%lu,"
       "\"heap\":%lu,\"largest\":%lu,\"ssid\":\"%s\","
-      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s%s%s\"mon\":[",
+      "\"mains\":%d,\"volts\":\"%.3f\",\"paused\":%d,%s%s%s%s%s\"mon\":[",
       _fw, wifiStateName(_wifi),
       ip[0], ip[1], ip[2], ip[3],
       (int)WiFi.RSSI(),
@@ -4594,7 +4832,7 @@ void WebTask::handleStatus() {
       _mon != nullptr ? (_mon->isMains() ? 1 : 0) : -1,
       _mon != nullptr ? _mon->lastVolts() : 0.0f,
       _mon != nullptr && _mon->monitorsPaused() ? 1 : 0,
-      budblk, adhocblk, simblk, timblk);
+      budblk, adhocblk, simblk, timblk, pollblk);
 
   if (n < 0 || (size_t)n >= sizeof(g_json)) {   /* kan niet; vangnet */
     _server->send(500, "text/plain", "antwoord te groot");
@@ -7109,6 +7347,373 @@ void WebTask::handleCli() {
 
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "text/plain", g_reply);
+}
+
+/* ===========================================================================
+ * /cli/remote  --  DEZELFDE CLI, MAAR OP EEN ANDERE REPEATER OVER LoRa
+ *
+ *   POST  target=<12..64 hex>&pass=<beheerderswachtwoord>&cmd=<opdracht>
+ *         [&confirm=<teken>]
+ *   GET   (geen argumenten) -> de stand van de lopende/laatste opdracht
+ *
+ * DIT IS handleCli() MET EEN ANDERE BESTEMMING, en de redenering erboven geldt
+ * hier ONVERKORT -- met een verschil dat alles zwaarder maakt:
+ *
+ *   bij /cli sluit je JEZELF buiten, bij /cli/remote iemand anders,
+ *   en die node hangt op een dak.
+ *
+ * Vandaar dat de weigerlijst hieronder LANGER is dan die van /cli, niet korter.
+ * Wat daar "doe dit over de seriële console" heet, heet hier "doe dit met een
+ * ladder".
+ *
+ * WEIGEREN, altijd, ongeacht wat er meegestuurd wordt:
+ *
+ *  - alles met prv.key. Bij /cli gaat de privésleutel over onversleuteld HTTP;
+ *    hier komt daar bij dat het ANTWOORD ook nog eens in het duwbericht naar
+ *    MeshManager belandt. De privésleutel van een ANDERE node in een logregel op
+ *    een server zetten is een lek dat je niet terugdraait.
+ *  - start ota / poweroff / shutdown. Op de eigen node kun je nog met een kabel
+ *    naar de node toe; op een node op een dak is er niets. 'poweroff' zonder
+ *    wektijd betekent dat er iemand moet klimmen.
+ *
+ * BEVESTIGING VERPLICHT (confirm=<teken> in de POST):
+ *
+ *  - clkreboot -> confirm=clkreboot. DIT IS DE GEVAARLIJKSTE VAN ALLEMAAL en de
+ *    reden staat niet in de MeshCore-documentatie: clkreboot zet de klok terug
+ *    naar mei 2024 EN herstart. Landt daarna geen 'time <epoch>', dan draagt elk
+ *    advert van die node een tijdstempel die LAGER is dan wat iedereen al van hem
+ *    kent -- en zo'n advert wordt overal weggegooid. De node zendt dan, hoort
+ *    alles, en is voor elke node die hem al kende ONZICHTBAAR tot 2026. Niet
+ *    stuk, niet weg: onbereikbaar op een manier die je niet ziet.
+ *  - reboot -> confirm=reboot. Twintig seconden weg is op zich niets, maar dit is
+ *    andermans repeater en de knop hoort niet zonder tweede handeling te werken.
+ *  - set radio / set freq -> confirm=radio. Een verkeerd getal en die node zit
+ *    niet meer op dit mesh -- en dan is er geen tweede weg naar hem toe, want
+ *    deze WAS de tweede weg.
+ *  - erase -> confirm=erase. Wist zijn toegangslijst; daarmee vervalt ook onze
+ *    eigen ingang en dus deze weg.
+ *
+ * EEN MUTEREND COMMANDO WORDT NIET HERHAALD. Die rem zit in RepeaterCli
+ * (isMutating + _max_attempts), niet hier -- want een herhaling met een nieuwe
+ * tijdstempel VOERT HET COMMANDO OPNIEUW UIT op de tegenkant, en dat is een
+ * eigenschap van het protocol en niet van de webroute. Hier staat alleen de
+ * bevestigingsvraag; de lijst waarop beide leunen is er EEN
+ * (RepeaterCli::isMutating).
+ *
+ * WAT ER NIET GEBEURT: er wordt niets herschreven of "verbeterd" aan de
+ * opdracht. Wat je typt is wat de repeater krijgt -- dezelfde afspraak als bij
+ * /cli, en hier des te belangrijker omdat het antwoord onder de naam
+ * "cmd:<opdracht>" naar MeshManager gaat: de vraag en het antwoord horen bij
+ * elkaar te blijven.
+ * ===========================================================================*/
+void WebTask::handleCliRemote() {
+  if (!requireAuth()) return;
+
+  if (_rcli == nullptr) {
+    _server->send(503, "text/plain",
+        "geen remote-CLI op deze variant. De sensor-variant (env 'meshuptime') "
+        "draagt hem niet; op de room-variant zet main_room.cpp hem met "
+        "web_task.setRepeaterCli(&the_mesh.rcli).\n");
+    return;
+  }
+
+  /* ---------------------------- GET: de stand ----------------------------- */
+  /* Antwoordt in gewone tekst en niet in JSON, precies zoals /cli: dit is een
+   * console-antwoord en het wordt gelezen door een mens of door curl. */
+  if (_server->method() == HTTP_GET) {
+    const char* st = "onbekend";
+    switch (_rcli->state()) {
+      case RepeaterCli::RCLI_IDLE:   st = "vrij";        break;
+      case RepeaterCli::RCLI_LOGIN:  st = "inloggen";    break;
+      case RepeaterCli::RCLI_CMD:    st = "commando onderweg"; break;
+      case RepeaterCli::RCLI_DONE:   st = "klaar";       break;
+      case RepeaterCli::RCLI_FAILED: st = "mislukt";     break;
+    }
+    snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+        "stand: %s\ndoel: %s\nopdracht: %s\npoging: %u\nloopt: %us\n"
+        "antwoord: %s\nfout: %s\n",
+        st, _rcli->targetHex(), _rcli->command(), (unsigned)_rcli->attempt(),
+        (unsigned)_rcli->elapsedSecs(), _rcli->answer(), _rcli->error());
+    _server->sendHeader("Cache-Control", "no-store");
+    _server->send(200, "text/plain", g_rcli_reply);
+    return;
+  }
+
+  /* --------------------------- POST: een opdracht ------------------------- */
+  char target[PUB_KEY_SIZE * 2 + 2];
+  if (!getArg(*_server, "target", target, sizeof(target)) || target[0] == 0) {
+    _server->send(400, "text/plain",
+        "geen doel: target=<pubkey, 12 tot 64 hextekens>\n");
+    return;
+  }
+
+  if (!getArg(*_server, "cmd", g_cmd, sizeof(g_cmd)) || g_cmd[0] == 0) {
+    _server->send(400, "text/plain", "geen opdracht\n");
+    return;
+  }
+  /* Regeleindes eraf en voorloopspaties weg -- zelfde twee redenen als in
+   * handleCli(): een script of curl stuurt ze wel, en "  erase" zou anders onze
+   * zeef langslopen en de zeef van de tegenkant wél raken. */
+  for (char* q = g_cmd; *q; q++) if (*q == '\r' || *q == '\n') { *q = 0; break; }
+  char* cmd = g_cmd;
+  while (*cmd == ' ') cmd++;
+  if (*cmd == 0) {
+    _server->send(400, "text/plain", "geen opdracht\n");
+    return;
+  }
+  if (strlen(cmd) > RCLI_CMD_MAX) {
+    char msg[112];
+    snprintf(msg, sizeof(msg),
+        "opdracht te lang: %u tekens, hoogstens %d (de mesh-tekstgrens)\n",
+        (unsigned)strlen(cmd), RCLI_CMD_MAX);
+    _server->send(400, "text/plain", msg);
+    return;
+  }
+
+  char pass[RCLI_PASS_MAX + 8];
+  if (!getArg(*_server, "pass", pass, sizeof(pass))) pass[0] = 0;
+  if (strlen(pass) > RCLI_PASS_MAX - 1) {
+    _server->send(400, "text/plain",
+        "wachtwoord te lang: het login-protocol draagt er hoogstens 15. Langer "
+        "wordt op de draad afgekapt en dan faalt de login zonder dat je ziet "
+        "waarom.\n");
+    return;
+  }
+
+  char cf[16];
+  if (!getArg(*_server, "confirm", cf, sizeof(cf))) cf[0] = 0;
+
+  /* ------------------------------ weigeringen ----------------------------- */
+
+  if (strstr(cmd, "prv.key") != NULL) {
+    _server->send(403, "text/plain",
+        "geweigerd: de privesleutel van een ANDERE node. Het antwoord zou hier "
+        "over onversleuteld HTTP komen en daarna in de push naar MeshManager "
+        "belanden. Wie hem meeleest IS voortaan die node.\n");
+    return;
+  }
+  if (cmdIs(cmd, "start ota")) {
+    _server->send(403, "text/plain",
+        "geweigerd: 'start ota' op afstand. De doelnode opent dan een eigen "
+        "accesspoint waar niemand bij kan, en deze weg (LoRa) blijft misschien "
+        "niet bestaan naast die tweede webserver.\n");
+    return;
+  }
+  if (cmdIs(cmd, "poweroff") || cmdIs(cmd, "shutdown")) {
+    _server->send(403, "text/plain",
+        "geweigerd: diepe slaap zonder wektijd op een node die je niet kunt "
+        "aanraken. Alleen een fysieke reset haalt hem daaruit. Gebruik 'reboot' "
+        "met confirm=reboot.\n");
+    return;
+  }
+
+  /* ----------------------------- bevestigingen ---------------------------- */
+
+  if (cmdIs(cmd, "clkreboot") && strcmp(cf, "clkreboot") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd zonder bevestiging: 'clkreboot' zet de klok van de doelnode "
+        "terug naar mei 2024 EN herstart hem. Komt daarna geen 'time <epoch>' "
+        "aan, dan draagt elk advert van die node een LAGERE tijdstempel dan wat "
+        "iedereen al van hem kent -- en zo'n advert wordt overal weggegooid. Hij "
+        "is dan tot 2026 onzichtbaar voor elke node die hem kende, terwijl hij "
+        "gewoon zendt. Zet 'time <epoch>' klaar VOOR je dit doet. Stuur "
+        "confirm=clkreboot mee.\n");
+    return;
+  }
+  if (cmdIs(cmd, "reboot") && strcmp(cf, "reboot") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd zonder bevestiging: dit herstart een node waar je niet bij "
+        "kunt. Stuur confirm=reboot mee.\n");
+    return;
+  }
+  if ((cmdIs(cmd, "set radio ") || cmdIs(cmd, "set freq ")) && strcmp(cf, "radio") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd zonder bevestiging: freq/bw/sf/cr bepalen of die node nog op "
+        "dit mesh zit. Een verkeerd getal en hij is over LoRa niet meer te "
+        "bereiken -- en LoRa was de weg waarlangs je hier praat. Stuur "
+        "confirm=radio mee.\n");
+    return;
+  }
+  if (cmdIs(cmd, "erase") && strcmp(cf, "erase") != 0) {
+    _server->send(409, "text/plain",
+        "geweigerd zonder bevestiging: 'erase' wist ook de toegangslijst van de "
+        "doelnode, en daarmee onze eigen ingang -- deze weg zelf dus. Stuur "
+        "confirm=erase mee.\n");
+    return;
+  }
+
+  /* ------------------------------- in de wacht ---------------------------- */
+
+  switch (_rcli->queue(target, pass, cmd)) {
+    case RepeaterCli::RCLI_BUSY:
+      snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+          "bezig met '%s' naar %s (poging %u, %us onderweg). Zendtijd is een "
+          "gedeelde band, dus er loopt er maar een tegelijk; probeer zo "
+          "opnieuw.\n",
+          _rcli->command(), _rcli->targetHex(), (unsigned)_rcli->attempt(),
+          (unsigned)_rcli->elapsedSecs());
+      _server->send(409, "text/plain", g_rcli_reply);
+      return;
+
+    case RepeaterCli::RCLI_BAD_KEY:
+      _server->send(400, "text/plain",
+          "doel niet bruikbaar: geef 12 tot 64 hextekens. Bij MINDER dan 64 moet "
+          "deze node ooit een advert van die repeater gehoord hebben (dan staat "
+          "zijn volledige sleutel in de buurtlijst); anders is er geen gedeeld "
+          "geheim te berekenen en is er geen gesprek mogelijk. De volledige "
+          "sleutel staat in /contacts.json.\n");
+      return;
+
+    case RepeaterCli::RCLI_BAD_ARG:
+      _server->send(400, "text/plain", "opdracht of wachtwoord onbruikbaar\n");
+      return;
+
+    case RepeaterCli::RCLI_NO_HOST:
+      _server->send(503, "text/plain", "meshlaag niet gekoppeld\n");
+      return;
+
+    case RepeaterCli::RCLI_OK:
+      break;
+  }
+
+  snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+      "gestart: '%s' naar %s%s.\nHet antwoord komt over LoRa terug (reken op "
+      "10-60 s) en gaat daarna naar MeshManager als 'cmd:%s'. Haal de stand op "
+      "met GET /cli/remote -- deze console wacht er niet op.\n",
+      cmd, _rcli->targetHex(),
+      RepeaterCli::isMutating(cmd) ? " (muterend: EEN poging, geen herhaling)" : "",
+      cmd);
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "text/plain", g_rcli_reply);
+}
+
+/* ===========================================================================
+ * DE MESHMANAGER-POLLER  (v2.6.0)
+ *
+ * Vier routes, allemaal achter dezelfde Basic-auth als de rest. De poller haalt de
+ * opdrachtwachtrij van MeshManager op en voert ze uit; hij vervangt de weg die tot
+ * nu toe over Home Assistant liep. Zie Poller.h voor het waarom.
+ *
+ * WACHTWOORDEN. De doel-wachtwoorden (om als admin op een repeater in te loggen)
+ * en het standaardwachtwoord worden hier GEZET maar NOOIT teruggelezen -- net als
+ * de wifi- en de web-credential. /repeater_targets.json geeft per doel alleen de
+ * prefix en "gezet: ja/nee". Dit is Basic-auth over onversleuteld HTTP; roteer op
+ * een net waar niemand meeleest en zet deze node niet open naar buiten.
+ * ===========================================================================*/
+void WebTask::handlePollerJson() {
+  if (!requireAuth()) return;
+  if (_poller == nullptr) {
+    _server->send(503, "text/plain", "geen poller op deze variant\n");
+    return;
+  }
+  const char* st = _rcli == nullptr ? "geen mesh"
+                 : _rcli->busy()    ? "sessie loopt" : "vrij";
+  char note[128]; jsonEscape(_poller->lastNote(), note, sizeof(note));
+  int n = snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+      "{\"on\":%d,\"poll_secs\":%u,\"ever\":%d,\"last_poll_age\":%lu,"
+      "\"processed\":%lu,\"dropped\":%lu,\"pending\":%u,\"refresh_dropped\":%d,"
+      "\"targets\":%d,\"default_pass\":%d,\"session\":\"%s\",\"note\":\"%s\"}",
+      _poller->enabled() ? 1 : 0, (unsigned)_poller->pollSecs(),
+      _poller->everPolled() ? 1 : 0, (unsigned long)_poller->lastPollAgeSecs(),
+      (unsigned long)_poller->processedCount(), (unsigned long)_poller->droppedCount(),
+      (unsigned)_poller->pendingCount(), _poller->lastRefreshDropped(),
+      _poller->targetCount(), _poller->defaultPassSet() ? 1 : 0, st, note);
+  if (n < 0 || (size_t)n >= sizeof(g_rcli_reply)) { _server->send(500, "text/plain", "te groot\n"); return; }
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_rcli_reply);
+}
+
+/* POST /poller   on=0|1 & poll_secs=<n>   (beide optioneel) */
+void WebTask::handlePoller() {
+  if (!requireAuth()) return;
+  if (_poller == nullptr) { _server->send(503, "text/plain", "geen poller op deze variant\n"); return; }
+
+  char v[12];
+  if (getArg(*_server, "poll_secs", v, sizeof(v)) && v[0]) {
+    long s = strtol(v, nullptr, 10);
+    if (s < POLL_SECS_MIN || s > POLL_SECS_MAX) {
+      snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+          "poll_secs %ld buiten bereik (%d..%d)\n", s, POLL_SECS_MIN, POLL_SECS_MAX);
+      _server->send(400, "text/plain", g_rcli_reply);
+      return;
+    }
+    _poller->setPollSecs((uint16_t)s);
+  }
+  if (getArg(*_server, "on", v, sizeof(v))) {
+    _poller->setEnabled(v[0] == '1');
+  }
+  snprintf(g_rcli_reply, sizeof(g_rcli_reply), "ok poller %s, interval %us\n",
+           _poller->enabled() ? "aan" : "uit", (unsigned)_poller->pollSecs());
+  _server->send(200, "text/plain", g_rcli_reply);
+}
+
+/* GET /repeater_targets.json  -- de doelen ZONDER wachtwoord. */
+void WebTask::handleTargetsJson() {
+  if (!requireAuth()) return;
+  if (_poller == nullptr) { _server->send(503, "text/plain", "geen poller op deze variant\n"); return; }
+
+  /* g_json (ruim) en niet g_rcli_reply: acht doelen met een volle 64-hex prefix
+   * zouden de kleine buffer net kunnen halen. */
+  size_t o = 0;
+  o += snprintf(g_json + o, sizeof(g_json) - o,
+                "{\"default_pass\":%d,\"targets\":[", _poller->defaultPassSet() ? 1 : 0);
+  char pfx[POLLER_PREFIX_MAX];
+  for (int i = 0; i < _poller->targetCount() && o + 160 < sizeof(g_json); i++) {
+    if (!_poller->targetAt(i, pfx, sizeof(pfx))) continue;
+    char esc[POLLER_PREFIX_MAX * 2]; jsonEscape(pfx, esc, sizeof(esc));
+    o += snprintf(g_json + o, sizeof(g_json) - o,
+                  "%s{\"prefix\":\"%s\",\"pass_set\":1}", i ? "," : "", esc);
+  }
+  o += snprintf(g_json + o, sizeof(g_json) - o, "]}");
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /repeater/target
+ *   prefix=<hex>&pass=<ww>       -> doel zetten (leeg pass = verwijderen)
+ *   default=<ww>                 -> standaardwachtwoord zetten (leeg = wissen)
+ *   del=<hex>                    -> doel verwijderen
+ * De prefix moet 12..64 hextekens zijn -- 6 byte is de prefix waarmee MeshManager
+ * de repeater kent, en korter zou de verkeerde node kunnen dekken. */
+void WebTask::handleTarget() {
+  if (!requireAuth()) return;
+  if (_poller == nullptr) { _server->send(503, "text/plain", "geen poller op deze variant\n"); return; }
+
+  char prefix[POLLER_PREFIX_MAX], pass[RCLI_PASS_MAX + 8], def[RCLI_PASS_MAX + 8], del[POLLER_PREFIX_MAX];
+
+  if (getArg(*_server, "del", del, sizeof(del)) && del[0]) {
+    bool ok = _poller->delTarget(del);
+    _server->send(ok ? 200 : 404, "text/plain", ok ? "ok verwijderd\n" : "niet gevonden\n");
+    return;
+  }
+  if (getArg(*_server, "default", def, sizeof(def))) {
+    if (strlen(def) > RCLI_PASS_MAX - 1) {
+      _server->send(400, "text/plain", "wachtwoord te lang (hoogstens 15 tekens)\n");
+      return;
+    }
+    _poller->setDefaultPass(def);
+    _server->send(200, "text/plain", def[0] ? "ok standaardwachtwoord gezet\n"
+                                            : "ok standaardwachtwoord gewist\n");
+    return;
+  }
+  if (!getArg(*_server, "prefix", prefix, sizeof(prefix)) || prefix[0] == 0) {
+    _server->send(400, "text/plain", "prefix=<12..64 hex> vereist (of default=, of del=)\n");
+    return;
+  }
+  if (!getArg(*_server, "pass", pass, sizeof(pass))) pass[0] = 0;
+  if (strlen(pass) > RCLI_PASS_MAX - 1) {
+    _server->send(400, "text/plain",
+        "wachtwoord te lang: het login-protocol draagt er hoogstens 15\n");
+    return;
+  }
+  bool ok = _poller->setTarget(prefix, pass);
+  if (!ok) {
+    _server->send(400, "text/plain",
+        "geweigerd: prefix moet 12..64 hextekens zijn, of de doeltabel is vol "
+        "(hoogstens 8)\n");
+    return;
+  }
+  _server->send(200, "text/plain", pass[0] ? "ok doel gezet\n" : "ok doel verwijderd\n");
 }
 
 /* De uitgestelde opdracht, uit loop(). Komt niet terug bij een herstart -- dat is

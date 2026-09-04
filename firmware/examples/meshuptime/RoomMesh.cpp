@@ -38,6 +38,23 @@
 
 #define RESP_SERVER_LOGIN_OK        0
 
+/* DE VIRTUELE PEER VAN RepeaterCli.
+ *
+ * searchPeersByHash() vult matching_peer_indexes met INDEXEN IN DE ACL van het
+ * actieve slot. Voor de repeater waar wij zelf CLIENT van zijn bestaat zo'n
+ * ACL-ingang niet -- hij is geen client van ons, wij zijn client van hem. In
+ * plaats van hem in onze ACL te zetten (waarmee hij ook posts en telemetrie zou
+ * mogen opvragen, en waarmee de sessie in flash zou belanden) krijgt hij deze
+ * ene, onmogelijke index. De drie callbacks die matching_peer_indexes lezen
+ * herkennen hem en leiden door naar rcli; alles wat ze daarna doen blijft
+ * ongewijzigd.
+ *
+ * Negatief en ver buiten bereik, zodat een bestaande grenscontrole
+ * (`i < 0 || i >= getNumClients()`) hem sowieso al zou afwijzen als iemand deze
+ * tak ooit weghaalt -- de fout is dan "werkt niet", nooit "leest verkeerd
+ * geheugen". */
+#define RCLI_PEER_IDX               (-1000)
+
 #define LAZY_CONTACTS_WRITE_DELAY   5000
 #define ALERT_ACK_EXPIRY_MILLIS     8000
 #define SENSOR_READ_INTERVAL_SECS_DEF  60
@@ -179,6 +196,11 @@ void RoomMesh::begin(FILESYSTEM* fs) {
   mesh::Mesh::begin();
   _fs = fs;
   _cli.loadPrefs(_fs);
+
+  /* De admin-CLI-client naar andere repeaters. Alleen koppelen; hij doet niets
+   * tot er een opdracht in de wacht staat en heeft geen eigen timer, geen
+   * opslag en geen advert. */
+  rcli.begin(this, this);
 
   bool had_room_cfg = (_fs != NULL) && _fs->exists(ROOM_CFG_PATH);
   loadRoomConfig();   // namen/wachtwoorden/stealth + welke slots actief zijn
@@ -813,6 +835,20 @@ int RoomMesh::searchPeersByHash(const uint8_t* hash) {
       matching_peer_indexes[n++] = i;
     }
   }
+
+  /* De repeater waar WIJ client van zijn, als extra kandidaat. Alleen tijdens een
+   * lopende RepeaterCli-sessie en alleen voor de HOOFDIDENTITEIT (room 0) -- dat
+   * is de identiteit waarmee rcliUseClientIdentity() inlogt, dus alleen daar kan
+   * zijn antwoord aankomen. Buiten een sessie bestaat die node hier niet en
+   * verandert er dus letterlijk niets aan het bestaande zoekpad.
+   *
+   * Merk op dat dit een KANDIDAAT is en geen beslissing: Mesh::onRecvPacket
+   * probeert elk gevonden geheim en houdt alleen wat de MAC-controle overleeft.
+   * Een toevallige botsing op de 1-byte afzenderhash kost dus hoogstens een
+   * mislukte ontsleuteling. */
+  if (n < MAX_CLIENTS && _active_snode < 0 && _active_slot == 0 && rcli.matchesSrcHash(hash)) {
+    matching_peer_indexes[n++] = RCLI_PEER_IDX;
+  }
   return n;
 }
 
@@ -824,6 +860,7 @@ void RoomMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
   }
   ClientACL& acl = activeSlot().acl;
   int i = matching_peer_indexes[peer_idx];
+  if (i == RCLI_PEER_IDX) { rcli.fillSharedSecret(dest_secret); return; }
   if (i >= 0 && i < acl.getNumClients()) {
     memcpy(dest_secret, acl.getClientByIdx(i)->shared_secret, PUB_KEY_SIZE);
   }
@@ -954,6 +991,13 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
 
   RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
   int i = matching_peer_indexes[sender_idx];
+
+  /* ANTWOORD VAN DE REPEATER WAAR WIJ CLIENT VAN ZIJN. Dit is het enige pakket
+   * dat NIET van een client van ons komt maar van een server van ons, en het gaat
+   * daarom langs de hele ACL-/post-/telemetriemachinerie hieronder heen. Zie
+   * RCLI_PEER_IDX bovenaan dit bestand. */
+  if (i == RCLI_PEER_IDX) { rcli.onPeerData(type, data, len); return; }
+
   if (i < 0 || i >= slot.acl.getNumClients()) return;
   ClientInfo* client = slot.acl.getClientByIdx(i);
 
@@ -1094,6 +1138,23 @@ bool RoomMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_
 
   RoomSlot& slot = activeSlot();
   int i = matching_peer_indexes[sender_idx];
+
+  /* HET PAD NAAR DE REPEATER WAAR WIJ CLIENT VAN ZIJN, en heel vaak OOK het
+   * loginantwoord: op een FLOOD-login antwoordt een repeater met een
+   * createPathReturn die het RESPONSE als 'extra' meedraagt. Zie punt 2 van het
+   * protocol in RepeaterCli.h -- wie dit mist, wacht op elke eerste login tot de
+   * time-out.
+   *
+   * We geven hier WEL true terug (en de rest van deze functie false, zoals
+   * altijd). Dat laat Mesh::onRecvPacket een wederkerig pad terugsturen, zodat de
+   * repeater zijn CLI-antwoord DIRECT kan sturen in plaats van geflood -- een
+   * klein pakket nu tegen een flood door het hele mesh straks. Het is precies wat
+   * BaseChatMesh::onContactPathRecv voor een gewone client ook doet. */
+  if (i == RCLI_PEER_IDX) {
+    rcli.onPath(path, path_len, extra_type, extra, extra_len);
+    return true;
+  }
+
   if (i >= 0 && i < slot.acl.getNumClients()) {
     ClientInfo* client = slot.acl.getClientByIdx(i);
     client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
@@ -1597,6 +1658,21 @@ void RoomMesh::loop() {
       }
     }
   }
+
+  /* De admin-CLI-sessie naar een andere repeater. HELEMAAL ACHTERAAN, en dat is
+   * een keuze: alles wat deze node MOET doen -- adverts, post-sync, bot,
+   * sensorleesronde, de alarmwachtrij -- heeft dan al zijn beurt gehad. Dit is
+   * een handmatig gevraagde extra, en die hoort nooit vóór de bewaking te komen.
+   *
+   * Staat er niets in de wacht, dan is dit één vergelijking (busy() is onwaar).
+   * Loopt er wel iets, dan gaat er hoogstens EEN pakket per ronde de deur uit --
+   * dezelfde discipline als DmCommands::loop().
+   *
+   * Let op de bijwerking: rcli zet self_id op rooms[0].id voordat hij een pakket
+   * maakt. Dat is precies de standaardidentiteit die RoomMesh overal herstelt (zie
+   * botSendTo), dus na deze regel staat self_id in de neutrale stand -- niet in
+   * die van de laatst ontvangen bot- of room-pakket. */
+  rcli.loop();
 
   uint32_t now = millis();
   uptime_millis += now - last_millis;
