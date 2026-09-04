@@ -62,6 +62,8 @@ void RepeaterCli::reset() {
   _deadline         = 0;
   _job_n            = 0;
   _job_i            = 0;
+  _job_kind         = RCLI_JOB_CLI;
+  _status_tag       = 0;
   _answer[0]        = 0;
   _nchunks          = 0;
   _answer_used      = 0;
@@ -151,8 +153,15 @@ RepeaterCli::Enq RepeaterCli::startJob(const char* pubkey_hex, const char* passw
 
   /* Het eerste commando alvast klaarzetten, puur zodat command() al iets zinnigs
    * toont zolang de login loopt (de statuspagina). De zending gebeurt pas na een
-   * gelukte login; dit stuurt niets. */
-  loadCurrentParam();
+   * gelukte login; dit stuurt niets. Een statusjob heeft geen CLI-tekst: daar
+   * zetten we alleen een leesbaar label. */
+  if (_job_kind == RCLI_JOB_STATUS) {
+    StrHelper::strncpy(_cur_param, "status", sizeof(_cur_param));
+    StrHelper::strncpy(_cmd, "(statusverzoek)", sizeof(_cmd));
+    _cmd_max_attempts = RCLI_MAX_ATTEMPTS;   // een leesactie: gewone drie pogingen
+  } else {
+    loadCurrentParam();
+  }
   return RCLI_OK;
 }
 
@@ -192,6 +201,21 @@ RepeaterCli::Enq RepeaterCli::queueJob(const char* pubkey_hex, const char* passw
   for (const char* p = _job; *p; p++) if (*p == ',') n++;
   if (n > RCLI_MAX_JOB) n = RCLI_MAX_JOB;
   _job_n = n;
+
+  return startJob(pubkey_hex, password);
+}
+
+/* Een STATUSVERZOEK (v2.7.0). De job is EEN stap ("status"), puur zodat de
+ * bestaande job-boekhouding (pogingen, tussenpauzes, bovengrens) ongewijzigd
+ * geldt. De parameternaam wordt niet gebruikt -- het antwoord gaat via de
+ * stats-callback en niet via de per-param-weg. */
+RepeaterCli::Enq RepeaterCli::queueStatus(const char* pubkey_hex, const char* password) {
+  if (busy()) return RCLI_BUSY;
+  reset();
+
+  StrHelper::strncpy(_job, "status", sizeof(_job));
+  _job_n    = 1;
+  _job_kind = RCLI_JOB_STATUS;
 
   return startJob(pubkey_hex, password);
 }
@@ -246,6 +270,22 @@ void RepeaterCli::beginNextCommand() {
 
 void RepeaterCli::failJob(const char* why) {
   StrHelper::strncpy(_error, why, sizeof(_error));
+
+  if (_job_kind == RCLI_JOB_STATUS) {
+    /* EEN MISLUKTE STATUSRONDE MELDT NIETS. Bij een settings-job is een null-
+     * antwoord informatie ("gevraagd, geen antwoord") omdat de server per parameter
+     * bijhoudt wat er gevraagd is. Bij een statusverzoek bestaat die boekhouding
+     * niet: het endpoint is /api/v1/ingest en dat neemt METINGEN aan. Een lege of
+     * half gevulde meting daar neerzetten is erger dan een lege pagina -- die zou
+     * als echte waarde in de reeksen en de grafieken belanden. Dus: alleen loggen
+     * en laten vallen. */
+    MESH_DEBUG_PRINTLN("RepeaterCli: statusronde voor %s mislukt (%s); GEEN metingen gemeld",
+                       _target_hex, _error);
+    memset(_pass, 0, sizeof(_pass));
+    _state = RCLI_FAILED;
+    return;
+  }
+
   /* Alle NOG NIET afgehandelde commando's als "geen antwoord" (null) afleveren, ook
    * als de LOGIN faalde en er dus geen enkel commando de deur uit is geweest. Zo
    * ziet MeshManager "gevraagd, geen antwoord" i.p.v. stilte. */
@@ -302,6 +342,43 @@ void RepeaterCli::sendCommand() {
   _deadline  = millis() + RCLI_STEP_TIMEOUT_MS;
 }
 
+/* Het statusverzoek. De vorm is LETTERLIJK die van BaseChatMesh::sendRequest(
+ * recipient, req_type, ...) uit de gepinde submodule (BaseChatMesh.cpp ~659):
+ *
+ *   uint8_t temp[13];
+ *   temp[0..3]  = tag (getCurrentTimeUnique)
+ *   temp[4]     = req_type
+ *   temp[5..8]  = 0            // reserved (mogelijk voor een 'since'-param)
+ *   temp[9..12] = random       // maakt de packet-hash uniek
+ *   createDatagram(PAYLOAD_TYPE_REQ, ...)
+ *
+ * De tag is niet decoratief: MyMesh::handleRequest kaatst de sender_timestamp terug
+ * in reply_data[0..3], dus we kunnen het antwoord aan ONS verzoek koppelen. Dat is
+ * hier belangrijker dan bij de CLI-weg, want een loginantwoord komt met hetzelfde
+ * PAYLOAD_TYPE_RESPONSE binnen.
+ *
+ * En net als bij de CLI: de repeater toetst `timestamp > client->last_timestamp`
+ * (STRIKT), dus elke poging krijgt een nieuwe tag. getCurrentTimeUnique() loopt
+ * altijd op, ook als de RTC stilstaat. */
+void RepeaterCli::sendStatusReq() {
+  uint8_t temp[13];
+  _status_tag = _mesh->getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &_status_tag, 4);
+  temp[4] = REQ_TYPE_GET_STATUS;
+  memset(&temp[5], 0, 4);
+  _mesh->getRNG()->random(&temp[9], 4);
+
+  _host->rcliUseClientIdentity();   // createDatagram schrijft de afzenderhash uit self_id
+  mesh::Identity dest(_target_pub);
+  mesh::Packet* pkt = _mesh->createDatagram(PAYLOAD_TYPE_REQ, dest, _secret, temp, sizeof(temp));
+  if (pkt == nullptr) { _next_send = millis() + 1000; return; }
+
+  _host->rcliSend(pkt, _path, _path_len);
+  _attempt++;
+  _next_send = millis() + RCLI_MIN_GAP_MS;
+  _deadline  = millis() + RCLI_STEP_TIMEOUT_MS;
+}
+
 /* ------------------------------------------------------------------------
  * loop -- hoogstens EEN zending per ronde
  * ------------------------------------------------------------------------ */
@@ -336,6 +413,15 @@ void RepeaterCli::loop() {
       failJob("geen loginantwoord na 3 pogingen (fout wachtwoord geeft ook stilte)");
       return;
     }
+  } else if (_state == RCLI_STATUS) {
+    if (_attempt >= RCLI_MAX_ATTEMPTS) {
+      /* Drie pogingen gehad. Herhalen MAG hier: een statusverzoek is een LEESactie
+       * (isMutating is er niet op van toepassing), dus dit is het verschil met een
+       * muterend CLI-commando. Blijft het stil, dan melden we NIETS -- zie de
+       * status-tak in failJob(). */
+      failJob("ingelogd, maar geen statusantwoord na 3 pogingen");
+      return;
+    }
   } else {   // RCLI_CMD
     if (_attempt >= _cmd_max_attempts) {
       /* Dit COMMANDO opgegeven -> als "geen antwoord" (null) afleveren en DOOR naar
@@ -358,8 +444,9 @@ void RepeaterCli::loop() {
     _have_cached_path = false;
   }
 
-  if (_state == RCLI_LOGIN) sendLogin();
-  else                      sendCommand();
+  if (_state == RCLI_LOGIN)       sendLogin();
+  else if (_state == RCLI_STATUS) sendStatusReq();
+  else                            sendCommand();
 }
 
 /* De verzamelde stukken op tijdstempel sorteren (hoogstens RCLI_CHUNK_MAX, dus
@@ -412,15 +499,71 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
       failJob("ingelogd zonder beheerdersrecht; dit wachtwoord mag geen CLI");
       return true;
     }
-    /* Login OK -> het EERSTE commando klaarzetten. _next_send staat al op
-     * login-tijd + gap, dus het commando wacht die afstand netjes uit. */
-    _state     = RCLI_CMD;
+    /* Login OK. _next_send staat al op login-tijd + gap, dus de volgende zending
+     * wacht die afstand netjes uit.
+     *
+     * LET OP HET ONDERSCHEID MET HET STATUSANTWOORD: dat komt met hetzelfde
+     * PAYLOAD_TYPE_RESPONSE binnen als dit loginantwoord. Ze worden uitsluitend
+     * door de STAAT gescheiden (RCLI_LOGIN vs RCLI_STATUS), en het statuspad toetst
+     * daarnaast de teruggekaatste tag. Zonder dat onderscheid zou data[4] van een
+     * stats-antwoord (de lage byte van batt_milli_volts) toevallig als
+     * RESP_SERVER_LOGIN_OK gelezen kunnen worden. */
     _attempt   = 0;
     _job_i     = 0;
     _answer[0] = 0;
     _nchunks   = 0;
     _answer_used = 0;
+    if (_job_kind == RCLI_JOB_STATUS) {
+      _state = RCLI_STATUS;
+      return true;
+    }
+    _state = RCLI_CMD;
     if (!loadCurrentParam()) { deliverCurrent(nullptr); beginNextCommand(); }
+    return true;
+  }
+
+  /* HET STATUSANTWOORD. Zelfde PAYLOAD_TYPE_RESPONSE als de login, dus alleen de
+   * staat (en de tag) scheiden ze. Zie de draadvorm bovenaan RepeaterCli.h. */
+  if (_state == RCLI_STATUS && type == PAYLOAD_TYPE_RESPONSE) {
+    if (_attempt == 0) return false;   // nog niets gevraagd; zie de CMD-tak hieronder
+
+    if (len < RCLI_STATUS_RESP_MIN) {
+      /* Te kort voor een RepeaterStats. Dit is GEEN antwoord dat we half mogen
+       * gebruiken: laten liggen en de gewone herhaling zijn werk laten doen. Komt
+       * het na drie pogingen niet, dan melden we niets. */
+      MESH_DEBUG_PRINTLN("RepeaterCli: statusantwoord van %s te kort (%u byte, >= %u nodig)",
+                         _target_hex, (unsigned)len, (unsigned)RCLI_STATUS_RESP_MIN);
+      return false;
+    }
+
+    /* De teruggekaatste tag: MyMesh::handleRequest zet onze sender_timestamp in
+     * reply_data[0..3]. Klopt hij niet, dan is dit het antwoord op een ANDER (ouder)
+     * verzoek en horen die cijfers niet bij deze ronde. */
+    uint32_t tag;
+    memcpy(&tag, data, 4);
+    if (tag != _status_tag) {
+      MESH_DEBUG_PRINTLN("RepeaterCli: statusantwoord van %s met vreemde tag; genegeerd",
+                         _target_hex);
+      return false;
+    }
+
+    RepeaterStatus st;
+    if (!parseStatus(data, len, st)) {
+      /* Ontleed maar NIET plausibel -> vermoedelijk een andere structuurindeling
+       * (een fork die een veld invoegde of herordende). Dan is elk getal verdacht,
+       * dus we melden niets en zeggen waarom. Opnieuw proberen heeft geen zin: de
+       * volgende poging levert dezelfde bytes. */
+      failJob("statusantwoord onverwacht van vorm; geen metingen gemeld");
+      return true;
+    }
+
+    if (_stats_fn != nullptr) _stats_fn(_stats_ctx, _target_hex, st);
+    snprintf(_answer, sizeof(_answer),
+             "status ok: %u mV, uptime %lus, airtime %lus",
+             (unsigned)st.batt_milli_volts, (unsigned long)st.total_up_time_secs,
+             (unsigned long)st.total_air_time_secs);
+    memset(_pass, 0, sizeof(_pass));
+    _state = RCLI_DONE;
     return true;
   }
 
@@ -496,4 +639,74 @@ void RepeaterCli::onPath(const uint8_t* path, uint8_t path_len, uint8_t extra_ty
   if (extra_type == PAYLOAD_TYPE_RESPONSE && extra_len > 0) {
     onPeerData(PAYLOAD_TYPE_RESPONSE, extra, extra_len);
   }
+}
+
+/* ------------------------------------------------------------------------
+ * parseStatus -- de bytes lezen EN toetsen
+ *
+ * Lezen met memcpy op expliciete offsets (zie de tabel bovenaan RepeaterCli.h):
+ * de buffer is niet gegarandeerd uitgelijnd en een struct-cast zou stil
+ * meeveranderen met onze eigen padding.
+ *
+ * De TOETS is het belangrijkste deel van deze functie. De doelrepeater hoeft niet
+ * onze build te draaien -- JessaZH draait dutchmeshcore v1.17.1-PS+filter+rollback
+ * -- en een fork die een veld INVOEGT of HERORDENT levert bytes die er volkomen
+ * geldig uitzien maar op de verkeerde plaats staan. Dat is aan de bytes zelf niet
+ * te zien, dus toetsen we de velden waarvan we het fysieke bereik kennen. Faalt er
+ * een, dan verwerpen we het HELE antwoord: liever een lege pagina dan een
+ * grafiek met een verzonnen getal erin.
+ *
+ * De grenzen, met hun reden:
+ *  - accuspanning: 0 (niet gemeten / geen accu) of 1500..6000 mV. Een 18650 of
+ *    LiPo op een LoRa-node zit tussen 3,0 en 4,3 V; 1,5-6,0 V laat elke
+ *    plausibele voeding door en verwerpt een teller die daar terechtkwam.
+ *  - uptime: < 20 jaar. Een node die langer beweert te lopen dan het protocol
+ *    bestaat, leest van de verkeerde offset.
+ *  - airtime en rx-airtime: mogen de uptime niet OVERSCHRIJDEN. Een radio kan niet
+ *    langer gezonden hebben dan hij aan stond. Dit is de scherpste toets die we
+ *    hebben en hij pakt precies de verschuiving die een ingevoegd veld geeft.
+ *    (Met uptime 0 -- een node die net op is -- slaan we deze toets over.)
+ *  - TX-wachtrij: <= 4096. De pakketpool van een node is enkele tientallen.
+ *  - ruisvloer/RSSI: -200..50 dBm; SNR: -50..50 dB. Buiten die banden bestaat
+ *    geen radio.
+ * ------------------------------------------------------------------------ */
+bool RepeaterCli::parseStatus(const uint8_t* data, size_t len, RepeaterStatus& out) {
+  if (len < RCLI_STATUS_RESP_MIN) return false;
+  const uint8_t* p = data + 4;   // achter de teruggekaatste tag
+
+  memcpy(&out.batt_milli_volts,       p +  0, 2);
+  memcpy(&out.curr_tx_queue_len,      p +  2, 2);
+  memcpy(&out.noise_floor,            p +  4, 2);
+  memcpy(&out.last_rssi,              p +  6, 2);
+  memcpy(&out.n_packets_recv,         p +  8, 4);
+  memcpy(&out.n_packets_sent,         p + 12, 4);
+  memcpy(&out.total_air_time_secs,    p + 16, 4);
+  memcpy(&out.total_up_time_secs,     p + 20, 4);
+  memcpy(&out.n_sent_flood,           p + 24, 4);
+  memcpy(&out.n_sent_direct,          p + 28, 4);
+  memcpy(&out.n_recv_flood,           p + 32, 4);
+  memcpy(&out.n_recv_direct,          p + 36, 4);
+  memcpy(&out.err_events,             p + 40, 2);
+  memcpy(&out.last_snr_x4,            p + 42, 2);
+  memcpy(&out.n_direct_dups,          p + 44, 2);
+  memcpy(&out.n_flood_dups,           p + 46, 2);
+  memcpy(&out.total_rx_air_time_secs, p + 48, 4);
+  memcpy(&out.n_recv_errors,          p + 52, 4);
+
+  const uint32_t TWENTY_YEARS = 631152000UL;   // 20 * 365,25 dagen in seconden
+
+  if (out.batt_milli_volts != 0 &&
+      (out.batt_milli_volts < 1500 || out.batt_milli_volts > 6000)) return false;
+  if (out.total_up_time_secs > TWENTY_YEARS) return false;
+  if (out.total_up_time_secs > 0) {
+    if (out.total_air_time_secs    > out.total_up_time_secs) return false;
+    if (out.total_rx_air_time_secs > out.total_up_time_secs) return false;
+  }
+  if (out.curr_tx_queue_len > 4096) return false;
+  if (out.noise_floor < -200 || out.noise_floor > 50) return false;
+  if (out.last_rssi   < -200 || out.last_rssi   > 50) return false;
+  const int snr_db = out.last_snr_x4 / 4;
+  if (snr_db < -50 || snr_db > 50) return false;
+
+  return true;
 }

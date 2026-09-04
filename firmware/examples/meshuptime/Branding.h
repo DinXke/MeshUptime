@@ -156,11 +156,22 @@
  *            machine), /poller.json + /poller + /repeater_targets.json + /repeater/
  *            target, en een poller-tegel op de statuspagina. Alles niet-blokkerend;
  *            de bewaking gaat voor en één sessie tegelijk.
+ *   v2.7.0 = STATUSVERZOEKEN uit de MeshManager-wachtrij. De poller voerde alleen
+ *            instellingenopvragingen uit en liet `refresh` vallen; nu doet hij ze
+ *            allebei. Per prefix dezelfde sessie-aanpak (login via RepeaterCli),
+ *            maar na de login EEN REQ_TYPE_GET_STATUS i.p.v. CLI-tekst; het
+ *            antwoord (RepeaterStats, 4+56 byte) wordt ontleed, op plausibiliteit
+ *            getoetst en als METINGEN naar POST /api/v1/ingest gestuurd (nieuw
+ *            PushTask KIND_INGEST). Statusverzoeken zijn LEESacties, dus de gewone
+ *            drie pogingen. Mislukt de ronde of is het antwoord niet plausibel, dan
+ *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
+ *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
+ *            opvragen" vanzelf aanzet.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.6.0"
+  #define MESHUPTIME_VERSION   "v2.7.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

@@ -85,12 +85,19 @@ void Poller::reset() {
   _pending_count = 0;
   _processed = 0;
   _dropped = 0;
-  _last_refresh_dropped = 0;
+  _last_refresh_seen = 0;
+  _status_ok = 0;
+  _status_fail = 0;
+  _status_wait = false;
+  _status_got = false;
   StrHelper::strncpy(_note, "nog niet gepold", sizeof(_note));
 }
 
 void Poller::begin(fs::FS* fs, PushTask* push, RepeaterCli* rcli) {
   _fs = fs; _push = push; _rcli = rcli;
+  /* De statusuitslag komt via RepeaterCli terug; de CLI-antwoorden lopen via de
+   * result-callback die main_room al zet. Twee wegen, twee endpoints. */
+  if (_rcli) _rcli->setStatsCallback(Poller::statsThunk, this);
   loadConfig();
   loadTargets();
   /* De eerste poll na een korte genadetijd (wifi/tijd/advert eerst). */
@@ -166,6 +173,12 @@ void Poller::setEnabled(bool on) {
   if (_on == on) return;
   _on = on;
   saveConfig();
+  /* Uitzetten midden in een statusronde: de afsluit-toets in loop() draait dan
+   * niet meer, en een blijvend gezette vlag zou bij het weer aanzetten een
+   * mislukking tellen die niet bij die ronde hoort. De ronde zelf loopt in
+   * RepeaterCli gewoon af (die kent geen aan/uit) -- er gaat alleen geen nieuwe
+   * meer starten. */
+  if (!_on) { _status_wait = false; _status_got = false; }
   if (_on) _next_poll = millis() + 1000;   // net aangezet: bijna meteen pollen
 }
 
@@ -328,8 +341,11 @@ void Poller::onPollBody(const char* body) {
   const char* end = body + strlen(body);
   int got_settings = 0;
 
-  /* --- refresh: NIET ondersteund; tellen en logboeken, dan laten vallen. --- */
-  _last_refresh_dropped = 0;
+  /* --- refresh: STATUSVERZOEKEN (v2.7.0). Elke prefix wordt een eigen sessie:
+   * login + REQ_TYPE_GET_STATUS. Ze gaan in DEZELFDE wachtrij als de
+   * instellingenopvragingen, zodat er nooit twee sessies tegelijk lopen en de
+   * clear-on-read-regel voor beide geldt. --- */
+  _last_refresh_seen = 0;
   const char* rp = strstr(body, "\"refresh\"");
   if (rp) {
     rp = strchr(rp, '[');
@@ -342,8 +358,12 @@ void Poller::onPollBody(const char* body) {
       while (q < rend) {
         const char* after = nullptr;
         if (readQuoted(q, rend, hex, sizeof(hex), &after) == nullptr) break;
-        _last_refresh_dropped++;
-        MESH_DEBUG_PRINTLN("Poller: refresh-verzoek voor %s NIET ondersteund (statusverzoek); genegeerd", hex);
+        _last_refresh_seen++;
+        if (!pushPending(hex, "", PEND_STATUS)) {
+          /* pushPending telt de overloop zelf (_dropped) en logt hem. Hier niets
+           * extra's: clear-on-read betekent dat dit verzoek weg is, en dat staat
+           * dan in het logboek en in de teller. */
+        }
         q = after;
       }
     }
@@ -386,15 +406,15 @@ void Poller::onPollBody(const char* body) {
       csv[o] = 0;
 
       if (o > 0) {
-        if (pushPending(prefix, csv)) got_settings++;
+        if (pushPending(prefix, csv, PEND_SETTINGS)) got_settings++;
         /* pushPending telt zelf de overloop (_dropped). */
       }
       p = rb + 1;   // door naar de volgende settings-ingang
     }
   }
 
-  snprintf(_note, sizeof(_note), "gepold: %d verzoek(en), %d refresh genegeerd",
-           got_settings, _last_refresh_dropped);
+  snprintf(_note, sizeof(_note), "gepold: %d instellingen, %d status",
+           got_settings, _last_refresh_seen);
   MESH_DEBUG_PRINTLN("Poller: %s", _note);
 }
 
@@ -402,7 +422,7 @@ void Poller::pollThunk(void* ctx, const char* body) {
   static_cast<Poller*>(ctx)->onPollBody(body);
 }
 
-bool Poller::pushPending(const char* prefix, const char* params_csv) {
+bool Poller::pushPending(const char* prefix, const char* params_csv, PendKind kind) {
   if (_pending_count >= POLLER_PENDING_MAX) {
     _dropped++;
     MESH_DEBUG_PRINTLN("Poller: wachtrij vol, verzoek voor %s VERVALLEN (clear-on-read; verloren: %lu)",
@@ -411,7 +431,8 @@ bool Poller::pushPending(const char* prefix, const char* params_csv) {
   }
   Pending& e = _pending[(_pending_head + _pending_count) % POLLER_PENDING_MAX];
   StrHelper::strncpy(e.prefix, prefix, sizeof(e.prefix));
-  StrHelper::strncpy(e.params, params_csv, sizeof(e.params));
+  StrHelper::strncpy(e.params, params_csv ? params_csv : "", sizeof(e.params));
+  e.kind = kind;
   _pending_count++;
   return true;
 }
@@ -424,6 +445,17 @@ void Poller::startNextPending() {
   if (_rcli == nullptr || _rcli->busy()) return;   // EEN sessie tegelijk
 
   Pending& e = _pending[_pending_head];
+
+  /* STATUSVERZOEK? Dan een heel ander vervolg na dezelfde login: geen CLI-tekst
+   * maar een REQ_TYPE_GET_STATUS, en geen per-param-nullen bij mislukking. */
+  if (e.kind == PEND_STATUS) {
+    Pending copy = e;                 /* kopie: we halen hem hieronder uit de ring */
+    _pending_head = (uint8_t)((_pending_head + 1) % POLLER_PENDING_MAX);
+    _pending_count--;
+    _processed++;
+    startStatus(copy);
+    return;
+  }
 
   const char* pass = passwordFor(e.prefix);
 
@@ -504,10 +536,80 @@ void Poller::startNextPending() {
 }
 
 /* ------------------------------------------------------------------------
+ * Een STATUSVERZOEK starten (v2.7.0)
+ *
+ * Lukt het niet, dan MELDEN WE NIETS. Bij een instellingenopvraging is een
+ * null-antwoord informatie ("gevraagd, geen antwoord"), want de server houdt per
+ * parameter bij wat er gevraagd is. Hier gaat het naar /api/v1/ingest, en dat
+ * neemt METINGEN aan: een lege of half gevulde meting zou daar als echte waarde in
+ * de reeksen en grafieken belanden. Dus alleen een logregel en een teller.
+ * ------------------------------------------------------------------------ */
+void Poller::startStatus(const Pending& e) {
+  const char* pass = passwordFor(e.prefix);
+  if (pass == nullptr) {
+    _status_fail++;
+    snprintf(_note, sizeof(_note), "%s: statusverzoek zonder wachtwoord, niets gemeld", e.prefix);
+    MESH_DEBUG_PRINTLN("Poller: %s", _note);
+    return;
+  }
+
+  /* keyFor() en niet e.prefix: staat de VOLLE 64-hex sleutel in de doeltabel, dan
+   * gebruiken we die. Anders moet RepeaterCli de prefix uit de buurtlijst oplossen,
+   * en dat lukt alleen als deze node ooit een advert van dat doel hoorde. Zelfde
+   * keuze als bij een settings-job (zie startNextPending). */
+  RepeaterCli::Enq r = _rcli->queueStatus(keyFor(e.prefix), pass);
+  if (r == RepeaterCli::RCLI_OK) {
+    _status_wait = true;
+    _status_got  = false;
+    snprintf(_note, sizeof(_note), "%s: statusronde gestart", e.prefix);
+  } else if (r == RepeaterCli::RCLI_BAD_KEY) {
+    _status_fail++;
+    snprintf(_note, sizeof(_note), "%s: sleutel onbekend (nooit gehoord?); status niet gevraagd",
+             e.prefix);
+    MESH_DEBUG_PRINTLN("Poller: %s", _note);
+  } else {
+    _status_fail++;
+    snprintf(_note, sizeof(_note), "%s: statusronde NIET gestart (rc=%d)", e.prefix, (int)r);
+    MESH_DEBUG_PRINTLN("Poller: %s", _note);
+  }
+}
+
+/* De uitslag van een geslaagde, PLAUSIBELE statusronde. RepeaterCli roept dit
+ * alleen aan als het antwoord volledig ontleed en getoetst is -- er komt hier dus
+ * nooit een half gevulde meting binnen. Alleen doorzetten naar de PushTask-ring
+ * (kopieren, geen I/O: dit draait in de ontvangstlus van de mesh). */
+void Poller::onStats(const char* pubkey_hex12, const RepeaterStatus& st) {
+  _status_ok++;
+  _status_got = true;
+  if (_push) _push->queueRepeaterStats(pubkey_hex12, st);
+  snprintf(_note, sizeof(_note), "%s: status gemeld (%u mV, uptime %lu d)",
+           pubkey_hex12, (unsigned)st.batt_milli_volts,
+           (unsigned long)(st.total_up_time_secs / 86400UL));
+  MESH_DEBUG_PRINTLN("Poller: %s", _note);
+}
+
+void Poller::statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st) {
+  static_cast<Poller*>(ctx)->onStats(pubkey_hex12, st);
+}
+
+/* ------------------------------------------------------------------------
  * loop
  * ------------------------------------------------------------------------ */
 void Poller::loop() {
   if (!_on || _push == nullptr) return;
+
+  /* Een gestarte statusronde afsluiten zodra RepeaterCli weer vrij is. Kwam er geen
+   * meting uit, dan is dat een MISLUKTE ronde en die hoort geteld te worden -- zie
+   * de uitleg bij _status_wait. De reden zelf staat in RepeaterCli::error() en in
+   * het seriële logboek; hier houden we alleen het aantal bij. */
+  if (_status_wait && _rcli != nullptr && !_rcli->busy()) {
+    if (!_status_got) {
+      _status_fail++;
+      snprintf(_note, sizeof(_note), "statusronde zonder meting: %s", _rcli->error());
+      MESH_DEBUG_PRINTLN("Poller: %s", _note);
+    }
+    _status_wait = false;
+  }
 
   /* Een wachtend verzoek starten zodra RepeaterCli vrij is. Dit VOOR het pollen,
    * zodat de wachtrij leegloopt voordat we nieuwe ophalen (clear-on-read: pollen

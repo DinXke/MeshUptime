@@ -3,6 +3,7 @@
 #include <Arduino.h>
 
 #include "MonitorSensors.h"   /* MonitorEvent, MonitorEventSink, de instellingen */
+#include "RepeaterCli.h"      /* RepeaterStatus -- de status-momentopname (v2.7.0) */
 
 class WifiTask;
 
@@ -159,6 +160,29 @@ public:
    * Er is er hoogstens EEN tegelijk: een tweede requestPoll() terwijl er een loopt
    * of klaarstaat doet niets (false terug). De heartbeat-klok wordt door een poll
    * NIET verzet -- pollen is geen meten. */
+  /* ------------------------------------------------------------------------
+   * EEN STATUS-MOMENTOPNAME VAN EEN ANDERE REPEATER (v2.7.0).
+   *
+   *   POST {push.url}/api/v1/ingest
+   *   Authorization: Bearer {push.token} ; Content-Type: application/json
+   *   {"repeater":{"pubkey_prefix":"<12 hex>"},"metrics":{...}}
+   *
+   * Een DERDE endpoint naast /api/sensorpush en /api/v1/repeater_settings, in
+   * dezelfde stijl: eigen KIND_, eigen kleine ring, eigen body-bouwer, maar
+   * dezelfde host/token/DNS-cache/socketmachine. Geen `ts` meegeven -- dan neemt de
+   * server zijn eigen tijd, en dat is hier de betrouwbaardere klok (de doelrepeater
+   * z'n klok kan ver weglopen; dat is juist een van de dingen die we willen kunnen
+   * repareren).
+   *
+   * DE METRIEKNAMEN ZIJN EEN CONTRACT met de serverkant (server/app/metrics.py);
+   * wat daar niet in staat wordt genegeerd. De omrekening naar de eenheden die daar
+   * gedocumenteerd staan (V, dagen, minuten, dB) gebeurt in buildIngestBody(), zodat
+   * ze op EEN plek staat.
+   *
+   * WAT DE FIRMWARE NIET MELDT, LATEN WE WEG. Geen nul verzinnen: op de server IS
+   * een nul een meting, en een verzonnen nul wordt een punt in een grafiek. */
+  void queueRepeaterStats(const char* pubkey_hex12, const RepeaterStatus& st);
+
   typedef void (*PollFn)(void* ctx, const char* body);
   bool requestPoll(PollFn cb, void* ctx);
   bool pollInFlight() const { return _poll_requested || _kind == KIND_POLL; }
@@ -187,7 +211,8 @@ private:
    * is voor beide identiek; alleen het pad en de body-opbouw verschillen, en
    * finishOk()/failXxx() ruimen de bijhorende ring op. Companion-pushes gaan
    * VOOR (een val mag niet achter een heartbeat aansluiten). */
-  enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION, KIND_REPCLI, KIND_POLL };
+  enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION, KIND_REPCLI, KIND_POLL,
+                           KIND_INGEST };
   PushKind _kind = KIND_SENSOR;
 
   /* De poll (GET /api/v1/commands). _poll_requested = de Poller wil pollen zodra
@@ -214,6 +239,20 @@ private:
   uint8_t _rring_tail    = 0;
   uint8_t _rring_count   = 0;
   uint8_t _rcli_inflight = 0;
+
+  /* De ring voor status-momentopnames van andere repeaters. TWEE plaatsen, om
+   * dezelfde reden als de cli-ring: RepeaterCli doet een sessie tegelijk, dus er
+   * kan er hoogstens een klaar zijn; de tweede vangt op dat er een binnenkomt
+   * terwijl de vorige de socket in gaat. Elke plaats kost ~72 byte. */
+  static const uint8_t ING_RING_SIZE = 2;
+  struct IngestPush {
+    char           node[13];   /* pubkey-prefix van de DOELrepeater, 12 hex */
+    RepeaterStatus st;
+  };
+  IngestPush _iring[ING_RING_SIZE];
+  uint8_t _iring_tail   = 0;
+  uint8_t _iring_count  = 0;
+  uint8_t _ing_inflight = 0;
 
   /* De companion-ring. Klein: val/loc-events zijn zeldzaam en de ring leegt zich
    * zodra de server bereikbaar is. Loopt hij toch over, dan valt de OUDSTE eruit
@@ -282,6 +321,7 @@ private:
   bool buildSensorBody(char* body, size_t cap, size_t& blen);
   bool buildCompanionBody(char* body, size_t cap, size_t& blen);
   bool buildRepCliBody(char* body, size_t cap, size_t& blen);
+  bool buildIngestBody(char* body, size_t cap, size_t& blen);
   bool buildPollRequest();   /* KIND_POLL: een GET zonder body */
   void stepConnect();
   void stepSend();
