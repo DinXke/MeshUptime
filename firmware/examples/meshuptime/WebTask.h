@@ -63,6 +63,8 @@
 class WifiTask;
 class MonitorSensors;
 class IWebNode;    // de node-interface (SensorMesh of RoomMesh); zie IWebNode.h
+class RepeaterCli; // admin-CLI naar een ANDERE repeater; zie RepeaterCli.h
+class Poller;      // MeshManager-opdrachtwachtrij-poller; zie Poller.h
 class WebServer;   // vooruit verklaard: WebServer.h hoort niet in deze header
 
 class WebTask {
@@ -95,6 +97,20 @@ public:
    * een tweede setter die hetzelfde veld zet. */
   void setAcl(IWebNode* mesh) { _acl = mesh; }
 
+  /* DE ADMIN-CLI NAAR EEN ANDERE REPEATER (POST /cli/remote).
+   *
+   * Aparte setter en geen veld op IWebNode: dit hoort bij de ROOM-variant. De
+   * sensor-variant (env `meshuptime`, de terugvalweg) heeft geen RepeaterCli
+   * gekoppeld, en dan antwoordt /cli/remote met 503 en de reden erbij --
+   * zichtbaar in plaats van stil, zoals /hook dat zonder sensorlaag ook doet.
+   * Zo hoeft er aan die env geen enkele regel te veranderen. */
+  void setRepeaterCli(RepeaterCli* rcli) { _rcli = rcli; }
+
+  /* DE MESHMANAGER-POLLER (v2.6.0, POST/GET /poller.json + /repeater_targets.json).
+   * Aparte setter en room-only, zoals setRepeaterCli: zonder poller antwoorden de
+   * routes 503 met de reden. Zo hoeft de sensor-variant niets. */
+  void setPoller(Poller* poller) { _poller = poller; }
+
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
   void loop();
 
@@ -104,6 +120,8 @@ private:
   WifiTask*       _wifi = nullptr;
   MonitorSensors* _mon = nullptr;
   IWebNode*       _acl = nullptr;
+  RepeaterCli*    _rcli = nullptr;
+  Poller*         _poller = nullptr;
   WebServer*      _server = nullptr;
   const char*     _fw = "";
   bool            _serving = false;
@@ -203,6 +221,33 @@ private:
    * dan is het antwoord verstuurd en heeft de TCP-stapel zijn beurt gehad. Geen
    * delay(), alleen een tijdstip. */
   void handleCli();
+
+  /* /cli/remote -- DEZELFDE opdracht, maar naar een ANDERE repeater over LoRa.
+   *
+   * POST zet er een in de wacht (target, pass, cmd, eventueel confirm), GET
+   * vraagt de stand op. Die splitsing is er omdat het antwoord SECONDEN later
+   * komt: over het mesh is er geen synchroon antwoord te geven zonder de
+   * hoofdlus tientallen seconden vast te zetten, en de radio gaat voor. Dat is
+   * precies de vorm die de ad-hoc ping in handleCli() ook heeft -- "gestart", en
+   * de uitslag verschijnt daarna.
+   *
+   * POST-only voor het STARTEN, om dezelfde reden als bij /sim en /alert/test:
+   * een GET die een opdracht naar een node op een dak stuurt is een link die
+   * iemand kan doorsturen, en een browser die hem voorlaadt zou hem uitvoeren.
+   * De GET hier LEEST alleen. */
+  void handleCliRemote();
+
+  /* DE POLLER (v2.6.0).
+   *  handlePollerJson()   GET  /poller.json          -- stand + config
+   *  handlePoller()       POST /poller              -- aan/uit + interval
+   *  handleTargetsJson()  GET  /repeater_targets.json -- doelen (ZONDER wachtwoord)
+   *  handleTarget()       POST /repeater/target      -- doel zetten/wissen + default
+   * Wachtwoorden komen NOOIT in een GET terug; de JSON zegt alleen "gezet: ja/nee". */
+  void handlePollerJson();
+  void handlePoller();
+  void handleTargetsJson();
+  void handleTarget();
+
   void handleCfgJson();
   void runDeferred();
 
@@ -331,6 +376,11 @@ private:
   friend void web_route_acldel();
   friend void web_route_aclstrict();
   friend void web_route_cli();
+  friend void web_route_cliremote();
+  friend void web_route_pollerjson();
+  friend void web_route_poller();
+  friend void web_route_targetsjson();
+  friend void web_route_target();
   friend void web_route_cfgjson();
   friend void web_route_webcred();
   friend void web_route_credreset();

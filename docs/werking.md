@@ -475,6 +475,9 @@ room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 | `/bot.json` | de bot: identiteit, join/QR, ontvangerslijst |
 | `/channels.json` | de kanalen: naam, kanaal-hash, aan/uit, `pub`-vlag (secret nooit) |
 | `/rooms/backup` | volledige room-config incl. sleutels (achter auth) |
+| `/cli/remote` | stand van de lopende/laatste remote-CLI-opdracht (v2.6.0) |
+| `/poller.json` | stand + config van de MeshManager-poller (v2.6.0) |
+| `/repeater_targets.json` | doel-prefixen + "wachtwoord gezet: ja/nee" — **nooit** het wachtwoord (v2.6.0) |
 | `/hook` | uitslag van buiten aanleveren (mag ook GET, zie onder) |
 
 `POST`:
@@ -501,9 +504,15 @@ room-backup/restore die sleutels dragen — zitten achter dezelfde auth.
 | `/bot/recipient` | een bot-ontvanger toevoegen/verwijderen |
 | `/bot/advert`, `/bot/sendto`, `/bot/post` | bot adverteren / DM sturen / posten |
 | `/channel/add`, `/channel/del`, `/channel/toggle` | kanaal toevoegen / wissen / aan-uit |
+| `/cli/remote` | één admin-opdracht naar een ANDERE repeater over LoRa (v2.6.0) |
+| `/poller` | de MeshManager-poller aan/uit + interval (v2.6.0) |
+| `/repeater/target` | doel-wachtwoord of standaardwachtwoord zetten/wissen (v2.6.0) |
 
 Op de sensor-variant bestaan de room-, snode-, bot- en kanaal-endpoints niet als
-functie: ze geven **`501`** en de bijbehorende GUI-tabbladen blijven verborgen.
+functie: ze geven **`501`** en de bijbehorende GUI-tabbladen blijven verborgen. De
+remote-CLI- en poller-endpoints (`/cli/remote`, `/poller`, `/repeater/target` en hun
+JSON-lezers) geven daar **`503`** met de reden erbij: ze leunen op `RepeaterCli` en
+`Poller`, die alleen de room-variant draagt.
 
 **Niets dat verandert gaat via GET**, en dat is geen formaliteit. Een GET die
 een monitor wist, wordt door elke browser, elke prefetch en elke linkchecker
@@ -547,6 +556,74 @@ dashboard aan de andere kant moet bijgewerkt worden.
 
 Dat bewerken moest er komen omdat kanalen schaars zijn: zonder bewerken kost elke
 typefout een nummer, want een uitgedeeld nummer wordt niet hergebruikt.
+
+### Een CLI-opdracht naar een ANDERE repeater (v2.6.0)
+
+Sommige repeaters — bijvoorbeeld de dak-node `BE-HSS-JessaZH.VIR` (`e3d3f4d7edd0`)
+— zijn alleen over LoRa te bereiken. `RepeaterCli` logt als beheerder op zo'n node
+in en voert er CLI-opdrachten uit, precies zoals de MeshCore-app dat doet, maar dan
+vanaf deze node in plaats van via een companion + Home Assistant.
+
+De **handmatige** weg is de CLI-console: typ `@<pubkey>[:<wachtwoord>] <opdracht>`,
+bijvoorbeeld `@e3d3f4d7edd0:geheim filter count`. De pubkey mag een prefix van 12
+hextekens zijn als deze node ooit een advert van die repeater hoorde (dan staat de
+volledige sleutel in de buurtlijst en kan het gedeelde ECDH-geheim berekend worden);
+anders geef je de volle 64 hex. Het antwoord komt tien tot zestig seconden later
+over LoRa terug — de console is niet-blokkerend en antwoordt "gestart" — en gaat
+daarna ook naar MeshManager onder de naam `cmd:<opdracht>`.
+
+Er loopt er **één tegelijk**: zendtijd is een gedeelde band. Een muterend commando
+wordt **niet herhaald** (een herhaling zou het op de tegenkant opnieuw uitvoeren), en
+`clkreboot`/`reboot`/`erase`/`set radio` eisen een expliciete `confirm=…` in de POST
+— de gevaarlijkste is `clkreboot`, die de klok van de doelnode op mei 2024 zet en
+hem herstart, waarna hij zonder een tijdig `time <epoch>` tot 2026 onzichtbaar is
+voor iedereen die hem al kende (adverts met een niet-gestegen tijdstempel worden
+weggegooid).
+
+### De MeshManager-poller: Home Assistant valt uit de keten (v2.6.0)
+
+MeshManager kan opdrachten in een wachtrij zetten voor een repeater die alleen iets
+anders kan bereiken. Tot v2.6.0 leegde **Home Assistant** die wachtrij (poll →
+companion → antwoord terug). De poller (`Poller.*`) doet dat nu op de node zelf:
+
+1. **pollen** — elke `poll_secs` (standaard 30, minimaal 10) een
+   `GET {push.url}/api/v1/commands` met het **sensorpush-token** als `Bearer`
+   (dezelfde `push.url`/`push.token` als de sensorpush; de server aanvaardt dat token
+   sinds kort ook op deze route). Antwoord:
+   `{"refresh":[…], "settings":[{"prefix":"<hex>","params":[…]}, …]}`;
+2. **uitvoeren** — voor elk `settings`-verzoek één `RepeaterCli`-sessie: eenmaal
+   inloggen, dan de N parameters achter elkaar. `cmd:X` → stuur `X` letterlijk; elke
+   andere param `P` → `get P` (exact de vertaling van de oude HA-pusher);
+3. **terugmelden** — elk antwoord naar `POST /api/v1/repeater_settings`; **geen
+   antwoord → `null`** ("gevraagd, geen antwoord"), nooit stilte.
+
+**Clear-on-read.** De wachtrij wist zich bij het uitreiken, dus wat je ophaalt
+bestaat daarna nergens meer. De poller polt daarom alleen als zijn eigen wachtrij
+leeg is (plaats om te bewaren) en telt/logt wat er tóch niet in past.
+
+**Wachtwoorden per doel.** Om in te loggen kent de node het admin-wachtwoord van het
+doel uit een klein persistent tabelletje (`/rep_targets.cfg`, hoogstens 8):
+pubkey-prefix → wachtwoord, plus één standaardwachtwoord als terugval. Beheer op de
+kaart *MeshManager-poller* (nodebeheer-tabblad) en via `/repeater_targets.json` /
+`/repeater/target`. Wachtwoorden worden **nooit teruggelezen** — de JSON zegt alleen
+"gezet: ja/nee". Een onbekend doel zonder wachtwoord wordt niet uitgevoerd; elke
+gevraagde parameter gaat als `null` terug.
+
+**Veiligheid.** Eén sessie tegelijk (een nieuw verzoek wacht), niets blokkeert de
+bewaking (alles stapsgewijs uit `loop()`, ná de monitoren en alarmen), geen
+herhaling van muterende commando's, en **gevaarlijke commando's komen niet uit de
+wachtrij de lucht in** (`clkreboot`/`reboot`/`erase`/`set radio`/`poweroff`/
+`shutdown`/`start ota`/`prv.key` → geweigerd, `null` gemeld, gelogd). In de praktijk
+stuurt MeshManager alleen leescommando's plus `cmd:filter count`/`cmd:region`; deze
+zeef is de gordel voor het geval de `cli_params`-lijst wordt uitgebreid.
+
+**Bekende beperking.** `refresh`-verzoeken (een statusverzoek, `REQ_TYPE_GET_STATUS`
+— een ander protocol dan de CLI-sessie) worden in deze versie **niet** uitgevoerd:
+ze worden gelogd als "niet ondersteund" en vallen weg.
+
+**Aanzetten.** De poller staat standaard **uit**. Zet het standaardwachtwoord (of een
+wachtwoord per doel-prefix), vink *poller aan* aan, kies eventueel het interval, en
+klik *opslaan*.
 
 ## De CLI
 

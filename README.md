@@ -12,9 +12,9 @@ De bot is intussen een **tweerichtings** mesh-diagnose-responder — hij antwoor
 `ping`/`test`/`path` zowel per DM als in **hashtag-/publieke kanalen** — de node
 synct zijn klok over **NTP** en toont menselijke tijden in de lokale tijdzone, en
 een **grote contactenlijst** lost overal node-namen op.
-De huidige versie is **MeshUptime v2.3.2** (eigen versionering, los van de
+De huidige versie is **MeshUptime v2.6.0** (eigen versionering, los van de
 MeshCore-bibliotheek v1.17.0); de branding toont beide:
-`MeshUptime v2.3.2 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
+`MeshUptime v2.6.0 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
 **[firmware/CHANGELOG.md](firmware/CHANGELOG.md)**.
 
 Er zijn **twee PlatformIO-envs**:
@@ -49,10 +49,10 @@ de kern en niet een aanvulling, en zit er een wifi-waakhond in.
 | Basis | `examples/simple_sensor` van MeshCore tag `companion-v1.17.0` |
 | Rol (sensor-env) | `ADV_TYPE_SENSOR` |
 | Rol (room-env) | rooms (`ADV_TYPE_ROOM`), sensor-nodes (`ADV_TYPE_SENSOR`), bot (`ADV_TYPE_CHAT`) |
-| RAM, room-env | ~54% (van 327.680) |
-| Flash, room-env | ~46% (van 3.342.336) |
-| RAM, sensor-env | ~47% (van 327.680) |
-| Flash, sensor-env | ~45% (van 3.342.336) |
+| RAM, room-env | ~59% (van 327.680) |
+| Flash, room-env | ~49% (van 3.342.336) |
+| RAM, sensor-env | ~48% (van 327.680) |
+| Flash, sensor-env | ~47% (van 3.342.336) |
 
 De room-env is groter: hij draagt de extra panelen (rooms, sensor-nodes, bot,
 SNMP, kanalen, tijd), de async netwerk-engine en de grote advert-/contactlijst
@@ -65,6 +65,19 @@ gekalibreerde drempels, de wifi-sensor met de waakhond erachter, ping-monitors d
 een herstart overleven, `/hook` voor een bestaande Uptime Kuma, telemetrie die
 door een tweede node opgevraagd en gelezen wordt, de webinterface met
 bewaking/toegang/nodebeheer, en de CLI over serieel.
+
+**MeshManager-poller (v2.6.0), room-variant.** De node haalt zelf de
+opdrachtwachtrij van MeshManager op (`GET {push.url}/api/v1/commands`, elke
+`poll_secs`, met het sensorpush-token) en voert de instellingen-opvragingen uit door
+als beheerder op een andere repeater over LoRa in te loggen en er CLI-commando's te
+draaien — de weg die vroeger over Home Assistant liep, nu zonder HA. Antwoorden gaan
+terug naar `/api/v1/repeater_settings`; geen antwoord wordt als `null` gemeld. Doel-
+wachtwoorden staan in een klein persistent tabelletje (nooit teruggelezen), te
+beheren op de kaart *MeshManager-poller* van het nodebeheer-tabblad. Eén sessie
+tegelijk, niet-blokkerend, geen herhaling van muterende commando's, en gevaarlijke
+commando's (`clkreboot` c.s.) komen niet uit de wachtrij de lucht in. Er is ook een
+handmatige weg: `@<pubkey>[:<wachtwoord>] <opdracht>` in de CLI-console. Zie
+[docs/werking.md](docs/werking.md).
 
 **Room-server-variant (v2.0.0 → v2.3.2), het huidige hoofdproduct:**
 

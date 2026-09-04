@@ -7,6 +7,97 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.6.0 — MeshManager-poller: Home Assistant valt uit de keten
+
+Alleen de room-server-variant (`env:meshuptime_room`). De bewaking (monitoren,
+alarmen, de push naar MeshManager, de webinterface) blijft **ongewijzigd**; dit is
+een **toevoeging**.
+
+**Waarom.** MeshManager kon al opdrachten in een wachtrij zetten voor een repeater
+die alleen iets anders over LoRa kan bereiken (`db.request_settings` /
+`request_refresh`). Tot nu toe leegde **Home Assistant** die wachtrij: het polde
+`/api/v1/commands`, sprak de repeater aan via een companion-node en pushte de
+antwoorden terug — drie schakels (HA, de integratie, de companion) tussen twee
+dozen op hetzelfde dak. v2.6.0 doet dat werk op de node zelf en haalt HA volledig
+uit de keten.
+
+**1. Pollerlus (`Poller.*`).** Elke `poll_secs` (config, standaard 30, minimaal 10)
+een `GET {push.url}/api/v1/commands` met `Authorization: Bearer {push.token}` — het
+**sensorpush-token**, dat de server sinds kort ook op deze route aanvaardt (geen
+tweede geheim op de node). Antwoord (clear-on-read):
+
+```
+{"refresh":["<hex>",...],
+ "settings":[{"prefix":"<hex>","params":["name","radio","cmd:filter count",...]},...]}
+```
+
+Omdat het **clear-on-read** is (`db.pop_settings_requests` wist de wachtrij bij het
+uitreiken), moet alles wat binnenkomt afgehandeld of expliciet gemeld worden. De
+poller polt daarom **alleen als zijn eigen wachtrij leeg is** (plaats om te
+bewaren), en telt/logt wat er tóch niet meer in past (`POLLER_PENDING_MAX = 4`
+repeaters).
+
+**2. Param → commando, één sessie per settings-verzoek.** Exact de vertaling van de
+oude HA-pusher (`pusher.py ~393`): `cmd:X` → stuur `X` letterlijk; elke andere
+param `P` → `get P`. Het antwoord gaat terug onder de **oorspronkelijke**
+parameternaam. `RepeaterCli` draait sinds nu een **JOB** van N commando's in **één**
+sessie: **eenmaal inloggen**, dan de N commando's achter elkaar (met dezelfde
+tussenpauzes en airtime-grenzen), niet N keer login. Elk antwoord (of het uitblijven
+ervan) wordt per commando afgeleverd en via `PushTask::queueRepeaterSetting` naar
+`POST /api/v1/repeater_settings` gepusht; **geen antwoord → `null`** ("gevraagd,
+geen antwoord", zoals `routes_api.repeater_settings` `None` behandelt), nooit stilte.
+
+**3. Wachtwoorden per doel.** Om als admin op een repeater in te loggen kent de node
+diens beheerderswachtwoord uit een klein persistent tabelletje
+(`/rep_targets.cfg`, cap 8): pubkey-prefix (12–64 hex) → wachtwoord, plus één
+**standaardwachtwoord** als terugval. Beheer via de web-GUI (kaart *MeshManager-
+poller* op het nodebeheer-tabblad) en `/repeater_targets.json` (GET) +
+`/repeater/target` (POST). **Wachtwoorden worden nooit teruggelezen** — de JSON zegt
+alleen "gezet: ja/nee". Onbekend doel zonder wachtwoord → het verzoek wordt niet
+uitgevoerd, elke param gaat als `null` terug en er komt een logregel.
+
+**4. `refresh`-verzoeken (`REQ_TYPE_GET_STATUS`, een ander protocol) worden in deze
+versie NIET uitgevoerd** — ze worden gelogd als "niet ondersteund" en vallen weg.
+Bekende beperking; zie `docs/werking.md`.
+
+**5. Airtime & veiligheid — de dak-repeater mag nooit onbereikbaar worden.** Eén
+sessie tegelijk (`RepeaterCli` is single-session); een nieuw verzoek wacht tot de
+vorige klaar is; de pollerlus blokkeert nooit (alles stapsgewijs uit `loop()`, ná de
+bewaking). **Geen automatische herhaling van muterende commando's**
+(`RepeaterCli::isMutating` → één poging; een herhaling zou het commando opnieuw
+uitvoeren). **Gevaarlijke commando's komen niet uit de wachtrij de lucht in**:
+`clkreboot`, `reboot`, `erase`, `set radio/freq`, `poweroff`/`shutdown`, `start ota`
+en alles met `prv.key` worden geweigerd (`null` gepusht + gelogd) — op afstand is
+daar geen bevestiging voor te geven. In de praktijk stuurt MeshManager alleen
+leescommando's plus `cmd:filter count`/`cmd:region`; deze zeef is de gordel voor het
+geval iemand de `cli_params`-lijst uitbreidt.
+
+**Onder de motorkap.** `PushTask` kreeg **`KIND_POLL`**: een niet-blokkerende
+`GET`-poll langs exact dezelfde DNS-cache/connect/send/recv-machine als de pushes
+(geen tweede HTTP-client naast mesh/wifi/webserver). De antwoordbuffer groeide van
+512 naar 2560 byte (de commands-JSON is genest en groter). `queueRepeaterSetting`
+aanvaardt nu `value == nullptr` → JSON `null`. Nieuwe endpoints: `GET /poller.json`,
+`POST /poller` (aan/uit + interval), `GET /repeater_targets.json`,
+`POST /repeater/target`, plus een poller-tegel op de hoofdstatuspagina
+(`status.json` veld `"poller"`).
+
+**Hoe aanzetten.** De poller staat standaard **UIT**. Op het nodebeheer-tabblad:
+zet in de kaart *MeshManager-poller* het standaardwachtwoord (of een wachtwoord per
+doel-prefix), vink **poller aan**, kies eventueel het interval, en klik *opslaan*.
+De push-URL en het token zijn dezelfde als voor de sensorpush (tabblad *Instellingen*
+→ `push.url` / `push.token`).
+
+**Handmatige tweelingweg.** Dezelfde `RepeaterCli` bedient ook `POST /cli/remote`
+(één opdracht naar één repeater, `@<pubkey>[:<wachtwoord>] <opdracht>` in de
+CLI-console), met een `GET /cli/remote` voor de stand. Dat is een job van één
+commando; de poller is een job van N. `clkreboot`/`reboot`/`erase`/`set radio` eisen
+daar een expliciete `confirm=…` (uit de wachtrij komen ze helemaal niet).
+
+**Nieuwe/gewijzigde bestanden:** `RepeaterCli.{h,cpp}` (job i.p.v. enkel commando,
++ `/cli/remote`), `Poller.{h,cpp}` (nieuw), `PushTask.{h,cpp}` (`KIND_POLL` +
+`null`-value), `WebTask.{h,cpp}` (endpoints + GUI-kaart + statustegel),
+`main_room.cpp` (bedrading), `Branding.h` (versie).
+
 ## v2.5.1 — instant companion-push + volledige companion-command-GUI + radio-GUI
 
 Drie additieve uitbreidingen op de companion-hub; alleen de room-server-variant

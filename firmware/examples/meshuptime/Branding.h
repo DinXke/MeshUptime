@@ -138,11 +138,29 @@
  *            expliciete confirm + rode waarschuwing ("kan de companion van de mesh
  *            doen vallen; fysieke seriële recovery nodig"), plus een 'radio show'
  *            leesknop. Stuurt '!radio <veld> <waarde> confirm'.
+ *   v2.6.0 = MESHMANAGER-POLLER: Home Assistant valt uit de keten. De node haalt
+ *            zelf de opdrachtwachtrij op (GET {push.url}/api/v1/commands, elke
+ *            poll_secs, Bearer=sensorpush-token) en voert de instellingen-
+ *            opvragingen uit langs RepeaterCli -- dat sinds nu een JOB van N
+ *            commando's in EEN sessie draait (eenmaal inloggen, dan de N commando's
+ *            achter elkaar), met de param->commando-vertaling van de oude HA-pusher
+ *            ("cmd:X"->X letterlijk, anders P->"get P"). Antwoorden gaan terug via
+ *            POST /api/v1/repeater_settings; geen antwoord -> null ("gevraagd, geen
+ *            antwoord"). Doel-wachtwoorden in een persistent tabelletje
+ *            (/rep_targets.cfg, cap 8, + standaardwachtwoord), beheerd via de web-GUI
+ *            en /repeater_targets.json (wachtwoorden nooit teruggelezen). Gevaarlijke
+ *            commando's (clkreboot/reboot/erase/set radio/...) komen NIET uit de
+ *            wachtrij; muterende worden niet herhaald. refresh-(status)verzoeken
+ *            worden gelogd als niet-ondersteund en vallen weg (bekende beperking).
+ *            Nieuw: PushTask KIND_POLL (niet-blokkerende GET langs dezelfde socket-
+ *            machine), /poller.json + /poller + /repeater_targets.json + /repeater/
+ *            target, en een poller-tegel op de statuspagina. Alles niet-blokkerend;
+ *            de bewaking gaat voor en één sessie tegelijk.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.5.1"
+  #define MESHUPTIME_VERSION   "v2.6.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

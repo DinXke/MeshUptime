@@ -108,6 +108,61 @@ public:
   void queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, float lon,
                       uint32_t seen, uint32_t fall_ts, uint8_t fall_kind, int16_t batt);
 
+  /* HET ANTWOORD VAN EEN REMOTE ADMIN-CLI-OPDRACHT naar MeshManager.
+   *
+   * Zelfde host/token/DNS-cache/socketmachine als de andere twee soorten -- alleen
+   * het pad en de body verschillen, precies zoals /api/companion er in v2.5.1
+   * naast kwam. Er is bewust GEEN tweede HTTP-client bijgekomen: die stack past
+   * niet naast mesh, wifi en de webserver (zie de uitleg bovenaan StatsPublisher
+   * in MeshCore over waarom een tweede TLS-sessie deze klasse node liet crashen).
+   *
+   *   POST {push.url}/api/v1/repeater_settings
+   *   Authorization: Bearer {push.token} ; Content-Type: application/json
+   *   {"repeater":{"pubkey_prefix":"<12 hex>"},"settings":{"<param>":"<waarde>"}}
+   *
+   * pubkey_prefix is de eerste 6 byte van de DOELrepeater (niet van deze node!) --
+   * dezelfde prefix waarmee MeshManager die repeater al kent.
+   *
+   * param is een CONTRACT met de serverkant: "cmd:filter count" is de vorm die
+   * pfstock.apply_cli_filter() herkent en in tegels en grafieken omzet. Wie hem
+   * anders schrijft, krijgt een instelling die de server bewaart en niemand
+   * gebruikt. RepeaterCli stelt hem samen als "cmd:" + de verstuurde opdracht.
+   *
+   * value == nullptr  -> JSON `null`: de server (routes_api.repeater_settings)
+   * telt zo'n parameter als "gevraagd, geen antwoord" i.p.v. beantwoord. DAT IS
+   * BELANGRIJK: een sweep die de helft niet uit de lucht kreeg hoort de
+   * beheerpagina "gevraagd, geen antwoord" te tonen, niet stilte -- precies de
+   * fout die dit project bestrijdt. RepeaterCli levert een verlopen commando met
+   * nullptr af.
+   *
+   * Push uit (geen url) -> stil laten vallen: geen server om iets aan kwijt te
+   * raken is een stand en geen verlies. */
+  void queueRepeaterSetting(const char* pubkey_hex12, const char* param, const char* value);
+
+  /* ------------------------------------------------------------------------
+   * DE MESHMANAGER-OPDRACHTWACHTRIJ POLLEN (v2.6.0) -- de kern waarmee Home
+   * Assistant uit de keten valt.
+   *
+   *   GET {push.url}/api/v1/commands
+   *   Authorization: Bearer {push.token}
+   *
+   * De Poller (Poller.*) beslist WANNEER er gepold wordt (elke poll_secs) en WAT
+   * er met het antwoord gebeurt; PushTask levert alleen de niet-blokkerende GET,
+   * langs exact dezelfde DNS-cache/connect/send/recv-machine als de pushes. Zo is
+   * er EEN gehard socketpad en geen tweede HTTP-client naast mesh/wifi/webserver.
+   *
+   * requestPoll() zet een vlag; de eigenlijke GET draait zodra loop() aan de beurt
+   * is en er geen dringender push (companion, cli-antwoord) voorligt. Het rauwe
+   * antwoord-BODY gaat via de callback terug naar de Poller, die het ontleedt --
+   * PushTask kent de vorm van de wachtrij niet en hoeft dat niet.
+   *
+   * Er is er hoogstens EEN tegelijk: een tweede requestPoll() terwijl er een loopt
+   * of klaarstaat doet niets (false terug). De heartbeat-klok wordt door een poll
+   * NIET verzet -- pollen is geen meten. */
+  typedef void (*PollFn)(void* ctx, const char* body);
+  bool requestPoll(PollFn cb, void* ctx);
+  bool pollInFlight() const { return _poll_requested || _kind == KIND_POLL; }
+
   /* Voor de statuspagina en het rapport. lostCount() is de belangrijkste:
    * gebeurtenissen die uit de ring gevallen zijn zonder afgeleverd te worden. */
   bool     enabled() const;              /* url gezet? */
@@ -132,8 +187,33 @@ private:
    * is voor beide identiek; alleen het pad en de body-opbouw verschillen, en
    * finishOk()/failXxx() ruimen de bijhorende ring op. Companion-pushes gaan
    * VOOR (een val mag niet achter een heartbeat aansluiten). */
-  enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION };
+  enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION, KIND_REPCLI, KIND_POLL };
   PushKind _kind = KIND_SENSOR;
+
+  /* De poll (GET /api/v1/commands). _poll_requested = de Poller wil pollen zodra
+   * het uitkomt; het antwoord-BODY gaat via _poll_cb terug. Geen ring: er is er
+   * altijd hoogstens een, en het antwoord is vluchtig (de Poller kopieert wat hij
+   * nodig heeft). */
+  bool    _poll_requested = false;
+  PollFn  _poll_cb        = nullptr;
+  void*   _poll_ctx       = nullptr;
+
+  /* De ring voor CLI-antwoorden van andere repeaters. TWEE plaatsen, en dat is
+   * geen zuinigheid maar een afspiegeling van de bron: RepeaterCli doet EEN
+   * opdracht tegelijk, dus er kan er hoogstens een tegelijk klaar zijn. De tweede
+   * plaats is er alleen zodat een antwoord dat binnenkomt terwijl de vorige nog
+   * de socket in gaat niet stil verdwijnt. Elke plaats kost ~250 byte. */
+  static const uint8_t RCLI_RING_SIZE = 2;
+  struct RepCliPush {
+    char node[13];    /* pubkey-prefix van de DOELrepeater, 12 hex + afsluiter */
+    char param[168];  /* "cmd:" + de opdracht (RCLI_CMD_MAX = 160) + afsluiter   */
+    char value[176];  /* de antwoordregel (RCLI_ANSWER_MAX)                      */
+    bool has_value;   /* false -> JSON null ("gevraagd, geen antwoord")          */
+  };
+  RepCliPush _rring[RCLI_RING_SIZE];
+  uint8_t _rring_tail    = 0;
+  uint8_t _rring_count   = 0;
+  uint8_t _rcli_inflight = 0;
 
   /* De companion-ring. Klein: val/loc-events zijn zeldzaam en de ring leegt zich
    * zodra de server bereikbaar is. Loopt hij toch over, dan valt de OUDSTE eruit
@@ -201,6 +281,8 @@ private:
   bool buildRequest(const char* host, const char* path);
   bool buildSensorBody(char* body, size_t cap, size_t& blen);
   bool buildCompanionBody(char* body, size_t cap, size_t& blen);
+  bool buildRepCliBody(char* body, size_t cap, size_t& blen);
+  bool buildPollRequest();   /* KIND_POLL: een GET zonder body */
   void stepConnect();
   void stepSend();
   void stepRecv();

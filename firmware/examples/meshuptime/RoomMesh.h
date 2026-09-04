@@ -62,6 +62,7 @@
 #include <target.h>
 
 #include "IWebNode.h"
+#include "RepeaterCli.h"
 
 /* v2.5.1: RoomMesh duwt companion-locatie/val METEEN naar MeshManager via
  * PushTask (setPushTask). Alleen een pointer + aanroepen in RoomMesh.cpp, dus
@@ -390,13 +391,61 @@ struct BotChannel {
   bool    is_public;              // true = de vaste publieke sleutel (het echte Public)
 };
 
-class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode {
+class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode,
+                 public RepeaterCliHost {
 public:
   RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::MillisecondClock& ms,
            mesh::RNG& rng, mesh::RTCClock& rtc, mesh::MeshTables& tables);
 
   void begin(FILESYSTEM* fs);
   void loop();
+
+  /* ---- ADMIN-CLI NAAR EEN ANDERE REPEATER (zie RepeaterCli.h) ----
+   *
+   * Publiek lid en geen pointer, net als DmCommands in RoomApp: er is er precies
+   * een, hij leeft even lang als de mesh, en main_room.cpp hoeft er alleen een
+   * uitslag-callback op te zetten. begin() koppelt hem aan deze klasse; zolang
+   * er geen opdracht in de wacht staat doet hij letterlijk niets -- geen timer,
+   * geen zending, geen enkele aanraking van de bestaande bewaking. */
+  RepeaterCli rcli;
+
+  /* ---- RepeaterCliHost: de drie dingen die RepeaterCli zelf niet kan ----
+   *
+   * Alle drie eenregelig, en dat is het bewijs dat de knip op de goede plek zit:
+   * wat hier staat is precies het stuk dat van DEZE node is (welke identiteit,
+   * welke regio-scope, welke gehoorde adverts) en niet van het protocol. */
+
+  /* Room 0 is de HOOFDIDENTITEIT van deze node -- dezelfde pubkey waarmee hij
+   * overal bekend staat en waarmee RoomMesh::sendAlertDM zijn DM's stuurt. Die
+   * gebruiken we ook als client, zodat de repeater aan de overkant EEN ingang in
+   * zijn toegangslijst krijgt en niet een per identiteit.
+   *
+   * De toewijzing aan self_id is geen bijwerking maar de reden van bestaan: op
+   * deze node wisselt self_id per ontvangen pakket (onRecvPacket), en
+   * createDatagram schrijft de afzenderhash eruit. */
+  const mesh::LocalIdentity& rcliUseClientIdentity() override {
+    self_id = rooms[0].id;
+    return rooms[0].id;
+  }
+
+  /* Direct als er een pad is, anders een flood MET de regio-transportcode --
+   * letterlijk dezelfde twee regels als sendAlertDM(). Zonder die scope gooit de
+   * packetfilter van een repeater in een regio onze flood weg (drop.hash) en
+   * verdwijnt de login spoorloos; zie de uitleg bij floodScoped in SensorMesh.h. */
+  void rcliSend(mesh::Packet* pkt, const uint8_t* path, uint8_t path_len) override {
+    if (path_len != OUT_PATH_UNKNOWN) sendDirect(pkt, path, path_len);
+    else sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  }
+
+  /* Prefix -> volle sleutel uit de buurtlijst: elk gehoord advert draagt de
+   * volledige 32 byte, en die zijn nodig voor het gedeelde geheim. false als de
+   * prefix onbekend is; de aanroeper moet dan de 64 hextekens leveren. */
+  bool rcliResolvePubKey(const uint8_t* prefix, int prefix_len, uint8_t* out_full) override {
+    const NeighbourEntry* e = neighbours.find(prefix, prefix_len);
+    if (e == NULL) return false;
+    memcpy(out_full, e->pub_key, PUB_KEY_SIZE);
+    return true;
+  }
 
   /* Room 0 gebruikt de BESTAANDE hoofdidentiteit; main_room.cpp laadt die met
    * store.load("_main", ...) en geeft haar hier door VOOR begin(). Zo blijft de

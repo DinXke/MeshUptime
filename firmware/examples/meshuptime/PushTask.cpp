@@ -62,7 +62,12 @@ static void push_do_resolve(void* ctx) {
  * instelling kan tussendoor veranderd zijn -- de cache van het opgeloste adres
  * (_addr_host in de klasse) vangt de gewone herhaling af. */
 static char     s_host[MON_PUSH_URL_LEN];
-static char     s_path[MON_PUSH_URL_LEN + 20];   /* prefix + "/api/sensorpush" */
+/* prefix + het langste contract-pad. Dat is sinds v2.6 niet meer
+ * "/api/sensorpush" (15) maar "/api/v1/repeater_settings" (25); +32 houdt daar
+ * marge boven. Te krap zou snprintf het pad stil AFKAPPEN en dan post de node
+ * naar een endpoint dat niet bestaat -- een 404 waarvan de oorzaak nergens te
+ * zien is. */
+static char     s_path[MON_PUSH_URL_LEN + 32];
 static uint16_t s_port = 80;
 
 /* Het volledige verzoek (koppen + body) en het antwoord. Nagerekend: de koppen
@@ -74,7 +79,13 @@ static uint16_t s_port = 80;
 static char   s_req[PUSH_BODY_MAX + 416];
 static size_t s_req_len = 0;
 static size_t s_req_off = 0;      /* hoeveel er al de socket in is */
-static char   s_resp[512];
+/* Het antwoord. 512 volstond voor de pushes ({"ok":1,"ack":[...]}), maar de
+ * POLL-GET van /api/v1/commands geeft de HELE opdrachtwachtrij terug -- tot 40
+ * parameters per repeater -- en die moet in zijn geheel gelezen worden om te
+ * ontleden. 2560 dekt een sweep voor een handvol repeaters ruim; wat er toch
+ * niet in past wordt geteld/gemeld (de Poller ziet aan een niet-afgesloten JSON
+ * dat er iets ontbrak) i.p.v. stil verminkt. */
+static char   s_resp[2560];
 static size_t s_resp_len = 0;
 
 /* Begrensd aanplakken. Geeft false zodra het niet meer paste; de aanroeper
@@ -190,6 +201,46 @@ void PushTask::queueCompanion(const uint8_t* pub_key, bool has_loc, float lat, f
   _cring_count++;
 }
 
+/* Het antwoord van een remote admin-CLI-opdracht in de eigen ring zetten. Zelfde
+ * overloopregel als de andere twee ringen: vol -> de OUDSTE valt eruit en wordt
+ * GETELD (_lost), nooit stil. In de praktijk kan dat hier nauwelijks gebeuren --
+ * RepeaterCli levert er hoogstens een per opdracht en doet er een tegelijk. */
+void PushTask::queueRepeaterSetting(const char* pubkey_hex12, const char* param,
+                                    const char* value) {
+  /* value MAG nullptr zijn (= "gevraagd, geen antwoord"); node en param niet. */
+  if (!enabled() || pubkey_hex12 == NULL || param == NULL) return;
+  if (pubkey_hex12[0] == 0 || param[0] == 0) return;
+
+  if (_rring_count >= RCLI_RING_SIZE) {
+    _rring_tail = (uint8_t)((_rring_tail + 1) % RCLI_RING_SIZE);
+    _rring_count--;
+    if (_rcli_inflight > 0) _rcli_inflight--;
+    _lost++;
+    MESH_DEBUG_PRINTLN("PushTask: repeater-cli-ring vol, oudste vervallen (verloren: %lu)",
+                       (unsigned long)_lost);
+  }
+  RepCliPush& r = _rring[(_rring_tail + _rring_count) % RCLI_RING_SIZE];
+  StrHelper::strncpy(r.node,  pubkey_hex12, sizeof(r.node));
+  StrHelper::strncpy(r.param, param,        sizeof(r.param));
+  /* value == nullptr -> JSON null. "" is een geldig (leeg) antwoord, null de
+   * afwezigheid ervan; de server behandelt die twee anders. */
+  r.has_value = (value != nullptr);
+  StrHelper::strncpy(r.value, value ? value : "", sizeof(r.value));
+  _rring_count++;
+}
+
+/* De MeshManager-opdrachtwachtrij pollen: alleen een vlag zetten. De GET zelf
+ * draait in loop() zodra er geen dringender push voorligt; er is er hoogstens EEN
+ * tegelijk. */
+bool PushTask::requestPoll(PollFn cb, void* ctx) {
+  if (!enabled() || cb == nullptr) return false;
+  if (_poll_requested || _kind == KIND_POLL) return false;   // er loopt/staat er al een
+  _poll_cb        = cb;
+  _poll_ctx       = ctx;
+  _poll_requested = true;
+  return true;
+}
+
 /* Wanneer moet er een POST uit? Zodra er iets te melden is (gebeurtenissen of
  * node-bevestigingen), en anders op de heartbeat-klok. De retry-rem gaat voor:
  * na een fout wordt er even niet geprobeerd, wat er ook klaarstaat. */
@@ -197,6 +248,12 @@ bool PushTask::dueNow(unsigned long now) const {
   if (_wifi == NULL || !_wifi->isOnline()) return false;
   if (_retry_at != 0 && (long)(now - _retry_at) < 0) return false;
   if (_cring_count > 0) return true;   /* companion-push: meteen (val/loc) */
+  /* Een CLI-antwoord is per definitie iets waar iemand NU op wacht (er is net
+   * met de hand een opdracht naar een repeater gestuurd), dus ook meteen. */
+  if (_rring_count > 0) return true;
+  /* Een gevraagde poll: zodra het uitkomt. Staat achter de pushes in prioriteit
+   * (startAttempt), maar mag de heartbeat niet hoeven af te wachten. */
+  if (_poll_requested) return true;
   if (_ring_count > 0 || _acked_pending != 0) return true;
   return (long)(now - _next_hb) >= 0;
 }
@@ -212,10 +269,12 @@ void PushTask::loop() {
   if (!enabled()) {
     /* Push staat uit. Een lopende poging afbreken en de wachtrij legen: wat er
      * ligt was voor een server die er nu niet meer is. */
-    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; _comp_inflight = 0; }
+    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; _comp_inflight = 0; _rcli_inflight = 0; }
     _ring_count = 0;
     _acked_pending = 0;
     _cring_count = 0;
+    _rring_count = 0;
+    _poll_requested = false;   /* geen server om aan te pollen */
     return;
   }
 
@@ -259,10 +318,14 @@ void PushTask::loop() {
  * bij ELKE poging opnieuw ontleed: de instelling kan veranderd zijn, en de
  * adrescache (op hostnaam) vangt de gewone herhaling af. */
 void PushTask::startAttempt() {
-  /* Companion-pushes gaan VOOR: een val/loc mag niet achter de heartbeat
-   * aansluiten. Staat er niets in de companion-ring, dan is dit een sensorpush.
-   * De rest van het pad (DNS/connect/send/recv) is voor beide identiek. */
-  _kind = (_cring_count > 0) ? KIND_COMPANION : KIND_SENSOR;
+  /* Voorrang: companion (een val mag nooit wachten), dan het antwoord van een
+   * remote CLI-opdracht (daar staat iemand met een browser op te wachten), dan de
+   * poll (nieuwe opdrachten ophalen), dan pas de gewone sensorpush/heartbeat. De
+   * rest van het pad (DNS/connect/send/recv) is voor alle vier identiek. */
+  _kind = (_cring_count > 0)  ? KIND_COMPANION
+        : (_rring_count > 0)  ? KIND_REPCLI
+        : (_poll_requested)   ? KIND_POLL
+                              : KIND_SENSOR;
 
   const char* url = _sensors->pushUrl();
 
@@ -286,7 +349,9 @@ void PushTask::startAttempt() {
   /* Wat er nog staat is het padvoorvoegsel (of niets). Het contract-pad hangt af
    * van het soort push -- zelfde host/token, ander endpoint. */
   snprintf(s_path, sizeof(s_path), "%s%s", *p ? p : "",
-           _kind == KIND_COMPANION ? "/api/companion" : "/api/sensorpush");
+           _kind == KIND_COMPANION ? "/api/companion" :
+           _kind == KIND_REPCLI    ? "/api/v1/repeater_settings" :
+           _kind == KIND_POLL      ? "/api/v1/commands" : "/api/sensorpush");
 
   if (s_host[0] == 0) { failNet("url: geen host"); return; }
 
@@ -328,11 +393,26 @@ void PushTask::startAttempt() {
  * _acked_sent leggen vast wat er in DEZE post zit, zodat finishOk() precies
  * dat opruimt en niets anders. */
 bool PushTask::buildRequest(const char* host, const char* path) {
+  /* De POLL is een GET zonder body: aparte, korte weg. Zelfde token, zelfde
+   * Connection: close (recv leest tot de server sluit). */
+  if (_kind == KIND_POLL) {
+    s_req_len = 0;
+    s_req_off = 0;
+    return appendf(s_req, sizeof(s_req), s_req_len,
+                   "GET %s HTTP/1.1\r\n"
+                   "Host: %s\r\n"
+                   "Authorization: Bearer %s\r\n"
+                   "Connection: close\r\n\r\n",
+                   path, host, _sensors->pushToken());
+  }
+
   static char body[PUSH_BODY_MAX];
   size_t blen = 0;
 
   if (_kind == KIND_COMPANION) {
     if (!buildCompanionBody(body, sizeof(body), blen)) return false;
+  } else if (_kind == KIND_REPCLI) {
+    if (!buildRepCliBody(body, sizeof(body), blen)) return false;
   } else {
     if (!buildSensorBody(body, sizeof(body), blen)) return false;
   }
@@ -355,6 +435,10 @@ bool PushTask::buildRequest(const char* host, const char* path) {
   s_req_len += blen;
   return true;
 }
+
+/* KIND_POLL heeft geen body om te bouwen; deze bestaat alleen zodat de
+ * declaratie in de header een definitie heeft en het pad symmetrisch leest. */
+bool PushTask::buildPollRequest() { return true; }
 
 /* v2.5.1 -- de companion-body. Alle wachtende companion-plaatsen gaan in één
  * POST (ze delen host/token); _comp_inflight legt vast hoeveel, zodat finishOk()
@@ -397,6 +481,39 @@ bool PushTask::buildCompanionBody(char* body, size_t cap, size_t& blen) {
   }
 
   if (!appendf(body, cap, blen, "]}")) return false;
+  return true;
+}
+
+/* De body van een remote-CLI-antwoord. EEN per POST en niet meerdere: het
+ * contract met MeshManager draagt een enkele repeater met een enkele
+ * settings-map, en RepeaterCli levert er toch maar een tegelijk. Bleef er een
+ * tweede in de ring staan, dan houdt dueNow() de volgende post meteen waar.
+ *
+ * De paramNAAM gaat door dezelfde ontsnapping als de waarde. Dat is geen
+ * overdaad: de naam is "cmd:" plus een opdracht die iemand in een webformulier
+ * getypt heeft, dus daar KAN een aanhalingsteken in zitten -- en een JSON die
+ * daarop breekt zou de hele post laten mislukken zonder dat er iets te zien is. */
+bool PushTask::buildRepCliBody(char* body, size_t cap, size_t& blen) {
+  blen = 0;
+  _rcli_inflight = 0;
+  if (_rring_count == 0) return false;
+
+  const RepCliPush& r = _rring[_rring_tail];
+
+  if (!appendf(body, cap, blen, "{\"repeater\":{\"pubkey_prefix\":\"%s\"},\"settings\":{\"",
+               r.node)) return false;
+  if (!appendJsonText(body, cap, blen, r.param)) return false;
+  /* value: een string "..." OF JSON null. null (has_value==false) = "gevraagd,
+   * geen antwoord"; de server telt die parameter als onbeantwoord. */
+  if (r.has_value) {
+    if (!appendf(body, cap, blen, "\":\"")) return false;
+    if (!appendJsonText(body, cap, blen, r.value)) return false;
+    if (!appendf(body, cap, blen, "\"}}")) return false;
+  } else {
+    if (!appendf(body, cap, blen, "\":null}}")) return false;
+  }
+
+  _rcli_inflight = 1;
   return true;
 }
 
@@ -548,10 +665,14 @@ void PushTask::stepRecv() {
       s_resp_len += (size_t)n;
       s_resp[s_resp_len] = 0;
     }
-    /* Al compleet zonder op de sluiting te wachten? Het contract-antwoord is
-     * één JSON-object; staat er na de koppen een '}', dan is hij binnen. */
+    /* Al compleet zonder op de sluiting te wachten? Het contract-antwoord van een
+     * PUSH is één plat JSON-object; staat er na de koppen een '}', dan is hij
+     * binnen. Voor de POLL geldt dat NIET: /api/v1/commands is genest
+     * ({"settings":[{...}]}), dus de eerste '}' is een BINNENSTE en zou het
+     * antwoord te vroeg afronden. Daarom leest de poll altijd tot de server sluit
+     * (Connection: close, dus n==0) of tot de deadline. */
     const char* hdr_end = strstr(s_resp, "\r\n\r\n");
-    if (hdr_end != NULL && strchr(hdr_end + 4, '}') != NULL) {
+    if (_kind != KIND_POLL && hdr_end != NULL && strchr(hdr_end + 4, '}') != NULL) {
       /* doorvallen naar afronden */
     } else {
       /* Nog niet compleet. De deadline geldt ook hier: een server die eindeloos
@@ -578,11 +699,21 @@ void PushTask::stepRecv() {
   }
   if (status != 200) { failHttp(status); return; }
 
+  const char* hdr_end = strstr(s_resp, "\r\n\r\n");
+  const char* body    = hdr_end ? hdr_end + 4 : s_resp;
+
+  /* DE POLL: het BODY naar de Poller, die het ontleedt. PushTask kent de vorm van
+   * de opdrachtwachtrij niet. De callback mag alleen kopieren (hij draait in
+   * loop(), niet in een radio-callback). */
+  if (_kind == KIND_POLL) {
+    if (_poll_cb != NULL) _poll_cb(_poll_ctx, body);
+    finishOk();
+    return;
+  }
+
   /* De server-bevestigingen: "ack":[kanaal,...] -> per kanaal het herhalen
    * stoppen, hetzelfde effect als een ok-DM maar dan gericht. Alleen zinvol op
    * de sensorpush; /api/companion kent geen ack-lijst. */
-  const char* hdr_end = strstr(s_resp, "\r\n\r\n");
-  const char* body    = hdr_end ? hdr_end + 4 : s_resp;
   const char* ap      = (_kind == KIND_SENSOR) ? strstr(body, "\"ack\"") : NULL;
   if (ap != NULL) {
     ap = strchr(ap, '[');
@@ -606,13 +737,25 @@ void PushTask::stepRecv() {
 void PushTask::finishOk() {
   closeSock();
 
-  if (_kind == KIND_COMPANION) {
+  if (_kind == KIND_POLL) {
+    /* De poll is af (de callback heeft het body al verwerkt). Niets op te ruimen,
+     * geen ring, en de heartbeat-klok blijft met rust: pollen is geen meten. */
+    _poll_requested = false;
+  } else if (_kind == KIND_COMPANION) {
     /* Alleen de companion-ring opruimen; de sensorring, het acked-masker en de
      * heartbeat-klok blijven met rust. Bleef er iets in de ring (overloop of
      * body vol), dan houdt dueNow() de volgende post meteen waar. */
     _cring_tail    = (uint8_t)((_cring_tail + _comp_inflight) % COMP_RING_SIZE);
     _cring_count   = (uint8_t)(_cring_count - _comp_inflight);
     _comp_inflight = 0;
+  } else if (_kind == KIND_REPCLI) {
+    /* Alleen de eigen ring opruimen. De heartbeat-klok blijft met rust: een
+     * CLI-antwoord is buiten de cadans om en mag de belofte "je hoort me elke
+     * hb_s" niet vooruitschuiven -- dan zou een handmatige opdracht de betekenis
+     * van de stilte tussen twee heartbeats veranderen. */
+    _rring_tail    = (uint8_t)((_rring_tail + _rcli_inflight) % RCLI_RING_SIZE);
+    _rring_count   = (uint8_t)(_rring_count - _rcli_inflight);
+    _rcli_inflight = 0;
   } else {
     /* Precies opruimen wat deze post droeg: _inflight plaatsen vanaf de staart
      * (onMonitorEvent heeft _inflight al verlaagd als de overloop er een van
@@ -641,7 +784,12 @@ void PushTask::failNet(const char* why) {
   _fail_net++;
   _inflight      = 0;
   _comp_inflight = 0;
+  _rcli_inflight = 0;
   _acked_sent    = 0;
+  /* Een mislukte POLL niet in de retry-lus vasthouden: de Poller vraagt op zijn
+   * eigen cadans (poll_secs) een nieuwe. Zo hamert een netwerkhapering de
+   * opdrachtwachtrij niet, en houdt poll_secs zijn betekenis. */
+  _poll_requested = false;
   /* Niet hameren: even wachten en dan gewoon opnieuw -- de gebeurtenissen staan
    * veilig in de ring en de bevestigingen in het masker. */
   _retry_at = millis() + PUSH_RETRY_MS;
@@ -655,7 +803,9 @@ void PushTask::failHttp(int status) {
   _fail_http++;
   _inflight      = 0;
   _comp_inflight = 0;
+  _rcli_inflight = 0;
   _acked_sent    = 0;
+  _poll_requested = false;   /* zie failNet: de Poller vraagt op zijn eigen cadans */
   _last_status = status;
 
   /* Loggen, niet spammen: één regel per nieuwe status, en dan wachten tot de

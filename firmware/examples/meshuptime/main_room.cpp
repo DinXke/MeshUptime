@@ -44,9 +44,14 @@ static unsigned long g_reboot_at = 0;
   #include "WifiTask.h"
   #include "WebTask.h"
   #include "PushTask.h"
+  #include "Poller.h"
   static WifiTask wifi_task;
   static WebTask  web_task;
   static PushTask push_task;
+  /* v2.6.0: de MeshManager-opdrachtwachtrij-poller. Haalt HA uit de keten. Alleen
+   * in de room-variant met wifi -- hij leunt op PushTask (HTTP) en the_mesh.rcli
+   * (RepeaterCli). Zie Poller.h. */
+  static Poller   poller;
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -657,6 +662,33 @@ void setup() {
     /* v2.5.1: de room-mesh mag companion-#LOC/val METEEN pushen (POST
      * /api/companion) via dezelfde PushTask -- geen wachten op de poll. */
     the_mesh.setPushTask(&push_task);
+
+    /* ADMIN-CLI NAAR EEN ANDERE REPEATER (zie RepeaterCli.h).
+     *
+     * Twee regels, en allebei een KOPPELING en geen gedrag:
+     *  - de webroute POST/GET /cli/remote krijgt de module te zien;
+     *  - het antwoord gaat naar MeshManager, via dezelfde PushTask/host/token als
+     *    de sensorpush (POST /api/v1/repeater_settings).
+     *
+     * De callback is captureless -> een gewone functiepointer, zodat std::function
+     * er niets voor op de heap zet. Dit is dezelfde vorm als de room-post-callback
+     * hierboven, en om dezelfde reden: RepeaterCli hoort niets van HTTP, tokens of
+     * MeshManager te weten, en main_room.cpp is de enige plek die beide kent. */
+    web_task.setRepeaterCli(&the_mesh.rcli);
+    the_mesh.rcli.setResultCallback(
+        [](void* ctx, const char* pubkey_hex12, const char* param, const char* value) {
+          ((PushTask*)ctx)->queueRepeaterSetting(pubkey_hex12, param, value);
+        },
+        &push_task);
+
+    /* DE POLLER (v2.6.0). Dezelfde PushTask (poll-GET + antwoord-POST) en dezelfde
+     * RepeaterCli (login + commando's). De antwoorden lopen via de callback die we
+     * hierboven al op rcli zetten -- de poller hoeft ze niet te onderscheppen; hij
+     * start alleen de jobs en pusht zelf de null-antwoorden voor geweigerde/
+     * wachtwoordloze parameters. De web-GUI beheert aan/uit, interval en de
+     * doel-wachtwoorden. */
+    poller.begin(&SPIFFS, &push_task, &the_mesh.rcli);
+    web_task.setPoller(&poller);
   }
   #ifdef HAS_MONITOR_SENSORS
     sensors.setWifiTask(&wifi_task);
@@ -701,6 +733,7 @@ void loop() {
   wifi_task.loop();
   web_task.loop();
   push_task.loop();
+  poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
 #endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();
