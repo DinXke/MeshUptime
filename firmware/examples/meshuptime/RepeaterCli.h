@@ -114,10 +114,17 @@
  * (BaseChatMesh MAX_TEXT_LEN, 10 cipherblokken van 16). */
 #define RCLI_CMD_MAX      160
 
-/* Het ANTWOORD. De tegenkant schrijft het in `uint8_t temp[166]` met de tekst op
- * offset 5 (simple_repeater/MyMesh.cpp), dus hoogstens 160 tekens + nul. 176 laat
- * marge. Het filterantwoord (78 tekens) en `clock` (20) passen ruim. */
-#define RCLI_ANSWER_MAX   176
+/* Het ANTWOORD. De stock-repeater schrijft het in `uint8_t temp[166]` met de
+ * tekst op offset 5 (simple_repeater/MyMesh.cpp): EEN pakket, hoogstens 160
+ * tekens. De dutchmeshcore/EasySkyMesh-fork op JessaZH doet dat NIET: die knipt
+ * een lang antwoord (`filter count` = kopregel + limiettabel, ~210 tekens) in
+ * meerdere TXT_MSG-pakketten, die over een flood niet per se in volgorde
+ * aankomen. Daarom RCLI_CHUNK_MAX stukken verzamelen, op hun tijdstempel
+ * sorteren en pas na RCLI_CHUNK_GAP_MS stilte afleveren. 400 is de som van vier
+ * volle stukken min de marge die nooit gehaald wordt; PushTask::value volgt. */
+#define RCLI_ANSWER_MAX   400
+#define RCLI_CHUNK_MAX    4
+#define RCLI_CHUNK_GAP_MS 3000UL
 
 /* Het wachtwoord. 16: sendLogin() kapt af op 15, dus meer komt nooit aan. */
 #define RCLI_PASS_MAX     16
@@ -300,6 +307,16 @@ private:
   char     _answer[RCLI_ANSWER_MAX];
   char     _error[80];
 
+  /* Stukken van het lopende antwoord: elk stuk staat achter elkaar in _answer
+   * (offset/lengte) met de tijdstempel uit zijn pakket; finishAnswer() sorteert
+   * en rijgt aaneen. Zie RCLI_CHUNK_MAX voor waarom dit bestaat. */
+  uint8_t  _nchunks;
+  uint32_t _chunk_ts[RCLI_CHUNK_MAX];
+  uint16_t _chunk_off[RCLI_CHUNK_MAX];
+  uint16_t _chunk_len[RCLI_CHUNK_MAX];
+  uint16_t _answer_used;
+  unsigned long _collect_until;   // na dit moment zonder nieuw stuk: afleveren
+
   /* Het pad NAAR het doel, geleerd uit de PATH die de repeater op onze flood
    * terugstuurt. Bewaard over commando's EN over sessies heen (alleen RAM), puur
    * zendtijdwinst: na de eerste flood gaan alle volgende commando's direct. */
@@ -317,6 +334,7 @@ private:
   void reset();
   void failJob(const char* why);          // login/bovengrens: rest als null afleveren
   void deliverCurrent(const char* value); // huidig cmd afleveren (value of nullptr)
+  void finishAnswer();                    // verzamelde stukken sorteren, afleveren, door
   bool loadCurrentParam();                // _cur_param + _cmd voor _job_i klaarzetten
   void beginNextCommand();                // naar het volgende commando (of DONE)
   void sendLogin();

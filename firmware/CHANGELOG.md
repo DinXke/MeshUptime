@@ -13,6 +13,25 @@ Alleen de room-server-variant (`env:meshuptime_room`). De bewaking (monitoren,
 alarmen, de push naar MeshManager, de webinterface) blijft **ongewijzigd**; dit is
 een **toevoeging**.
 
+**Sleutelresolutie zonder advert (toegevoegd bij de eerste inzet, 2026-09-04).**
+MeshManager stuurt in een verzoek altijd 12 hex, en `RepeaterCli` lost die alleen
+op via de buurtlijst — die na elke herstart leeg is tot de repeater weer
+adverteert (JessaZH: om de ~2 uur). Zet daarom de **volle 64-hex sleutel** in de
+doeltabel: `Poller::keyFor()` geeft die dan door in plaats van de prefix, en de
+sessie start meteen. Een 12-hex doelingang blijft werken zodra de advert gehoord
+is. De volle sleutel staat in elk ADVERT-pakket van de repeater (in MeshManager:
+`packets.raw`, vanaf de positie van de 12-hex prefix, 64 tekens).
+
+**Antwoord in meerdere pakketten (idem, 2026-09-04).** De eerste versie leverde
+het EERSTE TXT_MSG-pakket meteen af als volledig antwoord. `RepeaterCli`
+verzamelt nu tot vier stukken met hun tijdstempel, sorteert ze en levert pas na
+3 s stilte af (`RCLI_CHUNK_GAP_MS`); de antwoordbuffer ging van 176 naar 400
+tekens (PushTask volgt). Een lopende verzameling wordt nooit onderbroken door een
+herhaling (die zou het commando op de tegenkant opnieuw uitvoeren). Bevinding
+bij het testen op JessaZH: `filter count` geeft daar alleen de limiettabel (één
+pakket van 138 B); de statusregel met tellers komt van het kale `filter`. Dat is
+een MeshManager-kwestie (beide opvragen en samenvoegen), geen firmwarekwestie.
+
 **Waarom.** MeshManager kon al opdrachten in een wachtrij zetten voor een repeater
 die alleen iets anders over LoRa kan bereiken (`db.request_settings` /
 `request_refresh`). Tot nu toe leegde **Home Assistant** die wachtrij: het polde

@@ -207,7 +207,7 @@ private:
   struct RepCliPush {
     char node[13];    /* pubkey-prefix van de DOELrepeater, 12 hex + afsluiter */
     char param[168];  /* "cmd:" + de opdracht (RCLI_CMD_MAX = 160) + afsluiter   */
-    char value[176];  /* de antwoordregel (RCLI_ANSWER_MAX)                      */
+    char value[400];  /* de antwoordregel (= RCLI_ANSWER_MAX: meerdere pakketten aaneengeregen) */
     bool has_value;   /* false -> JSON null ("gevraagd, geen antwoord")          */
   };
   RepCliPush _rring[RCLI_RING_SIZE];
