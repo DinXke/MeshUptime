@@ -1,0 +1,49 @@
+; ---------------------------------------------------------------------------
+; MeshUptimeCompanion — PlatformIO overlay env for the Seeed T1000-E.
+;
+; OVERLAY PATTERN (mirrors MeshStats/docs/firmware.md): this file adds ONE env
+; on top of an unmodified MeshCore checkout. Nothing in MeshCore is edited.
+;
+; To build:
+;   1. Check out the STANDARD MeshCore at v1.17.1 (commit d929643) — the same
+;      official companion_radio base as the stock t1000e_companion_radio_ble
+;      build. NOT the PowerSaving-v17 fork: this pager must stay in continuous RX
+;      (no duty-cycling), which is exactly the standard base's behaviour.
+;         git clone https://github.com/meshcore-dev/MeshCore.git ../MeshCore-std
+;         cd ../MeshCore-std && git checkout d929643
+;   2. Copy THIS file to the MeshCore checkout root as `platformio.local.ini`
+;      (MeshCore's root platformio.ini already pulls it in via `extra_configs`).
+;   3. Make sure this repo (MU-companion) sits next to the MeshCore checkout, i.e.
+;         <parent>/MeshCore-std     (or MeshCore)
+;         <parent>/MU-companion/MeshUptimeCompanion
+;      The relative paths below assume that sibling layout.
+;   4. python -m platformio run -e t1000e_meshuptime_companion
+;
+; Paths: build_src_filter globs are relative to <MeshCore>/src, so `../../` is
+; the parent that holds both checkouts. `-I` flags are relative to <MeshCore>.
+; ---------------------------------------------------------------------------
+
+[env:t1000e_meshuptime_companion]
+extends = t1000-e
+board_build.ldscript = boards/nrf52840_s140_v7_extrafs.ld
+board_upload.maximum_size = 708608
+build_flags = ${t1000-e.build_flags}
+  -I examples/companion_radio
+  -I ../MU-companion/MeshUptimeCompanion
+  -D MAX_CONTACTS=350
+  -D MAX_GROUP_CHANNELS=40
+  -D OFFLINE_QUEUE_SIZE=256
+  -D BLE_PIN_CODE=123456
+  -D BLE_TX_POWER=0
+  -D PIN_BUZZER=25
+  -D PIN_BUZZER_EN=37        ; P1.5 — required for T1000-E buzzer
+  -D AUTO_SHUTDOWN_MILLIVOLTS=3400   ; graceful low-batt (matches heltec_v3); drives our warning
+  -D ADVERT_NAME='"@@MAC"'
+build_src_filter = ${t1000-e.build_src_filter}
+  +<helpers/nrf52/SerialBLEInterface.cpp>
+  +<../examples/companion_radio/DataStore.cpp>
+  +<../../MU-companion/MeshUptimeCompanion/*.cpp>
+lib_deps = ${t1000-e.lib_deps}
+  densaugeo/base64 @ ~1.4.0
+  stevemarple/MicroNMEA @ ^2.0.6
+  end2endzone/NonBlockingRTTTL@^1.3.0
