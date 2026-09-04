@@ -1441,9 +1441,15 @@ instellingen-opvragingen uit langs de remote-CLI hierboven &mdash; de weg die
 vroeger over Home Assistant liep. Antwoorden gaan terug naar
 <code>/api/v1/repeater_settings</code>; een parameter zonder antwoord wordt als
 <code>null</code> gemeld (&quot;gevraagd, geen antwoord&quot;), nooit als stilte.
-<b>Er loopt er één tegelijk</b> en de bewaking gaat voor. <code>refresh</code>-
-(status)verzoeken worden in deze versie <b>niet</b> uitgevoerd &mdash; ze worden
-genegeerd en geteld.</p>
+<b>Er loopt er één tegelijk</b> en de bewaking gaat voor.<br>
+Sinds v2.7.0 voert de poller ook <b>statusverzoeken</b> uit: de knop <i>Status nu
+opvragen</i> op de MeshManager-beheerpagina werkt daarmee op elke repeater waarvan
+deze node het wachtwoord kent, ook zonder onze eigen firmware aan de andere kant.
+Zo'n ronde logt in en stuurt één <code>REQ_TYPE_GET_STATUS</code>; het antwoord
+(accu, uptime, airtime, RSSI/SNR, tellers) gaat als metingen naar
+<code>/api/v1/ingest</code>. Lukt het niet, of ziet het antwoord er niet uit zoals
+verwacht, dan wordt er <b>niets</b> gemeld &mdash; een halve meting is erger dan een
+lege pagina.</p>
 <div id="pl-status" class="note">&hellip;</div>
 <div class="quick" style="margin-top:.4rem">
 <label style="align-self:center"><input type="checkbox" id="pl-on"> poller aan</label>
@@ -3082,7 +3088,7 @@ document.getElementById("pl-status").innerHTML=
 "<b>"+(j.on?"AAN":"uit")+"</b> &middot; laatste poll: "+age+
 " &middot; verwerkt: "+j.processed+" &middot; verloren: "+j.dropped+
 " &middot; wachtrij: "+j.pending+" &middot; sessie: "+esc(j.session)+
-(j.refresh_dropped?(" &middot; "+j.refresh_dropped+" refresh genegeerd"):"")+
+(j.status_ok||j.status_fail?(" &middot; status "+j.status_ok+" ok/"+j.status_fail+" mislukt"):"")+
 "<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})
 fetch("repeater_targets.json").then(function(r){return r.ok?r.json():null}).then(function(j){
 if(!j){return}
@@ -7611,12 +7617,14 @@ void WebTask::handlePollerJson() {
   char note[128]; jsonEscape(_poller->lastNote(), note, sizeof(note));
   int n = snprintf(g_rcli_reply, sizeof(g_rcli_reply),
       "{\"on\":%d,\"poll_secs\":%u,\"ever\":%d,\"last_poll_age\":%lu,"
-      "\"processed\":%lu,\"dropped\":%lu,\"pending\":%u,\"refresh_dropped\":%d,"
+      "\"processed\":%lu,\"dropped\":%lu,\"pending\":%u,\"refresh_seen\":%d,"
+      "\"status_ok\":%lu,\"status_fail\":%lu,"
       "\"targets\":%d,\"default_pass\":%d,\"session\":\"%s\",\"note\":\"%s\"}",
       _poller->enabled() ? 1 : 0, (unsigned)_poller->pollSecs(),
       _poller->everPolled() ? 1 : 0, (unsigned long)_poller->lastPollAgeSecs(),
       (unsigned long)_poller->processedCount(), (unsigned long)_poller->droppedCount(),
-      (unsigned)_poller->pendingCount(), _poller->lastRefreshDropped(),
+      (unsigned)_poller->pendingCount(), _poller->lastRefreshSeen(),
+      (unsigned long)_poller->statusOkCount(), (unsigned long)_poller->statusFailCount(),
       _poller->targetCount(), _poller->defaultPassSet() ? 1 : 0, st, note);
   if (n < 0 || (size_t)n >= sizeof(g_rcli_reply)) { _server->send(500, "text/plain", "te groot\n"); return; }
   _server->sendHeader("Cache-Control", "no-store");

@@ -15,6 +15,80 @@
   #define OUT_PATH_UNKNOWN  0xFF
 #endif
 
+/* Het statusverzoek (v2.7.0). Zelfde waarde als upstream:
+ * simple_repeater/MyMesh.cpp:46 `#define REQ_TYPE_GET_STATUS 0x01 // same as
+ * _GET_STATS`, en helpers/BaseChatMesh.h:18 draagt hem onder dezelfde naam.
+ * Lokaal herhaald achter een guard, om dezelfde reden als RESP_SERVER_LOGIN_OK:
+ * de headers die hem definieren slepen elk een basisklasse mee die deze module
+ * niet nodig heeft. */
+#ifndef REQ_TYPE_GET_STATUS
+  #define REQ_TYPE_GET_STATUS  0x01
+#endif
+
+/* ============================================================================
+ * DE DRAADVORM VAN HET STATUSANTWOORD -- OVERGENOMEN, NIET ONTHOUDEN
+ *
+ * Bron: `struct RepeaterStats` in vendor/MeshCore/examples/simple_repeater/
+ * MyMesh.h:43, gevuld in MyMesh::handleRequest() (~regel 216) en verstuurd als
+ * `return 4 + sizeof(stats)` -- dus: [0..3] de GEREFLECTEERDE sender_timestamp
+ * (onze tag) en daarna de struct.
+ *
+ * De struct draagt GEEN packed-attribuut, maar elk veld staat op zijn natuurlijke
+ * uitlijning, dus er zit geen padding in en sizeof == 56. Nagerekend veld voor
+ * veld (de offsets hieronder zijn de compileruitkomst, niet een schatting):
+ *
+ *    0  uint16 batt_milli_volts        24  uint32 n_sent_flood
+ *    2  uint16 curr_tx_queue_len       28  uint32 n_sent_direct
+ *    4  int16  noise_floor             32  uint32 n_recv_flood
+ *    6  int16  last_rssi               36  uint32 n_recv_direct
+ *    8  uint32 n_packets_recv          40  uint16 err_events  (was n_full_events)
+ *   12  uint32 n_packets_sent          42  int16  last_snr    (x 4)
+ *   16  uint32 total_air_time_secs     44  uint16 n_direct_dups
+ *   20  uint32 total_up_time_secs      46  uint16 n_flood_dups
+ *                                      48  uint32 total_rx_air_time_secs
+ *                                      52  uint32 n_recv_errors
+ *
+ * WIJ LEZEN MET memcpy OP EXPLICIETE OFFSETS en niet met een struct-cast. Twee
+ * redenen: de ontvangen buffer is niet gegarandeerd 4-byte uitgelijnd (een
+ * unaligned struct-load is op ESP32 een uitzondering), en een cast zou stil
+ * meeveranderen als onze compiler ooit anders padt dan de tegenkant. De offsets
+ * hierboven zijn het contract; als upstream de struct wijzigt, wijzigt dit mee.
+ *
+ * EN DAAROM DE PLAUSIBILITEITSTOETS. De doelrepeater hoeft niet dezelfde build te
+ * draaien (JessaZH draait dutchmeshcore v1.17.1-PS+filter+rollback). Een fork die
+ * een veld TOEVOEGT aan het eind is onschadelijk -- wij lezen de eerste 56 byte en
+ * negeren de rest. Een fork die een veld INVOEGT of HERORDENT is dat niet: dan
+ * lezen we getallen op de verkeerde plaats. Dat is niet aan de bytes te zien, dus
+ * toetst parseStatus() de velden waarvan we het BEREIK kennen (accuspanning,
+ * uptime, airtime <= uptime, RSSI/SNR/ruisvloer) en verwerpt het HELE antwoord als
+ * er iets niet plausibel is. Geen half gevulde meting, geen verzonnen nul. */
+#define RCLI_STATS_WIRE_LEN   56
+#define RCLI_STATUS_RESP_MIN  (4 + RCLI_STATS_WIRE_LEN)   /* 60 */
+
+/* Het ontlede statusantwoord. Alleen ruwe velden -- het omrekenen naar de
+ * MeshManager-eenheden (volt, dagen, minuten, dB) gebeurt bij het opbouwen van de
+ * ingest-body, zodat de omrekening op EEN plek staat. */
+struct RepeaterStatus {
+  uint16_t batt_milli_volts;
+  uint16_t curr_tx_queue_len;
+  int16_t  noise_floor;
+  int16_t  last_rssi;
+  uint32_t n_packets_recv;
+  uint32_t n_packets_sent;
+  uint32_t total_air_time_secs;
+  uint32_t total_up_time_secs;
+  uint32_t n_sent_flood;
+  uint32_t n_sent_direct;
+  uint32_t n_recv_flood;
+  uint32_t n_recv_direct;
+  uint16_t err_events;
+  int16_t  last_snr_x4;
+  uint16_t n_direct_dups;
+  uint16_t n_flood_dups;
+  uint32_t total_rx_air_time_secs;
+  uint32_t n_recv_errors;
+};
+
 /* ============================================================================
  * RepeaterCli -- admin-CLI-opdrachten naar een ANDERE repeater over LoRa, en de
  * antwoorden terug. Sinds v2.6.0 een JOB van N commando's in EEN sessie.
@@ -209,9 +283,18 @@ public:
     RCLI_IDLE = 0,   // vrij
     RCLI_LOGIN,      // login onderweg, wachten op RESP_SERVER_LOGIN_OK
     RCLI_CMD,        // een commando van de job onderweg, wachten op CLI_DATA
+    RCLI_STATUS,     // REQ_TYPE_GET_STATUS onderweg, wachten op de stats-RESPONSE
     RCLI_DONE,       // job klaar (alle commando's afgehandeld of overgeslagen)
     RCLI_FAILED      // job afgebroken (login mislukt / bovengrens); error() zegt waarom
   };
+
+  /* WAT VOOR JOB. Beide soorten delen de LOGIN (die is bij een statusverzoek net
+   * zo verplicht: MyMesh::handleRequest wordt alleen bereikt via onPeerDataRecv,
+   * en dat vereist dat de afzender in de ACL staat -- de anonieme weg kent alleen
+   * LOGIN/REGIONS/OWNER/CLOCK). Ze verschillen in wat er NA de login gebeurt:
+   * CLI-tekst (TXT_MSG met TXT_TYPE_CLI_DATA) of een REQ (PAYLOAD_TYPE_REQ met
+   * REQ_TYPE_GET_STATUS). */
+  enum JobKind : uint8_t { RCLI_JOB_CLI = 0, RCLI_JOB_STATUS };
 
   /* Wat een job-start teruggeeft. */
   enum Enq : uint8_t {
@@ -233,11 +316,18 @@ public:
   typedef void (*ResultFn)(void* ctx, const char* pubkey_hex12, const char* param,
                            const char* value);
 
+  /* Uitslag van een STATUSverzoek. Wordt ALLEEN aangeroepen als het antwoord
+   * volledig ontleed EN plausibel was; mislukt de ronde, dan komt er niets --
+   * geen half gevulde meting, geen verzonnen nul (zie parseStatus). */
+  typedef void (*StatsFn)(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st);
+
   RepeaterCli() { _host = nullptr; _mesh = nullptr; reset(); _have_cached_path = false;
-                  _result_fn = nullptr; _result_ctx = nullptr; }
+                  _result_fn = nullptr; _result_ctx = nullptr;
+                  _stats_fn = nullptr; _stats_ctx = nullptr; }
 
   void begin(mesh::Mesh* mesh, RepeaterCliHost* host) { _mesh = mesh; _host = host; }
   void setResultCallback(ResultFn fn, void* ctx) { _result_fn = fn; _result_ctx = ctx; }
+  void setStatsCallback(StatsFn fn, void* ctx)   { _stats_fn = fn; _stats_ctx = ctx; }
 
   /* HANDMATIG (/cli/remote): EEN opdracht.
    * pubkey_hex 12..64 hex; password <=15; command letterlijk. Wordt intern een job
@@ -251,12 +341,18 @@ public:
    * parameternaam P. Dit is exact de vertaling die de oude HA-pusher deed. */
   Enq queueJob(const char* pubkey_hex, const char* password, const char* params_csv);
 
+  /* POLLER: een STATUSVERZOEK (v2.7.0). Eenmaal inloggen, dan EEN
+   * REQ_TYPE_GET_STATUS, en het antwoord via de stats-callback. Een leesactie, dus
+   * de gewone drie pogingen (isMutating is hier niet van toepassing). */
+  Enq queueStatus(const char* pubkey_hex, const char* password);
+
   /* Uit de gewone loop(). Doet hoogstens EEN zending per ronde. */
   void loop();
 
   /* ---- inkomend, aangeroepen door de meshklasse ---- */
   bool matchesSrcHash(const uint8_t* hash) const {
-    return (_state == RCLI_LOGIN || _state == RCLI_CMD) && _target_pub[0] == hash[0];
+    return (_state == RCLI_LOGIN || _state == RCLI_CMD || _state == RCLI_STATUS)
+           && _target_pub[0] == hash[0];
   }
   void fillSharedSecret(uint8_t* dest) const { memcpy(dest, _secret, PUB_KEY_SIZE); }
   bool onPeerData(uint8_t type, const uint8_t* data, size_t len);
@@ -265,7 +361,8 @@ public:
 
   /* ---- uitlezen (webinterface, statuspagina) ---- */
   State       state() const   { return _state; }
-  bool        busy() const    { return _state == RCLI_LOGIN || _state == RCLI_CMD; }
+  bool        busy() const    { return _state == RCLI_LOGIN || _state == RCLI_CMD
+                                    || _state == RCLI_STATUS; }
   const char* error() const   { return _error; }
   const char* command() const { return _cmd; }         // het LOPENDE commando
   const char* answer() const  { return _answer; }       // antwoord op het lopende cmd
@@ -286,6 +383,11 @@ private:
   RepeaterCliHost* _host;
   ResultFn         _result_fn;
   void*            _result_ctx;
+  StatsFn          _stats_fn;
+  void*            _stats_ctx;
+
+  JobKind  _job_kind;
+  uint32_t _status_tag;   // de tag die de repeater in zijn antwoord terugkaatst
 
   State    _state;
   uint8_t  _attempt;          // pogingen aan het LOPENDE commando (of de login)
@@ -339,6 +441,10 @@ private:
   void beginNextCommand();                // naar het volgende commando (of DONE)
   void sendLogin();
   void sendCommand();
+  void sendStatusReq();
+  /* Ontleedt + toetst een stats-antwoord. false = niet plausibel of te kort; dan
+   * wordt er NIETS gemeld. */
+  static bool parseStatus(const uint8_t* data, size_t len, RepeaterStatus& out);
 
   /* De i-de parameter uit de job. Bij _job_n==1 is dat de HELE buffer (zodat een
    * handmatige opdracht met komma's heel blijft); anders het i-de komma-veld. */

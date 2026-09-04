@@ -7,6 +7,108 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.7.0 — statusverzoeken: "Status nu opvragen" werkt op elke repeater
+
+Alleen de room-server-variant (`env:meshuptime_room`). Additief op v2.6.0; de
+bewaking en de instellingenopvragingen blijven ongewijzigd.
+
+**Waarom.** v2.6.0 haalde Home Assistant uit de keten voor *instellingen*opvragingen,
+maar liet `refresh`-verzoeken (statusverzoeken) vallen. MeshManager zette de knop
+**Status nu opvragen** daarom uit, met als reden "de poller voert
+instellingenopvragingen uit en laat statusverzoeken vallen". Die reden is nu weg
+doordat het gewoon werkt — op **elke** repeater waarvan deze node het wachtwoord
+kent, ook zonder onze eigen firmware aan de andere kant.
+
+**1. Een statusronde is een eigen LoRa-sessie.** Dezelfde aanpak als een
+settings-job: **inloggen** via `RepeaterCli` (ook hier verplicht —
+`MyMesh::handleRequest` wordt alleen bereikt via `onPeerDataRecv`, en dat vereist dat
+de afzender in de toegangslijst staat; de anonieme weg kent alleen
+LOGIN/REGIONS/OWNER/CLOCK), en dan **één `REQ_TYPE_GET_STATUS`** als
+`PAYLOAD_TYPE_REQ`. De verzoekvorm is letterlijk die van
+`BaseChatMesh::sendRequest(recipient, req_type, ...)`: `[0..3]` tag, `[4]` req_type,
+`[5..8]` reserved 0, `[9..12]` random. De tag is niet decoratief — de repeater kaatst
+hem terug in `reply_data[0..3]`, zodat het antwoord aan ons verzoek te koppelen is.
+Dat is hier nodig omdat een **loginantwoord met hetzelfde `PAYLOAD_TYPE_RESPONSE`
+binnenkomt**; ze worden door de staat (`RCLI_LOGIN` vs de nieuwe `RCLI_STATUS`) én
+door die tag gescheiden.
+
+**2. Retries mogen hier wél.** Een statusverzoek is een **leesactie**, dus de gewone
+drie pogingen. Dat is het verschil met een muterend CLI-commando, waar een herhaling
+het commando op de tegenkant opnieuw zou uitvoeren.
+
+**3. Aflevering: `POST /api/v1/ingest`** (nieuw `PushTask` `KIND_INGEST`, in dezelfde
+stijl als `KIND_REPCLI`/`KIND_POLL`: eigen ring en body-bouwer, dezelfde
+host/token/DNS-cache/socketmachine). Body:
+`{"repeater":{"pubkey_prefix":"<12 hex>"},"metrics":{...}}`. Geen `ts` — dan stempelt
+de server met zijn eigen klok, en dat is hier de betrouwbaardere: de klok van de
+doelrepeater kan ver weglopen (dat is juist een van de dingen die we langs deze weg
+willen repareren).
+
+De metrieknamen zijn het contract met `server/app/metrics.py`, met de omrekeningen
+die daar gedocumenteerd staan: `bat` (mV/1000 → V), `uptime` (s/86400 → dagen),
+`airtime` en `rx_airtime` (s/60 → minuten), `last_snr` (de struct draagt ×4 → dB), en
+ongewijzigd `tx_queue_len`, `noise_floor`, `last_rssi`, `nb_recv`, `nb_sent`,
+`recv_flood`, `recv_direct`, `sent_flood`, `sent_direct`, `flood_dups`,
+`direct_dups`, `recv_errors`, `full_evts` (= `err_events`, dat in de struct nog
+"was n_full_events" heet).
+
+**Wat de firmware niet meldt, laten we weg** — geen nul verzinnen: op de server ís
+een nul een meting. Concreet: `bat` blijft weg als de tegenkant 0 mV rapporteert
+(geen accu / geen ADC), want 0,000 V zou een lege accu voorwenden.
+
+**`airtime_utilization` en `rx_airtime_utilization` sturen we NIET**, ook al kent de
+server die namen. Ze zijn daar **afgeleid**, geen opgeslagen meting: `db._UTIL_BASIS`
+zegt "de node stuurt een oplopende airtime-teller (in minuten), en de benutting is de
+helling ervan", en `computed_utilization()` voegt toe: *"Computed here instead of read
+from the node because the meshcore-side figure resets on every Home Assistant
+restart"*. De grafiek van die twee namen loopt via `_utilisatie_reeks()` en negeert
+een opgeslagen waarde toch. Wat wij zouden kunnen sturen is een levensduur-gemiddelde
+(airtime/uptime) — een **ander** getal dan de helling die de tegel toont, onder
+dezelfde naam. Dus: wij leveren de tellers, de server rekent.
+
+**4. Lukt het niet, dan melden we niets.** Mislukte login, drie keer stilte, of een
+antwoord dat de plausibiliteitstoets niet haalt: een logregel en een teller
+(`status_fail` in `/poller.json`), geen meting. `/api/v1/ingest` neemt metingen aan,
+en een halve of verzonnen meting zou daar als echte waarde in de reeksen en grafieken
+belanden. Ook een ronde die in `RepeaterCli` strandt (waar bewust geen callback
+volgt) wordt geteld — "niets gemeld" mag nooit hetzelfde lijken als "niets gebeurd".
+
+**5. De plausibiliteitstoets**, omdat de doelrepeater niet onze build hoeft te draaien
+(JessaZH draait `v1.17.1-PS+filter+rollback` van dutchmeshcore). De bytes worden met
+`memcpy` op **expliciete offsets** gelezen (nagerekend uit `struct RepeaterStats`,
+`simple_repeater/MyMesh.h:43` — geen struct-cast: de buffer is niet gegarandeerd
+uitgelijnd en een cast zou meeveranderen met onze eigen padding). Een fork die een
+veld *toevoegt* aan het eind is onschadelijk; een fork die een veld *invoegt* of
+*herordent* levert geldig uitziende getallen op de verkeerde plaats, en dat is aan de
+bytes niet te zien. Daarom worden de velden met een bekend fysiek bereik getoetst:
+accuspanning (0 of 1500–6000 mV), uptime (< 20 jaar), **airtime ≤ uptime** en
+**rx_airtime ≤ uptime** (een radio kan niet langer gezonden hebben dan hij aan stond —
+de scherpste toets, die precies een verschuiving pakt), TX-wachtrij ≤ 4096,
+ruisvloer/RSSI −200…50 dBm, SNR −50…50 dB. Faalt er één, dan wordt het **hele**
+antwoord verworpen.
+
+**6. Capability-opgave.** De poll-URL meldt nu `?caps=settings,refresh` in plaats van
+`?caps=settings`. Daarop zet MeshManager de knop vanzelf aan (`db.note_poller_seen`);
+aan de site verandert niets — dat is met opzet zo gebouwd. Dit is de **ene** plek die
+mee moet als er een soort bijkomt of wegvalt.
+
+**7. Airtime en voorrang, ongewijzigd.** Eén sessie tegelijk: een statusronde en een
+settings-verzoek delen dezelfde `RepeaterCli` en dezelfde clear-on-read-wachtrij, dus
+een statusronde kan nooit een settings-verzoek laten sneuvelen. Komen beide soorten in
+één poll binnen, dan worden ze na elkaar afgehandeld en wordt wat niet in de wachtrij
+past geteld en gelogd, zoals voorheen. De pollerlus staat achteraan in `loop()`; de
+bewaking gaat voor.
+
+**Nieuw in `/poller.json`:** `refresh_seen` (statusverzoeken in de laatste poll; was
+`refresh_dropped`), `status_ok` en `status_fail`. De GUI-kaart toont
+"status N ok/M mislukt".
+
+**Gewijzigde bestanden:** `RepeaterCli.{h,cpp}` (`RCLI_STATUS`-staat, `queueStatus`,
+`sendStatusReq`, `parseStatus` + toets, stats-callback), `PushTask.{h,cpp}`
+(`KIND_INGEST` + `queueRepeaterStats` + `buildIngestBody`, `?caps=settings,refresh`),
+`Poller.{h,cpp}` (refresh in dezelfde wachtrij, `startStatus`, tellers),
+`WebTask.cpp` (poller.json-velden + kaarttekst), `Branding.h` (versie).
+
 ## v2.6.0 — MeshManager-poller: Home Assistant valt uit de keten
 
 Alleen de room-server-variant (`env:meshuptime_room`). De bewaking (monitoren,

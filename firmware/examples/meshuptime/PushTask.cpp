@@ -241,6 +241,26 @@ bool PushTask::requestPoll(PollFn cb, void* ctx) {
   return true;
 }
 
+/* Een status-momentopname van een andere repeater in de eigen ring zetten (v2.7.0).
+ * Zelfde overloopregel als de andere ringen: vol -> de OUDSTE valt eruit en wordt
+ * GETELD (_lost), nooit stil. */
+void PushTask::queueRepeaterStats(const char* pubkey_hex12, const RepeaterStatus& st) {
+  if (!enabled() || pubkey_hex12 == NULL || pubkey_hex12[0] == 0) return;
+
+  if (_iring_count >= ING_RING_SIZE) {
+    _iring_tail = (uint8_t)((_iring_tail + 1) % ING_RING_SIZE);
+    _iring_count--;
+    if (_ing_inflight > 0) _ing_inflight--;
+    _lost++;
+    MESH_DEBUG_PRINTLN("PushTask: ingest-ring vol, oudste vervallen (verloren: %lu)",
+                       (unsigned long)_lost);
+  }
+  IngestPush& e = _iring[(_iring_tail + _iring_count) % ING_RING_SIZE];
+  StrHelper::strncpy(e.node, pubkey_hex12, sizeof(e.node));
+  e.st = st;
+  _iring_count++;
+}
+
 /* Wanneer moet er een POST uit? Zodra er iets te melden is (gebeurtenissen of
  * node-bevestigingen), en anders op de heartbeat-klok. De retry-rem gaat voor:
  * na een fout wordt er even niet geprobeerd, wat er ook klaarstaat. */
@@ -251,6 +271,9 @@ bool PushTask::dueNow(unsigned long now) const {
   /* Een CLI-antwoord is per definitie iets waar iemand NU op wacht (er is net
    * met de hand een opdracht naar een repeater gestuurd), dus ook meteen. */
   if (_rring_count > 0) return true;
+  /* Een status-momentopname: net als een cli-antwoord de uitkomst van een
+   * LoRa-ronde waar iemand op wacht, dus ook meteen. */
+  if (_iring_count > 0) return true;
   /* Een gevraagde poll: zodra het uitkomt. Staat achter de pushes in prioriteit
    * (startAttempt), maar mag de heartbeat niet hoeven af te wachten. */
   if (_poll_requested) return true;
@@ -269,11 +292,12 @@ void PushTask::loop() {
   if (!enabled()) {
     /* Push staat uit. Een lopende poging afbreken en de wachtrij legen: wat er
      * ligt was voor een server die er nu niet meer is. */
-    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; _comp_inflight = 0; _rcli_inflight = 0; }
+    if (_state != PUSH_IDLE) { closeSock(); _state = PUSH_IDLE; _inflight = 0; _acked_sent = 0; _comp_inflight = 0; _rcli_inflight = 0; _ing_inflight = 0; }
     _ring_count = 0;
     _acked_pending = 0;
     _cring_count = 0;
     _rring_count = 0;
+    _iring_count = 0;
     _poll_requested = false;   /* geen server om aan te pollen */
     return;
   }
@@ -324,6 +348,7 @@ void PushTask::startAttempt() {
    * rest van het pad (DNS/connect/send/recv) is voor alle vier identiek. */
   _kind = (_cring_count > 0)  ? KIND_COMPANION
         : (_rring_count > 0)  ? KIND_REPCLI
+        : (_iring_count > 0)  ? KIND_INGEST
         : (_poll_requested)   ? KIND_POLL
                               : KIND_SENSOR;
 
@@ -351,14 +376,20 @@ void PushTask::startAttempt() {
   snprintf(s_path, sizeof(s_path), "%s%s", *p ? p : "",
            _kind == KIND_COMPANION ? "/api/companion" :
            _kind == KIND_REPCLI    ? "/api/v1/repeater_settings" :
-           /* ?caps= zegt de server WAT deze poller waarmaakt. Wij voeren
-            * instellingenopvragingen uit en laten statusverzoeken vallen (die
-            * gaan over REQ_TYPE_GET_STATUS, een ander protocol -- zie
-            * Poller::parse). Zonder die opgave biedt de beheerpagina een knop
-            * "status opvragen" aan die een verzoek in de wachtrij legt dat hier
-            * gegarandeerd weggegooid wordt. Komt refresh er ooit bij, dan is dit
-            * de ene plek die mee moet. */
-           _kind == KIND_POLL      ? "/api/v1/commands?caps=settings" : "/api/sensorpush");
+           _kind == KIND_INGEST    ? "/api/v1/ingest" :
+           /* ?caps= zegt de server WAT deze poller waarmaakt. Sinds v2.7.0 zijn
+            * dat er TWEE: instellingenopvragingen (CLI over LoRa) EN
+            * statusverzoeken (REQ_TYPE_GET_STATUS -> /api/v1/ingest). Op die
+            * opgave zet MeshManager de knop "Status nu opvragen" aan of uit
+            * (db.note_poller_seen -> commanding.DEFAULT_POLLER_CAPS); aan de site
+            * hoeft daarvoor niets te veranderen, dat is met opzet zo gebouwd.
+            *
+            * DIT IS DE ENE PLEK die meemoet als er een soort bijkomt of wegvalt.
+            * Zet hier nooit iets wat de poller niet echt uitvoert: dan belooft de
+            * beheerpagina een knop die een verzoek in een wachtrij legt dat hier
+            * stil weggegooid wordt. */
+           _kind == KIND_POLL      ? "/api/v1/commands?caps=settings,refresh"
+                                   : "/api/sensorpush");
 
   if (s_host[0] == 0) { failNet("url: geen host"); return; }
 
@@ -420,6 +451,8 @@ bool PushTask::buildRequest(const char* host, const char* path) {
     if (!buildCompanionBody(body, sizeof(body), blen)) return false;
   } else if (_kind == KIND_REPCLI) {
     if (!buildRepCliBody(body, sizeof(body), blen)) return false;
+  } else if (_kind == KIND_INGEST) {
+    if (!buildIngestBody(body, sizeof(body), blen)) return false;
   } else {
     if (!buildSensorBody(body, sizeof(body), blen)) return false;
   }
@@ -521,6 +554,97 @@ bool PushTask::buildRepCliBody(char* body, size_t cap, size_t& blen) {
   }
 
   _rcli_inflight = 1;
+  return true;
+}
+
+/* ===========================================================================
+ * buildIngestBody -- een status-momentopname van een ANDERE repeater (v2.7.0)
+ *
+ * De METRIEKNAMEN zijn het contract met server/app/metrics.py; wat daar niet in
+ * staat wordt genegeerd. De omrekeningen, met hun bron:
+ *
+ *   bat          batt_milli_volts / 1000        -> V     (metrics.py: unit "V")
+ *   uptime       total_up_time_secs / 86400     -> dagen (unit "d")
+ *   airtime      total_air_time_secs / 60       -> min   (unit "min")
+ *   rx_airtime   total_rx_air_time_secs / 60    -> min   (unit "min")
+ *   last_snr     last_snr_x4 / 4                -> dB    (de struct draagt x4)
+ * De tellers en de radiowaarden gaan als geheel getal, ongewijzigd.
+ *
+ * WAAROM airtime_utilization EN rx_airtime_utilization HIER NIET IN ZITTEN, ook al
+ * kent de server die namen: ze zijn op de server AFGELEID en geen opgeslagen
+ * meting. db.py zegt het met zoveel woorden bij _UTIL_BASIS -- "de node stuurt een
+ * oplopende airtime-teller (in minuten), en de benutting is de helling ervan" --
+ * en computed_utilization() voegt eraan toe: "Computed here instead of read from
+ * the node because the meshcore-side figure resets on every Home Assistant
+ * restart". De grafiek van die twee namen loopt via _utilisatie_reeks() en negeert
+ * een opgeslagen waarde dus toch. Wat wij hier zouden kunnen sturen is een
+ * LEVENSDUUR-GEMIDDELDE (airtime / uptime), en dat is een ANDER getal dan de
+ * helling die de tegel toont -- twee verschillende cijfers onder een naam. Dus:
+ * wij sturen de tellers waar de server het uit rekent, en niets meer. Zie het
+ * rapport bij v2.7.0.
+ *
+ * `ts` laten we weg: dan stempelt de server met zijn eigen klok. Dat is hier de
+ * betrouwbaardere: de klok van de doelrepeater kan ver weglopen (dat is juist een
+ * van de dingen die we langs deze weg willen repareren), en een meting met een
+ * tijdstempel uit 2024 zou in de reeksen op de verkeerde plek belanden.
+ *
+ * ALLEEN DE KOP VAN DE RING per POST: het contract draagt EEN repeater met EEN
+ * metrics-map. Bleef er een tweede staan, dan houdt dueNow() de volgende post
+ * meteen waar. */
+bool PushTask::buildIngestBody(char* body, size_t cap, size_t& blen) {
+  blen = 0;
+  _ing_inflight = 0;
+  if (_iring_count == 0) return false;
+
+  const IngestPush& e = _iring[_iring_tail];
+  const RepeaterStatus& st = e.st;
+
+  if (!appendf(body, cap, blen,
+               "{\"repeater\":{\"pubkey_prefix\":\"%s\"},\"metrics\":{", e.node)) return false;
+
+  /* De accuspanning alleen als er een gemeten is. 0 mV betekent op de tegenkant
+   * "geen accu / niet gemeten" (een bord zonder ADC geeft dat), en dat als 0,000 V
+   * doorsturen zou een lege accu voorwenden -- precies de verzonnen nul die we niet
+   * willen. */
+  bool first = true;
+  #define ING_SEP()  do { if (!appendf(body, cap, blen, first ? "" : ",")) return false;                           first = false; } while (0)
+
+  if (st.batt_milli_volts != 0) {
+    ING_SEP();
+    if (!appendf(body, cap, blen, "\"bat\":%.3f", (double)st.batt_milli_volts / 1000.0)) return false;
+  }
+  ING_SEP();
+  if (!appendf(body, cap, blen, "\"uptime\":%.4f",
+               (double)st.total_up_time_secs / 86400.0)) return false;
+  ING_SEP();
+  if (!appendf(body, cap, blen, "\"airtime\":%.2f",
+               (double)st.total_air_time_secs / 60.0)) return false;
+  ING_SEP();
+  if (!appendf(body, cap, blen, "\"rx_airtime\":%.2f",
+               (double)st.total_rx_air_time_secs / 60.0)) return false;
+  ING_SEP();
+  if (!appendf(body, cap, blen, "\"last_snr\":%.2f",
+               (double)st.last_snr_x4 / 4.0)) return false;
+
+  ING_SEP();
+  if (!appendf(body, cap, blen,
+               "\"tx_queue_len\":%u,\"noise_floor\":%d,\"last_rssi\":%d,"
+               "\"nb_recv\":%lu,\"nb_sent\":%lu,"
+               "\"recv_flood\":%lu,\"recv_direct\":%lu,"
+               "\"sent_flood\":%lu,\"sent_direct\":%lu,"
+               "\"flood_dups\":%u,\"direct_dups\":%u,"
+               "\"recv_errors\":%lu,\"full_evts\":%u",
+               (unsigned)st.curr_tx_queue_len,
+               (int)st.noise_floor, (int)st.last_rssi,
+               (unsigned long)st.n_packets_recv, (unsigned long)st.n_packets_sent,
+               (unsigned long)st.n_recv_flood, (unsigned long)st.n_recv_direct,
+               (unsigned long)st.n_sent_flood, (unsigned long)st.n_sent_direct,
+               (unsigned)st.n_flood_dups, (unsigned)st.n_direct_dups,
+               (unsigned long)st.n_recv_errors, (unsigned)st.err_events)) return false;
+  #undef ING_SEP
+
+  if (!appendf(body, cap, blen, "}}")) return false;
+  _ing_inflight = 1;
   return true;
 }
 
@@ -755,6 +879,13 @@ void PushTask::finishOk() {
     _cring_tail    = (uint8_t)((_cring_tail + _comp_inflight) % COMP_RING_SIZE);
     _cring_count   = (uint8_t)(_cring_count - _comp_inflight);
     _comp_inflight = 0;
+  } else if (_kind == KIND_INGEST) {
+    /* Alleen de eigen ring opruimen; de heartbeat-klok blijft met rust -- een
+     * status-momentopname van een ANDERE node is geen meting van onszelf en mag de
+     * belofte "je hoort mij elke hb_s" niet vooruitschuiven. */
+    _iring_tail   = (uint8_t)((_iring_tail + _ing_inflight) % ING_RING_SIZE);
+    _iring_count  = (uint8_t)(_iring_count - _ing_inflight);
+    _ing_inflight = 0;
   } else if (_kind == KIND_REPCLI) {
     /* Alleen de eigen ring opruimen. De heartbeat-klok blijft met rust: een
      * CLI-antwoord is buiten de cadans om en mag de belofte "je hoort me elke
@@ -792,6 +923,7 @@ void PushTask::failNet(const char* why) {
   _inflight      = 0;
   _comp_inflight = 0;
   _rcli_inflight = 0;
+  _ing_inflight  = 0;
   _acked_sent    = 0;
   /* Een mislukte POLL niet in de retry-lus vasthouden: de Poller vraagt op zijn
    * eigen cadans (poll_secs) een nieuwe. Zo hamert een netwerkhapering de
@@ -811,6 +943,7 @@ void PushTask::failHttp(int status) {
   _inflight      = 0;
   _comp_inflight = 0;
   _rcli_inflight = 0;
+  _ing_inflight  = 0;
   _acked_sent    = 0;
   _poll_requested = false;   /* zie failNet: de Poller vraagt op zijn eigen cadans */
   _last_status = status;

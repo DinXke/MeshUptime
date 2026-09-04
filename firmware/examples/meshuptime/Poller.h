@@ -28,7 +28,10 @@ class PushTask;
  *      dan de N commando's), met de param->commando-vertaling van de oude
  *      HA-pusher ("cmd:X" -> X letterlijk, anders P -> "get P");
  *   3. elk antwoord (of het uitblijven ervan) terug via PushTask naar
- *      POST /api/v1/repeater_settings -- null bij "geen antwoord".
+ *      POST /api/v1/repeater_settings -- null bij "geen antwoord";
+ *   4. voor elk `refresh`-verzoek (v2.7.0): dezelfde sessie-aanpak, maar na de
+ *      login EEN REQ_TYPE_GET_STATUS in plaats van CLI-tekst. Het antwoord
+ *      (RepeaterStats) gaat als METINGEN naar POST /api/v1/ingest.
  *
  * ------------------------------------------------------------------------
  * CLEAR-ON-READ: WAT JE OPHAALT IS WEG
@@ -60,9 +63,13 @@ class PushTask;
  *    onbereikbaar. In de praktijk stuurt MeshManager alleen leescommando's
  *    (de cli_params-lijst) plus `cmd:filter count`/`cmd:region`; deze zeef is de
  *    gordel voor het geval iemand de lijst uitbreidt.
- *  - refresh-verzoeken (REQ_TYPE_GET_STATUS, een ANDER protocol) worden in deze
- *    versie NIET uitgevoerd: ze worden gelogd als "niet ondersteund" en vallen
- *    weg. Bekende beperking; staat in de docs.
+ *  - STATUSVERZOEKEN (refresh) zijn LEESacties: daar mag wel herhaald worden (de
+ *    gewone drie pogingen). Dat is het verschil met een muterend CLI-commando,
+ *    waar een herhaling het commando op de tegenkant opnieuw zou uitvoeren.
+ *  - Lukt een statusronde niet (login mislukt, geen antwoord, of een antwoord dat
+ *    niet plausibel is), dan wordt dat GELOGD en verder NIETS gemeld. /api/v1/ingest
+ *    neemt metingen aan; een half gevulde of verzonnen meting zou daar als echte
+ *    waarde in de reeksen en grafieken belanden. Liever een lege pagina.
  *
  * ------------------------------------------------------------------------
  * WACHTWOORDEN PER DOEL
@@ -83,7 +90,7 @@ class PushTask;
 #define POLLER_TARGETS_PATH   "/rep_targets.cfg"
 
 #define POLLER_MAX_TARGETS    8
-#define POLLER_PENDING_MAX    4       /* repeaters met een wachtend settings-verzoek */
+#define POLLER_PENDING_MAX    4       /* repeaters met een wachtend verzoek (settings of status) */
 
 #define POLL_SECS_DEFAULT     30
 #define POLL_SECS_MIN         10
@@ -136,7 +143,9 @@ public:
   uint32_t    processedCount() const { return _processed; }
   uint32_t    droppedCount() const   { return _dropped; }
   uint8_t     pendingCount() const   { return _pending_count; }
-  int         lastRefreshDropped() const { return _last_refresh_dropped; }
+  int         lastRefreshSeen() const { return _last_refresh_seen; }
+  uint32_t    statusOkCount() const   { return _status_ok; }
+  uint32_t    statusFailCount() const { return _status_fail; }
   const char* lastNote() const    { return _note; }
 
 private:
@@ -164,9 +173,16 @@ private:
   /* Wachtende settings-verzoeken uit de poll (clear-on-read, dus vastgehouden tot
    * verwerkt). Elk: de doel-prefix + de parameterlijst als CSV zoals de server ze
    * gaf. */
+  /* WAT VOOR VERZOEK er wacht. Twee soorten uit dezelfde wachtrij, elk met een
+   * eigen LoRa-sessie: een instellingenopvraging (params gevuld) of een
+   * statusverzoek (params leeg). Ze delen alles behalve wat er na de login de lucht
+   * in gaat. */
+  enum PendKind : uint8_t { PEND_SETTINGS = 0, PEND_STATUS };
+
   struct Pending {
-    char prefix[POLLER_PREFIX_MAX];
-    char params[RCLI_JOB_BUF];
+    char     prefix[POLLER_PREFIX_MAX];
+    char     params[RCLI_JOB_BUF];
+    PendKind kind;
   };
   Pending _pending[POLLER_PENDING_MAX];
   uint8_t _pending_head;   // volgende om te verwerken
@@ -174,7 +190,19 @@ private:
 
   uint32_t _processed;             // verwerkte settings-verzoeken (gestart of geweigerd)
   uint32_t _dropped;               // verzoeken die _pending niet meer in konden
-  int      _last_refresh_dropped;  // refresh-verzoeken in de laatste poll (niet ondersteund)
+  int      _last_refresh_seen;     // statusverzoeken in de laatste poll (nu uitgevoerd)
+  uint32_t _status_ok;             // geslaagde statusrondes (metingen gemeld)
+  uint32_t _status_fail;           // statusrondes zonder meting (login/stil/onplausibel)
+
+  /* EEN LOPENDE STATUSRONDE MOET OOK ALS ZE MISLUKT GETELD WORDEN, en dat is niet
+   * aan RepeaterCli te vragen: die meldt alleen SUCCES (de stats-callback). De
+   * mislukkingen -- login stil, drie keer geen antwoord, of een antwoord dat de
+   * plausibiliteitstoets niet haalde -- eindigen daar in failJob() zonder callback,
+   * met opzet (geen halve meting). Zonder deze twee vlaggen zou zo'n ronde nergens
+   * te zien zijn, en "niets gemeld" mag nooit hetzelfde lijken als "niets
+   * gebeurd". loop() sluit de ronde af zodra RepeaterCli weer vrij is. */
+  bool     _status_wait;           // er loopt een statusronde die wij startten
+  bool     _status_got;            // ... en er kwam een meting uit
   char     _note[96];              // korte, mensleesbare laatste-actie-regel
 
   void reset();
@@ -198,7 +226,15 @@ private:
 
   /* Een settings-verzoek in _pending zetten (clear-on-read: mag niet verloren
    * gaan). false = geen plaats meer (geteld in _dropped). */
-  bool pushPending(const char* prefix, const char* params_csv);
+  bool pushPending(const char* prefix, const char* params_csv, PendKind kind);
+
+  /* De uitslag van een statusronde, doorgegeven door RepeaterCli. Statische thunk
+   * -> deze instance; zet de meting in de PushTask-ring en telt mee. */
+  static void statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st);
+  void onStats(const char* pubkey_hex12, const RepeaterStatus& st);
+
+  /* Een statusverzoek starten (of weigeren met een logregel). */
+  void startStatus(const Pending& e);
 
   /* Het kop-verzoek uit _pending proberen te starten. Doet niets als RepeaterCli
    * bezig is. Weigert (null + log) bij onbekend wachtwoord of gevaarlijke params. */
