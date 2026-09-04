@@ -351,7 +351,14 @@ void PushTask::startAttempt() {
   snprintf(s_path, sizeof(s_path), "%s%s", *p ? p : "",
            _kind == KIND_COMPANION ? "/api/companion" :
            _kind == KIND_REPCLI    ? "/api/v1/repeater_settings" :
-           _kind == KIND_POLL      ? "/api/v1/commands" : "/api/sensorpush");
+           /* ?caps= zegt de server WAT deze poller waarmaakt. Wij voeren
+            * instellingenopvragingen uit en laten statusverzoeken vallen (die
+            * gaan over REQ_TYPE_GET_STATUS, een ander protocol -- zie
+            * Poller::parse). Zonder die opgave biedt de beheerpagina een knop
+            * "status opvragen" aan die een verzoek in de wachtrij legt dat hier
+            * gegarandeerd weggegooid wordt. Komt refresh er ooit bij, dan is dit
+            * de ene plek die mee moet. */
+           _kind == KIND_POLL      ? "/api/v1/commands?caps=settings" : "/api/sensorpush");
 
   if (s_host[0] == 0) { failNet("url: geen host"); return; }
 
