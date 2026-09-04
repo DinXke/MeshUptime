@@ -274,6 +274,24 @@ const char* Poller::passwordFor(const char* prefix_hex) const {
   return _default_pass[0] ? _default_pass : nullptr;
 }
 
+/* prefix -> de sleutel om mee te WERKEN: de volle 64 hex uit de doeltabel als
+ * die er staat, anders de gevraagde prefix zelf. MeshManager stuurt altijd 12
+ * hex, en RepeaterCli lost die alleen op via de buurtlijst -- die na elke
+ * herstart leeg is tot de repeater weer adverteert (Jessa: om de ~2 uur). Wie de
+ * volle sleutel in de doeltabel zet, hoort daar niet op te hoeven wachten; dat
+ * is precies waarom die tabel 64 tekens aankan. */
+const char* Poller::keyFor(const char* prefix_hex) const {
+  char want[POLLER_PREFIX_MAX];
+  lowerHex(prefix_hex, want, sizeof(want));
+  size_t wl = strlen(want);
+  for (int i = 0; i < _ntargets; i++) {
+    size_t tl = strlen(_targets[i].prefix);
+    size_t n = wl < tl ? wl : tl;
+    if (n >= 12 && tl == 64 && strncmp(_targets[i].prefix, want, n) == 0) return _targets[i].prefix;
+  }
+  return prefix_hex;
+}
+
 /* ------------------------------------------------------------------------
  * De poll ontleden
  *
@@ -461,7 +479,9 @@ void Poller::startNextPending() {
     return;
   }
 
-  RepeaterCli::Enq r = _rcli->queueJob(e.prefix, pass, safe);
+  /* De volle sleutel uit de doeltabel als die er is: dan hangt de sessie niet
+   * van een gehoorde advert af (zie keyFor). */
+  RepeaterCli::Enq r = _rcli->queueJob(keyFor(e.prefix), pass, safe);
   if (r == RepeaterCli::RCLI_OK) {
     snprintf(_note, sizeof(_note), "%s: sessie gestart (%s%s)", e.prefix, safe,
              refused ? ", enkele geweigerd" : "");

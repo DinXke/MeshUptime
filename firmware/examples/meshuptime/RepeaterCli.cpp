@@ -63,6 +63,9 @@ void RepeaterCli::reset() {
   _job_n            = 0;
   _job_i            = 0;
   _answer[0]        = 0;
+  _nchunks          = 0;
+  _answer_used      = 0;
+  _collect_until    = 0;
   _error[0]         = 0;
   _cmd[0]           = 0;
   _cur_param[0]     = 0;
@@ -140,6 +143,8 @@ RepeaterCli::Enq RepeaterCli::startJob(const char* pubkey_hex, const char* passw
   _attempt    = 0;
   _job_i      = 0;
   _answer[0]  = 0;
+  _nchunks    = 0;
+  _answer_used = 0;
   _error[0]   = 0;
   _started_at = millis();
   _next_send  = _started_at;   // de login mag meteen
@@ -229,6 +234,8 @@ void RepeaterCli::beginNextCommand() {
   _state     = RCLI_CMD;
   _attempt   = 0;
   _answer[0] = 0;
+  _nchunks   = 0;
+  _answer_used = 0;
   if (!loadCurrentParam()) {
     /* Onleesbare parameter (kan niet, maar dan niet stil): als null afleveren en
      * door. */
@@ -309,6 +316,14 @@ void RepeaterCli::loop() {
     return;
   }
 
+  /* Stukken van een antwoord aan het verzamelen? Dan niets zenden en zeker niet
+   * herhalen (een herhaling zou het commando op de tegenkant opnieuw uitvoeren);
+   * na RCLI_CHUNK_GAP_MS stilte is het antwoord compleet. */
+  if (_state == RCLI_CMD && _nchunks > 0) {
+    if ((long)(now - _collect_until) >= 0) finishAnswer();
+    return;
+  }
+
   /* Nog aan het wachten op het antwoord van de huidige poging? */
   if (_attempt > 0 && (long)(now - _deadline) < 0) return;
 
@@ -347,6 +362,38 @@ void RepeaterCli::loop() {
   else                      sendCommand();
 }
 
+/* De verzamelde stukken op tijdstempel sorteren (hoogstens RCLI_CHUNK_MAX, dus
+ * insertion sort), met één spatie aaneenrijgen, afleveren en door naar het
+ * volgende commando. De tegenkant geeft elk pakket een oplopende
+ * getCurrentTimeUnique(); zijn ze gelijk, dan blijft de aankomstvolgorde. */
+void RepeaterCli::finishAnswer() {
+  uint8_t order[RCLI_CHUNK_MAX];
+  for (uint8_t i = 0; i < _nchunks; i++) order[i] = i;
+  for (uint8_t i = 1; i < _nchunks; i++) {
+    uint8_t k = order[i];
+    int j = (int)i - 1;
+    while (j >= 0 && (int32_t)(_chunk_ts[order[j]] - _chunk_ts[k]) > 0) { order[j + 1] = order[j]; j--; }
+    order[j + 1] = k;
+  }
+  char out[RCLI_ANSWER_MAX];
+  size_t o = 0;
+  for (uint8_t i = 0; i < _nchunks; i++) {
+    uint8_t k = order[i];
+    if (o > 0 && o < RCLI_ANSWER_MAX - 1) out[o++] = ' ';
+    size_t l = _chunk_len[k];
+    if (o + l > RCLI_ANSWER_MAX - 1) l = RCLI_ANSWER_MAX - 1 - o;
+    memcpy(out + o, _answer + _chunk_off[k], l);
+    o += l;
+  }
+  out[o] = 0;
+  memcpy(_answer, out, o + 1);
+  _nchunks = 0;
+  _answer_used = 0;
+  deliverCurrent(o ? _answer : nullptr);
+  beginNextCommand();
+  _next_send = millis() + RCLI_MIN_GAP_MS;
+}
+
 /* ------------------------------------------------------------------------
  * Inkomend
  * ------------------------------------------------------------------------ */
@@ -371,6 +418,8 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
     _attempt   = 0;
     _job_i     = 0;
     _answer[0] = 0;
+    _nchunks   = 0;
+    _answer_used = 0;
     if (!loadCurrentParam()) { deliverCurrent(nullptr); beginNextCommand(); }
     return true;
   }
@@ -385,27 +434,47 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
     const uint8_t flags = (uint8_t)(data[4] >> 2);
     if (flags != TXT_TYPE_CLI_DATA && flags != TXT_TYPE_PLAIN) return false;
 
-    size_t n = 0;
+    /* EEN STUK van het antwoord. Bewaren met de tijdstempel uit het pakket
+     * (data[0..3]); afleveren gebeurt pas na RCLI_CHUNK_GAP_MS stilte in loop()
+     * (finishAnswer), zodat een antwoord dat de repeater in meerdere pakketten
+     * stuurt volledig en in de juiste volgorde bij MeshManager aankomt. De eerste
+     * versie leverde het EERSTE pakket meteen af: van Jessa's `filter count` kwam
+     * dan alleen de limiettabel binnen en nooit de kopregel met de tellers. */
+    uint32_t ts; memcpy(&ts, data, 4);
     const char* src = (const char*)&data[5];
     const size_t avail = len - 5;
-    while (n < avail && n < RCLI_ANSWER_MAX - 1 && src[n] != 0) {
-      char c = src[n];
-      _answer[n] = ((unsigned char)c < 0x20) ? ' ' : c;   // regeleindes -> spatie
-      n++;
+    size_t n = 0;
+    if (_nchunks < RCLI_CHUNK_MAX && _answer_used < RCLI_ANSWER_MAX - 1) {
+      char* dst = _answer + _answer_used;
+      const size_t room = RCLI_ANSWER_MAX - 1 - _answer_used;
+      while (n < avail && n < room && src[n] != 0) {
+        char c = src[n];
+        dst[n] = ((unsigned char)c < 0x20) ? ' ' : c;   // regeleindes -> spatie
+        n++;
+      }
+      while (n > 0 && dst[n - 1] == ' ') n--;
+      if (n > 0) {
+        _chunk_ts[_nchunks]  = ts;
+        _chunk_off[_nchunks] = _answer_used;
+        _chunk_len[_nchunks] = (uint16_t)n;
+        _nchunks++;
+        _answer_used += (uint16_t)n;
+      }
     }
-    while (n > 0 && _answer[n - 1] == ' ') n--;
-    _answer[n] = 0;
 
-    if (n == 0) {
+    if (n == 0 && _nchunks == 0) {
       /* Leeg antwoord = de repeater zag onze zending als herhaling (kan haast niet,
        * elke poging heeft een nieuwe tijdstempel) of het is een onbekende opdracht/
        * rechtenkwestie. Als "geen antwoord" (null) afleveren en door. */
       deliverCurrent(nullptr);
-    } else {
-      deliverCurrent(_answer);
+      beginNextCommand();
+      _next_send = millis() + RCLI_MIN_GAP_MS;
+      return true;
     }
-    beginNextCommand();
-    _next_send = millis() + RCLI_MIN_GAP_MS;
+
+    _collect_until = millis() + RCLI_CHUNK_GAP_MS;
+    /* Vol (stukken of tekens): dan heeft wachten geen zin meer. */
+    if (_nchunks >= RCLI_CHUNK_MAX || _answer_used >= RCLI_ANSWER_MAX - 1) finishAnswer();
     return true;
   }
 

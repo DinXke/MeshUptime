@@ -187,6 +187,11 @@ private:
    * het standaardwachtwoord, anders nullptr (onbekend doel). */
   const char* passwordFor(const char* prefix_hex) const;
 
+  /* De prefix -> de sleutel om mee te werken: de volle 64-hex doelingang als die
+   * er is (dan hoeft de buurtlijst de repeater niet te kennen), anders de prefix
+   * zelf. Zie Poller.cpp voor waarom dat na een herstart het verschil maakt. */
+  const char* keyFor(const char* prefix_hex) const;
+
   /* De poll-callback (statische thunk -> deze instance). Ontleedt het body. */
   static void pollThunk(void* ctx, const char* body);
   void onPollBody(const char* body);
