@@ -675,11 +675,19 @@ void setup() {
      * hierboven, en om dezelfde reden: RepeaterCli hoort niets van HTTP, tokens of
      * MeshManager te weten, en main_room.cpp is de enige plek die beide kent. */
     web_task.setRepeaterCli(&the_mesh.rcli);
+    /* De uitslag van ELK commando gaat naar MeshManager. De klok-job (v2.8.0) komt
+     * hier langs onder "cmd:clockfix"; die melden we ook aan de Poller, zodat zijn
+     * tellers en /poller.json de uitkomst kennen. De captureless lambda krijgt
+     * daarom niet PushTask maar een klein vast paar mee. */
     the_mesh.rcli.setResultCallback(
         [](void* ctx, const char* pubkey_hex12, const char* param, const char* value) {
-          ((PushTask*)ctx)->queueRepeaterSetting(pubkey_hex12, param, value);
+          (void)ctx;
+          push_task.queueRepeaterSetting(pubkey_hex12, param, value);
+          if (param != nullptr && strcmp(param, "cmd:clockfix") == 0) {
+            poller.noteClockFix(value);
+          }
         },
-        &push_task);
+        nullptr);
 
     /* DE POLLER (v2.6.0). Dezelfde PushTask (poll-GET + antwoord-POST) en dezelfde
      * RepeaterCli (login + commando's). De antwoorden lopen via de callback die we

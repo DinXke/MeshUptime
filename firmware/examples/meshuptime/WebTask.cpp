@@ -1449,7 +1449,19 @@ Zo'n ronde logt in en stuurt één <code>REQ_TYPE_GET_STATUS</code>; het antwoor
 (accu, uptime, airtime, RSSI/SNR, tellers) gaat als metingen naar
 <code>/api/v1/ingest</code>. Lukt het niet, of ziet het antwoord er niet uit zoals
 verwacht, dan wordt er <b>niets</b> gemeld &mdash; een halve meting is erger dan een
-lege pagina.</p>
+lege pagina.<br>
+Sinds v2.8.0 kan de poller ook de <b>klok van een repeater rechtzetten</b>
+(opdracht <code>cmd:clockfix</code> uit de wachtrij). De job leest eerst
+<code>clock</code>: wijkt die minder dan een minuut af, dan gebeurt er
+<b>niets</b> &mdash; een node herstarten voor niets is de duurste vorm van ijver.
+Loopt hij <i>achter</i>, dan volstaat <code>time &lt;epoch&gt;</code> zonder
+herstart. Loopt hij <i>voor</i>, dan weigert zijn firmware de klok achteruit
+(<code>ERR: clock cannot go backwards</code>) en is <code>clkreboot</code> de enige
+weg: klok naar mei 2024 + herstart, en daarna wordt er tot drie minuten lang elke
+tien seconden opnieuw ingelogd en <code>time</code> gestuurd tot het lukt. In dat
+venster is de node onzichtbaar voor iedereen die zijn oude tijdstempel onthield,
+dus die reeks staat met opzet <b>op de node</b> en niet in een serie
+serververzoeken. Er komt <b>nooit</b> een tweede <code>clkreboot</code>.</p>
 <div id="pl-status" class="note">&hellip;</div>
 <div class="quick" style="margin-top:.4rem">
 <label style="align-self:center"><input type="checkbox" id="pl-on"> poller aan</label>
@@ -3089,7 +3101,12 @@ document.getElementById("pl-status").innerHTML=
 " &middot; verwerkt: "+j.processed+" &middot; verloren: "+j.dropped+
 " &middot; wachtrij: "+j.pending+" &middot; sessie: "+esc(j.session)+
 (j.status_ok||j.status_fail?(" &middot; status "+j.status_ok+" ok/"+j.status_fail+" mislukt"):"")+
-"<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})
+(j.clockfix_ok||j.clockfix_fail?(" &middot; klok "+j.clockfix_ok+" ok/"+j.clockfix_fail+" mislukt"):"")+
+"<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"+
+/* De laatste klok-uitkomst voluit: dit is de handeling waarvan je achteraf wilt
+   kunnen zien wat er gebeurde, en de zin is voor een mens geschreven. */
+(j.clockfix_last?("<br><span style=\"color:var(--muted)\">klok: "+esc(j.clockfix_last)+
+"</span>"):"")}).catch(function(){})
 fetch("repeater_targets.json").then(function(r){return r.ok?r.json():null}).then(function(j){
 if(!j){return}
 var h="standaardwachtwoord: <b>"+(j.default_pass?"gezet":"niet gezet")+"</b>";
@@ -7615,20 +7632,34 @@ void WebTask::handlePollerJson() {
   const char* st = _rcli == nullptr ? "geen mesh"
                  : _rcli->busy()    ? "sessie loopt" : "vrij";
   char note[128]; jsonEscape(_poller->lastNote(), note, sizeof(note));
-  int n = snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+  /* De laatste klok-uitkomst is een hele ZIN (tot RCLI_ANSWER_MAX). jsonEscape kan
+   * van één teken zes maken (\uXXXX), maar dat geldt alleen voor STUURTEKENS -- en
+   * die kunnen hier niet voorkomen: RepeaterCli normaliseert elk antwoord al
+   * (regeleindes en stuurtekens worden een spatie) voordat het in deze zin belandt.
+   * Wat overblijft zijn " en \, en die worden twee tekens. Vandaar 2x en niet 6x:
+   * dat scheelt ~700 byte statisch RAM op een node zonder PSRAM.
+   *
+   * Dit antwoord gaat in g_json en niet in g_rcli_reply (640) -- met de zin erbij
+   * zou die net te krap kunnen worden. */
+  static char cfesc[RCLI_ANSWER_MAX * 2 + 1];
+  jsonEscape(_poller->clockfixLast(), cfesc, sizeof(cfesc));
+  int n = snprintf(g_json, sizeof(g_json),
       "{\"on\":%d,\"poll_secs\":%u,\"ever\":%d,\"last_poll_age\":%lu,"
       "\"processed\":%lu,\"dropped\":%lu,\"pending\":%u,\"refresh_seen\":%d,"
       "\"status_ok\":%lu,\"status_fail\":%lu,"
+      "\"clockfix_ok\":%lu,\"clockfix_fail\":%lu,\"clockfix_last\":\"%s\","
       "\"targets\":%d,\"default_pass\":%d,\"session\":\"%s\",\"note\":\"%s\"}",
       _poller->enabled() ? 1 : 0, (unsigned)_poller->pollSecs(),
       _poller->everPolled() ? 1 : 0, (unsigned long)_poller->lastPollAgeSecs(),
       (unsigned long)_poller->processedCount(), (unsigned long)_poller->droppedCount(),
       (unsigned)_poller->pendingCount(), _poller->lastRefreshSeen(),
       (unsigned long)_poller->statusOkCount(), (unsigned long)_poller->statusFailCount(),
+      (unsigned long)_poller->clockfixOkCount(), (unsigned long)_poller->clockfixFailCount(),
+      cfesc,
       _poller->targetCount(), _poller->defaultPassSet() ? 1 : 0, st, note);
-  if (n < 0 || (size_t)n >= sizeof(g_rcli_reply)) { _server->send(500, "text/plain", "te groot\n"); return; }
+  if (n < 0 || (size_t)n >= sizeof(g_json)) { _server->send(500, "text/plain", "te groot\n"); return; }
   _server->sendHeader("Cache-Control", "no-store");
-  _server->send(200, "application/json", g_rcli_reply);
+  _server->send(200, "application/json", g_json);
 }
 
 /* POST /poller   on=0|1 & poll_secs=<n>   (beide optioneel) */

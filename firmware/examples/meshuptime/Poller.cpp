@@ -90,6 +90,9 @@ void Poller::reset() {
   _status_fail = 0;
   _status_wait = false;
   _status_got = false;
+  _clockfix_ok = 0;
+  _clockfix_fail = 0;
+  _clockfix_last[0] = 0;
   StrHelper::strncpy(_note, "nog niet gepold", sizeof(_note));
 }
 
@@ -340,6 +343,7 @@ void Poller::onPollBody(const char* body) {
   _last_poll = millis();
   const char* end = body + strlen(body);
   int got_settings = 0;
+  int got_clockfix = 0;
 
   /* --- refresh: STATUSVERZOEKEN (v2.7.0). Elke prefix wordt een eigen sessie:
    * login + REQ_TYPE_GET_STATUS. Ze gaan in DEZELFDE wachtrij als de
@@ -396,12 +400,21 @@ void Poller::onPollBody(const char* body) {
         char one[RCLI_PARAM_MAX];
         const char* a2 = nullptr;
         if (readQuoted(q, rb, one, sizeof(one), &a2) == nullptr) break;
+        q = a2;
+
+        /* "cmd:clockfix" is GEEN CLI-tekst maar een eigen job (zie
+         * POLLER_CLOCKFIX_PARAM). Hem in de CSV laten staan zou het woord
+         * "clockfix" naar de repeater sturen, en dat kent die niet. */
+        if (strcmp(one, POLLER_CLOCKFIX_PARAM) == 0) {
+          if (pushPending(prefix, "", PEND_CLOCKFIX)) got_clockfix++;
+          continue;
+        }
+
         size_t l = strlen(one);
         if (o + l + 2 < sizeof(csv)) {
           if (o > 0) csv[o++] = ',';
           memcpy(csv + o, one, l); o += l;
         }
-        q = a2;
       }
       csv[o] = 0;
 
@@ -413,8 +426,8 @@ void Poller::onPollBody(const char* body) {
     }
   }
 
-  snprintf(_note, sizeof(_note), "gepold: %d instellingen, %d status",
-           got_settings, _last_refresh_seen);
+  snprintf(_note, sizeof(_note), "gepold: %d instellingen, %d status, %d klok",
+           got_settings, _last_refresh_seen, got_clockfix);
   MESH_DEBUG_PRINTLN("Poller: %s", _note);
 }
 
@@ -448,12 +461,13 @@ void Poller::startNextPending() {
 
   /* STATUSVERZOEK? Dan een heel ander vervolg na dezelfde login: geen CLI-tekst
    * maar een REQ_TYPE_GET_STATUS, en geen per-param-nullen bij mislukking. */
-  if (e.kind == PEND_STATUS) {
+  if (e.kind == PEND_STATUS || e.kind == PEND_CLOCKFIX) {
     Pending copy = e;                 /* kopie: we halen hem hieronder uit de ring */
+    const PendKind k = e.kind;
     _pending_head = (uint8_t)((_pending_head + 1) % POLLER_PENDING_MAX);
     _pending_count--;
     _processed++;
-    startStatus(copy);
+    if (k == PEND_STATUS) startStatus(copy); else startClockFix(copy);
     return;
   }
 
@@ -590,6 +604,59 @@ void Poller::onStats(const char* pubkey_hex12, const RepeaterStatus& st) {
 
 void Poller::statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st) {
   static_cast<Poller*>(ctx)->onStats(pubkey_hex12, st);
+}
+
+/* ------------------------------------------------------------------------
+ * De KLOK rechtzetten (v2.8.0)
+ *
+ * Deze job kan MINUTEN duren: bij een node die vóórloopt zit er een clkreboot en
+ * een herstart in. Dat is aanvaard -- de job houdt de enige sessie bezet, dus een
+ * ander pollerverzoek wacht (prima), maar de BEWAKING loopt gewoon door: alles
+ * gebeurt stapsgewijs vanuit loop() en er wordt nergens gewacht.
+ * ------------------------------------------------------------------------ */
+void Poller::startClockFix(const Pending& e) {
+  const char* pass = passwordFor(e.prefix);
+  if (pass == nullptr) {
+    _clockfix_fail++;
+    StrHelper::strncpy(_clockfix_last, "MISLUKT - geen wachtwoord voor dit doel",
+                       sizeof(_clockfix_last));
+    /* Wél terugmelden onder "cmd:clockfix": de beheerpagina hoort te zien waarom er
+     * niets gebeurde, niet een knop die stil niets doet. */
+    if (_push) _push->queueRepeaterSetting(e.prefix, POLLER_CLOCKFIX_PARAM, _clockfix_last);
+    snprintf(_note, sizeof(_note), "%s: klok-job zonder wachtwoord", e.prefix);
+    MESH_DEBUG_PRINTLN("Poller: %s", _note);
+    return;
+  }
+
+  RepeaterCli::Enq r = _rcli->queueClockFix(keyFor(e.prefix), pass);
+  if (r == RepeaterCli::RCLI_OK) {
+    snprintf(_note, sizeof(_note), "%s: klok-job gestart", e.prefix);
+    MESH_DEBUG_PRINTLN("Poller: %s", _note);
+    return;
+  }
+
+  _clockfix_fail++;
+  if (r == RepeaterCli::RCLI_BAD_KEY) {
+    StrHelper::strncpy(_clockfix_last,
+                       "MISLUKT - sleutel onbekend; geef de volle 64-hex in de doeltabel",
+                       sizeof(_clockfix_last));
+  } else {
+    snprintf(_clockfix_last, sizeof(_clockfix_last), "MISLUKT - job niet gestart (rc=%d)", (int)r);
+  }
+  if (_push) _push->queueRepeaterSetting(e.prefix, POLLER_CLOCKFIX_PARAM, _clockfix_last);
+  snprintf(_note, sizeof(_note), "%s: klok-job niet gestart", e.prefix);
+  MESH_DEBUG_PRINTLN("Poller: %s", _note);
+}
+
+/* De uitkomst van een klok-job, voor de eigen boekhouding. Het antwoord zelf is al
+ * onderweg naar MeshManager via de gewone result-callback; dit is wat /poller.json
+ * en het seriële logboek erover kunnen zeggen. */
+void Poller::noteClockFix(const char* answer) {
+  if (answer == nullptr) answer = "";
+  StrHelper::strncpy(_clockfix_last, answer, sizeof(_clockfix_last));
+  if (strncmp(answer, "OK", 2) == 0) _clockfix_ok++; else _clockfix_fail++;
+  snprintf(_note, sizeof(_note), "klok: %.70s", answer);
+  MESH_DEBUG_PRINTLN("Poller: klok-job klaar -> %s", answer);
 }
 
 /* ------------------------------------------------------------------------
