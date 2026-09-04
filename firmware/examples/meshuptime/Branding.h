@@ -167,11 +167,27 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.8.0 = DE KLOK VAN EEN REPEATER RECHTZETTEN, als EEN job (cmd:clockfix uit de
+ *            MeshManager-wachtrij). De firmware van de tegenkant weigert een klok
+ *            achteruit ("ERR: clock cannot go backwards", CommonCLI), dus bij een
+ *            node die VOORloopt is clkreboot (klok -> mei 2024 + herstart) de enige
+ *            weg, gevolgd door 'time <epoch>'. Tussen die twee is de node
+ *            onzichtbaar voor wie zijn oude tijdstempel onthield, en dat venster mag
+ *            geen HTTP-ronde of clear-on-read-wachtrij bevatten -- vandaar EEN job
+ *            op de node, die de sessie vasthoudt. Verloop: 'clock' lezen ->
+ *            < 60 s afwijking = NIETS doen (geen herstart) -> loopt achter = alleen
+ *            'time' -> loopt voor = clkreboot (geen antwoord verwacht), dan tot 3
+ *            minuten elke 10 s opnieuw login + 'time' met een verse epoch, dan
+ *            'clock' teruglezen. Antwoord = EEN mensleesbare zin onder cmd:clockfix.
+ *            NOOIT een tweede clkreboot. clkreboot blijft als LOS commando geweigerd
+ *            uit de wachtrij (de BRICK-zeef blijft staan). Nieuw in /poller.json:
+ *            clockfix_ok/clockfix_fail/clockfix_last; caps meldt nu
+ *            settings,refresh,clockfix.
  * Zie CHANGELOG.md in de firmware-repo.
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.7.0"
+  #define MESHUPTIME_VERSION   "v2.8.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

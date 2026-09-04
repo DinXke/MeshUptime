@@ -248,6 +248,54 @@ struct RepeaterStatus {
 #define RCLI_JOB_PERCMD_MS    90000UL
 #define RCLI_JOB_MAX_MS(n)    (RCLI_JOB_BASE_MS + (uint32_t)(n) * RCLI_JOB_PERCMD_MS)
 
+/* ---- de klok-rechtzet-job (v2.8.0) ----
+ *
+ * DREMPEL. Onder deze afwijking doen we NIETS -- een node herstarten voor niets
+ * is de duurste vorm van ijver. 60 s is ook de eerlijke ondergrens van de meting:
+ * `clock` antwoordt "HH:MM - D/M/YYYY UTC", dus ZONDER seconden. We schatten de
+ * tegenkant op het midden van die minuut (+30 s), waarmee er ±30 s onzekerheid
+ * overblijft; een drempel korter dan een minuut zou op ruis staan. */
+#define RCLI_CF_MIN_SKEW_SECS  60
+
+/* WACHTEN NA clkreboot voordat de eerste `time`-poging de lucht in gaat. Een
+ * ESP32-repeater is na ~10-15 s weer aan het luisteren; bij de handmatige run op
+ * JessaZH lukte `time` in de eerste poging 15 s na de herstart. Twaalf seconden is
+ * net vóór dat punt, zodat de eerste poging in het gunstige geval meteen raakt en
+ * we in het ongunstige geval niets verspild hebben behalve één pakket. */
+#define RCLI_CF_REBOOT_WAIT_MS 12000UL
+
+/* AFSTAND TUSSEN TWEE HERKANSINGEN op `time` na de herstart. Elke poging is een
+ * login + een `time` met een VERSE epoch (de oude zou inmiddels in het verleden
+ * liggen t.o.v. de mei-2024-klok, wat niet uitmaakt, maar een verse epoch zet de
+ * klok ook echt goed). Tien seconden is kort genoeg om het venster van drie
+ * minuten met ~15 pogingen te vullen en lang genoeg om de band niet vol te zetten
+ * op het moment dat die node net weer meedoet. */
+#define RCLI_CF_RETRY_GAP_MS   10000UL
+
+/* HOE LANG WE OP EEN ANTWOORD OP `clkreboot` WACHTEN voordat we het als
+ * "verstuurd" beschouwen. Kort, want we verwachten er GEEN: de node herstart
+ * voordat hij antwoordt. Vier seconden is genoeg om te weten dat het pakket de
+ * lucht in is en er niets terugkwam. De gewone RCLI_STEP_TIMEOUT_MS (25 s) zou
+ * hier pure verspilling zijn: dan begint de eerste `time`-poging pas 37 s na de
+ * herstart, terwijl de node na ~15 s al luistert -- en elke seconde in dat venster
+ * is een seconde waarin hij voor de rest van het mesh onzichtbaar is. */
+#define RCLI_CF_NOREPLY_MS     4000UL
+
+/* HET HERKANSINGSVENSTER na clkreboot. Drie minuten: daarna is er iets anders aan
+ * de hand dan een langzame herstart, en dan is doorhameren zinloos. Loopt dit af,
+ * dan meldt de job MISLUKT met de waarschuwing erin -- en er komt NOOIT een tweede
+ * clkreboot (zie _cf_reboot_sent). */
+#define RCLI_CF_WINDOW_MS      180000UL
+
+/* Harde bovengrens voor de HELE klok-job: het herkansingsvenster (180 s) PLUS
+ * ruimte voor de login en de `clock`-lezing ervoor en de controlelezing erna. Die
+ * aanloop kan in het slechtste geval zelf al ruim een minuut kosten (drie
+ * loginpogingen en drie `clock`-pogingen van 25 s), en dan mag de bovengrens het
+ * venster niet halverwege afkappen -- dat zou een MISLUKT melden terwijl de
+ * herkansing nog liep. Vijf minuten laat daar ruimte voor; hij is een vangnet
+ * tegen een vastgelopen job, niet de normale werking. */
+#define RCLI_CF_MAX_MS         300000UL
+
 class RepeaterCli;
 
 /* ------------------------------------------------------------------------
@@ -294,7 +342,42 @@ public:
    * LOGIN/REGIONS/OWNER/CLOCK). Ze verschillen in wat er NA de login gebeurt:
    * CLI-tekst (TXT_MSG met TXT_TYPE_CLI_DATA) of een REQ (PAYLOAD_TYPE_REQ met
    * REQ_TYPE_GET_STATUS). */
-  enum JobKind : uint8_t { RCLI_JOB_CLI = 0, RCLI_JOB_STATUS };
+  enum JobKind : uint8_t { RCLI_JOB_CLI = 0, RCLI_JOB_STATUS, RCLI_JOB_CLOCKFIX };
+
+  /* ------------------------------------------------------------------------
+   * DE KLOK RECHTZETTEN (v2.8.0) -- de stappen van EEN job
+   *
+   * WAAROM DIT EEN JOB IS EN GEEN REEKS LOSSE OPDRACHTEN. De firmware van de
+   * tegenkant weigert een klok ACHTERUIT te zetten: CommonCLI::handleCommand
+   * antwoordt bij `time <epoch>` met "(ERR: clock cannot go backwards)" zodra
+   * `secs <= curr`. Loopt een node VOOR, dan is de enige uitweg `clkreboot` --
+   * die zet de klok op 1715770351 (15 mei 2024) en herstart meteen -- gevolgd
+   * door `time <epoch>`.
+   *
+   * TUSSEN DIE TWEE IS DE NODE ONZICHTBAAR voor iedereen die zijn oude, in de
+   * toekomst liggende advert-tijdstempel onthield: een advert met een lagere
+   * tijdstempel wordt overal weggegooid. Dat venster mag dus GEEN HTTP-ronde,
+   * geen clear-on-read-wachtrij en geen serverstoring bevatten. Daarom staat de
+   * hele reeks HIER, in EEN job: zolang die loopt blijft busy() waar, houdt deze
+   * sessie de enige plek bezet en kan geen ander verzoek ertussen komen.
+   *
+   * De stappen:
+   *   CF_READ1   `clock` lezen en de afwijking bepalen
+   *   (beslissing) < RCLI_CF_MIN_SKEW_SECS -> klaar, GEEN herstart
+   *   CF_SET_BEHIND  loopt achter -> alleen `time <epoch>`, geen herstart
+   *   CF_REBOOT      loopt voor -> `clkreboot` (verwacht GEEN antwoord)
+   *   CF_SET_AFTER   elke ~RCLI_CF_RETRY_GAP_MS: login + `time <epoch>` met een
+   *                  VERSE epoch, tot "clock set" of tot het venster om is
+   *   CF_READ2   `clock` teruglezen voor het antwoord
+   * ------------------------------------------------------------------------ */
+  enum CfStep : uint8_t {
+    CF_NONE = 0,
+    CF_READ1,
+    CF_SET_BEHIND,
+    CF_REBOOT,
+    CF_SET_AFTER,
+    CF_READ2
+  };
 
   /* Wat een job-start teruggeeft. */
   enum Enq : uint8_t {
@@ -346,6 +429,12 @@ public:
    * de gewone drie pogingen (isMutating is hier niet van toepassing). */
   Enq queueStatus(const char* pubkey_hex, const char* password);
 
+  /* POLLER: DE KLOK RECHTZETTEN (v2.8.0). Eén job, meerdere stappen; zie CfStep.
+   * Het antwoord is EEN mensleesbare zin, afgeleverd onder de parameternaam
+   * "cmd:clockfix" -- het woord "clockfix" gaat NOOIT naar de repeater, die kent
+   * het niet. */
+  Enq queueClockFix(const char* pubkey_hex, const char* password);
+
   /* Uit de gewone loop(). Doet hoogstens EEN zending per ronde. */
   void loop();
 
@@ -388,6 +477,15 @@ private:
 
   JobKind  _job_kind;
   uint32_t _status_tag;   // de tag die de repeater in zijn antwoord terugkaatst
+
+  /* ---- klok-rechtzetten (v2.8.0) ---- */
+  CfStep   _cf_step;
+  bool     _cf_reboot_sent;      // NOOIT twee keer clkreboot in één job
+  uint8_t  _cf_tries;            // pogingen op `time` na de herstart
+  unsigned long _cf_window_end;  // einde van het herkansingsvenster
+  int32_t  _cf_skew;             // gemeten afwijking in seconden (+ = loopt voor)
+  char     _cf_was[8];           // "HH:MM" zoals de node hem eerst meldde
+  char     _cf_now[8];           // "HH:MM" na het zetten
 
   State    _state;
   uint8_t  _attempt;          // pogingen aan het LOPENDE commando (of de login)
@@ -445,6 +543,16 @@ private:
   /* Ontleedt + toetst een stats-antwoord. false = niet plausibel of te kort; dan
    * wordt er NIETS gemeld. */
   static bool parseStatus(const uint8_t* data, size_t len, RepeaterStatus& out);
+
+  /* ---- klok-rechtzetten ---- */
+  /* "HH:MM - D/M/YYYY UTC" (het antwoord van `clock`) -> epoch van het BEGIN van
+   * die minuut, plus de "HH:MM" apart voor het antwoord. false = onbekende vorm. */
+  static bool parseClock(const char* txt, uint32_t& epoch_out, char* hhmm, size_t hhmm_len);
+  static uint32_t civilToEpoch(int y, int mo, int d, int hh, int mi);
+  void cfBegin();                    // stap 1 klaarzetten
+  void cfOnAnswer(const char* ans);  // antwoord op de huidige stap
+  void cfOnTimeout();                // geen antwoord op de huidige stap
+  void cfFinish(const char* text);   // job afsluiten met deze zin
 
   /* De i-de parameter uit de job. Bij _job_n==1 is dat de HELE buffer (zodat een
    * handmatige opdracht met komma's heel blijft); anders het i-de komma-veld. */

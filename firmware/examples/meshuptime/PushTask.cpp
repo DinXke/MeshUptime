@@ -388,7 +388,7 @@ void PushTask::startAttempt() {
             * Zet hier nooit iets wat de poller niet echt uitvoert: dan belooft de
             * beheerpagina een knop die een verzoek in een wachtrij legt dat hier
             * stil weggegooid wordt. */
-           _kind == KIND_POLL      ? "/api/v1/commands?caps=settings,refresh"
+           _kind == KIND_POLL      ? "/api/v1/commands?caps=settings,refresh,clockfix"
                                    : "/api/sensorpush");
 
   if (s_host[0] == 0) { failNet("url: geen host"); return; }

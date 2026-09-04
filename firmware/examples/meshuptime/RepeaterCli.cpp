@@ -64,6 +64,13 @@ void RepeaterCli::reset() {
   _job_i            = 0;
   _job_kind         = RCLI_JOB_CLI;
   _status_tag       = 0;
+  _cf_step          = CF_NONE;
+  _cf_reboot_sent   = false;
+  _cf_tries         = 0;
+  _cf_window_end    = 0;
+  _cf_skew          = 0;
+  _cf_was[0]        = 0;
+  _cf_now[0]        = 0;
   _answer[0]        = 0;
   _nchunks          = 0;
   _answer_used      = 0;
@@ -159,6 +166,9 @@ RepeaterCli::Enq RepeaterCli::startJob(const char* pubkey_hex, const char* passw
     StrHelper::strncpy(_cur_param, "status", sizeof(_cur_param));
     StrHelper::strncpy(_cmd, "(statusverzoek)", sizeof(_cmd));
     _cmd_max_attempts = RCLI_MAX_ATTEMPTS;   // een leesactie: gewone drie pogingen
+  } else if (_job_kind == RCLI_JOB_CLOCKFIX) {
+    StrHelper::strncpy(_cur_param, "cmd:clockfix", sizeof(_cur_param));
+    cfBegin();
   } else {
     loadCurrentParam();
   }
@@ -220,10 +230,30 @@ RepeaterCli::Enq RepeaterCli::queueStatus(const char* pubkey_hex, const char* pa
   return startJob(pubkey_hex, password);
 }
 
+/* DE KLOK RECHTZETTEN (v2.8.0). Eén job met meerdere stappen; zie CfStep in de
+ * header voor het waarom. De job levert EEN antwoord af onder "cmd:clockfix". */
+RepeaterCli::Enq RepeaterCli::queueClockFix(const char* pubkey_hex, const char* password) {
+  if (busy()) return RCLI_BUSY;
+  reset();
+
+  /* De parameternaam waaronder het antwoord terug moet. Het WOORD "clockfix" gaat
+   * nooit de lucht in -- de tegenkant kent het niet; het is puur de sleutel waarop
+   * MeshManager het antwoord verwacht. */
+  StrHelper::strncpy(_job, "cmd:clockfix", sizeof(_job));
+  _job_n    = 1;
+  _job_kind = RCLI_JOB_CLOCKFIX;
+
+  return startJob(pubkey_hex, password);
+}
+
 /* ------------------------------------------------------------------------
  * De job doorlopen
  * ------------------------------------------------------------------------ */
 bool RepeaterCli::loadCurrentParam() {
+  /* De klok-job bepaalt zijn commando uit de STAP en niet uit de parameterlijst;
+   * cfBegin()/cfOnAnswer() hebben _cmd dan al gezet. */
+  if (_job_kind == RCLI_JOB_CLOCKFIX) return _cmd[0] != 0;
+
   if (!nthParam(_job_i, _cur_param, sizeof(_cur_param))) return false;
 
   /* param -> commando, exact zoals de oude HA-pusher (pusher.py ~393):
@@ -387,8 +417,17 @@ void RepeaterCli::loop() {
 
   const unsigned long now = millis();
 
-  /* Harde bovengrens voor de HELE job, geschaald met het aantal commando's. */
-  if ((long)(now - (_started_at + RCLI_JOB_MAX_MS(_job_n))) >= 0) {
+  /* Harde bovengrens voor de HELE job. De klok-job heeft een eigen, veel ruimere
+   * grens: hij moet een herstart van de tegenkant kunnen uitzitten. */
+  const uint32_t cap = (_job_kind == RCLI_JOB_CLOCKFIX)
+                         ? RCLI_CF_MAX_MS : RCLI_JOB_MAX_MS(_job_n);
+  if ((long)(now - (_started_at + cap)) >= 0) {
+    if (_job_kind == RCLI_JOB_CLOCKFIX) {
+      cfFinish(_cf_reboot_sent
+                 ? "MISLUKT - clkreboot verstuurd maar tijd op; klok NIET gezet"
+                 : "MISLUKT - tijd op bij het rechtzetten van de klok");
+      return;
+    }
     failJob("tijd op (bovengrens van de job bereikt)");
     return;
   }
@@ -405,7 +444,20 @@ void RepeaterCli::loop() {
   if (_attempt > 0 && (long)(now - _deadline) < 0) return;
 
   /* De poging is verlopen. */
-  if (_state == RCLI_LOGIN) {
+  if (_state == RCLI_LOGIN && _job_kind == RCLI_JOB_CLOCKFIX && _cf_step == CF_SET_AFTER) {
+    /* NA clkreboot is een stille login het NORMALE beeld zolang de node opnieuw
+     * opstart. Niet opgeven dus: opnieuw proberen tot het venster om is. Elke ronde
+     * is login + `time`; de login is tegelijk de "is hij al terug?"-proef. */
+    if (_attempt >= RCLI_MAX_ATTEMPTS) {
+      if ((long)(now - _cf_window_end) >= 0) {
+        cfFinish("MISLUKT - clkreboot verstuurd maar 'time' niet bevestigd; klok NIET gezet");
+        return;
+      }
+      _attempt   = 0;
+      _next_send = now + RCLI_CF_RETRY_GAP_MS;
+      return;
+    }
+  } else if (_state == RCLI_LOGIN) {
     if (_attempt >= RCLI_MAX_ATTEMPTS) {
       /* Een FOUT wachtwoord geeft op de tegenkant geen foutantwoord maar STILTE
        * (handleLoginReq geeft reply_len=0), dus "geen antwoord" en "verkeerd
@@ -422,6 +474,10 @@ void RepeaterCli::loop() {
       failJob("ingelogd, maar geen statusantwoord na 3 pogingen");
       return;
     }
+  } else if (_state == RCLI_CMD && _job_kind == RCLI_JOB_CLOCKFIX) {
+    /* De klok-job beslist zelf wat "geen antwoord" betekent -- bij `clkreboot` is
+     * dat namelijk het VERWACHTE gedrag (de node herstart voordat hij antwoordt). */
+    if (_attempt >= _cmd_max_attempts) { cfOnTimeout(); return; }
   } else {   // RCLI_CMD
     if (_attempt >= _cmd_max_attempts) {
       /* Dit COMMANDO opgegeven -> als "geen antwoord" (null) afleveren en DOOR naar
@@ -446,7 +502,15 @@ void RepeaterCli::loop() {
 
   if (_state == RCLI_LOGIN)       sendLogin();
   else if (_state == RCLI_STATUS) sendStatusReq();
-  else                            sendCommand();
+  else {
+    sendCommand();
+    /* `clkreboot` antwoordt nooit (de node herstart eerst). Niet de volle
+     * RCLI_STEP_TIMEOUT_MS wachten om dat vast te stellen: elke seconde hier is
+     * een seconde waarin die node voor de rest van het mesh onzichtbaar is. */
+    if (_job_kind == RCLI_JOB_CLOCKFIX && _cf_step == CF_REBOOT && _attempt > 0) {
+      _deadline = millis() + RCLI_CF_NOREPLY_MS;
+    }
+  }
 }
 
 /* De verzamelde stukken op tijdstempel sorteren (hoogstens RCLI_CHUNK_MAX, dus
@@ -476,6 +540,14 @@ void RepeaterCli::finishAnswer() {
   memcpy(_answer, out, o + 1);
   _nchunks = 0;
   _answer_used = 0;
+
+  /* De klok-job beslist zelf wat het volgende is; hij levert pas aan het EIND één
+   * mensleesbare zin af (cfFinish). */
+  if (_job_kind == RCLI_JOB_CLOCKFIX) {
+    cfOnAnswer(o ? _answer : "");
+    return;
+  }
+
   deliverCurrent(o ? _answer : nullptr);
   beginNextCommand();
   _next_send = millis() + RCLI_MIN_GAP_MS;
@@ -515,6 +587,24 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
     _answer_used = 0;
     if (_job_kind == RCLI_JOB_STATUS) {
       _state = RCLI_STATUS;
+      return true;
+    }
+    if (_job_kind == RCLI_JOB_CLOCKFIX) {
+      /* De klok-job zet zijn eigen commando. In de herkansingsfase NA clkreboot is
+       * elke login een nieuwe poging, en die krijgt een VERSE epoch: de vorige zou
+       * inmiddels een stuk in het verleden liggen, en we willen de klok niet alleen
+       * geldig maar ook JUIST zetten. */
+      _state   = RCLI_CMD;
+      _attempt = 0;
+      if (_cf_step == CF_SET_AFTER) {
+        if (_cf_tries < 255) _cf_tries++;
+        snprintf(_cmd, sizeof(_cmd), "time %lu",
+                 (unsigned long)_mesh->getRTCClock()->getCurrentTime());
+        _cmd_max_attempts = 1;   /* per cyclus één poging; de cyclus herhaalt */
+      }
+      /* Andere stappen hebben _cmd al klaarstaan (cfBegin / cfOnAnswer). Staat hij
+       * toch leeg, dan is er een stap vergeten -- dat niet stil laten passeren. */
+      if (_cmd[0] == 0) { cfFinish("MISLUKT - klok-job zonder commando in deze stap"); }
       return true;
     }
     _state = RCLI_CMD;
@@ -709,4 +799,291 @@ bool RepeaterCli::parseStatus(const uint8_t* data, size_t len, RepeaterStatus& o
   if (snr_db < -50 || snr_db > 50) return false;
 
   return true;
+}
+
+/* ===========================================================================
+ * DE KLOK RECHTZETTEN  (v2.8.0)
+ *
+ * Wat de tegenkant doet, uit de gepinde submodule (CommonCLI::handleCommand,
+ * src/helpers/CommonCLI.cpp regel 180-226):
+ *
+ *   `clock`         -> "%02d:%02d - %d/%d/%d UTC"       (GEEN seconden)
+ *   `time <epoch>`  -> secs > curr ? "OK - clock set: HH:MM - D/M/YYYY UTC"
+ *                                  : "(ERR: clock cannot go backwards)"
+ *   `clkreboot`     -> setCurrentTime(1715770351)  // 15 mei 2024, 20:50
+ *                      _board->reboot();           // KOMT NIET TERUG
+ *
+ * Die laatste regel is de hele reden dat dit EEN job is en geen reeks losse
+ * opdrachten: `clkreboot` antwoordt NOOIT, en tussen de herstart en een gelukte
+ * `time` is de node onzichtbaar voor iedereen die zijn oude, in de toekomst
+ * liggende advert-tijdstempel onthield. Dat venster mag geen HTTP-ronde en geen
+ * clear-on-read-wachtrij bevatten -- alleen de node zelf staat dicht genoeg bij
+ * de radio om er twintig seconden lang op te hameren.
+ * ===========================================================================*/
+
+/* Dagen sinds 1970 uit een burgerlijke datum (het days_from_civil-algoritme van
+ * Howard Hinnant). Integer-rekenwerk, geen tijdzone-bibliotheek: de tegenkant
+ * meldt UTC en wij rekenen in UTC. */
+uint32_t RepeaterCli::civilToEpoch(int y, int mo, int d, int hh, int mi) {
+  y -= (mo <= 2) ? 1 : 0;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (unsigned)((153 * (mo + (mo > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  const long days = (long)era * 146097 + (long)doe - 719468;
+  return (uint32_t)(days * 86400L + hh * 3600L + mi * 60L);
+}
+
+/* Een reeks cijfers lezen. Losse functie en geen lambda: dit bestand mikt op de
+ * eenvoudigste C++ die de compiler van dit project zeker aanneemt. */
+static bool cfNum(const char*& q, int& out, int maxdig) {
+  int n = 0, v = 0;
+  while (*q >= '0' && *q <= '9' && n < maxdig) { v = v * 10 + (*q - '0'); q++; n++; }
+  if (n == 0) return false;
+  out = v;
+  return true;
+}
+
+/* "HH:MM - D/M/YYYY UTC" ontleden. STRENG: is de vorm anders, dan geven we false
+ * en meldt de job dat de klok niet te lezen was. Liever dat dan een afwijking
+ * berekenen uit een getal dat we verkeerd begrepen hebben -- en dan op grond
+ * daarvan een node op een dak herstarten. */
+bool RepeaterCli::parseClock(const char* txt, uint32_t& epoch_out, char* hhmm, size_t hhmm_len) {
+  if (txt == NULL) return false;
+  while (*txt == ' ' || *txt == '>') txt++;      // een eventuele "> "-prefix eraf
+
+  int hh = 0, mi = 0, d = 0, mo = 0, y = 0;
+  const char* p = txt;
+
+  if (!cfNum(p, hh, 2)) return false;
+  if (*p++ != ':') return false;
+  if (!cfNum(p, mi, 2)) return false;
+  while (*p == ' ') p++;
+  if (*p++ != '-') return false;
+  while (*p == ' ') p++;
+  if (!cfNum(p, d, 2)) return false;
+  if (*p++ != '/') return false;
+  if (!cfNum(p, mo, 2)) return false;
+  if (*p++ != '/') return false;
+  if (!cfNum(p, y, 4)) return false;
+
+  if (hh > 23 || mi > 59 || d < 1 || d > 31 || mo < 1 || mo > 12 || y < 2020 || y > 2099)
+    return false;
+
+  epoch_out = civilToEpoch(y, mo, d, hh, mi);
+  if (hhmm != NULL && hhmm_len >= 6) snprintf(hhmm, hhmm_len, "%02d:%02d", hh, mi);
+  return true;
+}
+
+/* Stap 1: de klok lezen. */
+void RepeaterCli::cfBegin() {
+  _cf_step = CF_READ1;
+  StrHelper::strncpy(_cmd, "clock", sizeof(_cmd));
+  _cmd_max_attempts = RCLI_MAX_ATTEMPTS;   // een leesactie: herhalen mag
+}
+
+/* De job afsluiten met EEN mensleesbare zin. Die komt op de beheerpagina van
+ * MeshManager te staan, dus hij is geschreven voor een mens en niet voor een
+ * parser. */
+void RepeaterCli::cfFinish(const char* text) {
+  StrHelper::strncpy(_answer, text, sizeof(_answer));
+  deliverCurrent(_answer);          // onder "cmd:clockfix"
+  memset(_pass, 0, sizeof(_pass));
+  _cf_step = CF_NONE;
+  _state   = RCLI_DONE;
+  MESH_DEBUG_PRINTLN("RepeaterCli: clockfix %s -> %s", _target_hex, _answer);
+}
+
+/* Geen antwoord op de huidige stap. */
+void RepeaterCli::cfOnTimeout() {
+  const unsigned long now = millis();
+  char msg[RCLI_ANSWER_MAX];
+
+  switch (_cf_step) {
+    case CF_READ1:
+      cfFinish("MISLUKT - geen antwoord op 'clock'; niets gelezen, niets gewijzigd");
+      return;
+
+    case CF_SET_BEHIND:
+      cfFinish("MISLUKT - geen antwoord op 'time'; klok mogelijk niet gezet");
+      return;
+
+    case CF_REBOOT:
+      /* DIT IS HET VERWACHTE GEDRAG en geen fout: `clkreboot` herstart de node
+       * voordat hij antwoordt, dus stilte betekent hier "verstuurd". Nu de
+       * herstart uitzitten en dan aan `time` beginnen. */
+      MESH_DEBUG_PRINTLN("RepeaterCli: clkreboot naar %s verstuurd (geen antwoord verwacht)",
+                         _target_hex);
+      _cf_step       = CF_SET_AFTER;
+      _cf_tries      = 0;
+      _cf_window_end = now + RCLI_CF_WINDOW_MS;
+      /* Opnieuw inloggen: de sessie is met de node meegegaan. De login is tegelijk
+       * de proef of hij al terug is. */
+      _state     = RCLI_LOGIN;
+      _attempt   = 0;
+      _next_send = now + RCLI_CF_REBOOT_WAIT_MS;
+      _cmd[0]    = 0;
+      return;
+
+    case CF_SET_AFTER:
+      /* `time` bleef stil. Opnieuw, met een nieuwe login, tot het venster om is. */
+      if ((long)(now - _cf_window_end) >= 0) {
+        /* Eerlijk onderscheid: kwamen we helemaal niet binnen (geen enkele login
+         * gelukt), of wel binnen maar bleef `time` onbevestigd? Dat is voor wie dit
+         * achteraf leest een ander verhaal. */
+        if (_cf_tries == 0) {
+          snprintf(msg, sizeof(msg),
+                   "MISLUKT - clkreboot verstuurd maar node antwoordde geen enkele login; "
+                   "klok staat op mei 2024");
+        } else {
+          snprintf(msg, sizeof(msg),
+                   "MISLUKT - clkreboot verstuurd maar 'time' niet bevestigd na %u pogingen; "
+                   "klok staat op mei 2024", (unsigned)_cf_tries);
+        }
+        cfFinish(msg);
+        return;
+      }
+      _state     = RCLI_LOGIN;
+      _attempt   = 0;
+      _next_send = now + RCLI_CF_RETRY_GAP_MS;
+      _cmd[0]    = 0;
+      return;
+
+    case CF_READ2:
+      /* De klok IS gezet (daar kwam een "clock set" op); alleen de controlelezing
+       * bleef stil. Dat is geen mislukking van de handeling, en dat hoort het
+       * antwoord ook te zeggen. */
+      snprintf(msg, sizeof(msg),
+               "OK - klok gezet (liep %ld s %s), maar de controlelezing bleef stil",
+               (long)(_cf_skew < 0 ? -_cf_skew : _cf_skew),
+               _cf_skew > 0 ? "voor" : "achter");
+      cfFinish(msg);
+      return;
+
+    default:
+      cfFinish("MISLUKT - klok-job in een onbekende stap");
+      return;
+  }
+}
+
+/* Een antwoord op de huidige stap. `ans` is nooit NULL; leeg = geen tekst. */
+void RepeaterCli::cfOnAnswer(const char* ans) {
+  const unsigned long now = millis();
+  const uint32_t ours = _mesh->getRTCClock()->getCurrentTime();
+  char msg[RCLI_ANSWER_MAX];
+
+  switch (_cf_step) {
+    case CF_READ1: {
+      uint32_t remote_min = 0;
+      if (!parseClock(ans, remote_min, _cf_was, sizeof(_cf_was))) {
+        snprintf(msg, sizeof(msg), "MISLUKT - 'clock' onbegrepen antwoord: %.60s", ans);
+        cfFinish(msg);
+        return;
+      }
+      /* `clock` meldt GEEN seconden, dus de tegenkant zit ergens in die minuut.
+       * Het midden (+30 s) is de schatting met de kleinste maximale fout (30 s).
+       * Daarom is de drempel hieronder 60 s en niet 10: korter zou op ruis staan. */
+      const int32_t skew = (int32_t)((remote_min + 30) - ours);
+      _cf_skew = skew;
+      const int32_t mag = skew < 0 ? -skew : skew;
+
+      if (mag < RCLI_CF_MIN_SKEW_SECS) {
+        snprintf(msg, sizeof(msg),
+                 "OK - niets te doen: klok wijkt %ld s af (%s UTC), geen herstart",
+                 (long)mag, _cf_was);
+        cfFinish(msg);
+        return;
+      }
+
+      if (skew < 0) {
+        /* Loopt ACHTER: `time` alleen is genoeg, want vooruit mag altijd. GEEN
+         * herstart -- dat is de hele winst van deze tak. */
+        _cf_step = CF_SET_BEHIND;
+        snprintf(_cmd, sizeof(_cmd), "time %lu", (unsigned long)ours);
+        _cmd_max_attempts = 1;      /* muterend: niet blind herhalen */
+        _state     = RCLI_CMD;
+        _attempt   = 0;
+        _next_send = now + RCLI_MIN_GAP_MS;
+        return;
+      }
+
+      /* Loopt VOOR: de firmware weigert achteruit, dus clkreboot is de enige weg. */
+      if (_cf_reboot_sent) {          /* kan niet, maar nooit twee keer */
+        cfFinish("MISLUKT - clkreboot al verstuurd in deze job; niet nog een keer");
+        return;
+      }
+      _cf_step        = CF_REBOOT;
+      _cf_reboot_sent = true;
+      StrHelper::strncpy(_cmd, "clkreboot", sizeof(_cmd));
+      _cmd_max_attempts = 1;          /* EEN keer. Nooit twee clkreboots. */
+      _state     = RCLI_CMD;
+      _attempt   = 0;
+      _next_send = now + RCLI_MIN_GAP_MS;
+      return;
+    }
+
+    case CF_REBOOT:
+      /* Een fork die WEL antwoordt voordat hij herstart. Dat verandert niets aan
+       * het verloop: doorgaan naar de herkansingsfase, precies zoals bij stilte.
+       * Zonder deze tak zou zo'n antwoord in de default hieronder landen en de job
+       * met "onbekende stap" afbreken -- terwijl er niets mis is. */
+      MESH_DEBUG_PRINTLN("RepeaterCli: clkreboot naar %s antwoordde ('%.40s'); toch doorgaan",
+                         _target_hex, ans);
+      cfOnTimeout();
+      return;
+
+    case CF_SET_BEHIND:
+    case CF_SET_AFTER: {
+      if (strstr(ans, "clock set") != NULL) {
+        /* Gelukt. Teruglezen, zodat het antwoord de ECHTE nieuwe stand draagt en
+         * niet onze aanname. */
+        _cf_step = CF_READ2;
+        StrHelper::strncpy(_cmd, "clock", sizeof(_cmd));
+        _cmd_max_attempts = RCLI_MAX_ATTEMPTS;
+        _state     = RCLI_CMD;
+        _attempt   = 0;
+        _next_send = now + RCLI_MIN_GAP_MS;
+        return;
+      }
+      if (strstr(ans, "backwards") != NULL) {
+        /* De grendel uit CommonCLI. In de ACHTER-tak kan dit alleen als onze EIGEN
+         * klok fout staat; in de na-clkreboot-tak zou het betekenen dat de node
+         * niet herstart is. Geen tweede clkreboot -- dat is de regel. */
+        cfFinish(_cf_step == CF_SET_BEHIND
+                   ? "MISLUKT - node weigert achteruit; onze eigen klok staat mogelijk fout"
+                   : "MISLUKT - node weigert 'time' na clkreboot; niet nog een keer herstart");
+        return;
+      }
+      if (_cf_step == CF_SET_AFTER) {
+        cfOnTimeout();   /* iets anders (of leeg) terug: opnieuw tot het venster om is */
+        return;
+      }
+      snprintf(msg, sizeof(msg), "MISLUKT - onverwacht antwoord op 'time': %.60s", ans);
+      cfFinish(msg);
+      return;
+    }
+
+    case CF_READ2: {
+      uint32_t after = 0;
+      if (!parseClock(ans, after, _cf_now, sizeof(_cf_now))) {
+        StrHelper::strncpy(_cf_now, "?", sizeof(_cf_now));
+      }
+      const long mag = (long)(_cf_skew < 0 ? -_cf_skew : _cf_skew);
+      if (_cf_reboot_sent) {
+        snprintf(msg, sizeof(msg),
+                 "OK - klok gezet: %s UTC (was %s, liep %ld s voor; clkreboot + %u pogingen)",
+                 _cf_now, _cf_was, mag, (unsigned)_cf_tries);
+      } else {
+        snprintf(msg, sizeof(msg),
+                 "OK - klok gezet: %s UTC (was %s, liep %ld s achter, geen herstart nodig)",
+                 _cf_now, _cf_was, mag);
+      }
+      cfFinish(msg);
+      return;
+    }
+
+    default:
+      cfFinish("MISLUKT - klok-job in een onbekende stap");
+      return;
+  }
 }

@@ -7,6 +7,108 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.8.0 — de klok van een repeater rechtzetten, als één job
+
+Alleen de room-server-variant (`env:meshuptime_room`). Additief; de bewaking, de
+instellingenopvragingen en de statusverzoeken blijven ongewijzigd.
+
+**Waarom dit een node-job is en geen reeks serververzoeken.** De firmware van de
+tegenkant weigert een klok **achteruit** te zetten:
+`CommonCLI::handleCommand` antwoordt bij `time <epoch>` met
+`(ERR: clock cannot go backwards)` zodra `secs <= curr` — dezelfde grendel zit op
+`clock sync`. Loopt een node dus **voor** (JessaZH liep 18 minuten voor), dan is de
+enige uitweg `clkreboot`: die zet de klok op `1715770351` (15 mei 2024, 20:50) en
+roept meteen `_board->reboot()` — hij **antwoordt nooit**. Daarna moet er een
+`time <epoch>` landen.
+
+Tussen die twee is de node **onzichtbaar** voor iedereen die zijn oude, in de
+toekomst liggende advert-tijdstempel onthield: een advert met een lagere tijdstempel
+wordt overal weggegooid. Dat venster mag geen HTTP-ronde, geen clear-on-read-wachtrij
+en geen serverstoring bevatten. Daarom staat de hele reeks in **één job op de node**:
+zolang die loopt blijft `RepeaterCli::busy()` waar, houdt de job de enige sessie
+bezet en kan geen ander verzoek ertussen komen.
+
+**Het verloop.** MeshManager levert de opdracht als settings-parameter
+`cmd:clockfix`. Die wordt bij het ontleden **uit de parameterlijst gehaald** en een
+eigen job — het woord "clockfix" gaat nooit naar de repeater, die kent het niet.
+
+1. `clock` lezen en de afwijking bepalen.
+2. **Minder dan 60 s afwijking → niets doen.** Antwoord: "niets te doen", geen
+   herstart. Een node herstarten voor niets is de duurste vorm van ijver. 60 s is
+   ook de eerlijke ondergrens van de meting: `clock` antwoordt
+   `"%02d:%02d - %d/%d/%d UTC"`, dus **zonder seconden**. We schatten de tegenkant op
+   het midden van die minuut (+30 s), waarmee er ±30 s onzekerheid overblijft; een
+   drempel korter dan een minuut zou op ruis staan.
+3. **Loopt achter → alleen `time <epoch>`**, geen herstart. Vooruit mag altijd; dat
+   is de hele winst van deze tak.
+4. **Loopt voor → `clkreboot`.** Er wordt **geen antwoord verwacht**; stilte betekent
+   hier "verstuurd" en niet "mislukt". De wachttijd op die stilte is daarom kort
+   (`RCLI_CF_NOREPLY_MS`, 4 s) en niet de gewone 25 s: elke seconde in dit venster is
+   een seconde waarin de node onzichtbaar is.
+5. Daarna, na `RCLI_CF_REBOOT_WAIT_MS` (12 s), elke `RCLI_CF_RETRY_GAP_MS` (10 s)
+   opnieuw **login + `time <epoch>` met een VERSE epoch**, tot `clock set` terugkomt
+   of tot `RCLI_CF_WINDOW_MS` (3 minuten) om is. De login is tegelijk de
+   "is hij al terug?"-proef, en zorgt dat we weer in zijn toegangslijst staan als die
+   de herstart niet overleefde. 4 s + 12 s brengt de eerste poging op ~16 s na de
+   herstart — precies waar de handmatige run op JessaZH raakte (15 s).
+6. `clock` teruglezen, zodat het antwoord de **echte** nieuwe stand draagt en niet
+   onze aanname.
+
+**Het antwoord** is één zin voor een mens, afgeleverd onder `cmd:clockfix`:
+
+```
+OK - niets te doen: klok wijkt 12 s af (11:39 UTC), geen herstart
+OK - klok gezet: 11:22 UTC (was 11:05, liep 1040 s achter, geen herstart nodig)
+OK - klok gezet: 11:22 UTC (was 11:39, liep 1040 s voor; clkreboot + 2 pogingen)
+MISLUKT - clkreboot verstuurd maar 'time' niet bevestigd na 15 pogingen; klok staat op mei 2024
+MISLUKT - node weigert achteruit; onze eigen klok staat mogelijk fout
+```
+
+**Geen tweede clkreboot, ooit.** `_cf_reboot_sent` staat maar één keer per job aan, en
+een `backwards`-antwoord ná een clkreboot leidt tot MISLUKT en niet tot een tweede
+herstart. Twee clkreboots achter elkaar is precies hoe je een node op een dak in 2024
+achterlaat. Ook `clkreboot` als **los** commando uit de wachtrij blijft geweigerd: de
+BRICK-zeef in `Poller::paramAllowedFromQueue` staat er nog, dus "iemand zet clkreboot
+in `cli_params`" blijft onmogelijk. Alleen deze job mag hem sturen, en alleen als stap
+4 van het verloop hierboven.
+
+**Geen lead op de epoch.** We sturen de epoch van het verzendmoment, zonder marge voor
+de vluchttijd. Overschatten zou de node opnieuw **vóór** laten lopen, en dat is de
+dure richting (die kost weer een clkreboot); een paar seconden achterlopen is
+onschadelijk en wordt door de gewone `clock sync` van elke app rechtgetrokken.
+
+**Airtime en voorrang.** Deze job kan minuten duren en dat is aanvaard: hij houdt de
+enige sessie bezet, dus een ander pollerverzoek **wacht** — maar de **bewaking** loopt
+door, want alles gebeurt stapsgewijs vanuit `loop()` en er wordt nergens gewacht. De
+job heeft een eigen bovengrens (`RCLI_CF_MAX_MS`, 4 minuten) los van de gewone
+job-cap.
+
+**Zichtbaarheid.** Elke stap gaat serieel het logboek in, en `/poller.json` draagt nu
+`clockfix_ok`, `clockfix_fail` en `clockfix_last` (de laatste uitkomst voluit). De
+GUI-kaart toont "klok N ok/M mislukt" plus die zin. Dit is de handeling waarvan je
+achteraf wilt kunnen zien wat er gebeurde.
+
+**Capability-opgave.** De poll-URL meldt nu `?caps=settings,refresh,clockfix`.
+MeshManager laat de knop alleen verschijnen als die vlag er staat, dus zolang deze
+firmware niet draait verandert er niets aan de site.
+
+**Wat er gebeurt als de node halverwege zélf herstart** (stroomdip, watchdog): de job
+merkt dat als stilte. In stap 1/3/6 eindigt hij met MISLUKT en er is **niets**
+gewijzigd (geen clkreboot verstuurd). Zit hij al in stap 5, dan is een herstart van de
+tegenkant niet te onderscheiden van de herstart die wij zelf uitlokten — en dat hoeft
+ook niet: de herkansingslus blijft gewoon inloggen en `time` sturen tot het lukt.
+Herstart **onze eigen** node halverwege, dan is de job weg (hij leeft alleen in RAM) en
+staat de doelrepeater op mei 2024 tot iemand de knop opnieuw indrukt; dat staat als
+risico in het rapport en is de reden dat `clockfix_last` bewaard blijft tot de
+volgende job.
+
+**Gewijzigde bestanden:** `RepeaterCli.{h,cpp}` (`RCLI_JOB_CLOCKFIX` + `CfStep`,
+`queueClockFix`, `cfBegin`/`cfOnAnswer`/`cfOnTimeout`/`cfFinish`, `parseClock` +
+`civilToEpoch`), `Poller.{h,cpp}` (`cmd:clockfix` eruit filteren, `PEND_CLOCKFIX`,
+`startClockFix`, `noteClockFix`, tellers), `PushTask.cpp` (caps),
+`WebTask.cpp` (`/poller.json`-velden + GUI-kaart), `main_room.cpp` (de klok-uitkomst
+ook aan de Poller melden), `Branding.h` (versie).
+
 ## v2.7.0 — statusverzoeken: "Status nu opvragen" werkt op elke repeater
 
 Alleen de room-server-variant (`env:meshuptime_room`). Additief op v2.6.0; de

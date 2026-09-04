@@ -146,6 +146,15 @@ public:
   int         lastRefreshSeen() const { return _last_refresh_seen; }
   uint32_t    statusOkCount() const   { return _status_ok; }
   uint32_t    statusFailCount() const { return _status_fail; }
+  uint32_t    clockfixOkCount() const   { return _clockfix_ok; }
+  uint32_t    clockfixFailCount() const { return _clockfix_fail; }
+  const char* clockfixLast() const      { return _clockfix_last; }
+
+  /* De uitkomst van een klok-job, doorgegeven door de result-callback in
+   * main_room.cpp: die ziet het antwoord onder "cmd:clockfix" langskomen en meldt
+   * het hier zodat de tellers en /poller.json het weten. Het antwoord gaat langs de
+   * gewone weg naar MeshManager -- deze melding is alleen voor de eigen boekhouding. */
+  void noteClockFix(const char* answer);
   const char* lastNote() const    { return _note; }
 
 private:
@@ -177,7 +186,13 @@ private:
    * eigen LoRa-sessie: een instellingenopvraging (params gevuld) of een
    * statusverzoek (params leeg). Ze delen alles behalve wat er na de login de lucht
    * in gaat. */
-  enum PendKind : uint8_t { PEND_SETTINGS = 0, PEND_STATUS };
+  enum PendKind : uint8_t { PEND_SETTINGS = 0, PEND_STATUS, PEND_CLOCKFIX };
+
+/* DE KLOK-OPDRACHT uit de wachtrij. MeshManager levert hem als settings-parameter
+ * "cmd:clockfix". Dat woord gaat NOOIT naar de repeater -- die kent het niet; het
+ * is puur de sleutel waaronder het antwoord terug moet. We halen hem daarom bij het
+ * ontleden uit de parameterlijst en maken er een eigen job van. */
+#define POLLER_CLOCKFIX_PARAM  "cmd:clockfix"
 
   struct Pending {
     char     prefix[POLLER_PREFIX_MAX];
@@ -193,6 +208,9 @@ private:
   int      _last_refresh_seen;     // statusverzoeken in de laatste poll (nu uitgevoerd)
   uint32_t _status_ok;             // geslaagde statusrondes (metingen gemeld)
   uint32_t _status_fail;           // statusrondes zonder meting (login/stil/onplausibel)
+  uint32_t _clockfix_ok;           // klok-jobs die met "OK - " eindigden
+  uint32_t _clockfix_fail;         // klok-jobs die met "MISLUKT" eindigden
+  char     _clockfix_last[RCLI_ANSWER_MAX];   // de laatste uitkomst, voluit
 
   /* EEN LOPENDE STATUSRONDE MOET OOK ALS ZE MISLUKT GETELD WORDEN, en dat is niet
    * aan RepeaterCli te vragen: die meldt alleen SUCCES (de stats-callback). De
@@ -235,6 +253,9 @@ private:
 
   /* Een statusverzoek starten (of weigeren met een logregel). */
   void startStatus(const Pending& e);
+
+  /* Een klok-rechtzet-job starten (of weigeren met een logregel). */
+  void startClockFix(const Pending& e);
 
   /* Het kop-verzoek uit _pending proberen te starten. Doet niets als RepeaterCli
    * bezig is. Weigert (null + log) bij onbekend wachtwoord of gevaarlijke params. */
