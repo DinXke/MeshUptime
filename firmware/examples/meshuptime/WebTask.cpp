@@ -491,6 +491,10 @@ void web_route_botdiag()      { if (g_self) g_self->handleBotDiag(); }
 void web_route_botadvert()    { if (g_self) g_self->handleBotAdvert(); }
 void web_route_botsendto()    { if (g_self) g_self->handleBotSendto(); }
 void web_route_botpost()      { if (g_self) g_self->handleBotPost(); }
+void web_route_ircjson()      { if (g_self) g_self->handleIrcJson(); }
+void web_route_ircuser()      { if (g_self) g_self->handleIrcUser(); }
+void web_route_irckey()       { if (g_self) g_self->handleIrcKey(); }
+void web_route_ircname()      { if (g_self) g_self->handleIrcName(); }
 void web_route_channelsjson() { if (g_self) g_self->handleChannelsJson(); }
 void web_route_channeladd()   { if (g_self) g_self->handleChannelAdd(); }
 void web_route_channeldel()   { if (g_self) g_self->handleChannelDel(); }
@@ -992,6 +996,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button id="tabsnodes" data-p="5" hidden>sensor-nodes</button>
 <button id="tabbot" data-p="6" hidden>bot</button>
 <button id="tabcomp" data-p="7" hidden>companions</button>
+<button id="tabirc" data-p="8" hidden>irc</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -2168,6 +2173,63 @@ browser internet heeft; zonder internet valt dit terug op <code>lat,lon</code> a
 tekst met een OpenStreetMap-link per companion.</p>
 </section>
 
+<section id="p8" hidden>
+<h2>IRC-server &mdash; klassieke chatclients op het mesh</h2>
+<p class="why"><b>Wat dit is:</b> een gewone IRC-client (HexChat, irssi, WeeChat,
+mIRC) verbindt met deze node en praat daarna op het mesh. Een <b>IRC-gebruiker</b>
+is hier &eacute;&eacute;n ding: een <b>bot-slot</b> (de MeshCore-identiteit met een
+eigen sleutelpaar) plus een <b>account</b> (nick&nbsp;+&nbsp;wachtwoord) dat er
+permanent aan vastzit. Ze worden hieronder samen gemaakt en samen gewist &mdash;
+los van elkaar zijn ze allebei onbruikbaar. De service-bots (alert, MGMT) staan op
+de <b>bot</b>-tab en horen bij geen account.</p>
+<div id="ircstat" class="card"></div>
+
+<h2>Gebruikers</h2>
+<div class="card pad0"><table id="ircul"></table></div>
+<div class="frow" style="margin-top:.4rem">
+<input id="irc-nick" placeholder="nick" maxlength="20" spellcheck="false" style="flex:1;min-width:7rem">
+<input id="irc-pass" type="password" placeholder="wachtwoord (min. 6)" maxlength="39" style="flex:1;min-width:9rem">
+<input id="irc-bot" placeholder="botnaam (leeg = IRC-&lt;nick&gt;)" maxlength="23" spellcheck="false" style="flex:1;min-width:9rem">
+<button type="button" id="irc-add">+ gebruiker</button></div>
+<div id="ircmsg"></div>
+<p class="note">Een nieuwe gebruiker krijgt een <b>vers sleutelpaar</b> en adverteert
+meteen. <b>wis</b> haalt het account weg en laat de identiteit staan;
+<b>wis+identiteit</b> gooit ook het sleutelpaar weg &mdash; dan bereiken de contacten
+van die gebruiker niemand meer, en dat is onomkeerbaar.</p>
+
+<h2>App-config importeren</h2>
+<p class="why"><b>Waarvoor:</b> met de configexport van de MeshCore-app wordt een
+IRC-gebruiker <b>dezelfde identiteit</b> als op je telefoon &mdash; je bestaande
+contacten bereiken je zonder iets toe te voegen. Het bestand wordt <b>in je browser</b>
+gelezen, niet ge&uuml;pload: met 350 contacten is het ~126&nbsp;kB en dat past niet in
+het geheugen van deze webserver. De pagina stuurt alleen wat de node kan gebruiken.</p>
+<div class="card">
+<input type="file" id="irc-file" accept=".json,application/json">
+<div id="irc-prev" style="margin-top:.5rem"></div>
+</div>
+<p class="note"><b>Wat NIET meegaat:</b> de radio-instellingen (die zouden deze node
+van het mesh af zetten) en je positie. <b>Wat wel:</b> naam, sleutelpaar, de
+aangevinkte kanalen en de contacten als naamtabel.</p>
+<p class="note" style="border-left:3px solid var(--x,#c33);padding-left:.6rem">
+<b>Lees dit voor je de sleutel meestuurt.</b> Deze pagina is HTTP <b>zonder TLS</b>.
+Je private key gaat leesbaar over je netwerk, en daarna staat hij op de node: wie de
+node of deze pagina beheert kan jou vanaf dat moment <b>permanent nadoen</b>, ook als
+je nooit meer inlogt &mdash; MeshCore kent geen revocation. En dezelfde sleutel staat
+dan op twee apparaten die allebei adverteren, waardoor de routecache van repeaters
+gaat klappen; zet je telefoon-identiteit dus stil, of laat de sleutel hier weg en
+gebruik de sleutel die de node zelf maakte. Wil je dit niet over het web, doe het dan
+over de seri&euml;le console met <code>irc key set</code>.</p>
+
+<h2>Naamtabel &mdash; wie <code>/msg &lt;naam&gt;</code> kan bereiken</h2>
+<p class="why">Een node-brede tabel <b>naam &rarr; pubkey</b>, gevuld uit elke import.
+Hij bestaat zodat <code>/msg Lutterade</code> ook werkt voor nodes die deze node zelf
+nooit heeft horen adverteren. Node-breed en niet per gebruiker: een pubkey is geen
+persoonlijk bezit, en per gebruiker zou 350 contacten &times; 8 accounts betekenen.
+Vol &rarr; de oudste eruit.</p>
+<div id="ircnames" class="card"></div>
+<div class="quick"><button type="button" id="irc-names-clear">naamtabel wissen</button></div>
+</section>
+
 <!-- QR-generator: qrcode-generator van Kazuhiko Arase (MIT), getrimd tot de
      encoder-kern en geminifieerd. Client-side, geen externe asset, geen C-lib in de
      flash. De matrix is byte-identiek geverifieerd t.o.v. de volledige lib. -->
@@ -2906,12 +2968,13 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=7;k++){document.getElementById("p"+k).hidden=(""+k)!=p}
+for(var k=1;k<=8;k++){var pk=document.getElementById("p"+k);if(pk)pk.hidden=(""+k)!=p}
 if(p=="3"){cfg()}
 if(p=="4"){roomsLoad();refreshPickers()}
 if(p=="5"){snodesLoad();refreshPickers()}
 if(p=="6"){botLoad()}
-if(p=="7"){companionsLoad()}}}
+if(p=="7"){companionsLoad()}
+if(p=="8"){ircLoad()}}}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -3633,7 +3696,8 @@ function roomsProbe(){roomsGet().then(function(d){
 var t=document.getElementById("tabrooms");if(t)t.hidden=!(d&&d.max>0);
 var ts=document.getElementById("tabsnodes");if(ts)ts.hidden=!(d&&d.snode_max>0);
 var tb=document.getElementById("tabbot");if(tb)tb.hidden=!(d&&d.max>0);
-var tc=document.getElementById("tabcomp");if(tc)tc.hidden=!(d&&d.max>0)})
+var tc=document.getElementById("tabcomp");if(tc)tc.hidden=!(d&&d.max>0);
+ircProbe()})
 .catch(function(){})}
 
 function roomsLoad(){roomsGet().then(function(d){
@@ -3897,6 +3961,132 @@ var BOT=null;
    niet-alert-bot (companion-MANAGEMENT); ALERTBOT = index van de alert-bot. */
 var BOTSEL="",MGMTBOT="",ALERTBOT=0;
 function botSelQ(pre){return (BOTSEL!==""?pre+"bot="+encodeURIComponent(BOTSEL):"")}
+/* ---- IRC-tab -------------------------------------------------------------
+   De import wordt HIER geparsed en niet op de node: een app-config met 350
+   contacten is ~126 kB, en de synchrone webserver houdt een POST-body in RAM.
+   De browser stuurt alleen wat de node kan opslaan; radio-instellingen en
+   positie uit dat bestand blijven waar ze zijn. */
+var IRCIMP=null;
+function ircBind(){if(!document.getElementById("irc-add"))return;
+document.getElementById("irc-add").onclick=ircAdd;
+document.getElementById("irc-names-clear").onclick=ircNamesClear;
+document.getElementById("irc-file").onchange=ircFile;
+}
+function ircGet(){return fetch("irc.json",{credentials:"include"})
+.then(function(r){if(r.status==401){location="/login";throw 0}
+if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
+function ircProbe(){ircGet().then(function(d){
+var t=document.getElementById("tabirc");if(t)t.hidden=!d}).catch(function(){})}
+function ircLoad(){return ircGet().then(function(d){if(!d)return;
+var st=document.getElementById("ircstat");
+st.innerHTML="<div class=row><b>poort "+d.port+"</b><span>"+d.sessions+
+" sessie(s) &middot; "+(d.users?d.users.length:0)+" van "+d.max+" slots &middot; "+
+d.names+" van "+d.names_max+" namen</span></div>";
+var e=document.getElementById("ircul");e.innerHTML="";
+var h=e.insertRow();["nick","identiteit","pubkey",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+(d.users||[]).forEach(function(u){var r=e.insertRow();
+var c=r.insertCell();c.textContent=u.nick+(u.online?" ●":"");
+if(u.online)c.title="nu ingelogd";
+c=r.insertCell();c.textContent=u.botname;
+c=r.insertCell();c.className="key";c.textContent=u.pub.slice(0,8)+"…"+u.pub.slice(-4);
+c=r.insertCell();c.className="acts";
+var mk=function(l,f){var x=document.createElement("button");x.textContent=l;x.onclick=f;x.style.marginLeft=".2rem";return x};
+c.appendChild(mk("wachtwoord",function(){ircPass(u.nick)}));
+c.appendChild(mk("wis",function(){ircDel(u.nick,0)}));
+c.appendChild(mk("wis+identiteit",function(){ircDel(u.nick,1)}))});
+if(!(d.users||[]).length){var r=e.insertRow();var c=r.insertCell();c.colSpan=4;
+c.textContent="(nog geen IRC-gebruikers)";c.style.color="var(--muted)"}
+document.getElementById("ircnames").textContent=d.names+" namen bekend, ruimte voor "+d.names_max+".";
+}).catch(function(){bmsg("ircmsg","kon IRC-status niet laden",0)})}
+function ircPost(url,body,okmsg){return fetch(url,{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+.then(function(r){return r.json()}).then(function(j){
+if(okmsg)bmsg("ircmsg",j.ok?okmsg:("mislukt: "+(j.error||"")),j.ok?1:0);
+if(j.ok)ircLoad();return j})}
+function ircAdd(){var n=document.getElementById("irc-nick").value.trim();
+var p=document.getElementById("irc-pass").value;
+var b=document.getElementById("irc-bot").value.trim();
+if(!n||p.length<6){bmsg("ircmsg","nick en een wachtwoord van minstens 6 tekens",0);return}
+ircPost("irc/user","nick="+encodeURIComponent(n)+"&pass="+encodeURIComponent(p)+
+"&bot="+encodeURIComponent(b),"gebruiker toegevoegd").then(function(j){
+if(j.ok){document.getElementById("irc-nick").value="";
+document.getElementById("irc-pass").value="";document.getElementById("irc-bot").value=""}})}
+function ircPass(nick){var p=prompt("Nieuw wachtwoord voor "+nick+" (min. 6):");
+if(p===null)return;if(p.length<6){bmsg("ircmsg","minstens 6 tekens",0);return}
+ircPost("irc/user","mode=pass&nick="+encodeURIComponent(nick)+"&pass="+encodeURIComponent(p),"wachtwoord gewijzigd")}
+function ircDel(nick,drop){
+var q=drop?("Ook de IDENTITEIT van "+nick+" wissen? Het sleutelpaar gaat weg en de contacten van die gebruiker bereiken niemand meer. Dit kan niet terug.\n\nTyp de nick om te bevestigen:")
+:("Account "+nick+" wissen? De identiteit (het bot-slot) blijft staan.\n\nTyp de nick om te bevestigen:");
+var a=prompt(q);if(a===null)return;
+if(a.trim()!==nick){bmsg("ircmsg","niet bevestigd",0);return}
+ircPost("irc/user","del="+encodeURIComponent(nick)+"&drop="+(drop?1:0),drop?"gebruiker en identiteit gewist":"account gewist")}
+function ircNamesClear(){if(!confirm("De hele naamtabel wissen?"))return;
+ircPost("irc/name","clear=1","naamtabel gewist")}
+
+/* Het bestand lezen en tonen wat we ermee kunnen. Niets verlaat de browser tot
+   je op importeren klikt. */
+function ircFile(ev){var f=ev.target.files&&ev.target.files[0];if(!f)return;
+var rd=new FileReader();rd.onload=function(){var d;
+try{d=JSON.parse(rd.result)}catch(e){document.getElementById("irc-prev").innerHTML=
+"<span class=x>dit is geen leesbare JSON-configexport</span>";return}
+if(!d.public_key||!d.private_key){document.getElementById("irc-prev").innerHTML=
+"<span class=x>geen sleutelpaar in dit bestand &mdash; is dit een app-configexport?</span>";return}
+IRCIMP=d;
+/* De app zet soms een vlag-emoji voor de naam; die past niet in een botnaam van
+   24 byte en levert in IRC een onleesbare nick op. */
+var nm=String(d.name||"").replace(/[^ -~]/g,"").trim().slice(0,23);
+var ch=d.channels||[],ct=d.contacts||[];
+var esc=function(t){return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")};
+var h="<div class=row><b>"+esc(nm)+"</b><span class=key>"+esc(d.public_key.slice(0,8))+"…"+esc(d.public_key.slice(-4))+"</span></div>";
+h+="<p class=note>"+ch.length+" kanalen, "+ct.length+" contacten in dit bestand.</p>";
+h+="<label><input type=checkbox id=imp-key> <b>sleutelpaar overnemen</b> (lees de waarschuwing hieronder)</label><br>";
+h+="<label><input type=checkbox id=imp-names checked> contacten als naamtabel (hoogstens de eerste 64)</label>";
+h+="<p class=note style=margin-top:.5rem>Kanalen om over te nemen:</p>";
+ch.forEach(function(c,i){if(!c.secret)return;
+h+="<label style=display:block><input type=checkbox class=impch data-i="+i+"> "+esc(c.name)+"</label>"});
+h+="<div class=frow style=margin-top:.5rem><input id=imp-nick placeholder='nick voor deze gebruiker' maxlength=20 style=flex:1>"+
+"<input id=imp-pass type=password placeholder='wachtwoord (min. 6)' maxlength=39 style=flex:1>"+
+"<button type=button id=imp-go>importeren</button></div><div id=impmsg></div>";
+document.getElementById("irc-prev").innerHTML=h;
+document.getElementById("imp-go").onclick=ircImport};
+rd.readAsText(f)}
+
+function ircImport(){var d=IRCIMP;if(!d)return;
+var nick=document.getElementById("imp-nick").value.trim();
+var pw=document.getElementById("imp-pass").value;
+if(!nick||pw.length<6){bmsg("impmsg","nick en een wachtwoord van minstens 6 tekens",0);return}
+var wantkey=document.getElementById("imp-key").checked;
+if(wantkey&&!confirm("Je private key gaat leesbaar over dit netwerk en blijft daarna op de node staan. Wie de node beheert kan jou permanent nadoen. Doorgaan?"))return;
+var nm=String(d.name||"").replace(/[^ -~]/g,"").trim().slice(0,23)||("IRC-"+nick);
+var chans=[];Array.prototype.forEach.call(document.querySelectorAll(".impch:checked"),function(x){
+chans.push(d.channels[parseInt(x.getAttribute("data-i"),10)])});
+var names=document.getElementById("imp-names").checked?(d.contacts||[]).slice(0,64):[];
+bmsg("impmsg","bezig…",1);
+/* Op volgorde en niet parallel: de node is een ESP32 met een synchrone
+   webserver, dus gelijktijdige POSTs komen toch in de rij -- en zo weten we
+   welke stap faalde. */
+ircPost("irc/user","nick="+encodeURIComponent(nick)+"&pass="+encodeURIComponent(pw)+
+"&bot="+encodeURIComponent(nm),null).then(function(j){
+if(!j.ok)throw new Error(j.error||"gebruiker aanmaken mislukt");
+if(!wantkey)return{ok:true};
+return ircPost("irc/key","nick="+encodeURIComponent(nick)+"&prv="+d.private_key+"&pub="+d.public_key,null)
+.then(function(k){if(!k.ok)throw new Error(k.error||"sleutel zetten mislukt");return k})})
+.then(function(){var p=Promise.resolve();
+chans.forEach(function(c){p=p.then(function(){
+return fetch("channel/add",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"name="+encodeURIComponent(String(c.name).slice(0,23))+"&secret="+encodeURIComponent(c.secret)+"&enabled=1"})})});
+names.forEach(function(c){if(!c.public_key||!c.name)return;p=p.then(function(){
+return fetch("irc/name",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"key="+encodeURIComponent(c.public_key)+"&name="+encodeURIComponent(
+String(c.custom_name||c.name).replace(/[^ -~]/g,"").slice(0,19))})})});
+return p})
+.then(function(){bmsg("impmsg","import klaar",1);IRCIMP=null;
+document.getElementById("irc-file").value="";document.getElementById("irc-prev").innerHTML="";ircLoad()})
+.catch(function(e){bmsg("impmsg","mislukt: "+(e.message||e),0);ircLoad()})}
+
 function botGet(){var q=BOTSEL!==""?("?bot="+encodeURIComponent(BOTSEL)):"";
 return fetch("bot.json"+q,{credentials:"include"})
 .then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
@@ -3991,6 +4181,7 @@ bmsg("botmsg",j.ok?("bot-advert verstuurd ("+(flood?"flood":"zero-hop")+")"):"mi
 .catch(function(){bmsg("botmsg","mislukt",0)})}
 document.getElementById("bot-add").onclick=botAdd;
 document.getElementById("bot-new").onclick=botNew;
+ircBind();
 
 /* ---- zend-diagnose: vinkjes, URL-modus en het live ruimte-tellertje ---- */
 var DFIT=[0,0,0],DURLMAX=0;
@@ -4583,6 +4774,12 @@ void WebTask::routes() {
   _server->on("/bot/post", HTTP_POST, web_route_botpost);
   _server->on("/bot/diag", HTTP_POST, web_route_botdiag);
   _server->on("/channels.json", HTTP_GET, web_route_channelsjson);
+  /* IRC-server (v2.9.0). De import wordt in de browser geparsed; deze routes
+   * krijgen alleen de brokjes die de node kan opslaan. */
+  _server->on("/irc.json", HTTP_GET, web_route_ircjson);
+  _server->on("/irc/user", HTTP_POST, web_route_ircuser);
+  _server->on("/irc/key", HTTP_POST, web_route_irckey);
+  _server->on("/irc/name", HTTP_POST, web_route_ircname);
   _server->on("/channel/add", HTTP_POST, web_route_channeladd);
   _server->on("/channel/del", HTTP_POST, web_route_channeldel);
   _server->on("/channel/toggle", HTTP_POST, web_route_channeltoggle);
@@ -6617,6 +6814,140 @@ void WebTask::handleChannelsJson() {
   _server->send(200, "application/json", g_json);
 }
 
+/* ------------------------------------------------------------------------ */
+/*  IRC-server (v2.9.0)                                                       */
+/* ------------------------------------------------------------------------ */
+
+bool WebTask::ircAvailable() {
+  if (_acl == nullptr) { _server->send(503, "text/plain", "meshlaag niet gekoppeld"); return false; }
+  if (!_acl->webIrcAvailable()) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"deze build heeft geen IRC-server\"}");
+    return false;
+  }
+  return true;
+}
+
+/* GET /irc.json -- status + accounts + naamtabel-teller. */
+void WebTask::handleIrcJson() {
+  if (!requireAuth()) return;
+  if (!ircAvailable()) return;
+
+  int n = snprintf(g_json, sizeof(g_json),
+      "{\"port\":%d,\"sessions\":%d,\"max\":%d,\"names\":%d,\"names_max\":%d,\"users\":[",
+      _acl->webIrcPort(), _acl->webIrcSessions(), _acl->webIrcAcctMax(),
+      _acl->webNameCount(), _acl->webNameMax());
+  bool first = true;
+  for (int i = 0; i < _acl->webIrcAcctMax(); i++) {
+    char nick[24] = {0}, bname[24] = {0}, pub[PUB_KEY_SIZE * 2 + 1] = {0};
+    int bot = -1; bool online = false;
+    if (!_acl->webIrcAcctGet(i, nick, sizeof(nick), &bot, bname, sizeof(bname),
+                             pub, sizeof(pub), &online)) continue;
+    if ((size_t)n > sizeof(g_json) - 220) break;
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+        "%s{\"nick\":\"%s\",\"bot\":%d,\"botname\":\"%s\",\"pub\":\"%s\",\"online\":%s}",
+        first ? "" : ",", nick, bot, bname, pub, online ? "true" : "false");
+    first = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /irc/user -- add (nick,pass[,bot]) | pass (nick,pass) | del (del=nick[,drop=1]) */
+void WebTask::handleIrcUser() {
+  if (!requireAuth()) return;
+  if (!ircAvailable()) return;
+
+  char nick[24], pw[40], bot[24], drop[4];
+  if (getArg(*_server, "del", nick, sizeof(nick)) && nick[0]) {
+    if (!getArg(*_server, "drop", drop, sizeof(drop))) drop[0] = 0;
+    int r = _acl->webIrcUserDel(nick, drop[0] == '1' ? 1 : 0);
+    if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"onbekende nick\"}");
+    return;
+  }
+  if (!getArg(*_server, "nick", nick, sizeof(nick)) || nick[0] == 0 ||
+      !getArg(*_server, "pass", pw, sizeof(pw)) || pw[0] == 0) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"nick en wachtwoord nodig\"}");
+    return;
+  }
+  char mode[8];
+  if (getArg(*_server, "mode", mode, sizeof(mode)) && strcmp(mode, "pass") == 0) {
+    int r = _acl->webIrcUserPass(nick, pw);
+    if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"onbekende nick of wachtwoord korter dan 6\"}");
+    return;
+  }
+  if (!getArg(*_server, "bot", bot, sizeof(bot))) bot[0] = 0;
+  int r = _acl->webIrcUserAdd(nick, pw, bot);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  const char* err = r == -1 ? "geen vrij bot-slot (MAX_BOTS bereikt)"
+                  : r == -3 ? "die nick bestaat al"
+                            : "ongeldige nick of wachtwoord korter dan 6 tekens";
+  char out[160];
+  snprintf(out, sizeof(out), "{\"ok\":false,\"error\":\"%s\"}", err);
+  _server->send(400, "application/json", out);
+}
+
+/* POST /irc/key -- BYOK. De private sleutel gaat hier over HTTP zonder TLS; dat is
+ * dezelfde afweging als bij /rooms/backup, dat de room-sleutels al zo uitlevert.
+ * De pagina waarschuwt ervoor en vraagt een aparte bevestiging. */
+void WebTask::handleIrcKey() {
+  if (!requireAuth()) return;
+  if (!ircAvailable()) return;
+
+  char nick[24], prv[PRV_KEY_SIZE * 2 + 1], pub[PUB_KEY_SIZE * 2 + 1];
+  if (!getArg(*_server, "nick", nick, sizeof(nick)) || nick[0] == 0 ||
+      !getArg(*_server, "prv", prv, sizeof(prv)) ||
+      !getArg(*_server, "pub", pub, sizeof(pub))) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"nick, prv en pub nodig\"}");
+    return;
+  }
+  if (strlen(prv) != PRV_KEY_SIZE * 2 || strlen(pub) != PUB_KEY_SIZE * 2) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"sleutellengte klopt niet (128 en 64 hex)\"}");
+    return;
+  }
+  /* Dezelfde keuring als 'irc key set' op de CLI -- een gedeelde functie, geen
+   * tweede schrijfpad. */
+  int r = _acl->webIrcKeySet(nick, prv, pub);
+  if (r == 0 || r == -4) {
+    _server->send(200, "application/json",
+        r == -4 ? "{\"ok\":true,\"msg\":\"ongewijzigd\"}"
+                : "{\"ok\":true,\"msg\":\"sleutel gezet; advert de lucht in\"}");
+    return;
+  }
+  _server->send(400, "application/json",
+      r == -2 ? "{\"ok\":false,\"error\":\"onbekende nick\"}"
+              : "{\"ok\":false,\"error\":\"sleutellengte klopt niet\"}");
+}
+
+/* POST /irc/name -- een ingang in de gedeelde naamtabel, of clear=1. De browser
+ * post de geimporteerde contacten in brokjes; per aanroep een. */
+void WebTask::handleIrcName() {
+  if (!requireAuth()) return;
+  if (!ircAvailable()) return;
+
+  char clr[4];
+  if (getArg(*_server, "clear", clr, sizeof(clr)) && clr[0] == '1') {
+    _acl->webNameClear();
+    _server->send(200, "application/json", "{\"ok\":true}");
+    return;
+  }
+  char key[PUB_KEY_SIZE * 2 + 1], name[24];
+  if (!getArg(*_server, "key", key, sizeof(key)) || strlen(key) != PUB_KEY_SIZE * 2 ||
+      !getArg(*_server, "name", name, sizeof(name)) || name[0] == 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"key (64 hex) en name nodig\"}");
+    return;
+  }
+  int r = _acl->webNameAdd(key, name);
+  if (r == 0) { _server->send(200, "application/json", "{\"ok\":true}"); return; }
+  _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige pubkey\"}");
+}
+
 /* POST /channel/add  (name, secret [leeg=hashtag/afgeleid, of 32/64 hex], enabled=0|1)
  * Zoals de MeshCore-app: geen secret -> HASHTAG-kanaal, sleutel = sha256(naam)[:16].
  * Het antwoord meldt of de sleutel is afgeleid + de kanaal-hash, zodat de GUI kan
@@ -7290,20 +7621,6 @@ void WebTask::handleCli() {
     return;
   }
 
-  /* v2.9.0: 'irc key set <bot> <prv> <pub>' draagt een private sleutel zonder dat
-   * "prv.key" erin staat, dus de zeef hierboven ziet hem niet. Zelfde bezwaar en
-   * dus dezelfde weigering: deze pagina is HTTP zonder TLS. Het verschil is alleen
-   * WIENS identiteit eraan gaat -- die van de gebruiker die zijn telefoonsleutel
-   * meebrengt, en die kan de meelezer daarna permanent nadoen (MeshCore kent geen
-   * revocation). De rest van 'irc ...' (account aanmaken, wachtwoord, verwijderen)
-   * mag hier wel: daar zit geen sleutel in. */
-  if (cmdIs(cmd, "irc key ")) {
-    _server->send(403, "text/plain",
-        "geweigerd: 'irc key set' draagt een prive sleutel, en deze pagina is "
-        "HTTP zonder TLS. Wie hem meeleest kan die gebruiker voortaan nadoen. "
-        "Doe dit over de seriele console.\n");
-    return;
-  }
   if (cmdIs(cmd, "start ota")) {
     _server->send(403, "text/plain",
         "geweigerd: 'start ota' opent een eigen accesspoint en een TWEEDE "
@@ -7531,15 +7848,6 @@ void WebTask::handleCliRemote() {
     return;
   }
 
-  /* v2.9.0: en dezelfde weigering voor de sleutel van een IRC-gebruiker op een
-   * ANDERE node -- zelfde pad, zelfde onversleutelde HTTP, en de push naar
-   * MeshManager erachteraan. */
-  if (cmdIs(cmd, "irc key ")) {
-    _server->send(403, "text/plain",
-        "geweigerd: 'irc key set' op afstand draagt een prive sleutel over "
-        "onversleuteld HTTP. Doe dit op de seriele console van die node.\n");
-    return;
-  }
   if (cmdIs(cmd, "start ota")) {
     _server->send(403, "text/plain",
         "geweigerd: 'start ota' op afstand. De doelnode opent dan een eigen "

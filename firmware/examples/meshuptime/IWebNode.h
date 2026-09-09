@@ -222,6 +222,62 @@ public:
   /* Verwijderen op prefix (>= 12 hex). 1 ok, <0 fout. */
   virtual int  webCompanionDel(const char* prefix_hex) { (void)prefix_hex; return -1; }
 
+  /* ---- IRC-SERVER (web-GUI, v2.9.0) -----------------------------------------
+   * De IRC-tab beheert IRC-GEBRUIKERS, en dat is bewust een samengesteld ding:
+   * een bot-slot (de MeshCore-identiteit met haar eigen sleutelpaar) plus een
+   * account (nick + wachtwoord) dat er permanent aan vastzit. Ze worden hier in
+   * EEN handeling gemaakt en gewist, want los van elkaar zijn ze allebei
+   * onbruikbaar: een slot zonder account kan niemand gebruiken, en een account
+   * zonder slot kan de server niet toewijzen.
+   *
+   * De service-bots (alert, MGMT) blijven op de bot-tab: die horen bij geen
+   * account en de IRC-tab laat ze dan ook niet zien.
+   *
+   * WAT HIER NIET KAN: de PRIVATE SLEUTEL zetten (BYOK). Deze pagina is HTTP
+   * zonder TLS; zie de weigering in handleCli(). Dat gaat over de seriele
+   * console, met 'irc key set'. Alleen RoomMesh implementeert dit. */
+  virtual bool webIrcAvailable()  { return false; }   // false = geen IRC-server in deze build
+  virtual int  webIrcPort()       { return 0; }
+  virtual int  webIrcSessions()   { return 0; }       // open IRC-verbindingen nu
+  virtual int  webIrcAcctMax()    { return 0; }       // == aantal bot-slots
+  virtual int  webIrcAcctCount()  { return 0; }
+  /* Leest account i (0..webIrcAcctMax()-1; niet elke index is bezet): nick, het
+   * bot-slot, de botnaam, de pubkey (64 hex) en of er nu iemand op ingelogd is. */
+  virtual bool webIrcAcctGet(int i, char* nick, size_t nick_len, int* bot,
+                             char* botname, size_t botname_len,
+                             char* pub64, size_t pub_len, bool* online)
+                             { (void)i; (void)nick; (void)nick_len; (void)bot;
+                               (void)botname; (void)botname_len; (void)pub64;
+                               (void)pub_len; (void)online; return false; }
+  /* Nieuwe IRC-gebruiker: maakt het bot-slot (vers sleutelpaar) EN het account.
+   * Mislukt het account, dan wordt het zojuist gemaakte slot weer opgeruimd --
+   * anders blijft er een identiteit achter die niemand kan gebruiken.
+   * 0 ok, -1 geen vrij bot-slot, -2 ongeldige nick/wachtwoord, -3 nick bestaat al. */
+  virtual int  webIrcUserAdd(const char* nick, const char* password, const char* botname)
+                             { (void)nick; (void)password; (void)botname; return -1; }
+  virtual int  webIrcUserPass(const char* nick, const char* password)
+                             { (void)nick; (void)password; return -1; }
+  /* Wist het account. drop_identity=1 wist ook het bot-slot; dat is onomkeerbaar
+   * voor de contacten van die gebruiker en vraagt daarom een aparte bevestiging. */
+  /* De gedeelde naamtabel (naam -> pubkey), gevuld uit een geimporteerde
+   * app-config. Node-breed, niet per gebruiker: een pubkey is geen persoonlijk
+   * bezit en hij bestaat alleen om '/msg <naam>' te laten werken voor nodes die
+   * deze node zelf nooit hoorde adverteren. */
+  virtual int  webNameCount() { return 0; }
+  virtual int  webNameMax()   { return 0; }
+  virtual int  webNameAdd(const char* pub_hex, const char* name)
+                             { (void)pub_hex; (void)name; return -1; }
+  virtual int  webNameClear() { return -1; }
+
+  /* BYOK: het sleutelpaar van een gebruiker op zijn bot-slot leggen. De private
+   * sleutel gaat hier over HTTP zonder TLS -- dezelfde afweging als /rooms/backup,
+   * dat de room-sleutels al zo uitlevert. De pagina waarschuwt en laat bevestigen.
+   * 0 ok, -2 onbekende nick, -3 sleutellengte, -4 ongewijzigd. */
+  virtual int  webIrcKeySet(const char* nick, const char* prv_hex, const char* pub_hex)
+                             { (void)nick; (void)prv_hex; (void)pub_hex; return -1; }
+  virtual int  webIrcUserDel(const char* nick, int drop_identity)
+                             { (void)nick; (void)drop_identity; return -1; }
+
   /* ---- INKOMENDE-BERICHTEN-INBOX --------------------------------------------
    * Alle inkomende companion-DM's (commando-antwoorden, #LOC-rapporten, enz.) in
    * een ringbuffer, zodat ze in de node-GUI (/messages.json) en in MeshManager te

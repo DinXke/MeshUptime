@@ -292,6 +292,7 @@ private:
   bool roomsAvailable();
   bool botAvailable();
   bool channelsAvailable();
+  bool ircAvailable();
 
   /* VIRTUELE SENSOR-NODES. Symmetrisch met /room/add|edit|del; de lijst zit in
    * /rooms.json (aparte "snodes"-array), backup/restore loopt mee met /rooms/*. */
@@ -337,6 +338,24 @@ private:
   /* De `bot=`-selector (idx of naam) uit de request oplossen naar een slot; leeg
    * -> de alert-bot. -1 als onbekend (dan stuurt de aanroeper zelf een 400). */
   int  botArgIndex();
+
+  /* IRC-SERVER (v2.9.0). De tab beheert IRC-GEBRUIKERS: bot-slot + account in een
+   * handeling. De import van een MeshCore-app-config wordt IN DE BROWSER geparsed
+   * -- zo'n bestand is ~126 kB met 350 contacten en dat past niet in het RAM van de
+   * synchrone webserver. De pagina post alleen wat de node kan gebruiken: de naam,
+   * het sleutelpaar, de aangevinkte kanalen (via het bestaande /channel/add) en de
+   * contacten in brokjes (/irc/name). Radio-instellingen en positie uit dat bestand
+   * blijven in de browser -- die zouden de node van het mesh af zetten.
+   *
+   *  /irc.json    (GET)  : status, accounts, naamtabel-teller
+   *  /irc/user    (POST) : add (nick,pass,bot) | pass | del [+drop=1]
+   *  /irc/key     (POST) : BYOK -- prv+pub op het slot van een gebruiker
+   *  /irc/name    (POST) : naamtabel: key+name, of clear=1
+   */
+  void handleIrcJson();
+  void handleIrcUser();
+  void handleIrcKey();
+  void handleIrcName();
 
   /* Hashtag-/publieke kanalen: /channels.json (GET), /channel/add|del|toggle (POST). */
   void handleChannelsJson();
@@ -414,6 +433,10 @@ private:
   friend void web_route_botsendto();
   friend void web_route_botpost();
   friend void web_route_botdiag();
+  friend void web_route_ircjson();
+  friend void web_route_ircuser();
+  friend void web_route_irckey();
+  friend void web_route_ircname();
   friend void web_route_channelsjson();
   friend void web_route_channeladd();
   friend void web_route_channeldel();

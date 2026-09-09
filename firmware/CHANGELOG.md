@@ -68,6 +68,42 @@ die je in een chatvenster typt staat daarna in je client-log en op elke switch
 onderweg. Wie hem zet, geeft de node bovendien de mogelijkheid hem permanent na te
 doen — MeshCore kent geen revocation.
 
+**De IRC-tab in de webinterface.** Beheert *gebruikers*: bot-slot en account in één
+handeling, met terugdraaien als het account faalt — anders blijft er een verse
+identiteit achter die al geadverteerd heeft en die niemand kan gebruiken. Nieuw:
+`/irc.json`, `/irc/user`, `/irc/key`, `/irc/name`, en `webIrc*`/`webName*` in
+`IWebNode`.
+
+**Import van een MeshCore-app-config, geparsed in de BROWSER.** Zo'n export is
+~126 kB met 350 contacten en past niet in het RAM van de synchrone webserver. De
+pagina leest het bestand lokaal en post alleen wat de node kan opslaan: naam,
+sleutelpaar (als je het aanvinkt), de aangevinkte kanalen en de eerste 64 contacten
+als naamtabel. Radio-instellingen gaan er expliciet **niet** in — die zouden de node
+van het mesh af zetten.
+
+**De gedeelde naamtabel** (`MAX_NAMES` 64, ~3,3 kB) maakt `/msg <naam>` werkend voor
+nodes die deze node zelf nooit hoorde adverteren. Node-breed en niet per gebruiker:
+een pubkey is geen persoonlijk bezit, en per gebruiker zou 350 × 8 betekenen.
+`ircResolveNick()` zet hem bóven de buurtlijst — hij is expliciet aangeleverd,
+terwijl een advert-naam is wat een node over zichzelf beweert.
+
+**Een geëmuleerde ledenlijst.** Een mesh-kanaal heeft geen aanwezigheid, en een leeg
+`/NAMES` leest als "hier is niemand". Wie zendt krijgt een `JOIN`, na 45 min stilte
+een `PART`. Dat is *gehoord*, niet *lidmaatschap*: meelezers verschijnen nooit, een
+verzonnen naam wel, en de `PART` is een gok op stilte.
+
+**Terugspoelen sinds je laatste sessie.** Een ringbuffer van 32 berichten (~6 kB);
+per account de tijd van het laatste uitloggen, en alles daarna komt bij het inloggen
+(DM's) of bij `JOIN` (het kanaal) alsnog binnen, met `[uu:mm]` ervoor. Bovengrens
+12 uur. Puur RAM — een herstart wist hem, dit is geen logserver.
+
+**`irc key set` mag wél over het web.** Eerst geblokkeerd, daarna teruggedraaid:
+`/rooms/backup` levert de room- en snode-sleutels al over dezelfde onversleutelde
+verbinding uit, dus de blokkade was een inconsistentie en geen bescherming. Het
+staat nu achter een expliciete waarschuwing en een bevestiging, met de reden erbij:
+de node kan je daarna permanent nadoen, en twee apparaten die dezelfde pubkey
+adverteren laten de routecache van repeaters klappen.
+
 **Geen TLS**, met opzet: naast mesh, WiFi en de webserver is er geen heap voor
 TLS-sessies, en een halve TLS is erger dan geen. Vertrouwd LAN of VPN; 6667 niet
 open naar het internet.

@@ -123,12 +123,78 @@
 #define IRC_ACCOUNTS_FILE  "/irc_accounts"
 #define IRC_SALT_LEN       8
 
-/* Een account: nick, salt+hash, en het bot-slot dat er permanent bij hoort. */
+/* GEEMULEERDE LEDENLIJST (v2.9.0). Een MeshCore-kanaal HEEFT geen ledenlijst: er
+ * is geen join, geen aanwezigheid, alleen wie toevallig zendt. IRC-clients tonen
+ * een leeg /NAMES dan als een leeg kanaal, en dat leest als "er is hier niemand"
+ * terwijl er een heel mesh meeluistert.
+ *
+ * Daarom onthouden we per kanaal wie we hebben HOREN zenden en presenteren we die
+ * als leden: bij de eerste keer een JOIN naar de kijkende clients, na
+ * IRC_SEEN_TTL_MS stilte een PART. Wat je ziet is dus "recent gehoord", en dat is
+ * iets anders dan lidmaatschap:
+ *
+ *   - wie meeleest maar nooit zendt, verschijnt NOOIT;
+ *   - wie een naam verzint, verschijnt WEL -- een group-pakket draagt geen
+ *     handtekening per afzender, dus de naam is onbewezen tekst;
+ *   - de PART is een gok op stilte, geen vertrek.
+ *
+ * De 366-regel bij /NAMES zegt dat er met zoveel woorden bij. */
+#ifndef IRC_SEEN_PER_CHAN
+  #define IRC_SEEN_PER_CHAN  10
+#endif
+#ifndef IRC_SEEN_TTL_MS
+  #define IRC_SEEN_TTL_MS  (45UL * 60UL * 1000UL)   /* 45 min stilte -> PART */
+#endif
+
+struct IrcSeen {
+  char          nick[IRC_NICK_MAX + 1];
+  unsigned long last;      // millis() van de laatste keer gehoord; 0 = leeg
+};
+
+/* TERUGSPOELEN NA HET INLOGGEN (v2.9.0). Een LoRa-mesh heeft geen geschiedenis:
+ * wie niet verbonden was, heeft het gemist. Voor een IRC-gebruiker is dat vreemd
+ * -- hij logt in en ziet een leeg kanaal terwijl er de hele dag gepraat is.
+ *
+ * Daarom een GEDEELDE ringbuffer van de laatste berichten, kanaalregels en DM's
+ * door elkaar. Je krijgt terug wat er langskwam TERWIJL JE WEG WAS: per account
+ * onthouden we de RTC-tijd van het laatste uitloggen, en alles van na dat moment
+ * komt bij het inloggen (je DM's) of bij JOIN (dat kanaal) alsnog binnen. Wie
+ * nooit eerder inlogde krijgt wat er nog in de ring zit.
+ *
+ * IRC_LOG_TTL_S is de bovengrens daarop: was je een week weg, dan is het geen
+ * gemist gesprek meer maar archief, en daar is deze node de plek niet voor.
+ *
+ * GEDEELD en niet per client: de inhoud is voor iedereen dezelfde, en per client
+ * zou het geheugen met het aantal sessies meegroeien. Puur RAM -- een herstart
+ * wist hem, en dat is eerlijk: dit is een radio met een chatserver erop, geen
+ * logserver. Kosten: IRC_LOG_MAX x ~190 byte, bij 32 dus ~6 kB voor allemaal. */
+#ifndef IRC_LOG_MAX
+  #define IRC_LOG_MAX  32
+#endif
+#ifndef IRC_LOG_TTL_S
+  #define IRC_LOG_TTL_S  (12UL * 3600UL)   /* 12 uur */
+#endif
+
+#define IRC_LOG_DM  (-1)   /* chan-waarde voor een DM */
+
+struct IrcLogEntry {
+  uint32_t ts;                      /* RTC-seconden; 0 = leeg slot */
+  int8_t   chan;                    /* BotChannel-index, of IRC_LOG_DM */
+  int8_t   bot;                     /* bij een DM: voor welk bot-slot */
+  char     nick[IRC_NICK_MAX + 1];
+  char     text[BOT_MAX_TEXT_LEN];
+};
+
+/* Een account: nick, salt+hash, en het bot-slot dat er permanent bij hoort.
+ * last_off is de RTC-tijd van het laatste uitloggen en staat ALLEEN in RAM: hij
+ * hoort bij de ringbuffer, en die overleeft een herstart ook niet. Hem bij elke
+ * logout naar flash schrijven zou een wisbeurt kosten voor niets. */
 struct IrcAccount {
-  char    nick[IRC_NICK_MAX + 1];
-  uint8_t salt[IRC_SALT_LEN];
-  uint8_t hash[32];
-  int8_t  bot;        // bot-slot 0..MAX_BOTS-1; -1 = vrije ingang
+  char     nick[IRC_NICK_MAX + 1];
+  uint8_t  salt[IRC_SALT_LEN];
+  uint8_t  hash[32];
+  int8_t   bot;        // bot-slot 0..MAX_BOTS-1; -1 = vrije ingang
+  uint32_t last_off;   // RTC-s van het laatste uitloggen; 0 = nooit ingelogd
 };
 
 /* Een open sessie. chan_mask is een bit per BotChannel-index, dus MAX_CHANNELS
@@ -178,6 +244,9 @@ public:
   int  acctCount() const;
   bool acctGet(int i, char* nick, size_t nick_len, int* bot) const;
   int  acctFind(const char* nick) const;
+  int  acctFindByBot(int bot) const;              // welk account hoort bij dit slot; -1 = geen
+  bool acctOnline(int i) const;                   // is er nu een sessie op account i
+  int  port() const { return IRC_PORT; }
   /* 0 = ok, -1 = tabel vol, -2 = ongeldige nick/wachtwoord, -3 = nick bestaat al,
    * -4 = bot-slot bestaat niet of is al vergeven. */
   int  acctAdd(const char* nick, const char* password, int bot);
@@ -192,6 +261,12 @@ private:
 
   IrcAccount  _accts[MAX_BOTS];
   IrcClient   _cl[IRC_MAX_CLIENTS];
+
+  IrcLogEntry _log[IRC_LOG_MAX];
+  uint16_t    _log_wr = 0;
+
+  IrcSeen     _seen[MAX_CHANNELS][IRC_SEEN_PER_CHAN];
+  unsigned long _seen_next_sweep = 0;
 
   /* Gedeelde zendemmer over alle clients. */
   uint8_t       _bucket = IRC_BUCKET_MAX;
@@ -221,6 +296,22 @@ private:
   void joinChannel(IrcClient& c, const char* name, const char* key);
   void partChannel(IrcClient& c, const char* name, const char* reason);
   void sendNames(IrcClient& c, int idx);
+
+  /* Ledenlijst per kanaal. seenTouch() zet een JOIN voor wie nieuw is; seenExpire()
+   * draait in loop() en zet de PART voor wie te lang stil was. */
+  void seenTouch(int chan_idx, const char* nick);
+  void seenExpire();
+  void seenBroadcast(int chan_idx, const char* nick, bool joining);
+
+  /* De ringbuffer. logAdd() bewaart, replay*() speelt terug naar een client. */
+  void logAdd(int chan, int bot, const char* nick, const char* text);
+  void replayChannel(IrcClient& c, int chan_idx);
+  void replayDms(IrcClient& c);
+  /* Vanaf welk moment voor deze client, met IRC_LOG_TTL_S als bovengrens. */
+  uint32_t replaySince(const IrcClient& c) const;
+  /* "[14:03] ", of leeg als de klok niet gesynct is -- liever geen tijd dan een
+   * verzonnen tijd uit 2024, de terugvalwaarde van een ESP32 zonder RTC-batterij. */
+  void logStamp(uint32_t ts, char* out, size_t out_len) const;
 
   void doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice);
   bool txAllowed(IrcClient& c, char* why, size_t why_len);

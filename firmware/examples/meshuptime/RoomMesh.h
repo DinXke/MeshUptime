@@ -182,6 +182,21 @@ class IrcTask;
   #define MAX_CHANNELS  8
 #endif
 
+/* GEDEELDE NAAMTABEL (v2.9.0). Naam -> pubkey, gevuld uit de app-config die een
+ * IRC-gebruiker importeert. Waarom node-BREED en niet per gebruiker: hij bestaat
+ * alleen om `/msg <naam>` te laten werken voor nodes die deze node zelf nooit
+ * heeft horen adverteren, en dat antwoord is voor iedereen hetzelfde -- een
+ * pubkey is geen persoonlijk bezit. Per gebruiker zou 350 contacten x 8 accounts
+ * betekenen; dit is een vaste 64 x 52 byte voor allemaal samen.
+ *
+ * Vol = de OUDSTE eruit (ronddraaiende schrijfwijzer). Wie een verse app-config
+ * importeert duwt dus zijn eigen contacten naar voren, en dat is de bedoeling:
+ * de laatst geimporteerde lijst is de meest actuele. */
+#ifndef MAX_NAMES
+  #define MAX_NAMES  64
+#endif
+#define NAME_ENTRY_LEN  20
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -395,6 +410,13 @@ struct BotChannel {
   bool    enabled;                // meelezen/antwoorden aan/uit
   bool    derived;                // true = geen expliciet secret (naam-only add)
   bool    is_public;              // true = de vaste publieke sleutel (het echte Public)
+};
+
+/* Een ingang in de gedeelde naamtabel. */
+struct NameEntry {
+  uint8_t pub_key[PUB_KEY_SIZE];
+  char    name[NAME_ENTRY_LEN];   // afgekapt; genoeg om te typen in /msg
+  bool    used;
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode,
@@ -634,6 +656,23 @@ public:
                  char* text, size_t text_len, uint32_t* ts) override
                 { return compMsgGet(i, pub64, pub_len, name, name_len, text, text_len, ts); }
 
+  /* ---- IWebNode: de IRC-tab (v2.9.0). Doorgeefluik naar IrcTask, plus het
+   * samengestelde aanmaken/wissen dat BEIDE kanten raakt (bot-slot + account) --
+   * en dat kan alleen hier, want IrcTask kent de bot-slots niet. ---- */
+  bool webIrcAvailable() override { return _irc != nullptr; }
+  int  webIrcPort() override;
+  int  webIrcSessions() override;
+  int  webIrcAcctMax() override   { return MAX_BOTS; }
+  int  webIrcAcctCount() override;
+  bool webIrcAcctGet(int i, char* nick, size_t nick_len, int* bot,
+                     char* botname, size_t botname_len,
+                     char* pub64, size_t pub_len, bool* online) override;
+  int  webIrcUserAdd(const char* nick, const char* password, const char* botname) override;
+  int  webIrcUserPass(const char* nick, const char* password) override;
+  int  webIrcUserDel(const char* nick, int drop_identity) override;
+  int  webIrcKeySet(const char* nick, const char* prv_hex, const char* pub_hex) override;
+  int  ircKeySet(int bot, const char* prv_hex, const char* pub_hex);  // gedeeld met de CLI
+
   /* ---- IRC-server (v2.9.0). De vier dingen die IrcTask van de mesh nodig heeft
    * en die er nog niet waren. Bewust GEEN eigen interfaceklasse zoals IWebNode:
    * die bestaat omdat WebTask zowel SensorMesh als RoomMesh bedient, terwijl
@@ -663,6 +702,19 @@ public:
   /* Een regel WHOIS-tekst over een mesh-node: pubkey, laatst gehoord, SNR, hops.
    * false = die node is nooit gehoord. */
   bool ircWhois(const char* nick, char* out, size_t out_len) const;
+
+  /* De gedeelde naamtabel. add() overschrijft een bestaande pubkey en duwt anders
+   * de oudste ingang eruit. 0 = ok, <0 = ongeldig. */
+  int  nameTableAdd(const uint8_t* pubkey, const char* name);
+  int  nameTableCount() const;
+  void nameTableClear();
+  bool nameTableGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len) const;
+
+  /* IWebNode: de naamtabel in de IRC-tab. */
+  int  webNameCount() override { return nameTableCount(); }
+  int  webNameMax() override   { return MAX_NAMES; }
+  int  webNameAdd(const char* pub_hex, const char* name) override;
+  int  webNameClear() override { nameTableClear(); return 0; }
 
   /* ---- Bots: publieke API (CLI + intern). Alle bewerkingen zijn index-adresseerbaar
    * (b = slot 0..MAX_BOTS-1). ---- */
@@ -847,6 +899,11 @@ private:
    * MeshManager terug op de poll van /companions.json). */
   PushTask*     _push = nullptr;
   IrcTask*      _irc  = nullptr;
+  NameEntry     _names[MAX_NAMES];
+  int           _name_wr = 0;        // ronddraaiende schrijfwijzer
+  void          saveNames();
+  void          loadNames();
+  int           nameTableFind(const char* name, uint8_t* pub_out) const;
 
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */

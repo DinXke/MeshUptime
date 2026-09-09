@@ -325,6 +325,7 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   /* Hashtag-/publieke kanalen die de bot meeleest (persistent, /channels.cfg). */
   loadChannels();
+  loadNames();      /* v2.9.0: de gedeelde naamtabel */
 
   /* Companions (v2.4.0): persistente lijst in /companions.cfg. Seed niets. */
   loadCompanions();
@@ -3309,6 +3310,190 @@ int RoomMesh::botSay(int b, int chan_idx, const char* text) {
   return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/*  De gedeelde naamtabel (v2.9.0)                                            */
+/* ------------------------------------------------------------------------ */
+
+int RoomMesh::nameTableFind(const char* name, uint8_t* pub_out) const {
+  if (!name || !name[0]) return -1;
+  for (int i = 0; i < MAX_NAMES; i++) {
+    if (!_names[i].used) continue;
+    if (strcasecmp(_names[i].name, name) != 0) continue;
+    if (pub_out) memcpy(pub_out, _names[i].pub_key, PUB_KEY_SIZE);
+    return i;
+  }
+  return -1;
+}
+
+int RoomMesh::nameTableAdd(const uint8_t* pubkey, const char* name) {
+  if (!pubkey || !name || !name[0]) return -1;
+  /* Zelfde pubkey al bekend -> naam bijwerken. Anders zou een tweede import van
+   * dezelfde lijst de tabel met duplicaten vullen en de rest eruit duwen. */
+  for (int i = 0; i < MAX_NAMES; i++) {
+    if (!_names[i].used || memcmp(_names[i].pub_key, pubkey, PUB_KEY_SIZE) != 0) continue;
+    StrHelper::strncpy(_names[i].name, name, sizeof(_names[i].name));
+    saveNames();
+    return 0;
+  }
+  int idx = -1;
+  for (int i = 0; i < MAX_NAMES; i++) if (!_names[i].used) { idx = i; break; }
+  if (idx < 0) { idx = _name_wr; _name_wr = (_name_wr + 1) % MAX_NAMES; }   // oudste eruit
+  memcpy(_names[idx].pub_key, pubkey, PUB_KEY_SIZE);
+  StrHelper::strncpy(_names[idx].name, name, sizeof(_names[idx].name));
+  _names[idx].used = true;
+  saveNames();
+  return 0;
+}
+
+int RoomMesh::nameTableCount() const {
+  int n = 0;
+  for (int i = 0; i < MAX_NAMES; i++) if (_names[i].used) n++;
+  return n;
+}
+
+void RoomMesh::nameTableClear() {
+  memset(_names, 0, sizeof(_names));
+  _name_wr = 0;
+  saveNames();
+}
+
+bool RoomMesh::nameTableGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len) const {
+  if (i < 0 || i >= MAX_NAMES || !_names[i].used) return false;
+  if (name) StrHelper::strncpy(name, _names[i].name, name_len);
+  if (pub64 && pub_len > PUB_KEY_SIZE * 2) mesh::Utils::toHex(pub64, _names[i].pub_key, PUB_KEY_SIZE);
+  return true;
+}
+
+int RoomMesh::webNameAdd(const char* pub_hex, const char* name) {
+  if (!pub_hex || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -2;
+  uint8_t pub[PUB_KEY_SIZE];
+  if (!mesh::Utils::fromHex(pub, PUB_KEY_SIZE, pub_hex)) return -2;
+  return nameTableAdd(pub, name);
+}
+
+/* Een regel per ingang: "<pubkeyhex> <naam>". Zelfde vorm als de andere kleine
+ * tabellen op deze node -- leesbaar met 'cat' over de seriele console, en een
+ * kapotte regel kost een ingang en niet het bestand. */
+void RoomMesh::saveNames() {
+  if (_fs == NULL) return;
+  File f = _fs->open("/irc_names", "w", true);
+  if (!f) return;
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  for (int i = 0; i < MAX_NAMES; i++) {
+    if (!_names[i].used) continue;
+    mesh::Utils::toHex(hex, _names[i].pub_key, PUB_KEY_SIZE);
+    f.print(hex); f.print(' '); f.println(_names[i].name);
+  }
+  f.close();
+}
+
+void RoomMesh::loadNames() {
+  memset(_names, 0, sizeof(_names));
+  _name_wr = 0;
+  if (_fs == NULL) return;
+  File f = _fs->open("/irc_names", "r");
+  if (!f) return;
+  int n = 0;
+  while (f.available() && n < MAX_NAMES) {
+    String line = f.readStringUntil(10);
+    line.trim();
+    if (line.length() < PUB_KEY_SIZE * 2 + 2) continue;
+    String hex = line.substring(0, PUB_KEY_SIZE * 2);
+    String nm  = line.substring(PUB_KEY_SIZE * 2 + 1);
+    if (!mesh::Utils::fromHex(_names[n].pub_key, PUB_KEY_SIZE, hex.c_str())) continue;
+    StrHelper::strncpy(_names[n].name, nm.c_str(), sizeof(_names[n].name));
+    _names[n].used = true;
+    n++;
+  }
+  f.close();
+}
+
+/* ---- IWebNode: de IRC-tab. ---------------------------------------------- */
+
+int RoomMesh::webIrcPort()     { return _irc ? _irc->port() : 0; }
+int RoomMesh::webIrcSessions() { return _irc ? _irc->numClients() : 0; }
+
+int RoomMesh::webIrcAcctCount() { return _irc ? _irc->acctCount() : 0; }
+
+bool RoomMesh::webIrcAcctGet(int i, char* nick, size_t nick_len, int* bot,
+                             char* botname, size_t botname_len,
+                             char* pub64, size_t pub_len, bool* online) {
+  if (!_irc) return false;
+  int b = -1;
+  if (!_irc->acctGet(i, nick, nick_len, &b)) return false;
+  if (bot) *bot = b;
+  if (botname) StrHelper::strncpy(botname, webBotSlotName(b), botname_len);
+  if (pub64) { pub64[0] = 0; webBotSlotPubHex(b, pub64, pub_len); }
+  if (online) *online = _irc->acctOnline(i);
+  return true;
+}
+
+/* Bot-slot EN account in een handeling. De volgorde is bot-eerst, want zonder
+ * slot heeft het account nergens heen; mislukt het account daarna, dan halen we
+ * het slot weer weg. Anders blijft er een verse identiteit achter die al een
+ * advert de lucht in gestuurd heeft en die niemand kan gebruiken -- en die je op
+ * de bot-tab met de hand zou moeten opruimen zonder te weten waarom hij er staat. */
+int RoomMesh::webIrcUserAdd(const char* nick, const char* password, const char* botname) {
+  if (!_irc) return -1;
+  if (!nick || !nick[0] || !password) return -2;
+  if (_irc->acctFind(nick) >= 0) return -3;
+
+  char nm[24];
+  if (botname && botname[0]) StrHelper::strncpy(nm, botname, sizeof(nm));
+  else snprintf(nm, sizeof(nm), "IRC-%s", nick);
+
+  int b = webBotAdd(nm);
+  if (b < 0) return -1;                       // geen vrij slot
+
+  int rc = _irc->acctAdd(nick, password, b);
+  if (rc != 0) { webBotDel(b); return rc; }   // terugdraaien
+  return 0;
+}
+
+/* Het sleutelpaar van een gebruiker vervangen. Gedeeld door 'irc key set' op de
+ * CLI en /irc/key op de webpagina, zodat er niet twee keuringen ontstaan die uit
+ * elkaar lopen. 0 ok, -3 lengte, -4 ongewijzigd. */
+int RoomMesh::ircKeySet(int bot, const char* prv_hex, const char* pub_hex) {
+  if (bot < 0 || bot >= MAX_BOTS || !_bots[bot].used) return -2;
+  if (!prv_hex || !pub_hex) return -3;
+  if (strlen(prv_hex) != PRV_KEY_SIZE * 2 || strlen(pub_hex) != PUB_KEY_SIZE * 2) return -3;
+  mesh::LocalIdentity id(prv_hex, pub_hex);
+  if (memcmp(id.pub_key, _bots[bot].id.pub_key, PUB_KEY_SIZE) == 0) return -4;
+  _bots[bot].id = id;
+  saveBotIdentity(bot);
+  sendBotAdvertisement(bot, 2000, true);
+  return 0;
+}
+
+int RoomMesh::webIrcKeySet(const char* nick, const char* prv_hex, const char* pub_hex) {
+  if (!_irc || !nick) return -2;
+  int i = _irc->acctFind(nick);
+  if (i < 0) return -2;
+  int bot = -1;
+  char tmp[IRC_NICK_MAX + 1];
+  _irc->acctGet(i, tmp, sizeof(tmp), &bot);
+  return ircKeySet(bot, prv_hex, pub_hex);
+}
+
+int RoomMesh::webIrcUserPass(const char* nick, const char* password) {
+  return _irc ? _irc->acctSetPassword(nick, password) : -1;
+}
+
+int RoomMesh::webIrcUserDel(const char* nick, int drop_identity) {
+  if (!_irc) return -1;
+  int i = _irc->acctFind(nick);
+  if (i < 0) return -2;
+  int bot = -1;
+  char tmp[IRC_NICK_MAX + 1];
+  _irc->acctGet(i, tmp, sizeof(tmp), &bot);
+  int rc = _irc->acctDel(nick);
+  if (rc != 0) return rc;
+  /* Het slot pas NA het account, en alleen op uitdrukkelijk verzoek: de sleutel
+   * gaat dan mee en de contacten van die gebruiker bereiken niemand meer. */
+  if (drop_identity && bot >= 0) webBotDel(bot);
+  return 0;
+}
+
 int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
                              size_t resolved_len) const {
   if (!nick || !nick[0] || !pub_out) return -1;
@@ -3330,7 +3515,19 @@ int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
     return 0;
   }
 
-  /* 3. De buurtlijst. Namen op een mesh zijn NIET uniek: twee nodes mogen dezelfde
+  /* 3. De gedeelde naamtabel uit een geimporteerde app-config. Boven de buurtlijst,
+   *    want dit is EXPLICIET door iemand aangeleverd terwijl een advert-naam is wat
+   *    een node over zichzelf beweert -- en die kan van vandaag op morgen wisselen. */
+  {
+    uint8_t p[PUB_KEY_SIZE];
+    if (nameTableFind(nick, p) >= 0) {
+      memcpy(pub_out, p, PUB_KEY_SIZE);
+      if (resolved) StrHelper::strncpy(resolved, nick, resolved_len);
+      return 0;
+    }
+  }
+
+  /* 4. De buurtlijst. Namen op een mesh zijn NIET uniek: twee nodes mogen dezelfde
    *    naam adverteren. We kiezen de laatst gehoorde en melden de dubbelzinnigheid
    *    terug (retour 1), zodat IrcTask de gebruiker kan waarschuwen in plaats van
    *    stil de verkeerde te kiezen. */
@@ -3958,11 +4155,9 @@ void RoomMesh::handleIrcCommand(char* args, char* reply) {
       sprintf(reply, "ERR sleutellengte: prv %d hex, pub %d hex", PRV_KEY_SIZE * 2, PUB_KEY_SIZE * 2);
       return;
     }
-    mesh::LocalIdentity id(prv, pub);
-    if (memcmp(id.pub_key, _bots[b].id.pub_key, PUB_KEY_SIZE) == 0) { strcpy(reply, "OK (ongewijzigd)"); return; }
-    _bots[b].id = id;
-    saveBotIdentity(b);
-    sendBotAdvertisement(b, 2000, true);
+    int rc = ircKeySet(b, prv, pub);
+    if (rc == -4) { strcpy(reply, "OK (ongewijzigd)"); return; }
+    if (rc != 0)  { sprintf(reply, "ERR code %d", rc); return; }
     sprintf(reply, "OK bot %d draagt nu jouw sleutel; advert de lucht in", b);
     return;
   }

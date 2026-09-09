@@ -81,6 +81,8 @@ void IrcTask::begin(RoomMesh* node, const char* firmware_version) {
     _cl[i].acct = -1; _cl[i].bot = -1; _cl[i].chan_mask = 0;
     _cl[i].ping_sent = false;
   }
+  memset(_seen, 0, sizeof(_seen));
+  memset(_log, 0, sizeof(_log));
   loadAccounts();
 
   _server.begin();
@@ -110,6 +112,10 @@ void IrcTask::loop() {
 
   pollAccept();
   for (int i = 0; i < IRC_MAX_CLIENTS; i++) pollClient(_cl[i]);
+
+  /* De geemuleerde ledenlijst opruimen. Eens per 30 s is ruim genoeg voor een
+   * TTL van drie kwartier, en het houdt loop() goedkoop. */
+  if ((long)(now - _seen_next_sweep) >= 0) { _seen_next_sweep = now + 30000UL; seenExpire(); }
 }
 
 void IrcTask::pollAccept() {
@@ -136,6 +142,11 @@ void IrcTask::pollAccept() {
 }
 
 void IrcTask::closeClient(IrcClient& c, const char* quit_reason) {
+  /* Het moment van weggaan onthouden, zodat de volgende sessie precies vanaf hier
+   * kan terugspoelen. Ook bij een harde disconnect: pollClient() roept ons dan
+   * alsnog aan zodra de socket dood blijkt. */
+  if (c.registered && c.acct >= 0)
+    _accts[c.acct].last_off = _node->getRTCClock()->getCurrentTime();
   if (c.sock.connected()) {
     if (quit_reason && quit_reason[0]) c.sock.printf("ERROR :%s\r\n", quit_reason);
     c.sock.flush();
@@ -297,6 +308,19 @@ int IrcTask::acctFind(const char* nick) const {
   return -1;
 }
 
+int IrcTask::acctFindByBot(int bot) const {
+  if (bot < 0) return -1;
+  for (int i = 0; i < MAX_BOTS; i++)
+    if (_accts[i].bot == bot && _accts[i].nick[0]) return i;
+  return -1;
+}
+
+bool IrcTask::acctOnline(int i) const {
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+    if (_cl[k].registered && _cl[k].acct == i) return true;
+  return false;
+}
+
 int IrcTask::acctAdd(const char* nick, const char* password, int bot) {
   if (!nickValid(nick)) return -2;
   if (!password || strlen(password) < 6) return -2;
@@ -406,6 +430,7 @@ void IrcTask::sendWelcome(IrcClient& c) {
   numeric(c, 376, ":Einde van het bericht van de dag");
 
   notice(c, "Let op: IRC is onversleuteld. Alleen op een vertrouwd netwerk gebruiken.");
+  replayDms(c);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -424,6 +449,121 @@ bool IrcTask::chanIrcName(int idx, char* out, size_t out_len) const {
   return true;
 }
 
+/* ------------------------------------------------------------------------ */
+/*  Terugspoelen                                                              */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::logAdd(int chan, int bot, const char* nick, const char* text) {
+  if (!text || !text[0]) return;
+  uint32_t now = _node->getRTCClock()->getCurrentTime();
+  if (now == 0) now = 1;                 /* 0 betekent "leeg slot" */
+  IrcLogEntry& e = _log[_log_wr];
+  _log_wr = (uint16_t)((_log_wr + 1) % IRC_LOG_MAX);
+  e.ts = now;
+  e.chan = (int8_t)chan;
+  e.bot = (int8_t)bot;
+  StrHelper::strncpy(e.nick, (nick && nick[0]) ? nick : "mesh", sizeof(e.nick));
+  StrHelper::strncpy(e.text, text, sizeof(e.text));
+}
+
+void IrcTask::logStamp(uint32_t ts, char* out, size_t out_len) const {
+  out[0] = 0;
+  /* Onder deze grens staat de klok op de fabriekswaarde en is een tijdstip een
+   * leugen. Zelfde gedachte als TIME_FLOOR, hier lokaal: 1 januari 2025. */
+  if (ts < 1735689600UL) return;
+  time_t t = (time_t)ts;
+  struct tm tmv;
+  if (!localtime_r(&t, &tmv)) return;
+  snprintf(out, out_len, "[%02d:%02d] ", tmv.tm_hour, tmv.tm_min);
+}
+
+uint32_t IrcTask::replaySince(const IrcClient& c) const {
+  uint32_t now = _node->getRTCClock()->getCurrentTime();
+  uint32_t oldest = (now > IRC_LOG_TTL_S) ? (now - IRC_LOG_TTL_S) : 0;
+  uint32_t since = (c.acct >= 0) ? _accts[c.acct].last_off : 0;
+  return since > oldest ? since : oldest;
+}
+
+/* De ring op volgorde van schrijven aflopen: begin bij de plek waar we hierna
+ * zouden schrijven (de oudste) en loop rond. Zo komt het gesprek in de juiste
+ * volgorde binnen en niet omgekeerd. */
+void IrcTask::replayChannel(IrcClient& c, int chan_idx) {
+  char cname[28];
+  if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
+  uint32_t since = replaySince(c);
+  int n = 0;
+  for (int k = 0; k < IRC_LOG_MAX; k++) {
+    const IrcLogEntry& e = _log[(_log_wr + k) % IRC_LOG_MAX];
+    if (e.ts == 0 || e.chan != chan_idx || e.ts <= since) continue;
+    if (n == 0)
+      raw(c, ":%s NOTICE %s :--- gemist sinds je laatste sessie ---",
+          _node->getNodeName(), cname);
+    char st[12]; logStamp(e.ts, st, sizeof(st));
+    raw(c, ":%s!%s PRIVMSG %s :%s%s", e.nick, IRC_MESH_USERHOST, cname, st, e.text);
+    n++;
+  }
+  if (n) raw(c, ":%s NOTICE %s :--- einde, hierna is het live ---",
+             _node->getNodeName(), cname);
+}
+
+void IrcTask::replayDms(IrcClient& c) {
+  uint32_t since = replaySince(c);
+  int n = 0;
+  for (int k = 0; k < IRC_LOG_MAX; k++) {
+    const IrcLogEntry& e = _log[(_log_wr + k) % IRC_LOG_MAX];
+    if (e.ts == 0 || e.chan != IRC_LOG_DM || e.bot != c.bot || e.ts <= since) continue;
+    if (n == 0) notice(c, "DM's die binnenkwamen terwijl je weg was:");
+    char st[12]; logStamp(e.ts, st, sizeof(st));
+    raw(c, ":%s!%s PRIVMSG %s :%s%s", e.nick, IRC_MESH_USERHOST, c.nick, st, e.text);
+    n++;
+  }
+}
+
+/* Naar iedereen die dit kanaal volgt: nick komt binnen of gaat weg. */
+void IrcTask::seenBroadcast(int chan_idx, const char* nick, bool joining) {
+  char cname[28];
+  if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
+    if (!_cl[k].registered || !(_cl[k].chan_mask & (1UL << chan_idx))) continue;
+    if (joining) raw(_cl[k], ":%s!%s JOIN %s", nick, IRC_MESH_USERHOST, cname);
+    else raw(_cl[k], ":%s!%s PART %s :stil sinds %lu min", nick, IRC_MESH_USERHOST,
+             cname, (unsigned long)(IRC_SEEN_TTL_MS / 60000UL));
+  }
+}
+
+void IrcTask::seenTouch(int chan_idx, const char* nick) {
+  if (chan_idx < 0 || chan_idx >= MAX_CHANNELS || !nick || !nick[0]) return;
+  IrcSeen* row = _seen[chan_idx];
+  unsigned long now = millis();
+  if (now == 0) now = 1;   // 0 betekent "leeg"
+
+  int free_i = -1, oldest = 0;
+  for (int i = 0; i < IRC_SEEN_PER_CHAN; i++) {
+    if (row[i].last == 0) { if (free_i < 0) free_i = i; continue; }
+    if (strcasecmp(row[i].nick, nick) == 0) { row[i].last = now; return; }   // al lid
+    if (row[i].last < row[oldest].last) oldest = i;
+  }
+  /* Vol -> de langst stille eruit. Die krijgt een PART, anders blijft hij in de
+   * ledenlijst van de client staan terwijl wij hem niet meer kennen. */
+  int idx = free_i;
+  if (idx < 0) { idx = oldest; seenBroadcast(chan_idx, row[idx].nick, false); }
+  StrHelper::strncpy(row[idx].nick, nick, sizeof(row[idx].nick));
+  row[idx].last = now;
+  seenBroadcast(chan_idx, nick, true);
+}
+
+void IrcTask::seenExpire() {
+  unsigned long now = millis();
+  for (int c = 0; c < MAX_CHANNELS; c++)
+    for (int i = 0; i < IRC_SEEN_PER_CHAN; i++) {
+      if (_seen[c][i].last == 0) continue;
+      if ((now - _seen[c][i].last) < IRC_SEEN_TTL_MS) continue;
+      seenBroadcast(c, _seen[c][i].nick, false);
+      _seen[c][i].last = 0;
+      _seen[c][i].nick[0] = 0;
+    }
+}
+
 void IrcTask::sendNames(IrcClient& c, int idx) {
   char cname[28];
   if (!chanIrcName(idx, cname, sizeof(cname))) return;
@@ -439,8 +579,16 @@ void IrcTask::sendNames(IrcClient& c, int idx) {
     o += snprintf(line + o, sizeof(line) - o, "%s%s", o ? " " : "", _cl[k].nick);
     if (o > (int)sizeof(line) - 32) break;
   }
+  /* En de nodes die we in dit kanaal hebben HOREN zenden. */
+  if (idx < MAX_CHANNELS)
+    for (int i = 0; i < IRC_SEEN_PER_CHAN; i++) {
+      if (_seen[idx][i].last == 0) continue;
+      if (o > (int)sizeof(line) - 32) break;
+      o += snprintf(line + o, sizeof(line) - o, "%s%s", o ? " " : "", _seen[idx][i].nick);
+    }
   numeric(c, 353, "= %s :%s", cname, line);
-  numeric(c, 366, "%s :Einde van /NAMES (mesh-deelnemers verschijnen zodra ze zenden)", cname);
+  numeric(c, 366, "%s :Einde van /NAMES -- dit is wie er GEHOORD is, niet wie er is: "
+                  "meelezers verschijnen nooit en een naam in een kanaal is onbewezen", cname);
 }
 
 void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
@@ -478,6 +626,7 @@ void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
           pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash,
           en ? "" : " (UITGESCHAKELD -- 'channel on' op de CLI)");
   sendNames(c, idx);
+  replayChannel(c, idx);
 }
 
 void IrcTask::partChannel(IrcClient& c, const char* name, const char* reason) {
@@ -556,6 +705,9 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     /* Lokale weergalm: het mesh stuurt ons eigen group-pakket niet terug, dus de
      * andere sessies op deze node zouden het bericht anders nooit zien. */
     char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+    /* Ook onze EIGEN regel in de ring: wie later joint hoort het gesprek te zien
+     * zoals het gevoerd is, niet met alleen de andere kant erin. */
+    logAdd(idx, -1, _node->webBotSlotName(c.bot), body);
     for (int k = 0; k < IRC_MAX_CLIENTS; k++)
       if (&_cl[k] != &c && _cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
         raw(_cl[k], ":%s!%s PRIVMSG %s :%s", c.nick, IRC_MESH_USERHOST, cname, body);
@@ -788,6 +940,12 @@ void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* te
   char cname[28];
   if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
 
+  /* Eerst de ledenlijst bijwerken: wie nu zendt is "aanwezig", en de JOIN moet
+   * VOOR het bericht komen -- een PRIVMSG van iemand die de client niet in het
+   * kanaal ziet staan, laten sommige clients in een apart venster belanden. */
+  seenTouch(chan_idx, nick);
+  logAdd(chan_idx, -1, nick, text);
+
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];
     if (!c.registered || !(c.chan_mask & (1UL << chan_idx))) continue;
@@ -813,6 +971,8 @@ void IrcTask::onMeshDm(int bot_idx, const uint8_t* sender_pub, const char* sende
     mesh::Utils::toHex(hex, sender_pub, PUB_KEY_SIZE);
     snprintf(nick, sizeof(nick), "%.12s", hex);
   }
+
+  logAdd(IRC_LOG_DM, bot_idx, nick, text);
 
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];

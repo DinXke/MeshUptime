@@ -61,6 +61,69 @@ Een nick in een kanaal is dus een beleefdheid, geen bewijs.
 sleutelparen, met een MAC. Zonder de private key van de afzender is een DM niet
 te vervalsen.
 
+## De IRC-tab in de webinterface
+
+Alles hieronder kan ook met de muis, op de **irc**-tab van de nodepagina. Die tab
+beheert *IRC-gebruikers*, en dat is bewust één ding: een bot-slot plus het account
+dat er permanent aan vastzit. Ze worden samen gemaakt en samen gewist, want los
+van elkaar zijn ze allebei onbruikbaar. De service-bots (alert, MGMT) blijven op de
+**bot**-tab en horen bij geen account.
+
+De tab toont per gebruiker de nick, de identiteit, de pubkey en of er nu iemand op
+ingelogd is, plus knoppen voor wachtwoord, *wis* (account weg, identiteit blijft)
+en *wis+identiteit* (het sleutelpaar gaat mee — onomkeerbaar).
+
+### App-config importeren
+
+Met de configexport van de MeshCore-app wordt een gebruiker **dezelfde identiteit
+als op je telefoon**. Het bestand wordt **in je browser** gelezen en niet geüpload:
+met 350 contacten is het ~126 kB, en de synchrone webserver van deze node houdt een
+POST-body in RAM. De pagina stuurt alleen door wat de node kan opslaan.
+
+| Uit het bestand | Gaat naar de node? |
+|---|---|
+| `name` | ja, als botnaam (niet-ASCII eruit, 23 tekens) |
+| `private_key` + `public_key` | alleen als je het vinkje zet — lees de waarschuwing |
+| `channels[].secret` | de kanalen die je aanvinkt |
+| `contacts[]` | de eerste 64, als naamtabel |
+| `radio_settings` | **nee** — dat zou deze node van het mesh af zetten |
+| `position_settings` | nee, dat is jouw positie |
+
+### Naamtabel
+
+Een node-brede tabel **naam → pubkey**, gevuld uit elke import, hoogstens
+`MAX_NAMES` (64) ingangen, vol → de oudste eruit. Hij bestaat zodat
+`/msg Lutterade` ook werkt voor een node die deze node zelf nooit heeft horen
+adverteren. Node-breed en niet per gebruiker: een pubkey is geen persoonlijk bezit,
+en per gebruiker zou 350 contacten × 8 accounts betekenen.
+
+`ircResolveNick()` kijkt op volgorde: een geplakte hex-pubkey, de companion-store,
+de naamtabel, en dan pas de buurtlijst. De naamtabel staat boven de buurtlijst
+omdat hij expliciet is aangeleverd, terwijl een advert-naam is wat een node over
+zichzelf beweert — en dat kan morgen anders zijn.
+
+## Ledenlijst en geschiedenis
+
+Twee dingen die IRC verwacht en een mesh niet heeft, en hoe ze nagebootst worden.
+
+**`/NAMES` toont wie er gehoord is.** Een MeshCore-kanaal heeft geen aanwezigheid:
+geen join, geen ledenlijst, alleen wie toevallig zendt. Een leeg `/NAMES` leest
+echter als "hier is niemand". Daarom onthoudt de node per kanaal wie er gezonden
+heeft en presenteert die als leden: de eerste keer een `JOIN`, na 45 minuten stilte
+een `PART`. Wat je ziet is dus *recent gehoord*:
+
+- wie meeleest maar nooit zendt, verschijnt **nooit**;
+- wie een naam verzint, verschijnt **wel** — kanaalnamen zijn onbewezen tekst;
+- de `PART` is een gok op stilte, geen vertrek.
+
+**Terugspoelen na het inloggen.** Een gedeelde ringbuffer van de laatste 32
+berichten (kanaalregels en DM's door elkaar). Je krijgt terug wat er langskwam
+*terwijl je weg was*: per account onthoudt de node de tijd van je laatste uitloggen,
+en alles van daarna komt bij het inloggen (je DM's) of bij `JOIN` (dat kanaal)
+alsnog binnen, met `[uu:mm]` ervoor. Bovengrens 12 uur — daarna is het archief en
+daar is deze node de plek niet voor. De buffer staat puur in RAM: een herstart wist
+hem, dit is een radio met een chatserver erop en geen logserver.
+
 ## Accounts aanmaken
 
 Registratie kan **niet** over IRC: een account claimt een bot-slot, en dat is een
@@ -233,6 +296,9 @@ te weten. Een mesh-afzender verschijnt zodra hij zendt.
 | `IRC_NICK_MAX` | 20 | nicklengte |
 | `IRC_TX_MIN_MS` | 3000 | zendrem per gebruiker |
 | `IRC_BUCKET_MAX` / `IRC_BUCKET_MS` | 6 / 10000 | gedeelde emmer |
+| `IRC_SEEN_PER_CHAN` / `IRC_SEEN_TTL_MS` | 10 / 45 min | geëmuleerde ledenlijst |
+| `IRC_LOG_MAX` / `IRC_LOG_TTL_S` | 32 / 12 u | terugspoelbuffer (~190 byte per regel) |
+| `MAX_NAMES` | 64 | gedeelde naamtabel (52 byte per ingang) |
 
 Meer gebruikers = meer bot-slots. `MAX_BOTS` staat in `env:meshuptime_room` op 8.
 Gemeten op een Heltec V3:
