@@ -45,7 +45,9 @@ Zou een slot bij logout vrijkomen en later aan iemand anders gaan, dan komen DM'
 die onderweg waren bij de verkeerde persoon aan, en praten contacten die jou
 toegevoegd hebben opeens met een ander.
 
-Gevolg: **het aantal accounts is hard begrensd op `MAX_BOTS`** (standaard 4).
+Gevolg: **het aantal accounts is hard begrensd op `MAX_BOTS`** (8 in
+`env:meshuptime_room`). Twee slots zijn doorgaans al vergeven aan de alert-bot en
+de MGMT-bot, dus reken op zes IRC-gebruikers.
 
 ### Wat een kanaalnaam wél en niet bewijst
 
@@ -62,8 +64,9 @@ te vervalsen.
 ## Accounts aanmaken
 
 Registratie kan **niet** over IRC: een account claimt een bot-slot, en dat is een
-beheerdaad. Het gaat via de CLI — serieel op 115200, of via `POST /cli` in de
-webinterface.
+beheerdaad. Het gaat via de CLI — serieel op 115200, of via het CLI-venster van de
+webinterface (`POST /cli`). Alleen `irc key set` kan **niet** over het web; zie
+*Je eigen sleutel meebrengen*.
 
 ```
 bot list                                  # welke bot-slots bestaan er
@@ -117,10 +120,68 @@ bereiken je, zonder iets toe te voegen.
 - zit dezelfde sleutel op twee plaatsen tegelijk (telefoon en node), en dat is
   precies het patroon dat een gestolen sleutel onzichtbaar maakt.
 
-Daarom kan het **niet over IRC**. IRC is onversleuteld: een private key die je in
-een chatvenster typt staat daarna in je client-log, in je scrollback en op elke
-switch onderweg. Zet hem over serieel of over de webinterface, of gebruik gewoon
-de sleutel die de node zelf gemaakt heeft.
+Daarom kan het **alleen over de seriële console**. Niet over IRC, want dat is
+onversleuteld: een private key die je in een chatvenster typt staat daarna in je
+client-log, in je scrollback en op elke switch onderweg. En niet over de
+webinterface, want die is HTTP zonder TLS met het wachtwoord in base64 ernaast —
+`POST /cli` weigert `irc key set` om dezelfde reden waarom hij `prv.key` al
+weigerde. Of gebruik gewoon de sleutel die de node zelf gemaakt heeft.
+
+## Stappenplan: nieuwe IRC-client met je bestaande sleutelpaar
+
+Uitgangspunt: je hebt al een MeshCore-identiteit (telefoon of companion) en je wil
+op IRC diezelfde persoon zijn. Lees eerst de waarschuwing hierboven — dit is
+onomkeerbaar in de zin dat je de sleutel niet kunt terugtrekken.
+
+**1. Haal je sleutelpaar op.** In de MeshCore-app: instellingen → identiteit /
+back-up. Op een companion met CLI: `get prv.key` en `get pub.key` over serieel.
+Je hebt beide nodig: 64 hextekens privaat, 64 hextekens publiek.
+
+**2. Maak een bot-slot** op de node, over serieel (115200, regels afsluiten met CR):
+
+```
+bot list
+bot add IRC-<jouwnaam>
+```
+
+**3. Leg je eigen sleutel in dat slot.** Alleen serieel — de webinterface weigert
+dit, en over IRC kan het niet:
+
+```
+irc key set IRC-<jouwnaam> <privhex64> <pubhex64>
+```
+
+De node antwoordt `OK bot <n> draagt nu jouw sleutel; advert de lucht in`.
+
+**4. Zet je telefoon-identiteit stil.** Vanaf nu adverteren twee apparaten
+dezelfde pubkey. Repeaters cachen routes per pubkey, dus twee zenders op één
+identiteit laat het pad heen en weer klappen en dan komen DM's soms op het
+verkeerde toestel aan. Kies er één: laat de telefoon niet meer adverteren, of
+gebruik op de node een nieuwe sleutel in plaats van BYOK.
+
+**5. Maak het IRC-account:**
+
+```
+irc user add <nick> <wachtwoord> IRC-<jouwnaam>
+irc list
+```
+
+**6. Zoek het IP van de node** (webinterface, of je router) en verbind. In irssi:
+
+```
+/server add -auto -network mesh <node-ip> 6667 <wachtwoord>
+/connect mesh
+```
+
+In HexChat: *Netwerklijst* → *Toevoegen* → server `<node-ip>/6667`, bij *Wachtwoord*
+je accountwachtwoord, *Nick* je accountnaam, en **Autoconnect** aan als je wil.
+Geen SSL aanvinken.
+
+**7. Join een kanaal.** `/list` toont wat de node al kent; `/join #test` volgt een
+bestaand of nieuw hashtag-kanaal, `/join #geheim <hex>` een privé-kanaal.
+
+**8. Controleer.** `/whois <jouwnick>` moet jouw pubkey tonen — dezelfde als op je
+telefoon. Zo niet, dan is stap 3 niet aangekomen.
 
 ## Airtime
 
@@ -173,6 +234,16 @@ te weten. Een mesh-afzender verschijnt zodra hij zendt.
 | `IRC_TX_MIN_MS` | 3000 | zendrem per gebruiker |
 | `IRC_BUCKET_MAX` / `IRC_BUCKET_MS` | 6 / 10000 | gedeelde emmer |
 
-Meer gebruikers = meer bot-slots. `MAX_BOTS` verhogen kost per slot een
-sleutelpaar, een naam, 16 ontvangers van 33 byte en de diagnose-instellingen; zie
-[metingen.md](metingen.md) voor het gemeten RAM-verbruik voordat je hem opdraait.
+Meer gebruikers = meer bot-slots. `MAX_BOTS` staat in `env:meshuptime_room` op 8.
+Gemeten op een Heltec V3:
+
+| Build | RAM |
+|---|---|
+| zonder IRC | 60,1% (197 024 B) |
+| IRC, `MAX_BOTS=4` | 61,0% (199 944 B) |
+| IRC, `MAX_BOTS=8` | 62,8% (205 840 B) |
+
+De server zelf kost 2 920 byte, elk extra slot (bot + sessie) ~1 475 byte. Verder
+opdraaien kan statisch, maar wat overblijft moet naast mesh, WiFi en de webserver
+nog een HTTP-antwoord kunnen samenstellen — en dat is waar het eerder knelde. Meet
+opnieuw voor je verder gaat.

@@ -7289,6 +7289,21 @@ void WebTask::handleCli() {
         "Doe dit over de seriele console.\n");
     return;
   }
+
+  /* v2.9.0: 'irc key set <bot> <prv> <pub>' draagt een private sleutel zonder dat
+   * "prv.key" erin staat, dus de zeef hierboven ziet hem niet. Zelfde bezwaar en
+   * dus dezelfde weigering: deze pagina is HTTP zonder TLS. Het verschil is alleen
+   * WIENS identiteit eraan gaat -- die van de gebruiker die zijn telefoonsleutel
+   * meebrengt, en die kan de meelezer daarna permanent nadoen (MeshCore kent geen
+   * revocation). De rest van 'irc ...' (account aanmaken, wachtwoord, verwijderen)
+   * mag hier wel: daar zit geen sleutel in. */
+  if (cmdIs(cmd, "irc key ")) {
+    _server->send(403, "text/plain",
+        "geweigerd: 'irc key set' draagt een prive sleutel, en deze pagina is "
+        "HTTP zonder TLS. Wie hem meeleest kan die gebruiker voortaan nadoen. "
+        "Doe dit over de seriele console.\n");
+    return;
+  }
   if (cmdIs(cmd, "start ota")) {
     _server->send(403, "text/plain",
         "geweigerd: 'start ota' opent een eigen accesspoint en een TWEEDE "
@@ -7513,6 +7528,16 @@ void WebTask::handleCliRemote() {
         "geweigerd: de privesleutel van een ANDERE node. Het antwoord zou hier "
         "over onversleuteld HTTP komen en daarna in de push naar MeshManager "
         "belanden. Wie hem meeleest IS voortaan die node.\n");
+    return;
+  }
+
+  /* v2.9.0: en dezelfde weigering voor de sleutel van een IRC-gebruiker op een
+   * ANDERE node -- zelfde pad, zelfde onversleutelde HTTP, en de push naar
+   * MeshManager erachteraan. */
+  if (cmdIs(cmd, "irc key ")) {
+    _server->send(403, "text/plain",
+        "geweigerd: 'irc key set' op afstand draagt een prive sleutel over "
+        "onversleuteld HTTP. Doe dit op de seriele console van die node.\n");
     return;
   }
   if (cmdIs(cmd, "start ota")) {

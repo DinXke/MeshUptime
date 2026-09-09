@@ -25,7 +25,11 @@ Elk account houdt **permanent** hetzelfde bot-slot, ook uitgelogd. Je pubkey is 
 adres op het mesh: kwam een slot bij logout vrij en ging het later naar iemand
 anders, dan landden DM's die onderweg waren bij de verkeerde persoon en praatten
 contacten die jou toegevoegd hadden opeens met een ander. Prijs daarvan: het
-aantal accounts is hard begrensd op `MAX_BOTS` (4).
+aantal accounts is hard begrensd op `MAX_BOTS`, en die staat in
+`env:meshuptime_room` daarom op **8** in plaats van 4 — twee slots zijn al
+vergeven aan de alert-bot en de MGMT-bot. Gemeten op een Heltec V3: zonder IRC
+60,1% RAM, met IRC en 4 slots 61,0%, met 8 slots 62,8%. De server zelf kost
+2 920 byte, elk slot ~1 475 byte.
 
 **Nieuw in de firmware.**
 
