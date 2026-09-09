@@ -15,6 +15,8 @@ in [openstaand.md](openstaand.md).
 | account (wachtwoord bij inloggen) | een vast **bot-slot** met eigen sleutelpaar |
 | `#kanaal` zonder sleutel | hashtag-kanaal, geheim uit de naam afgeleid |
 | `#kanaal` met sleutel (`JOIN #x <hex>`) | group-channel met expliciet 16/32-byte geheim |
+| `#Public` | het standaardkanaal — **geen** hashtag: vaste, ingebakken sleutel |
+| antwoorden (IRCv3 `+draft/reply`) | `>origineel.. jouw tekst` als gewone tekst |
 | bericht in een kanaal | group-datagram, geflood |
 | `/msg <nick> tekst` | DM, ECDH vanaf jouw bot-sleutelpaar |
 | `/whois <nick>` | pubkey, SNR, hopcount, laatst gehoord |
@@ -101,6 +103,54 @@ en per gebruiker zou 350 contacten × 8 accounts betekenen.
 de naamtabel, en dan pas de buurtlijst. De naamtabel staat boven de buurtlijst
 omdat hij expliciet is aangeleverd, terwijl een advert-naam is wat een node over
 zichzelf beweert — en dat kan morgen anders zijn.
+
+## Kanaalnamen
+
+Op de node draagt een hashtag-kanaal de `#` **in zijn naam**, en die gaat mee in
+`sha256(naam)` — `#dinx` en `dinx` zijn dus verschillende kanalen met verschillende
+sleutels. De brug houdt daar rekening mee en maakt een nieuw kanaal altijd mét de
+`#` aan.
+
+`Public` is een uitzondering en **geen hashtag-kanaal**: zijn sleutel is de vaste
+`PUBLIC_GROUP_SECRET_HEX` die in de firmware staat, en de naam doet er niet aan mee.
+Vandaar dat hij zonder `#` in de kanaaltabel staat. In IRC heet hij `#Public`, want
+een IRC-kanaalnaam moet met `#` beginnen — dat voorvoegsel is daar puur cosmetisch.
+Of het kanaal publiek is, wordt bepaald door de **sleutel** en niet door de naam
+(`channelSecretIsPublic()`).
+
+Een mesh-kanaal mag heten wat het wil; `NodeNet FireMesh Limbur` staat er echt in.
+IRC verbiedt spatie, komma en `:` in een kanaalnaam, dus die worden `_` (een reeks
+wordt één). Dat is niet omkeerbaar, daarom zoekt de brug door de IRC-vorm van elke
+tabelingang te vergelijken. Botsen twee kanalen daardoor op dezelfde IRC-naam, dan
+krijgen ze **allebei** de kanaalhash erachter (`#A_B~3f`) — anders bepaalt de
+tabelvolgorde wie de kale naam houdt en verspringt dat bij de volgende import.
+`/LIST` toont de naam zoals hij op de node staat erbij.
+
+## Antwoorden
+
+MeshCore v1.17.0 heeft **geen antwoordveld**. De tekstlaag is drie types
+(`TXT_TYPE_PLAIN`, `_CLI_DATA`, `_SIGNED_PLAIN`) en verder niets: geen bericht-id,
+geen `reply_to`, geen thread. Alles wat de brug verzint moet dus leesbare tekst
+zijn, anders ziet iemand met de app ruis. Daarom twee lagen:
+
+**Op de draad** een compacte quote: `>wat is de frequentie.. 869.618 sf8`. De
+`.. ` erachter staat er altijd, ook als er niets afviel — zo is deterministisch te
+zien waar de quote ophoudt. De quote kost tot 23 tekens van je budget van 160.
+
+**Op de IRC-verbinding** de IRCv3-capabilities `message-tags` en `server-time`,
+onderhandeld met `CAP`. Elk bericht dat de node uitlevert krijgt een `msgid`; een
+antwoord uit je client komt binnen als `+draft/reply=<msgid>` en wordt hierboven
+omgezet in de quote. Andersom: begint een binnenkomende mesh-regel met een quote,
+dan zoekt de node het origineel in de ringbuffer en hangt er `+draft/reply` aan —
+echte threading in je client. Tags gaan alleen over TCP en kosten **geen airtime**.
+
+Clients die `message-tags` niet kennen zien gewoon de tekst met de quote erin, en
+dat is ook precies wat de MeshCore-app te zien krijgt. Is het origineel uit de ring
+gerold, dan gaat je regel zonder quote weg met een `NOTICE` erbij — beter dan
+weigeren.
+
+Met `server-time` zet je client zelf het juiste tijdstip bij een teruggespeelde
+regel; dan laat de node zijn eigen `[uu:mm]` weg.
 
 ## Ledenlijst en geschiedenis
 
@@ -297,6 +347,7 @@ te weten. Een mesh-afzender verschijnt zodra hij zendt.
 | `IRC_BUCKET_MAX` / `IRC_BUCKET_MS` | 6 / 10000 | gedeelde emmer |
 | `IRC_SEEN_PER_CHAN` / `IRC_SEEN_TTL_MS` | 10 / 45 min | geëmuleerde ledenlijst |
 | `IRC_LOG_MAX` / `IRC_LOG_TTL_S` | 32 / 12 u | terugspoelbuffer (~190 byte per regel) |
+| `IRC_QUOTE_LEN` | 20 | tekens van het origineel in een antwoord |
 | `MAX_NAMES` | 64 | gedeelde naamtabel (52 byte per ingang) |
 
 Meer gebruikers = meer bot-slots. `MAX_BOTS` staat in `env:meshuptime_room` op 8.

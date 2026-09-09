@@ -87,6 +87,7 @@ void IrcTask::begin(RoomMesh* node, const char* firmware_version) {
     _cl[i].in_len = 0; _cl[i].overflow = false;
     _cl[i].nick[0] = 0; _cl[i].user[0] = 0; _cl[i].pass[0] = 0;
     _cl[i].have_pass = false; _cl[i].registered = false;
+    _cl[i].cap_pending = false; _cl[i].cap_tags = false; _cl[i].cap_time = false;
     _cl[i].acct = -1; _cl[i].bot = -1; _cl[i].chan_mask = 0;
     _cl[i].ping_sent = false;
   }
@@ -139,6 +140,7 @@ void IrcTask::pollAccept() {
     c.in_len = 0; c.overflow = false;
     c.nick[0] = 0; c.user[0] = 0; c.pass[0] = 0;
     c.have_pass = false; c.registered = false;
+    c.cap_pending = false; c.cap_tags = false; c.cap_time = false;
     c.acct = -1; c.bot = -1; c.chan_mask = 0;
     c.last_rx = millis(); c.last_tx_mesh = 0; c.ping_sent = false;
     return;
@@ -379,6 +381,7 @@ int IrcTask::acctDel(const char* nick) {
 
 void IrcTask::tryRegister(IrcClient& c) {
   if (c.registered || !c.nick[0] || !c.user[0]) return;
+  if (c.cap_pending) return;            /* CAP END nog niet gezien */
 
   if (!c.have_pass) {
     numeric(c, 464, ":Wachtwoord vereist. Stel het in je client in als serverwachtwoord (PASS).");
@@ -432,8 +435,11 @@ void IrcTask::sendWelcome(IrcClient& c) {
   numeric(c, 372, ":- Je praat op een LoRa-mesh. Airtime is schaars: hooguit één");
   numeric(c, 372, ":- bericht per %lu s, en %d tekens per bericht.",
           (unsigned long)(IRC_TX_MIN_MS / 1000), (int)BOT_MAX_TEXT_LEN);
-  numeric(c, 372, ":- JOIN #naam         volgt een hashtag-kanaal (sleutel uit de naam)");
-  numeric(c, 372, ":- JOIN #naam sleutel volgt een prive-kanaal (16/32 byte, hex)");
+  numeric(c, 372, ":- JOIN #naam         hashtag-kanaal: de sleutel volgt uit de naam");
+  numeric(c, 372, ":- JOIN #naam sleutel prive-kanaal met een eigen sleutel (16/32 byte hex)");
+  numeric(c, 372, ":- JOIN #Public       het standaardkanaal -- vaste sleutel, GEEN hashtag");
+  numeric(c, 372, ":- antwoorden         wordt op het mesh '>origineel.. jouw tekst',");
+  numeric(c, 372, ":-                    want MeshCore kent geen antwoordveld");
   numeric(c, 372, ":- PRIVMSG nick       DM vanaf jouw eigen sleutelpaar");
   numeric(c, 372, ":- WHOIS nick         pubkey, SNR en hopcount van de laatste hoor");
   numeric(c, 372, ":- Anderen voegen je toe met deze link:");
@@ -505,17 +511,70 @@ int IrcTask::chanIndexFor(const char* irc_name) const {
 /*  Terugspoelen                                                              */
 /* ------------------------------------------------------------------------ */
 
-void IrcTask::logAdd(int chan, int bot, const char* nick, const char* text) {
-  if (!text || !text[0]) return;
+int IrcTask::logAdd(int chan, int bot, const char* nick, const char* text) {
+  if (!text || !text[0]) return -1;
   uint32_t now = _node->getRTCClock()->getCurrentTime();
   if (now == 0) now = 1;                 /* 0 betekent "leeg slot" */
-  IrcLogEntry& e = _log[_log_wr];
+  int idx = _log_wr;
+  IrcLogEntry& e = _log[idx];
   _log_wr = (uint16_t)((_log_wr + 1) % IRC_LOG_MAX);
   e.ts = now;
+  e.id = ++_msg_seq;
   e.chan = (int8_t)chan;
   e.bot = (int8_t)bot;
   StrHelper::strncpy(e.nick, (nick && nick[0]) ? nick : "mesh", sizeof(e.nick));
   StrHelper::strncpy(e.text, text, sizeof(e.text));
+  return idx;
+}
+
+int IrcTask::logFindById(uint32_t id) const {
+  if (!id) return -1;
+  for (int i = 0; i < IRC_LOG_MAX; i++)
+    if (_log[i].ts != 0 && _log[i].id == id) return i;
+  return -1;
+}
+
+int IrcTask::logFindBySnippet(const char* snip) const {
+  if (!snip || !snip[0]) return -1;
+  size_t n = strlen(snip);
+  /* Nieuwste eerst: dezelfde vraag wordt op een mesh vaker gesteld, en dan is het
+   * laatste voorkomen bijna altijd het bedoelde. */
+  for (int k = IRC_LOG_MAX; k > 0; k--) {
+    const IrcLogEntry& e = _log[(_log_wr + k - 1) % IRC_LOG_MAX];
+    if (e.ts == 0) continue;
+    if (strncasecmp(e.text, snip, n) == 0) return (_log_wr + k - 1) % IRC_LOG_MAX;
+  }
+  return -1;
+}
+
+void IrcTask::isoTime(uint32_t ts, char* out, size_t out_len) const {
+  out[0] = 0;
+  if (ts < 1735689600UL) return;         /* klok niet gesynct; zie logStamp() */
+  time_t t = (time_t)ts;
+  struct tm tmv;
+  if (!gmtime_r(&t, &tmv)) return;
+  snprintf(out, out_len, "%04d-%02d-%02dT%02d:%02d:%02d.000Z",
+           tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+           tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+}
+
+/* Een PRIVMSG met de tags die DEZE client gevraagd heeft. Wie geen message-tags
+ * negotieerde krijgt precies wat hij altijd kreeg -- de tags weglaten is hier geen
+ * verlies maar de hele reden dat dit degradeert. */
+void IrcTask::sendMsg(IrcClient& c, const IrcLogEntry* e, const char* nick,
+                      const char* target, const char* text, uint32_t reply_to) {
+  char tags[96]; tags[0] = 0;
+  int t = 0;
+  if (c.cap_tags && e && e->id)
+    t += snprintf(tags + t, sizeof(tags) - t, "%smsgid=m%lx", t ? ";" : "@", (unsigned long)e->id);
+  if (c.cap_tags && reply_to)
+    t += snprintf(tags + t, sizeof(tags) - t, "%s+draft/reply=m%lx", t ? ";" : "@", (unsigned long)reply_to);
+  if (c.cap_time && e && e->ts) {
+    char iso[32]; isoTime(e->ts, iso, sizeof(iso));
+    if (iso[0]) t += snprintf(tags + t, sizeof(tags) - t, "%stime=%s", t ? ";" : "@", iso);
+  }
+  if (t) raw(c, "%s :%s!%s PRIVMSG %s :%s", tags, nick, IRC_MESH_USERHOST, target, text);
+  else   raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, target, text);
 }
 
 void IrcTask::logStamp(uint32_t ts, char* out, size_t out_len) const {
@@ -550,8 +609,16 @@ void IrcTask::replayChannel(IrcClient& c, int chan_idx) {
     if (n == 0)
       raw(c, ":%s NOTICE %s :--- gemist sinds je laatste sessie ---",
           _node->getNodeName(), cname);
-    char st[12]; logStamp(e.ts, st, sizeof(st));
-    raw(c, ":%s!%s PRIVMSG %s :%s%s", e.nick, IRC_MESH_USERHOST, cname, st, e.text);
+    /* Met server-time zet de client zelf het juiste tijdstip voor de regel; dan is
+     * ons eigen "[uu:mm]" dubbelop en laten we het weg. */
+    if (c.cap_time) {
+      sendMsg(c, &e, e.nick, cname, e.text, 0);
+    } else {
+      char st[12]; logStamp(e.ts, st, sizeof(st));
+      char line[BOT_MAX_TEXT_LEN + 16];
+      snprintf(line, sizeof(line), "%s%s", st, e.text);
+      sendMsg(c, &e, e.nick, cname, line, 0);
+    }
     n++;
   }
   if (n) raw(c, ":%s NOTICE %s :--- einde, hierna is het live ---",
@@ -565,8 +632,14 @@ void IrcTask::replayDms(IrcClient& c) {
     const IrcLogEntry& e = _log[(_log_wr + k) % IRC_LOG_MAX];
     if (e.ts == 0 || e.chan != IRC_LOG_DM || e.bot != c.bot || e.ts <= since) continue;
     if (n == 0) notice(c, "DM's die binnenkwamen terwijl je weg was:");
-    char st[12]; logStamp(e.ts, st, sizeof(st));
-    raw(c, ":%s!%s PRIVMSG %s :%s%s", e.nick, IRC_MESH_USERHOST, c.nick, st, e.text);
+    if (c.cap_time) {
+      sendMsg(c, &e, e.nick, c.nick, e.text, 0);
+    } else {
+      char st[12]; logStamp(e.ts, st, sizeof(st));
+      char line[BOT_MAX_TEXT_LEN + 16];
+      snprintf(line, sizeof(line), "%s%s", st, e.text);
+      sendMsg(c, &e, e.nick, c.nick, line, 0);
+    }
     n++;
   }
 }
@@ -710,6 +783,59 @@ void IrcTask::partChannel(IrcClient& c, const char* name, const char* reason) {
 }
 
 /* ------------------------------------------------------------------------ */
+/*  Antwoorden                                                               */
+/* ------------------------------------------------------------------------ */
+
+/* De waarde van een tag uit "k=v;k2=v2". Retour NULL als hij er niet staat. */
+static const char* ircTagValue(const char* tags, const char* key, char* buf, size_t buf_len) {
+  size_t klen = strlen(key);
+  for (const char* p = tags; p && *p; ) {
+    const char* end = strchr(p, ';');
+    size_t seg = end ? (size_t)(end - p) : strlen(p);
+    if (seg > klen && p[klen] == '=' && strncmp(p, key, klen) == 0) {
+      size_t vlen = seg - klen - 1;
+      if (vlen >= buf_len) vlen = buf_len - 1;
+      memcpy(buf, p + klen + 1, vlen);
+      buf[vlen] = 0;
+      return buf;
+    }
+    p = end ? end + 1 : NULL;
+  }
+  return NULL;
+}
+
+/* ">origineel.. antwoord" bouwen. De quote wordt op IRC_QUOTE_LEN afgekapt en het
+ * scheidingsteken staat er ALTIJD, ook als er niets afviel -- anders is bij het
+ * teruglezen niet te zien waar de quote ophoudt. */
+static void ircBuildQuote(const char* orig, const char* reply, char* out, size_t out_len) {
+  char snip[IRC_QUOTE_LEN + 1];
+  size_t n = 0;
+  for (const char* p = orig; *p && n < IRC_QUOTE_LEN; p++) {
+    if ((unsigned char)*p < ' ') break;          /* geen controltekens in de quote */
+    snip[n++] = *p;
+  }
+  snip[n] = 0;
+  snprintf(out, out_len, ">%s%s%s", snip, IRC_QUOTE_SEP, reply);
+}
+
+/* Begint deze mesh-regel met een quote? Zo ja: het origineel opzoeken in de ring en
+ * het msgid teruggeven, met `body` op het antwoord gezet. 0 = geen quote. */
+uint32_t IrcTask::quoteLookup(const char* text, const char** body) const {
+  *body = text;
+  if (!text || text[0] != '>') return 0;
+  const char* sep = strstr(text + 1, IRC_QUOTE_SEP);
+  if (!sep) return 0;
+  char snip[IRC_QUOTE_LEN + 2];
+  size_t n = (size_t)(sep - (text + 1));
+  if (n == 0 || n >= sizeof(snip)) return 0;
+  memcpy(snip, text + 1, n); snip[n] = 0;
+  int i = logFindBySnippet(snip);
+  if (i < 0) return 0;
+  *body = sep + strlen(IRC_QUOTE_SEP);
+  return _log[i].id;
+}
+
+/* ------------------------------------------------------------------------ */
 /*  Zenden                                                                   */
 /* ------------------------------------------------------------------------ */
 
@@ -728,7 +854,8 @@ bool IrcTask::txAllowed(IrcClient& c, char* why, size_t why_len) {
   return true;
 }
 
-void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice) {
+void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice,
+                        const char* tags) {
   if (!target || !target[0]) { numeric(c, 411, ":Geen ontvanger opgegeven"); return; }
   if (!text || !text[0]) { numeric(c, 412, ":Geen tekst om te versturen"); return; }
 
@@ -753,6 +880,25 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     StrHelper::strncpy(body, text, sizeof(body));
   }
 
+  /* Een antwoord uit de client (+draft/reply=<msgid>) wordt hier een quote op de
+   * draad. Kan het origineel niet meer gevonden worden -- uit de ring gerold --
+   * dan gaat het bericht gewoon zonder quote weg; dat is beter dan weigeren. */
+  char tagbuf[40];
+  const char* rt = tags ? ircTagValue(tags, "+draft/reply", tagbuf, sizeof(tagbuf)) : NULL;
+  if (!rt && tags) rt = ircTagValue(tags, "draft/reply", tagbuf, sizeof(tagbuf));
+  if (rt) {
+    uint32_t id = (uint32_t)strtoul(rt[0] == 'm' ? rt + 1 : rt, NULL, 16);
+    int oi = logFindById(id);
+    if (oi >= 0) {
+      char q[BOT_MAX_TEXT_LEN + 8];
+      ircBuildQuote(_log[oi].text, body, q, sizeof(q));
+      StrHelper::strncpy(body, q, sizeof(body));
+    } else {
+      notice(c, "Het bericht waarop je antwoordt is uit de buffer gerold; "
+                "je regel gaat zonder quote de lucht in.");
+    }
+  }
+
   char why[128];
   if (!txAllowed(c, why, sizeof(why))) { notice(c, "%s", why); return; }
 
@@ -771,10 +917,14 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     char cname[32]; chanIrcName(idx, cname, sizeof(cname));
     /* Ook onze EIGEN regel in de ring: wie later joint hoort het gesprek te zien
      * zoals het gevoerd is, niet met alleen de andere kant erin. */
-    logAdd(idx, -1, _node->webBotSlotName(c.bot), body);
+    int mi = logAdd(idx, -1, _node->webBotSlotName(c.bot), body);
+    const IrcLogEntry* me = (mi >= 0) ? &_log[mi] : NULL;
+    /* Ook de afzender krijgt het msgid terug, zodat zijn eigen regel een geldig
+     * antwoorddoel is -- in een echt IRC-netwerk komt je eigen bericht ook langs. */
+    if (c.cap_tags && me) sendMsg(c, me, c.nick, cname, body, 0);
     for (int k = 0; k < IRC_MAX_CLIENTS; k++)
       if (&_cl[k] != &c && _cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
-        raw(_cl[k], ":%s!%s PRIVMSG %s :%s", c.nick, IRC_MESH_USERHOST, cname, body);
+        sendMsg(_cl[k], me, c.nick, cname, body, 0);
     return;
   }
 
@@ -802,6 +952,18 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
 /* ------------------------------------------------------------------------ */
 
 void IrcTask::handleLine(IrcClient& c, char* line) {
+  /* IRCv3-tags staan VOOR het commando: "@k=v;k2=v2 PRIVMSG #x :hoi". We knippen
+   * ze eraf en bewaren ze; de rest van deze functie ziet een gewone regel. */
+  const char* tags = "";
+  if (*line == '@') {
+    char* sp = strchr(line, ' ');
+    if (!sp) return;                    /* alleen tags, geen commando */
+    *sp = 0;
+    tags = line + 1;
+    line = sp + 1;
+    while (*line == ' ') line++;
+  }
+
   char* argv[8];
   int argc = ircSplit(line, argv, 8);
   if (argc == 0) return;
@@ -810,10 +972,34 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
 
   /* --- Voor registratie --- */
   if (!strcmp(cmd, "CAP")) {
-    /* Geen capabilities. Netjes antwoorden zodat clients niet in de CAP-onder-
-     * handeling blijven hangen (irssi en HexChat doen dat allebei bij stilte). */
-    if (argc >= 2 && !strcasecmp(argv[1], "LS")) raw(c, ":%s CAP * LS :", _node->getNodeName());
-    else if (argc >= 2 && !strcasecmp(argv[1], "REQ")) raw(c, ":%s CAP * NAK :%s", _node->getNodeName(), argc >= 3 ? argv[2] : "");
+    const char* host = _node->getNodeName();
+    if (argc >= 2 && !strcasecmp(argv[1], "LS")) {
+      c.cap_pending = true;             /* wachten met registreren tot CAP END */
+      raw(c, ":%s CAP * LS :message-tags server-time", host);
+    } else if (argc >= 2 && !strcasecmp(argv[1], "LIST")) {
+      char have[48]; snprintf(have, sizeof(have), "%s%s%s",
+          c.cap_tags ? "message-tags" : "", (c.cap_tags && c.cap_time) ? " " : "",
+          c.cap_time ? "server-time" : "");
+      raw(c, ":%s CAP * LIST :%s", host, have);
+    } else if (argc >= 2 && !strcasecmp(argv[1], "REQ")) {
+      c.cap_pending = true;
+      /* Alles-of-niets, zoals de specificatie eist: kennen we er een niet, dan NAK
+       * op het HELE verzoek en zetten we ook de andere niet aan. */
+      const char* want = argc >= 3 ? argv[2] : "";
+      bool tagsq = strstr(want, "message-tags") != NULL;
+      bool timeq = strstr(want, "server-time") != NULL;
+      char rest[128]; StrHelper::strncpy(rest, want, sizeof(rest));
+      bool unknown = false;
+      for (char* p = strtok(rest, " "); p; p = strtok(NULL, " "))
+        if (strcmp(p, "message-tags") && strcmp(p, "server-time")) unknown = true;
+      if (unknown || (!tagsq && !timeq)) { raw(c, ":%s CAP * NAK :%s", host, want); return; }
+      if (tagsq) c.cap_tags = true;
+      if (timeq) c.cap_time = true;
+      raw(c, ":%s CAP * ACK :%s", host, want);
+    } else if (argc >= 2 && !strcasecmp(argv[1], "END")) {
+      c.cap_pending = false;
+      tryRegister(c);
+    }
     return;
   }
   if (!strcmp(cmd, "PASS")) {
@@ -877,7 +1063,7 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
   }
   if (!strcmp(cmd, "PRIVMSG") || !strcmp(cmd, "NOTICE")) {
     if (argc < 3) { numeric(c, 461, "%s :Te weinig parameters", cmd); return; }
-    doPrivmsg(c, argv[1], argv[2], cmd[0] == 'N');
+    doPrivmsg(c, argv[1], argv[2], cmd[0] == 'N', tags);
     return;
   }
   if (!strcmp(cmd, "NAMES")) {
@@ -1014,12 +1200,20 @@ void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* te
    * VOOR het bericht komen -- een PRIVMSG van iemand die de client niet in het
    * kanaal ziet staan, laten sommige clients in een apart venster belanden. */
   seenTouch(chan_idx, nick);
-  logAdd(chan_idx, -1, nick, text);
+  /* Een binnenkomende regel die met een quote begint koppelen we terug aan het
+   * origineel in de ring; clients met message-tags krijgen er dan echte threading
+   * van. De quote blijft WEL in de tekst staan -- wie de tag niet snapt (en dat is
+   * ook iedereen in de MeshCore-app) moet hem gewoon kunnen lezen. */
+  const char* body = text;
+  uint32_t rt = quoteLookup(text, &body);
+
+  int li = logAdd(chan_idx, -1, nick, text);
+  const IrcLogEntry* le = (li >= 0) ? &_log[li] : NULL;
 
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];
     if (!c.registered || !(c.chan_mask & (1UL << chan_idx))) continue;
-    raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, cname, text);
+    sendMsg(c, le, nick, cname, text, rt);
     /* Het signaalrapport apart, als NOTICE in hetzelfde kanaalvenster. Zo blijft
      * de gespreksregel schoon en is toch te zien hoe het pakket binnenkwam. */
     raw(c, ":%s!%s NOTICE %s :[%s SNR %.1f dB, RSSI %d dBm, %d hop%s]",
@@ -1042,12 +1236,15 @@ void IrcTask::onMeshDm(int bot_idx, const uint8_t* sender_pub, const char* sende
     snprintf(nick, sizeof(nick), "%.12s", hex);
   }
 
-  logAdd(IRC_LOG_DM, bot_idx, nick, text);
+  const char* dbody = text;
+  uint32_t drt = quoteLookup(text, &dbody);
+  int dli = logAdd(IRC_LOG_DM, bot_idx, nick, text);
+  const IrcLogEntry* dle = (dli >= 0) ? &_log[dli] : NULL;
 
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];
     if (!c.registered || c.bot != bot_idx) continue;
-    raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, c.nick, text);
+    sendMsg(c, dle, nick, c.nick, text, drt);
     raw(c, ":%s!%s NOTICE %s :[SNR %.1f dB, RSSI %d dBm, %d hop%s]",
         nick, IRC_MESH_USERHOST, c.nick, snr, rssi, hops, hops == 1 ? "" : "s");
   }

@@ -104,6 +104,22 @@ staat nu achter een expliciete waarschuwing en een bevestiging, met de reden erb
 de node kan je daarna permanent nadoen, en twee apparaten die dezelfde pubkey
 adverteren laten de routecache van repeaters klappen.
 
+**Antwoorden, in twee lagen.** MeshCore v1.17.0 heeft geen antwoordveld — de
+tekstlaag is drie types en verder niets. Op de draad wordt een antwoord daarom een
+leesbare quote (`>origineel.. tekst`, met de `.. ` altijd als scheider, zodat hij
+deterministisch terug te vinden is); op de IRC-verbinding doen `message-tags` en
+`server-time` het echte werk. Elk uitgeleverd bericht krijgt een `msgid`, een
+`+draft/reply=<msgid>` uit de client wordt de quote, en een binnenkomende mesh-regel
+die met een quote begint wordt teruggekoppeld aan de ringbuffer. Tags gaan alleen
+over TCP en kosten geen airtime; clients zonder die capability zien precies wat de
+MeshCore-app ziet. `CAP` houdt de registratie nu ook netjes vast tot `CAP END`.
+
+**Public is geen hashtag-kanaal**, en de MOTD beweerde dat wel. Zijn sleutel is de
+vaste `PUBLIC_GROUP_SECRET_HEX`; de naam doet er niet aan mee, en daarom staat hij
+zonder `#` in de tabel. De `#` die IRC eist is daar cosmetisch. De code maakte het
+onderscheid al goed (`channelSecretIsPublic()` kijkt naar de sleutel, niet naar de
+naam) — alleen de tekst niet.
+
 **Geen TLS**, met opzet: naast mesh, WiFi en de webserver is er geen heap voor
 TLS-sessies, en een halve TLS is erger dan geen. Vertrouwd LAN of VPN; 6667 niet
 open naar het internet.

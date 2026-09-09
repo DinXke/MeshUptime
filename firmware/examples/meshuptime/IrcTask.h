@@ -177,8 +177,35 @@ struct IrcSeen {
 
 #define IRC_LOG_DM  (-1)   /* chan-waarde voor een DM */
 
+/* ANTWOORDEN (v2.9.0) -- en waarom het er op de draad zo simpel uitziet.
+ *
+ * MeshCore v1.17.0 heeft GEEN antwoordveld. De hele tekstlaag is drie types
+ * (TXT_TYPE_PLAIN / _CLI_DATA / _SIGNED_PLAIN, TxtDataHelpers.h) en verder niets:
+ * geen bericht-id, geen reply_to, geen thread. Wat wij verzinnen moet dus LEESBARE
+ * TEKST zijn, anders ziet iemand met de MeshCore-app op zijn telefoon ruis.
+ *
+ * Daarom twee lagen, en de onderste is de echte:
+ *
+ *  - OP DE DRAAD een compacte quote: ">wat is de freq.. 869.618". Werkt in elke
+ *    client, ook in de app. De ".. " erachter is het scheidingsteken, ALTIJD, ook
+ *    als de quote niet afgekapt is -- zo is hij deterministisch terug te vinden.
+ *  - OP DE IRC-VERBINDING de IRCv3-tags `message-tags` en `server-time`. Wij geven
+ *    elk bericht een `msgid`, een antwoord komt binnen met `+draft/reply=<msgid>`,
+ *    en een binnenkomende mesh-regel die met '>' begint koppelen we terug aan de
+ *    ringbuffer. Dat is echte threading in je client, het degradeert naar leesbare
+ *    tekst op het mesh, en het kost GEEN airtime: tags gaan alleen over TCP.
+ *
+ * Wat we NIET doen: een kort id op de draad zetten ("~a3 tekst"). Compact voor ons,
+ * maar in de app leest het als ruis -- en dat is precies de lezer die de context
+ * niet heeft. */
+#ifndef IRC_QUOTE_LEN
+  #define IRC_QUOTE_LEN  20        /* tekens van het origineel in de quote */
+#endif
+#define IRC_QUOTE_SEP  ".. "       /* scheidt de quote van het antwoord */
+
 struct IrcLogEntry {
   uint32_t ts;                      /* RTC-seconden; 0 = leeg slot */
+  uint32_t id;                      /* msgid, oplopend; 0 = leeg */
   int8_t   chan;                    /* BotChannel-index, of IRC_LOG_DM */
   int8_t   bot;                     /* bij een DM: voor welk bot-slot */
   char     nick[IRC_NICK_MAX + 1];
@@ -208,6 +235,12 @@ struct IrcClient {
   char          user[12];
   bool          have_pass;
   bool          registered;
+  /* CAP-onderhandeling. cap_pending betekent: de client is met CAP begonnen, dus
+   * we mogen hem NIET registreren tot er CAP END komt -- doen we dat wel, dan
+   * mist hij het welkom of krijgt hij het dubbel. */
+  bool          cap_pending;
+  bool          cap_tags;      // message-tags: msgid + draft/reply
+  bool          cap_time;      // server-time: echte tijd op teruggespeelde regels
   char          pass[40];
   int8_t        acct;            // index in _accts; -1 = nog niet bekend
   int8_t        bot;             // bot-slot van dat account; -1 = geen
@@ -271,6 +304,7 @@ private:
 
   IrcLogEntry _log[IRC_LOG_MAX];
   uint16_t    _log_wr = 0;
+  uint32_t    _msg_seq = 0;
 
   IrcSeen     _seen[MAX_CHANNELS][IRC_SEEN_PER_CHAN];
   unsigned long _seen_next_sweep = 0;
@@ -327,7 +361,19 @@ private:
   void seenBroadcast(int chan_idx, const char* nick, bool joining);
 
   /* De ringbuffer. logAdd() bewaart, replay*() speelt terug naar een client. */
-  void logAdd(int chan, int bot, const char* nick, const char* text);
+  /* Retour: de index in de ring, of -1. De beller heeft hem nodig om het msgid
+   * mee te sturen dat hij zojuist heeft laten aanmaken. */
+  int  logAdd(int chan, int bot, const char* nick, const char* text);
+  int  logFindById(uint32_t id) const;
+  /* De ring-ingang waarvan de tekst met `snip` begint -- zo koppelen we een
+   * binnenkomende ">quote.. " terug aan het origineel. -1 = niet gevonden. */
+  int  logFindBySnippet(const char* snip) const;
+
+  /* Een PRIVMSG met de juiste IRCv3-tags ervoor. `e` mag NULL zijn (dan geen
+   * msgid), `reply_to` is 0 of het msgid waarop dit een antwoord is. */
+  void sendMsg(IrcClient& c, const IrcLogEntry* e, const char* nick,
+               const char* target, const char* text, uint32_t reply_to);
+  void isoTime(uint32_t ts, char* out, size_t out_len) const;
   void replayChannel(IrcClient& c, int chan_idx);
   void replayDms(IrcClient& c);
   /* Vanaf welk moment voor deze client, met IRC_LOG_TTL_S als bovengrens. */
@@ -336,7 +382,11 @@ private:
    * verzonnen tijd uit 2024, de terugvalwaarde van een ESP32 zonder RTC-batterij. */
   void logStamp(uint32_t ts, char* out, size_t out_len) const;
 
-  void doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice);
+  void doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice,
+                 const char* tags);
+  /* Begint deze mesh-regel met ">origineel.. "? Dan het msgid van het origineel,
+   * met `body` op het antwoord gezet. 0 = geen quote herkend. */
+  uint32_t quoteLookup(const char* text, const char** body) const;
   bool txAllowed(IrcClient& c, char* why, size_t why_len);
 
   static bool nickValid(const char* n);
