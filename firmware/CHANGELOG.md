@@ -120,6 +120,43 @@ zonder `#` in de tabel. De `#` die IRC eist is daar cosmetisch. De code maakte h
 onderscheid al goed (`channelSecretIsPublic()` kijkt naar de sleutel, niet naar de
 naam) — alleen de tekst niet.
 
+**Wat er richting de radio mag — nagerekend en aangescherpt.** De eerste
+berichtenteller (6 per emmer, 1 erbij per 10 s) was een tempo en geen bescherming:
+met de radio-instellingen van deze node kost een vol bericht ~1,6 s lucht, dus zes
+per minuut is ~16 % zendtijd terwijl de sub-band 869,4–869,65 MHz op 10 % staat. Een
+gekoppeld script of een sensor die elke drie seconden iets stuurt zat daarmee boven
+de wettelijke grens, en de repeaters die het floodverkeer herhalen kwamen daar nog
+bovenop. Nieuw:
+
+- een **luchtbegroting op de gemeten zendtijd van de radio**
+  (`Dispatcher::getTotalAirTime()`, dus inclusief adverts en alarmen — chat wijkt
+  voor het echte werk), standaard 2 % over het laatste uur;
+- de **aanloop na een herstart** telt niet mee: het boot-advert kostte gemeten ~9 s
+  in twintig seconden, en zonder uitzondering lag chat daarna acht minuten plat
+  zonder dat er iemand iets getypt had;
+- **opmaak en controltekens eruit** — kleur, vetdruk, cursief, reset. Op een mesh
+  betekenen ze niets en in de app zijn ze vuil. Blijft er niets over, dan geen
+  pakket;
+- **afkappen op een UTF-8-grens**, want een halve reeks toont als blokje;
+- een **herhalingsrem**: exact dezelfde regel naar hetzelfde doel binnen 10 minuten
+  wordt geweigerd. Dit is de rem tegen precies het soort koppeling dat eerder op dit
+  mesh kanalen volpompte;
+- **per pakket afrekenen** in plaats van per opdracht: een lange DM wordt in stukken
+  geknipt en die tellen allemaal mee.
+
+**Een ingebouwde `HELP`** met numerics 704/705/706, en onderwerpen KANALEN, DM,
+ANTWOORDEN, AIRTIME, IDENTITEIT, LEDEN en GEMIST. Deze server doet een half dozijn
+dingen die op een gewoon IRC-netwerk niet bestaan; die moet je kunnen opzoeken
+zonder de repo open te hebben. In HexChat en irssi is `/help` een commando van de
+client zelf, dus daar is het `/quote HELP <onderwerp>`.
+
+**De naam van wie je citeert staat nu in de quote** (`>Jan: wat is de.. 869.618`).
+In een kanaal draagt elk bericht al `"<naam>: "` als gewone tekst, dus de lezer zag
+wie er antwoordde maar niet aan wie; vragen twee mensen iets soortgelijks, dan is
+het antwoord niet meer thuis te brengen. In een DM blijft de naam weg — daar zijn
+maar twee partijen en is hij verspilde airtime. `quoteLookup()` slaat de naamprefix
+over en gebruikt hem om de juiste ring-ingang te kiezen.
+
 **Geen TLS**, met opzet: naast mesh, WiFi en de webserver is er geen heap voor
 TLS-sessies, en een halve TLS is erger dan geen. Vertrouwd LAN of VPN; 6667 niet
 open naar het internet.

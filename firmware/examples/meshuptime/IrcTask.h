@@ -103,8 +103,26 @@
   #define IRC_NICK_MAX  20
 #endif
 
-/* Zendrem. 3 s per client is geen wet maar de ondergrens waarbij een gesprek nog
- * gesprek blijft; de gedeelde emmer is wat het mesh echt beschermt. */
+/* ZENDREM -- EN WAAROM EEN BERICHTENTELLER NIET GENOEG IS.
+ *
+ * De eerste versie telde berichten: zes per emmer, een erbij per tien seconden.
+ * Dat is geen bescherming maar een tempo. Nagerekend met de radio-instellingen van
+ * deze node (869,618 MHz, BW 62,5 kHz, SF8, CR4/8) kost een vol bericht ~1,6 s
+ * lucht; zes per minuut is dan ~16% zendtijd, terwijl de sub-band 869,4-869,65 MHz
+ * op 10% duty cycle staat. Een client die stug elke drie seconden iets stuurt --
+ * een sensor, een statusscript, een brug die iemand aanzet en vergeet -- zat dus
+ * BOVEN de wettelijke grens, en de repeaters die het floodverkeer herhalen deden er
+ * nog een schep bovenop.
+ *
+ * Daarom is de echte rem nu een LUCHTBEGROTING op de meting van de radio zelf
+ * (Dispatcher::getTotalAirTime, dus inclusief adverts, alerts en doorgegeven
+ * pakketten). Komt de node boven IRC_DUTY_PCT over het laatste uur, dan mag IRC
+ * niet meer zenden -- het chatverkeer wijkt voor het echte werk van de node.
+ * IRC_DUTY_PCT staat bewust ver onder de 10%: er moet ruimte overblijven voor de
+ * bewaking, en het floodverkeer kost elders op het mesh nog eens hetzelfde.
+ *
+ * De berichtenteller en de 3 s per client blijven ernaast staan: die begrenzen
+ * pieken, de luchtbegroting begrenst het gemiddelde. */
 #ifndef IRC_TX_MIN_MS
   #define IRC_TX_MIN_MS  3000
 #endif
@@ -113,6 +131,28 @@
 #endif
 #ifndef IRC_BUCKET_MS
   #define IRC_BUCKET_MS  10000
+#endif
+#ifndef IRC_DUTY_PCT
+  #define IRC_DUTY_PCT  2          /* procent zendtijd over het venster hieronder */
+#endif
+#ifndef IRC_DUTY_WINDOW_MS
+  #define IRC_DUTY_WINDOW_MS  (60UL * 60UL * 1000UL)   /* 1 uur */
+#endif
+/* DE AANLOOP TELT NIET MEE. Bij het opstarten zendt de node zijn advert de lucht
+ * in, en gemeten is dat ~9 s zendtijd in de eerste twintig seconden. Zou dat in de
+ * begroting vallen, dan mag IRC daarna acht minuten niets -- terwijl er niemand
+ * gechat heeft. Het nulpunt schuift daarom mee tot de node IRC_DUTY_GRACE_MS
+ * draait; pas daarna begint het venster echt te tellen. De piekremmen (3 s per
+ * client, de emmer) gelden in die tijd gewoon. */
+#ifndef IRC_DUTY_GRACE_MS
+  #define IRC_DUTY_GRACE_MS  90000UL
+#endif
+
+/* HERHALINGSREM. Precies het geval dat dit moet vangen: een gekoppelde server of
+ * sensor die elke zoveel seconden dezelfde regel het kanaal in duwt. Twee keer
+ * exact hetzelfde binnen dit venster wordt geweigerd, per gebruiker en per doel. */
+#ifndef IRC_REPEAT_MS
+  #define IRC_REPEAT_MS  (10UL * 60UL * 1000UL)   /* 10 minuten */
 #endif
 
 /* Stille sessie afsluiten. Eerst een PING, dan pas weg -- een client die alleen
@@ -186,9 +226,15 @@ struct IrcSeen {
  *
  * Daarom twee lagen, en de onderste is de echte:
  *
- *  - OP DE DRAAD een compacte quote: ">wat is de freq.. 869.618". Werkt in elke
+ *  - OP DE DRAAD een compacte quote: ">Jan: wat is de.. 869.618". Werkt in elke
  *    client, ook in de app. De ".. " erachter is het scheidingsteken, ALTIJD, ook
  *    als de quote niet afgekapt is -- zo is hij deterministisch terug te vinden.
+ *
+ *    De NAAM van wie je citeert staat erbij, en dat is geen sier. In een kanaal
+ *    draagt elk bericht al "<naam>: " als gewone tekst, dus de lezer ziet wie er
+ *    ANTWOORDT -- maar zonder naam in de quote niet aan wie. Vragen twee mensen
+ *    iets soortgelijks, dan is het antwoord niet meer thuis te brengen. In een DM
+ *    laten we hem weg: daar zijn maar twee partijen en is hij verspilde airtime.
  *  - OP DE IRC-VERBINDING de IRCv3-tags `message-tags` en `server-time`. Wij geven
  *    elk bericht een `msgid`, een antwoord komt binnen met `+draft/reply=<msgid>`,
  *    en een binnenkomende mesh-regel die met '>' begint koppelen we terug aan de
@@ -199,7 +245,10 @@ struct IrcSeen {
  * maar in de app leest het als ruis -- en dat is precies de lezer die de context
  * niet heeft. */
 #ifndef IRC_QUOTE_LEN
-  #define IRC_QUOTE_LEN  20        /* tekens van het origineel in de quote */
+  #define IRC_QUOTE_LEN  16        /* tekens van het origineel in de quote */
+#endif
+#ifndef IRC_QUOTE_NAME_LEN
+  #define IRC_QUOTE_NAME_LEN  8    /* tekens van de naam ervoor (0 = geen naam) */
 #endif
 #define IRC_QUOTE_SEP  ".. "       /* scheidt de quote van het antwoord */
 
@@ -248,6 +297,8 @@ struct IrcClient {
   unsigned long last_rx;
   unsigned long last_tx_mesh;
   bool          ping_sent;
+  uint32_t      last_hash;       // FNV van doel+tekst van het vorige bericht
+  unsigned long last_hash_at;
 };
 
 class IrcTask {
@@ -312,6 +363,10 @@ private:
   /* Gedeelde zendemmer over alle clients. */
   uint8_t       _bucket = IRC_BUCKET_MAX;
   unsigned long _bucket_at = 0;
+  /* Nulpunt van het luchtvenster: wanneer, en hoeveel de radio toen al gezonden had. */
+  unsigned long _duty_ref_at = 0;
+  unsigned long _duty_ref_air = 0;
+  bool          _duty_armed = false;
 
   void loadAccounts();
   void saveAccounts();
@@ -324,6 +379,12 @@ private:
   void handleLine(IrcClient& c, char* line);
   void tryRegister(IrcClient& c);
   void sendWelcome(IrcClient& c);
+  /* De ingebouwde help (RPL_HELPSTART/HELPTXT/ENDOFHELP, 704/705/706). Zonder
+   * onderwerp een overzicht, met een onderwerp de uitleg erbij. Dit staat er omdat
+   * deze server een half dozijn dingen doet die op een gewoon IRC-netwerk niet
+   * bestaan -- airtime-rem, quote-antwoorden, een geemuleerde ledenlijst -- en die
+   * moet je kunnen opzoeken zonder de repo open te hebben. */
+  void sendHelp(IrcClient& c, const char* topic);
 
   /* Uitvoer. numeric() zet het servervoorvoegsel en de nick van de ontvanger er
    * zelf voor; raw() doet dat niet. Beide voegen CR-LF toe. */
@@ -367,7 +428,9 @@ private:
   int  logFindById(uint32_t id) const;
   /* De ring-ingang waarvan de tekst met `snip` begint -- zo koppelen we een
    * binnenkomende ">quote.. " terug aan het origineel. -1 = niet gevonden. */
-  int  logFindBySnippet(const char* snip) const;
+  /* `nick` mag NULL zijn. Staat hij er wel, dan wint een ingang van die afzender;
+   * anders valt hij terug op de nieuwste met dezelfde tekst. */
+  int  logFindBySnippet(const char* snip, const char* nick) const;
 
   /* Een PRIVMSG met de juiste IRCv3-tags ervoor. `e` mag NULL zijn (dan geen
    * msgid), `reply_to` is 0 of het msgid waarop dit een antwoord is. */
@@ -384,6 +447,16 @@ private:
 
   void doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice,
                  const char* tags);
+
+  /* WAT ER RICHTING HET MESH MAG. Deze drie staan tussen de IRC-lijn en de radio:
+   *  - meshClean() haalt eruit wat op een mesh geen betekenis heeft (IRC-kleuren,
+   *    vetdruk, controltekens) en knipt op een UTF-8-grens af;
+   *  - isRepeat() weigert exact dezelfde regel binnen IRC_REPEAT_MS;
+   *  - dutyOk() kijkt naar de gemeten zendtijd van de radio.
+   * Alles wat naar botSay()/botSendTo() gaat is hier langs geweest. */
+  static size_t meshClean(const char* in, char* out, size_t out_len);
+  bool isRepeat(IrcClient& c, const char* target, const char* body);
+  bool dutyOk(int payload_len, int chunks, char* why, size_t why_len);
   /* Begint deze mesh-regel met ">origineel.. "? Dan het msgid van het origineel,
    * met `body` op het antwoord gezet. 0 = geen quote herkend. */
   uint32_t quoteLookup(const char* text, const char** body) const;

@@ -306,7 +306,44 @@ Zonder rem is deze brug een zendmachine die het eigen netwerk platlegt. Daarom:
 | minimaal tussen twee verzendingen per gebruiker | 3 s | `IRC_TX_MIN_MS` |
 | gedeelde emmer over alle gebruikers | 6 berichten | `IRC_BUCKET_MAX` |
 | hervultempo van die emmer | 1 per 10 s | `IRC_BUCKET_MS` |
+| **luchtbegroting op de gemeten zendtijd** | 2 % per uur | `IRC_DUTY_PCT` |
+| aanloop na een herstart die niet meetelt | 90 s | `IRC_DUTY_GRACE_MS` |
+| dezelfde regel opnieuw naar hetzelfde doel | 10 min | `IRC_REPEAT_MS` |
 | tekstlengte incl. `"<naam>: "` | 160 tekens | `BOT_MAX_TEXT_LEN` |
+
+### Waarom een berichtenteller niet genoeg was
+
+De eerste versie telde alleen berichten. Dat is een tempo, geen bescherming.
+Nagerekend met de radio-instellingen van deze node (869,618 MHz, BW 62,5 kHz, SF8,
+CR4/8) kost een vol bericht ongeveer **1,6 s** lucht. Zes per minuut is dan ~16 %
+zendtijd, terwijl de sub-band 869,4–869,65 MHz op **10 %** duty cycle staat. Een
+client die stug elke drie seconden iets stuurt — een sensor, een statusscript, een
+brug die iemand aanzet en vergeet — zat dus boven de wettelijke grens, en de
+repeaters die het floodverkeer herhalen deden er nog een schep bovenop.
+
+De echte rem is daarom een **luchtbegroting op wat de radio werkelijk gezonden
+heeft** (`Dispatcher::getTotalAirTime()`). Adverts, alarmen en doorgegeven pakketten
+tellen mee: als de node het druk heeft met zijn eigenlijke werk, mag chat niet meer
+zenden. 2 % laat ruim marge onder de 10 %, want hetzelfde pakket kost bij elke
+repeater die het herhaalt opnieuw airtime.
+
+De aanloop na een herstart telt niet mee: het boot-advert kostte gemeten ~9 s in de
+eerste twintig seconden, en zonder uitzondering lag chat daarna acht minuten plat
+zonder dat er iemand iets getypt had.
+
+### Wat er nog meer tussen IRC en de radio staat
+
+- **Opmaak en controltekens gaan eruit.** IRC-clients sturen kleur (`0x03`),
+  vetdruk (`0x02`), cursief, onderstrepen en reset mee. Op een mesh betekent dat
+  niets: in de MeshCore-app is het vuil in de tekst, en het kost airtime. Blijft er
+  na het schoonmaken niets over, dan gaat er geen pakket de lucht in.
+- **Afkappen op een UTF-8-grens.** Halverwege een meerbytes-teken knippen levert een
+  ongeldige reeks op en dan toont de app een blokje of slikt de regel.
+- **Herhalingsrem.** Exact dezelfde regel naar hetzelfde doel binnen 10 minuten
+  wordt geweigerd — per gebruiker, want dezelfde tekst in twee kanalen kan legitiem
+  zijn. Dit is de rem tegen gekoppelde scripts en sensoren die blijven doorpompen.
+- **Per pakket afrekenen.** Een lange DM wordt door `botSendTo()` in stukken
+  geknipt en elk stuk is een eigen pakket; die tellen allemaal mee.
 
 `JOIN`, `PART`, `QUIT`, `TOPIC` en `NAMES` gaan **nooit** het mesh op. `NOTICE`
 evenmin — clients sturen daar automatische dingen mee. CTCP wordt genegeerd,

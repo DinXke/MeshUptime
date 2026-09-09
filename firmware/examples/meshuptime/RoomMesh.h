@@ -706,6 +706,15 @@ public:
    * false = die node is nooit gehoord. */
   bool ircWhois(const char* nick, char* out, size_t out_len) const;
 
+  /* Hoeveel milliseconden lucht kost een pakket van deze lengte, met de radio-
+   * instellingen die NU actief zijn? Nodig voor de duty-cycle-begroting van de
+   * IRC-server; zelf uitrekenen zou een tweede waarheid opleveren die na een
+   * 'set sf' niet meer klopt. */
+  uint32_t ircEstAirtimeMs(int len_bytes);
+  /* Alles wat deze node ooit heeft uitgezonden, in ms. Ook adverts, alerts en
+   * doorgegeven pakketten -- de IRC-server hoort te wijken voor het echte werk. */
+  unsigned long ircTotalAirtimeMs() const { return getTotalAirTime(); }
+
   /* De gedeelde naamtabel. add() overschrijft een bestaande pubkey en duwt anders
    * de oudste ingang eruit. 0 = ok, <0 = ongeldig. */
   int  nameTableAdd(const uint8_t* pubkey, const char* name);

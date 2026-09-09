@@ -90,6 +90,7 @@ void IrcTask::begin(RoomMesh* node, const char* firmware_version) {
     _cl[i].cap_pending = false; _cl[i].cap_tags = false; _cl[i].cap_time = false;
     _cl[i].acct = -1; _cl[i].bot = -1; _cl[i].chan_mask = 0;
     _cl[i].ping_sent = false;
+    _cl[i].last_hash = 0; _cl[i].last_hash_at = 0;
   }
   memset(_seen, 0, sizeof(_seen));
   memset(_log, 0, sizeof(_log));
@@ -99,6 +100,8 @@ void IrcTask::begin(RoomMesh* node, const char* firmware_version) {
   _server.setNoDelay(true);
   _bucket = IRC_BUCKET_MAX;
   _bucket_at = millis();
+  _duty_ref_at = millis();
+  _duty_ref_air = node->ircTotalAirtimeMs();
   _running = true;
   Serial.printf("[irc] server op poort %d, %d account(s)\n", IRC_PORT, acctCount());
 }
@@ -143,6 +146,7 @@ void IrcTask::pollAccept() {
     c.cap_pending = false; c.cap_tags = false; c.cap_time = false;
     c.acct = -1; c.bot = -1; c.chan_mask = 0;
     c.last_rx = millis(); c.last_tx_mesh = 0; c.ping_sent = false;
+    c.last_hash = 0; c.last_hash_at = 0;
     return;
   }
 
@@ -438,10 +442,11 @@ void IrcTask::sendWelcome(IrcClient& c) {
   numeric(c, 372, ":- JOIN #naam         hashtag-kanaal: de sleutel volgt uit de naam");
   numeric(c, 372, ":- JOIN #naam sleutel prive-kanaal met een eigen sleutel (16/32 byte hex)");
   numeric(c, 372, ":- JOIN #Public       het standaardkanaal -- vaste sleutel, GEEN hashtag");
-  numeric(c, 372, ":- antwoorden         wordt op het mesh '>origineel.. jouw tekst',");
+  numeric(c, 372, ":- antwoorden         wordt op het mesh '>Naam: origineel.. jouw tekst',");
   numeric(c, 372, ":-                    want MeshCore kent geen antwoordveld");
   numeric(c, 372, ":- PRIVMSG nick       DM vanaf jouw eigen sleutelpaar");
   numeric(c, 372, ":- WHOIS nick         pubkey, SNR en hopcount van de laatste hoor");
+  numeric(c, 372, ":- HELP               de volledige uitleg (in HexChat: /quote HELP)");
   numeric(c, 372, ":- Anderen voegen je toe met deze link:");
   char uri[160];
   if (_node->webBotSlotJoinUri(c.bot, uri, sizeof(uri))) numeric(c, 372, ":-   %s", uri);
@@ -534,17 +539,24 @@ int IrcTask::logFindById(uint32_t id) const {
   return -1;
 }
 
-int IrcTask::logFindBySnippet(const char* snip) const {
+int IrcTask::logFindBySnippet(const char* snip, const char* nick) const {
   if (!snip || !snip[0]) return -1;
   size_t n = strlen(snip);
+  size_t nn = (nick && nick[0]) ? strlen(nick) : 0;
+  int fallback = -1;
   /* Nieuwste eerst: dezelfde vraag wordt op een mesh vaker gesteld, en dan is het
    * laatste voorkomen bijna altijd het bedoelde. */
   for (int k = IRC_LOG_MAX; k > 0; k--) {
-    const IrcLogEntry& e = _log[(_log_wr + k - 1) % IRC_LOG_MAX];
+    int i = (_log_wr + k - 1) % IRC_LOG_MAX;
+    const IrcLogEntry& e = _log[i];
     if (e.ts == 0) continue;
-    if (strncasecmp(e.text, snip, n) == 0) return (_log_wr + k - 1) % IRC_LOG_MAX;
+    if (strncasecmp(e.text, snip, n) != 0) continue;
+    /* De naam in de quote is op IRC_QUOTE_NAME_LEN afgekapt, dus op prefix
+     * vergelijken en niet op gelijkheid. */
+    if (nn == 0 || strncasecmp(e.nick, nick, nn) == 0) return i;
+    if (fallback < 0) fallback = i;
   }
-  return -1;
+  return fallback;
 }
 
 void IrcTask::isoTime(uint32_t ts, char* out, size_t out_len) const {
@@ -804,10 +816,22 @@ static const char* ircTagValue(const char* tags, const char* key, char* buf, siz
   return NULL;
 }
 
-/* ">origineel.. antwoord" bouwen. De quote wordt op IRC_QUOTE_LEN afgekapt en het
- * scheidingsteken staat er ALTIJD, ook als er niets afviel -- anders is bij het
- * teruglezen niet te zien waar de quote ophoudt. */
-static void ircBuildQuote(const char* orig, const char* reply, char* out, size_t out_len) {
+/* ">Naam: origineel.. antwoord" bouwen. Het scheidingsteken staat er ALTIJD, ook
+ * als er niets afviel -- anders is bij het teruglezen niet te zien waar de quote
+ * ophoudt. `with_name` is false voor een DM: daar zijn maar twee partijen. */
+static void ircBuildQuote(const char* nick, const char* orig, const char* reply,
+                          bool with_name, char* out, size_t out_len) {
+  char nm[IRC_QUOTE_NAME_LEN + 1]; nm[0] = 0;
+  if (with_name && nick && nick[0]) {
+    size_t n = 0;
+    for (const char* p = nick; *p && n < IRC_QUOTE_NAME_LEN; p++) {
+      /* Geen spatie of ':' in de naam: die twee zijn bij het teruglezen juist de
+       * scheiders waarop we de naam van de tekst onderscheiden. */
+      if ((unsigned char)*p <= ' ' || *p == ':') continue;
+      nm[n++] = *p;
+    }
+    nm[n] = 0;
+  }
   char snip[IRC_QUOTE_LEN + 1];
   size_t n = 0;
   for (const char* p = orig; *p && n < IRC_QUOTE_LEN; p++) {
@@ -815,7 +839,8 @@ static void ircBuildQuote(const char* orig, const char* reply, char* out, size_t
     snip[n++] = *p;
   }
   snip[n] = 0;
-  snprintf(out, out_len, ">%s%s%s", snip, IRC_QUOTE_SEP, reply);
+  if (nm[0]) snprintf(out, out_len, ">%s: %s%s%s", nm, snip, IRC_QUOTE_SEP, reply);
+  else       snprintf(out, out_len, ">%s%s%s", snip, IRC_QUOTE_SEP, reply);
 }
 
 /* Begint deze mesh-regel met een quote? Zo ja: het origineel opzoeken in de ring en
@@ -825,11 +850,27 @@ uint32_t IrcTask::quoteLookup(const char* text, const char** body) const {
   if (!text || text[0] != '>') return 0;
   const char* sep = strstr(text + 1, IRC_QUOTE_SEP);
   if (!sep) return 0;
-  char snip[IRC_QUOTE_LEN + 2];
+  char q[IRC_QUOTE_NAME_LEN + IRC_QUOTE_LEN + 4];
   size_t n = (size_t)(sep - (text + 1));
-  if (n == 0 || n >= sizeof(snip)) return 0;
-  memcpy(snip, text + 1, n); snip[n] = 0;
-  int i = logFindBySnippet(snip);
+  if (n == 0 || n >= sizeof(q)) return 0;
+  memcpy(q, text + 1, n); q[n] = 0;
+
+  /* "Naam: tekst", of alleen "tekst" als er geen naam bij zat -- dat laatste is ook
+   * wat iemand typt die de conventie met de hand nabootst, en dat moet blijven
+   * werken. Een ': ' telt alleen als scheider met een KORT stuk zonder spatie
+   * ervoor; anders is het gewoon leestekens in het citaat. */
+  const char* snip = q;
+  const char* nm = NULL;
+  char nmbuf[IRC_QUOTE_NAME_LEN + 1];
+  char* cs = strstr(q, ": ");
+  if (cs) {
+    size_t nl = (size_t)(cs - q);
+    bool plausible = nl > 0 && nl <= IRC_QUOTE_NAME_LEN;
+    for (size_t i = 0; plausible && i < nl; i++) if (q[i] == ' ') plausible = false;
+    if (plausible) { memcpy(nmbuf, q, nl); nmbuf[nl] = 0; nm = nmbuf; snip = cs + 2; }
+  }
+
+  int i = logFindBySnippet(snip, nm);
   if (i < 0) return 0;
   *body = sep + strlen(IRC_QUOTE_SEP);
   return _log[i].id;
@@ -838,6 +879,97 @@ uint32_t IrcTask::quoteLookup(const char* text, const char** body) const {
 /* ------------------------------------------------------------------------ */
 /*  Zenden                                                                   */
 /* ------------------------------------------------------------------------ */
+
+/* WAT ER OP HET MESH GEEN BETEKENIS HEEFT, GAAT ER HIER UIT.
+ *
+ * Een IRC-client stuurt opmaak als controlbytes mee: 0x02 vet, 0x03 kleur (met een
+ * of twee cijfers, eventueel een komma en nog twee), 0x1D cursief, 0x1F onderstreept,
+ * 0x16 omgekeerd, 0x0F reset, 0x04 hexkleur. Op een mesh is dat niets -- in de
+ * MeshCore-app verschijnt het als vuil in de tekst, en het kost airtime. Weg dus,
+ * net als elk ander controlteken.
+ *
+ * Afkappen gebeurt op een UTF-8-GRENS. Halverwege een meerbytes-teken knippen levert
+ * een ongeldige reeks op, en dan toont de app een blokje of slikt de hele regel. */
+size_t IrcTask::meshClean(const char* in, char* out, size_t out_len) {
+  size_t o = 0;
+  bool sp = true;                      /* leidende spaties overslaan */
+  for (const unsigned char* p = (const unsigned char*)in; *p && o + 1 < out_len; p++) {
+    unsigned char ch = *p;
+    if (ch == 0x03) {                  /* kleur: [cijfer][cijfer][,cijfer[cijfer]] */
+      int d = 0;
+      while (d < 2 && p[1] >= '0' && p[1] <= '9') { p++; d++; }
+      if (d && p[1] == ',' && p[2] >= '0' && p[2] <= '9') {
+        p++; d = 0;
+        while (d < 2 && p[1] >= '0' && p[1] <= '9') { p++; d++; }
+      }
+      continue;
+    }
+    if (ch == 0x04) {                  /* hexkleur: zes hextekens */
+      int d = 0;
+      while (d < 6 && isxdigit(p[1])) { p++; d++; }
+      continue;
+    }
+    if (ch < 0x20 || ch == 0x7f) continue;         /* alle overige controltekens */
+    if (ch == ' ') { if (sp) continue; sp = true; }
+    else sp = false;
+    out[o++] = (char)ch;
+  }
+  while (o > 0 && out[o - 1] == ' ') o--;          /* achterliggende spaties weg */
+  /* Zit het laatste teken midden in een UTF-8-reeks, dan die reeks helemaal weg. */
+  while (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0x80) o--;
+  if (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0xC0) o--;
+  out[o] = 0;
+  return o;
+}
+
+/* Dezelfde regel nog eens, binnen het venster? Dat is geen gesprek. Precies het
+ * geval dat we willen tegenhouden: een sensor of script dat elke x seconden
+ * hetzelfde het kanaal in duwt. Per gebruiker en per doel, want dezelfde regel in
+ * twee kanalen kan wel legitiem zijn. */
+bool IrcTask::isRepeat(IrcClient& c, const char* target, const char* body) {
+  uint32_t h = 2166136261UL;                        /* FNV-1a */
+  for (const char* p = target; *p; p++) { h ^= (unsigned char)tolower(*p); h *= 16777619UL; }
+  h ^= 0xff; h *= 16777619UL;
+  for (const char* p = body; *p; p++)   { h ^= (unsigned char)*p; h *= 16777619UL; }
+  unsigned long now = millis();
+  if (c.last_hash == h && c.last_hash_at && (now - c.last_hash_at) < IRC_REPEAT_MS) return true;
+  c.last_hash = h;
+  c.last_hash_at = now;
+  return false;
+}
+
+/* De luchtbegroting. We meten wat de RADIO gezonden heeft, niet wat wij dachten te
+ * sturen -- adverts, alerts en doorgegeven pakketten tellen dus mee, en het IRC-
+ * verkeer wijkt daarvoor. Het venster schuift met sprongen: elk uur zetten we het
+ * nulpunt opnieuw. Dat is grover dan een echt glijdend venster, maar het kost geen
+ * ringbuffer met tijdstempels op een node die er al krap bij zit. */
+bool IrcTask::dutyOk(int payload_len, int chunks, char* why, size_t why_len) {
+  unsigned long now = millis();
+  unsigned long air = _node->ircTotalAirtimeMs();
+  /* Aanloop: nulpunt meeschuiven tot het opstartverkeer voorbij is. */
+  if (!_duty_armed) {
+    if (now < IRC_DUTY_GRACE_MS) { _duty_ref_at = now; _duty_ref_air = air; return true; }
+    _duty_armed = true;
+    _duty_ref_at = now;
+    _duty_ref_air = air;
+  }
+  if ((long)(now - _duty_ref_at) >= (long)IRC_DUTY_WINDOW_MS || air < _duty_ref_air) {
+    _duty_ref_at = now;                 /* nieuw venster; air < ref = teller omgelopen */
+    _duty_ref_air = air;
+  }
+  unsigned long elapsed = now - _duty_ref_at;
+  if (elapsed < 1000) elapsed = 1000;   /* vlak na een herstart niet delen door bijna nul */
+  unsigned long used = air - _duty_ref_air;
+  /* Wat dit bericht er nog bovenop doet. +24 byte voor de MeshCore-header en de MAC. */
+  unsigned long want = (unsigned long)_node->ircEstAirtimeMs(payload_len + 24) * (chunks > 0 ? chunks : 1);
+  unsigned long budget = (elapsed / 100UL) * IRC_DUTY_PCT;   /* elapsed * pct / 100 */
+  if (used + want <= budget) return true;
+  snprintf(why, why_len,
+      "Luchtbegroting op: de node zond %lu s in de laatste %lu min, en dat is de "
+      "grens van %d%%. Chatverkeer wijkt voor de bewaking. Probeer het later.",
+      used / 1000UL, elapsed / 60000UL, (int)IRC_DUTY_PCT);
+  return false;
+}
 
 bool IrcTask::txAllowed(IrcClient& c, char* why, size_t why_len) {
   unsigned long now = millis();
@@ -880,6 +1012,18 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     StrHelper::strncpy(body, text, sizeof(body));
   }
 
+  /* Opmaakcodes en controltekens eruit, voor alles wat hierna komt. Een lege regel
+   * na het schoonmaken (iemand stuurde alleen kleurcodes of spaties) gaat NIET de
+   * lucht in -- dat is een pakket zonder inhoud. */
+  {
+    char cleaned[sizeof(body)];
+    if (meshClean(body, cleaned, sizeof(cleaned)) == 0) {
+      numeric(c, 412, ":Na het weghalen van opmaak en controltekens bleef er geen tekst over");
+      return;
+    }
+    memcpy(body, cleaned, sizeof(body));
+  }
+
   /* Een antwoord uit de client (+draft/reply=<msgid>) wordt hier een quote op de
    * draad. Kan het origineel niet meer gevonden worden -- uit de ring gerold --
    * dan gaat het bericht gewoon zonder quote weg; dat is beter dan weigeren. */
@@ -890,8 +1034,9 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     uint32_t id = (uint32_t)strtoul(rt[0] == 'm' ? rt + 1 : rt, NULL, 16);
     int oi = logFindById(id);
     if (oi >= 0) {
-      char q[BOT_MAX_TEXT_LEN + 8];
-      ircBuildQuote(_log[oi].text, body, q, sizeof(q));
+      char q[BOT_MAX_TEXT_LEN + 16];
+      /* De naam alleen in een kanaal: in een DM weet je met wie je praat. */
+      ircBuildQuote(_log[oi].nick, _log[oi].text, body, target[0] == '#', q, sizeof(q));
       StrHelper::strncpy(body, q, sizeof(body));
     } else {
       notice(c, "Het bericht waarop je antwoordt is uit de buffer gerold; "
@@ -899,8 +1044,47 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     }
   }
 
-  char why[128];
+  /* Afkappen op het mesh-budget en op een UTF-8-grens. botSay() zet er nog
+   * "<botnaam>: " voor, dus dat gaat er hier al af -- laten we dat aan snprintf
+   * over, dan knipt hij midden in een teken. */
+  {
+    size_t room = BOT_MAX_TEXT_LEN - 2;
+    if (target[0] == '#') {
+      const char* bn = _node->webBotSlotName(c.bot);
+      size_t pre = (bn && bn[0]) ? strlen(bn) + 2 : 5;
+      room = (BOT_MAX_TEXT_LEN > pre + 1) ? (BOT_MAX_TEXT_LEN - pre - 1) : 16;
+    }
+    if (strlen(body) > room) {
+      body[room] = 0;
+      size_t o = strlen(body);
+      while (o > 0 && ((unsigned char)body[o - 1] & 0xC0) == 0x80) o--;
+      if (o > 0 && ((unsigned char)body[o - 1] & 0xC0) == 0xC0) o--;
+      body[o] = 0;
+      notice(c, "Je regel was te lang voor een mesh-bericht en is op %u tekens afgekapt.",
+             (unsigned)o);
+    }
+  }
+
+  if (isRepeat(c, target, body)) {
+    notice(c, "Exact dezelfde regel stuurde je net al naar %s. Herhalingen kosten "
+              "airtime die iedereen deelt; wacht %lu minuten of typ iets anders.",
+           target, (unsigned long)(IRC_REPEAT_MS / 60000UL));
+    return;
+  }
+
+  char why[224];
   if (!txAllowed(c, why, sizeof(why))) { notice(c, "%s", why); return; }
+  {
+    /* Een DM wordt door botSendTo() in stukken van MAX_POST_TEXT_LEN geknipt en
+     * elk stuk is een eigen pakket -- die tellen allemaal mee in de begroting. */
+    int chunks = 1;
+    if (target[0] != '#') {
+      size_t n = strlen(body);
+      chunks = (int)((n + MAX_POST_TEXT_LEN - 1) / MAX_POST_TEXT_LEN);
+      if (chunks < 1) chunks = 1;
+    }
+    if (!dutyOk((int)strlen(body) + 12, chunks, why, sizeof(why))) { notice(c, "%s", why); return; }
+  }
 
   if (target[0] == '#') {
     int idx = chanIndexFor(target);
@@ -943,7 +1127,12 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
   int rc = _node->botSendTo(c.bot, pub, body);
   if (rc < 0) { notice(c, "DM versturen mislukt (code %d)", rc); return; }
   c.last_tx_mesh = millis();
-  if (_bucket) _bucket--;
+  /* Per PAKKET afrekenen, niet per opdracht: een lange DM is er meerdere. */
+  {
+    size_t n = strlen(body);
+    int chunks = (int)((n + MAX_POST_TEXT_LEN - 1) / MAX_POST_TEXT_LEN);
+    while (chunks-- > 0 && _bucket) _bucket--;
+  }
   notice(c, "DM de lucht in naar %s (geen leesbevestiging op dit pad)", resolved);
 }
 
@@ -1162,6 +1351,10 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
     numeric(c, 303, ":%s", out);
     return;
   }
+  if (!strcmp(cmd, "HELP") || !strcmp(cmd, "HELPOP")) {
+    sendHelp(c, argc >= 2 ? argv[1] : NULL);
+    return;
+  }
   if (!strcmp(cmd, "MOTD")) { sendWelcome(c); return; }
   if (!strcmp(cmd, "AWAY")) { numeric(c, argc >= 2 ? 306 : 305, ":Afwezigheid bestaat niet op het mesh"); return; }
   if (!strcmp(cmd, "USERHOST")) { numeric(c, 302, ":"); return; }
@@ -1172,6 +1365,167 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
   }
 
   numeric(c, 421, "%s :Onbekend commando", cmd);
+}
+
+void IrcTask::sendHelp(IrcClient& c, const char* topic) {
+  const char* t = (topic && topic[0]) ? topic : "";
+  #define HELP(...) numeric(c, 705, __VA_ARGS__)
+
+  if (!t[0]) {
+    numeric(c, 704, "* :MeshUptime IRC -- een LoRa-mesh achter een IRC-server");
+    HELP("* :");
+    HELP("* :Je bent hier een MeshCore-identiteit met een eigen sleutelpaar. Wat je");
+    HELP("* :in een kanaal typt gaat als radiobericht de lucht in, en airtime is");
+    HELP("* :schaars -- lees HELP AIRTIME voor je gaat plakken.");
+    HELP("* :");
+    HELP("* :  HELP KANALEN      joinen, sleutels, namen met spaties, #Public");
+    HELP("* :  HELP DM           iemand rechtstreeks bereiken, nicks oplossen");
+    HELP("* :  HELP ANTWOORDEN   waarom een reply een quote wordt");
+    HELP("* :  HELP AIRTIME      de zendrem en waarom hij er is");
+    HELP("* :  HELP IDENTITEIT   je sleutelpaar, je pubkey, wie je kan nadoen");
+    HELP("* :  HELP LEDEN        waarom /NAMES iets anders betekent dan je denkt");
+    HELP("* :  HELP GEMIST       wat je terugkrijgt na het inloggen");
+    HELP("* :");
+    HELP("* :In HexChat en irssi bereik je dit met /quote HELP <onderwerp> --");
+    HELP("* :/help is daar een commando van de client zelf.");
+    numeric(c, 706, "* :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "KANALEN") || !strcasecmp(t, "CHANNELS")) {
+    numeric(c, 704, "KANALEN :Kanalen op het mesh");
+    HELP("KANALEN :JOIN #naam          hashtag-kanaal; de sleutel volgt uit de naam,");
+    HELP("KANALEN :                    dus wie de naam kent kan meelezen.");
+    HELP("KANALEN :JOIN #naam <hex>    prive-kanaal met een eigen sleutel (32 of 64");
+    HELP("KANALEN :                    hextekens, dus 128 of 256 bit).");
+    HELP("KANALEN :JOIN #Public        het standaardkanaal. GEEN hashtag: de sleutel");
+    HELP("KANALEN :                    staat vast in de firmware. Ook het drukste.");
+    HELP("KANALEN :LIST                alles wat deze node kent, met de kanaalhash.");
+    HELP("KANALEN :");
+    HELP("KANALEN :De '#' hoort BIJ de naam en gaat mee in de sleutelberekening:");
+    HELP("KANALEN :#dinx en dinx zijn verschillende kanalen. Een mesh-kanaal mag");
+    HELP("KANALEN :spaties dragen, IRC niet, dus die worden '_'. Botsen twee kanalen");
+    HELP("KANALEN :daardoor op dezelfde naam, dan krijgen ze allebei de hash erachter");
+    HELP("KANALEN :(#A_B~3f). /LIST toont de naam zoals hij op de node staat.");
+    HELP("KANALEN :");
+    HELP("KANALEN :PART is 'ik lees even niet mee'. De sleutel blijft op de node --");
+    HELP("KANALEN :weggooien doet de beheerder met 'channel del'.");
+    numeric(c, 706, "KANALEN :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "DM") || !strcasecmp(t, "PRIVMSG")) {
+    numeric(c, 704, "DM :Rechtstreekse berichten");
+    HELP("DM :PRIVMSG <nick> :tekst   gaat als DM de lucht in, versleuteld met een");
+    HELP("DM :                        gedeeld geheim uit jouw sleutelpaar en dat van");
+    HELP("DM :                        de ontvanger. Dit is het ENIGE berichttype dat");
+    HELP("DM :                        echt aan een afzender vastzit.");
+    HELP("DM :");
+    HELP("DM :Een nick wordt in deze volgorde opgezocht: een geplakte pubkey van 64");
+    HELP("DM :hextekens, de companion-lijst van de node, de geimporteerde naamtabel,");
+    HELP("DM :en dan de nodes die deze node zelf heeft horen adverteren.");
+    HELP("DM :Namen op een mesh zijn NIET uniek. Zijn er meerdere, dan neemt de node");
+    HELP("DM :de laatst gehoorde en zegt dat erbij -- plak de pubkey om zeker te zijn.");
+    HELP("DM :");
+    HELP("DM :Er is geen leesbevestiging op dit pad: verzonden is niet aangekomen.");
+    numeric(c, 706, "DM :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "ANTWOORDEN") || !strcasecmp(t, "REPLY")) {
+    numeric(c, 704, "ANTWOORDEN :Antwoorden op een bericht");
+    HELP("ANTWOORDEN :MeshCore heeft GEEN antwoordveld. Een reply wordt daarom");
+    HELP("ANTWOORDEN :gewone tekst op de draad:");
+    HELP("ANTWOORDEN :");
+    HELP("ANTWOORDEN :  >Jan: wat is de.. 869.618 sf8");
+    HELP("ANTWOORDEN :");
+    HELP("ANTWOORDEN :De naam en de eerste tekens van het origineel, dan '.. ' als");
+    HELP("ANTWOORDEN :scheider, dan jouw tekst. Dat leest ook in de MeshCore-app, en");
+    HELP("ANTWOORDEN :dat is de reden dat het geen kort id is.");
+    HELP("ANTWOORDEN :");
+    HELP("ANTWOORDEN :Heeft je client message-tags (WeeChat, Textual, Goguma), dan");
+    HELP("ANTWOORDEN :doet +draft/reply het werk en bouwt de node de quote. Zo niet,");
+    HELP("ANTWOORDEN :typ je hem gewoon zelf -- het resultaat op het mesh is exact");
+    HELP("ANTWOORDEN :hetzelfde. Een binnenkomende quote wordt teruggekoppeld aan de");
+    HELP("ANTWOORDEN :buffer, dus clients die het snappen tonen alsnog een thread.");
+    HELP("ANTWOORDEN :De quote kost tot 30 van je 160 tekens.");
+    numeric(c, 706, "ANTWOORDEN :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "AIRTIME")) {
+    numeric(c, 704, "AIRTIME :De zendrem, en waarom hij er is");
+    HELP("AIRTIME :Dit is LoRa. EU868 kent 1% duty cycle en een bericht is hoogstens");
+    HELP("AIRTIME :160 tekens. Een matig druk IRC-kanaal produceert meer verkeer dan");
+    HELP("AIRTIME :het mesh kan dragen, dus:");
+    HELP("AIRTIME :  - minstens 3 s tussen twee berichten van jou;");
+    HELP("AIRTIME :  - een gedeelde emmer van 6 berichten over ALLE gebruikers, die");
+    HELP("AIRTIME :    per 10 s met een bijvult;");
+    HELP("AIRTIME :  - een LUCHTBEGROTING op de gemeten zendtijd van de radio: komt");
+    HELP("AIRTIME :    de node boven 2% over het laatste uur, dan mag IRC niet meer");
+    HELP("AIRTIME :    zenden. Adverts en alarmen tellen mee -- chat wijkt daarvoor;");
+    HELP("AIRTIME :  - exact dezelfde regel binnen 10 minuten wordt geweigerd. Dat is");
+    HELP("AIRTIME :    voor gekoppelde scripts en sensoren die blijven herhalen;");
+    HELP("AIRTIME :  - opmaak (kleuren, vetdruk) en controltekens gaan eruit: op een");
+    HELP("AIRTIME :    mesh betekenen ze niets en in de app zijn ze vuil;");
+    HELP("AIRTIME :  - langere tekst wordt afgekapt, op een UTF-8-grens.");
+    HELP("AIRTIME :");
+    HELP("AIRTIME :Wat geweigerd wordt komt terug als NOTICE met de wachttijd erbij,");
+    HELP("AIRTIME :niet als stilte. JOIN, PART, QUIT, TOPIC en NAMES gaan nooit de");
+    HELP("AIRTIME :lucht in, NOTICE evenmin, en CTCP wordt genegeerd behalve /me.");
+    numeric(c, 706, "AIRTIME :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "IDENTITEIT") || !strcasecmp(t, "IDENTITY")) {
+    numeric(c, 704, "IDENTITEIT :Je sleutelpaar");
+    HELP("IDENTITEIT :Je account hoort permanent bij een bot-slot op deze node, en");
+    HELP("IDENTITEIT :dat slot draagt een eigen sleutelpaar. Die pubkey is je adres");
+    HELP("IDENTITEIT :op het mesh; WHOIS op je eigen nick toont hem, en MOTD toont de");
+    HELP("IDENTITEIT :link waarmee anderen je toevoegen.");
+    HELP("IDENTITEIT :");
+    HELP("IDENTITEIT :Je nick kan niet wijzigen: hij zit aan die identiteit vast.");
+    HELP("IDENTITEIT :Een tweede login op hetzelfde account gooit de eerste eruit.");
+    HELP("IDENTITEIT :");
+    HELP("IDENTITEIT :Let op wat dit NIET is. In een kanaal is de afzendernaam gewone");
+    HELP("IDENTITEIT :tekst in de payload, niet ondertekend: wie de kanaalsleutel");
+    HELP("IDENTITEIT :heeft kan elke naam voorzetten, en de sleutel van #Public is");
+    HELP("IDENTITEIT :algemeen bekend. Alleen DM's zitten cryptografisch vast aan een");
+    HELP("IDENTITEIT :afzender. En de beheerder van deze node heeft je private key.");
+    numeric(c, 706, "IDENTITEIT :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "LEDEN") || !strcasecmp(t, "NAMES")) {
+    numeric(c, 704, "LEDEN :Wat /NAMES hier betekent");
+    HELP("LEDEN :Een mesh-kanaal heeft geen aanwezigheid: geen join, geen ledenlijst,");
+    HELP("LEDEN :alleen wie toevallig zendt. Een leeg /NAMES zou lezen als 'hier is");
+    HELP("LEDEN :niemand', terwijl er een heel netwerk meeluistert.");
+    HELP("LEDEN :");
+    HELP("LEDEN :Daarom toont de node wie hij heeft HOREN zenden: een JOIN bij het");
+    HELP("LEDEN :eerste bericht, een PART na 45 minuten stilte. Dus:");
+    HELP("LEDEN :  - wie meeleest maar nooit zendt, verschijnt nooit;");
+    HELP("LEDEN :  - wie een naam verzint, verschijnt wel;");
+    HELP("LEDEN :  - de PART is een gok op stilte, geen vertrek.");
+    numeric(c, 706, "LEDEN :Einde van de help");
+    return;
+  }
+
+  if (!strcasecmp(t, "GEMIST") || !strcasecmp(t, "HISTORY")) {
+    numeric(c, 704, "GEMIST :Wat je terugkrijgt na het inloggen");
+    HELP("GEMIST :De node bewaart de laatste berichten in een ringbuffer en speelt");
+    HELP("GEMIST :terug wat er langskwam terwijl JIJ weg was: je DM's bij het");
+    HELP("GEMIST :inloggen, een kanaal bij JOIN. Bovengrens 12 uur.");
+    HELP("GEMIST :");
+    HELP("GEMIST :Die buffer staat in RAM en is klein. Een herstart van de node wist");
+    HELP("GEMIST :hem, en bij druk verkeer rolt het oudste eruit. Dit is een radio");
+    HELP("GEMIST :met een chatserver erop, geen logserver -- reken er niet op.");
+    numeric(c, 706, "GEMIST :Einde van de help");
+    return;
+  }
+
+  numeric(c, 524, "%s :Geen help over dat onderwerp. Typ HELP voor de lijst.", t);
+  #undef HELP
 }
 
 /* ------------------------------------------------------------------------ */

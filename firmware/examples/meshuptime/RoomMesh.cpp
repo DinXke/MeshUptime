@@ -3420,6 +3420,10 @@ void RoomMesh::loadNames() {
 
 /* ---- IWebNode: de IRC-tab. ---------------------------------------------- */
 
+uint32_t RoomMesh::ircEstAirtimeMs(int len_bytes) {
+  return radio_driver.getEstAirtimeFor(len_bytes);
+}
+
 int RoomMesh::webIrcPort()     { return _irc ? _irc->port() : 0; }
 int RoomMesh::webIrcSessions() { return _irc ? _irc->numClients() : 0; }
 
