@@ -1,6 +1,7 @@
 #include "RoomMesh.h"
 #include "TimeFmt.h"
 #include "PushTask.h"   /* v2.5.1: instant companion-push via _push->queueCompanion() */
+#include "IrcTask.h"    /* v2.9.0: kanaaltekst en DM's doorgeven aan de IRC-sessies */
 
 /* === KANAAL-COMMANDO-DIAGNOSE (v2.3.7) ======================================
  * ALTIJD-AAN seriële logging (MESH_DEBUG staat uit), prefix "[chan]" -- net als
@@ -1848,6 +1849,21 @@ static void botRecipsPath(int b, char* out, size_t out_len) {
   else snprintf(out, out_len, "%s_%d", BOT_RECIPS_PATH, b);
 }
 
+/* Het sleutelpaar dat NU in slot b zit wegschrijven. Tegenhanger van
+ * loadOrCreateBotIdentity(), nodig voor `irc key set`: daar vervangen we de
+ * identiteit in RAM en moet die de herstart overleven, want anders praat de bot
+ * na de volgende boot weer onder de oude sleutel en zijn alle contacten stuk. */
+bool RoomMesh::saveBotIdentity(int b) {
+  if (_fs == NULL || b < 0 || b >= MAX_BOTS) return false;
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  IdentityStore store(*_fs, "");
+#else
+  IdentityStore store(*_fs, "/identity");
+#endif
+  char idname[16]; botIdName(b, idname, sizeof(idname));
+  return store.save(idname, _bots[b].id);
+}
+
 void RoomMesh::loadOrCreateBotIdentity(int b) {
   if (_fs == NULL || b < 0 || b >= MAX_BOTS) return;
 #if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
@@ -2610,6 +2626,25 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
   for (int i = 0; i < _num_active_snodes; i++)
     if (memcmp(sender_pub, snodes[i].id.pub_key, PUB_KEY_SIZE) == 0) return;
 
+  /* v2.9.0: de DM doorgeven aan de IRC-sessie die op DEZE bot ingelogd is, vóór
+   * het commandopad. De IRC-gebruiker is de eigenaar van dit sleutelpaar; hij
+   * hoort alles te zien wat eraan geadresseerd is, ook wat de bot zelf niet als
+   * commando herkent. Naam: uit de companion-store, anders uit de buurtlijst,
+   * anders laten we hem leeg en maakt IrcTask er een pubkey-prefix van. */
+  if (_irc) {
+    const char* who = "";
+    int ci = companionFindByPub(sender_pub);
+    if (ci >= 0) who = _companions[ci].name;
+    if (!who[0]) {
+      for (int k = 0; k < neighbours.getNumEntries(); k++) {
+        const NeighbourEntry* e = neighbours.getEntryByIdx(k);
+        if (e && e->name[0] && memcmp(e->pub_key, sender_pub, PUB_KEY_SIZE) == 0) { who = e->name; break; }
+      }
+    }
+    _irc->onMeshDm(b, sender_pub, who, text, ((float)packet->_snr) / 4.0f,
+                   (int)radio_driver.getLastRSSI(), (int)packet->getPathHashCount());
+  }
+
   /* De lokale kloktijd op ontvangstmoment (RTC = UTC -> lokaal via de TZ), met de
    * zone-afkorting (CET/CEST). Onder TIME_FLOOR: "niet gesynct". */
   uint32_t now_s = getRTCClock()->getCurrentTime();
@@ -2870,6 +2905,14 @@ int RoomMesh::channelFindByName(const char* name) const {
   return -1;
 }
 
+int RoomMesh::channelFindBySecret(const mesh::GroupChannel& ch) const {
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (!_channels[i].used) continue;
+    if (memcmp(_channels[i].secret, ch.secret, _channels[i].secret_len) == 0) return i;
+  }
+  return -1;
+}
+
 int RoomMesh::channelCount() const {
   int n = 0;
   for (int i = 0; i < MAX_CHANNELS; i++) if (_channels[i].used) n++;
@@ -3125,6 +3168,18 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
     return;
   }
 
+  /* v2.9.0: ELKE leesbare kanaalregel gaat naar de IRC-sessies die dit kanaal
+   * volgen -- niet alleen ping/test/path. Dat onderscheid hieronder gaat over
+   * waar de BOT op antwoordt; een IRC-gebruiker wil het hele gesprek zien.
+   * Bewust hier en niet verderop: onder deze regel staan de vroege returns voor
+   * "geen bot-commando", en dan zou IRC alleen de drie commando's zien. */
+  if (_irc) {
+    int ci = channelFindBySecret(channel);
+    if (ci >= 0)
+      _irc->onMeshChannelText(ci, sender, msg, ((float)packet->_snr) / 4.0f,
+                              (int)radio_driver.getLastRSSI(), (int)packet->getPathHashCount());
+  }
+
   /* Alleen op een KAAL commando reageren (ping/test/path), evt. met een leading '#',
    * '!' of '/' dat sommige clients toevoegen. Verb = tot de eerste whitespace, dan
    * trailing leestekens eraf (bv. "ping!"/"ping."). Zo blijft het kanaal niet
@@ -3221,6 +3276,102 @@ void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* r
   mesh::GroupChannel ch = channel;   // niet-const kopie voor de API
   mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
   if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+}
+
+/* ------------------------------------------------------------------------ */
+/*  IRC-server: wat IrcTask van de mesh nodig heeft (v2.9.0)                  */
+/* ------------------------------------------------------------------------ */
+
+/* "<botnaam>: <tekst>" in kanaal chan_idx, geflood. Zelfde draadvorm als
+ * sendChannelReply(), maar met de naam van BOT b in plaats van die van de
+ * alert-bot -- zie de toelichting bij botSay() in de header. */
+int RoomMesh::botSay(int b, int chan_idx, const char* text) {
+  if (b < 0 || b >= MAX_BOTS || !_bots[b].used) return -1;
+  if (chan_idx < 0 || chan_idx >= MAX_CHANNELS) return -2;
+  if (!_channels[chan_idx].used || !_channels[chan_idx].enabled) return -3;
+  if (!text || !text[0]) return -4;
+
+  mesh::GroupChannel ch;
+  ch.hash[0] = _channels[chan_idx].hash;
+  memcpy(ch.secret, _channels[chan_idx].secret, PUB_KEY_SIZE);
+
+  uint8_t temp[MAX_PACKET_PAYLOAD];
+  uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &ts, 4);
+  temp[4] = 0;   // TXT_TYPE_PLAIN
+  const char* nm = _bots[b].name[0] ? _bots[b].name : "bot";
+  int off = 5 + snprintf((char*)&temp[5], MAX_PACKET_PAYLOAD - 6, "%s: %s", nm, text);
+  if (off > MAX_PACKET_PAYLOAD - 1) off = MAX_PACKET_PAYLOAD - 1;
+
+  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
+  if (!pkt) return -5;
+  sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+  return 0;
+}
+
+int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
+                             size_t resolved_len) const {
+  if (!nick || !nick[0] || !pub_out) return -1;
+
+  /* 1. Een volledige pubkey als nick. Dat is de weg die ALTIJD werkt, ook voor een
+   *    node die we nooit gehoord hebben -- en de enige die eenduidig is. */
+  size_t n = strlen(nick);
+  if (n == PUB_KEY_SIZE * 2 && mesh::Utils::fromHex(pub_out, PUB_KEY_SIZE, nick)) {
+    if (resolved) StrHelper::strncpy(resolved, nick, resolved_len);
+    return 0;
+  }
+
+  /* 2. De companion-store: apparaten die wij zelf beheren, dus de meest bedoelde
+   *    ontvanger als de naam matcht. */
+  for (int i = 0; i < MAX_COMPANIONS; i++) {
+    if (!_companions[i].used || strcasecmp(_companions[i].name, nick) != 0) continue;
+    memcpy(pub_out, _companions[i].pub_key, PUB_KEY_SIZE);
+    if (resolved) StrHelper::strncpy(resolved, _companions[i].name, resolved_len);
+    return 0;
+  }
+
+  /* 3. De buurtlijst. Namen op een mesh zijn NIET uniek: twee nodes mogen dezelfde
+   *    naam adverteren. We kiezen de laatst gehoorde en melden de dubbelzinnigheid
+   *    terug (retour 1), zodat IrcTask de gebruiker kan waarschuwen in plaats van
+   *    stil de verkeerde te kiezen. */
+  int best = -1, hits = 0;
+  for (int k = 0; k < neighbours.getNumEntries(); k++) {
+    const NeighbourEntry* e = neighbours.getEntryByIdx(k);
+    if (!e || !e->name[0] || strcasecmp(e->name, nick) != 0) continue;
+    hits++;
+    if (best < 0 || e->heard_at > neighbours.getEntryByIdx(best)->heard_at) best = k;
+  }
+  if (best >= 0) {
+    const NeighbourEntry* e = neighbours.getEntryByIdx(best);
+    memcpy(pub_out, e->pub_key, PUB_KEY_SIZE);
+    if (resolved) StrHelper::strncpy(resolved, e->name, resolved_len);
+    return hits > 1 ? 1 : 0;
+  }
+  return -1;
+}
+
+bool RoomMesh::ircWhois(const char* nick, char* out, size_t out_len) const {
+  uint8_t pub[PUB_KEY_SIZE];
+  char resolved[32];
+  if (ircResolveNick(nick, pub, resolved, sizeof(resolved)) < 0) return false;
+
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  mesh::Utils::toHex(hex, pub, PUB_KEY_SIZE);
+
+  /* De hoorgegevens komen uit de buurtlijst; een companion die alleen DM't staat
+   * daar niet in en dan blijft het bij de pubkey. Liever dat dan verzonnen SNR. */
+  for (int k = 0; k < neighbours.getNumEntries(); k++) {
+    const NeighbourEntry* e = neighbours.getEntryByIdx(k);
+    if (!e || memcmp(e->pub_key, pub, PUB_KEY_SIZE) != 0) continue;
+    uint32_t now_s = const_cast<RoomMesh*>(this)->getRTCClock()->getCurrentTime();
+    uint32_t age = (now_s > e->heard_at) ? (now_s - e->heard_at) : 0;
+    snprintf(out, out_len, "pubkey %s | SNR %.1f dB | %u hop%s | %u advert%s | %lu s geleden gehoord",
+             hex, ((float)e->snr4) / 4.0f, (unsigned)e->hops, e->hops == 1 ? "" : "s",
+             (unsigned)e->count, e->count == 1 ? "" : "s", (unsigned long)age);
+    return true;
+  }
+  snprintf(out, out_len, "pubkey %s | nog geen advert gehoord", hex);
+  return true;
 }
 
 /* Ad-hoc schone DM vanaf de bot naar één pubkey (flash-melding). Enqueue als een
@@ -3373,6 +3524,8 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     handleBotCommand(command + 4, reply);
   } else if (memcmp(command, "channel ", 8) == 0) {
     handleChannelCommand(command + 8, reply);
+  } else if (memcmp(command, "irc ", 4) == 0) {
+    handleIrcCommand(command + 4, reply);
   } else if (memcmp(command, "room ", 5) == 0) {
     handleRoomCommand(command + 5, reply);
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {
@@ -3714,6 +3867,109 @@ void RoomMesh::handleBotCommand(char* args, char* reply) {
 
 /* channel list | add <naam> [secrethex] | del <naam> | on <naam> | off <naam>
  * Zonder secret bij 'add' -> hashtag-kanaal (sleutel uit de naam, zoals de app). */
+/* CLI: irc ... -- accountbeheer voor de IRC-server (v2.9.0).
+ *
+ * WAAROM ACCOUNTS HIER EN NIET OVER IRC. Een account claimt PERMANENT een
+ * bot-slot, en een bot-slot is een MeshCore-identiteit met een eigen sleutelpaar.
+ * Zelfregistratie zou betekenen dat wie de poort bereikt een identiteit op jouw
+ * node kan maken en er onder jouw radio mee kan zenden. Dat is een beheerdaad, dus
+ * staat hij op de CLI -- serieel, of via de webinterface die op dezelfde
+ * handleCommand uitkomt.
+ *
+ * `irc key set` is de BYOK-weg: je eigen sleutelpaar (van je telefoon) in een
+ * bot-slot leggen, zodat je op IRC dezelfde identiteit bent als in de app. Dat kan
+ * NIET over IRC, en met opzet: IRC is onversleuteld en een private key die je in
+ * een chatvenster typt staat daarna in je client-log, in de scrollback en op elke
+ * switch onderweg. Wie hem hier zet, weet bovendien dat de node hem houdt en je
+ * vanaf dat moment kan nadoen -- zie SECURITY in docs/irc.md.
+ */
+void RoomMesh::handleIrcCommand(char* args, char* reply) {
+  while (*args == ' ') args++;
+  if (!_irc) { strcpy(reply, "ERR IRC-server niet actief (geen wifi-build?)"); return; }
+
+  if (strncmp(args, "list", 4) == 0 || *args == 0) {
+    char* p = reply;
+    p += sprintf(p, "irc: %d sessie(s), accounts:", _irc->numClients());
+    int n = 0;
+    for (int i = 0; i < MAX_BOTS; i++) {
+      char nick[IRC_NICK_MAX + 1]; int bot;
+      if (!_irc->acctGet(i, nick, sizeof(nick), &bot)) continue;
+      if ((p - reply) > 170) { p += sprintf(p, " ..."); break; }
+      p += sprintf(p, " %s(bot %d=%s)", nick, bot, webBotSlotName(bot));
+      n++;
+    }
+    if (n == 0) strcat(reply, " (geen)");
+    return;
+  }
+
+  if (memcmp(args, "user add ", 9) == 0) {
+    char* nick = args + 9; while (*nick == ' ') nick++;
+    char* pw = strchr(nick, ' ');
+    if (!pw) { strcpy(reply, "gebruik: irc user add <nick> <wachtwoord> <botnaam-of-index>"); return; }
+    *pw++ = 0; while (*pw == ' ') pw++;
+    char* botsel = strchr(pw, ' ');
+    if (!botsel) { strcpy(reply, "gebruik: irc user add <nick> <wachtwoord> <botnaam-of-index>"); return; }
+    *botsel++ = 0; while (*botsel == ' ') botsel++;
+    int b = botResolve(botsel);
+    if (b < 0) { sprintf(reply, "ERR onbekende bot '%s' (zie 'bot list')", botsel); return; }
+    int rc = _irc->acctAdd(nick, pw, b);
+    switch (rc) {
+      case 0:  sprintf(reply, "OK %s -> bot %d (%s)", nick, b, webBotSlotName(b)); break;
+      case -1: strcpy(reply, "ERR accounttabel vol"); break;
+      case -2: strcpy(reply, "ERR ongeldige nick of wachtwoord korter dan 6 tekens"); break;
+      case -3: strcpy(reply, "ERR die nick bestaat al"); break;
+      case -4: strcpy(reply, "ERR bot bestaat niet of is al aan een account vergeven"); break;
+      default: sprintf(reply, "ERR code %d", rc); break;
+    }
+    return;
+  }
+
+  if (memcmp(args, "user pass ", 10) == 0) {
+    char* nick = args + 10; while (*nick == ' ') nick++;
+    char* pw = strchr(nick, ' ');
+    if (!pw) { strcpy(reply, "gebruik: irc user pass <nick> <nieuw wachtwoord>"); return; }
+    *pw++ = 0; while (*pw == ' ') pw++;
+    int rc = _irc->acctSetPassword(nick, pw);
+    strcpy(reply, rc == 0 ? "OK" : (rc == -2 ? "ERR onbekende nick of te kort wachtwoord" : "ERR"));
+    return;
+  }
+
+  if (memcmp(args, "user del ", 9) == 0) {
+    char* nick = args + 9; while (*nick == ' ') nick++;
+    int rc = _irc->acctDel(nick);
+    strcpy(reply, rc == 0 ? "OK" : "ERR onbekende nick");
+    return;
+  }
+
+  /* irc key set <botnaam-of-index> <privhex64> <pubhex64> -- BYOK. Beide sleutels,
+   * want een Ed25519-private key alleen laat de publieke niet eenduidig afleiden in
+   * de vorm die MeshCore bewaart; LocalIdentity(prv_hex, pub_hex) wil ze allebei. */
+  if (memcmp(args, "key set ", 8) == 0) {
+    char* sel = args + 8; while (*sel == ' ') sel++;
+    char* prv = strchr(sel, ' ');
+    if (!prv) { strcpy(reply, "gebruik: irc key set <bot> <privhex> <pubhex>"); return; }
+    *prv++ = 0; while (*prv == ' ') prv++;
+    char* pub = strchr(prv, ' ');
+    if (!pub) { strcpy(reply, "gebruik: irc key set <bot> <privhex> <pubhex>"); return; }
+    *pub++ = 0; while (*pub == ' ') pub++;
+    int b = botResolve(sel);
+    if (b < 0) { sprintf(reply, "ERR onbekende bot '%s'", sel); return; }
+    if (strlen(prv) != PRV_KEY_SIZE * 2 || strlen(pub) != PUB_KEY_SIZE * 2) {
+      sprintf(reply, "ERR sleutellengte: prv %d hex, pub %d hex", PRV_KEY_SIZE * 2, PUB_KEY_SIZE * 2);
+      return;
+    }
+    mesh::LocalIdentity id(prv, pub);
+    if (memcmp(id.pub_key, _bots[b].id.pub_key, PUB_KEY_SIZE) == 0) { strcpy(reply, "OK (ongewijzigd)"); return; }
+    _bots[b].id = id;
+    saveBotIdentity(b);
+    sendBotAdvertisement(b, 2000, true);
+    sprintf(reply, "OK bot %d draagt nu jouw sleutel; advert de lucht in", b);
+    return;
+  }
+
+  strcpy(reply, "gebruik: irc list | user add|pass|del ... | key set <bot> <prv> <pub>");
+}
+
 void RoomMesh::handleChannelCommand(char* args, char* reply) {
   while (*args == ' ') args++;
 

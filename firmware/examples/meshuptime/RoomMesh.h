@@ -69,6 +69,12 @@
  * een vooruit-declaratie volstaat -- geen PushTask.h in deze header. */
 class PushTask;
 
+/* v2.9.0: de IRC-server (IrcTask) hangt er op dezelfde manier aan als PushTask --
+ * een pointer die main_room.cpp zet, en aanroepen in RoomMesh.cpp. IrcTask.h
+ * includeert WEL RoomMesh.h (hij heeft de hele mesh-API nodig); andersom zou dat
+ * een kring worden, dus hier alleen een vooruit-declaratie. */
+class IrcTask;
+
 /* ------------------------------ Config -------------------------------- */
 
 #ifndef FIRMWARE_BUILD_DATE
@@ -456,6 +462,7 @@ public:
    * naar MeshManager gaat (POST /api/companion) i.p.v. te wachten op de poll van
    * /companions.json. Alleen een pointer; NULL = terugval op de poll. */
   void setPushTask(PushTask* p) { _push = p; }
+  void setIrcTask(IrcTask* t) { _irc = t; }
 
   /* ---- Publieke room-API (alerts, commando-antwoorden, web/CLI) ---- */
 
@@ -626,6 +633,36 @@ public:
   bool webMsgGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len,
                  char* text, size_t text_len, uint32_t* ts) override
                 { return compMsgGet(i, pub64, pub_len, name, name_len, text, text_len, ts); }
+
+  /* ---- IRC-server (v2.9.0). De vier dingen die IrcTask van de mesh nodig heeft
+   * en die er nog niet waren. Bewust GEEN eigen interfaceklasse zoals IWebNode:
+   * die bestaat omdat WebTask zowel SensorMesh als RoomMesh bedient, terwijl
+   * IrcTask alleen in de room-variant gebouwd wordt. Een tweede interface zou
+   * enkel een lijst virtuals zijn om synchroon te houden. ---- */
+
+  /* Post IN een kanaal ONDER DE NAAM VAN BOT b. sendChannelReply() kan dit niet:
+   * die zet altijd de ALERT-bot ervoor, want hij is er voor de ping/test/path-
+   * antwoorden. Met N IRC-gebruikers op N bots moet elk bericht de naam van zijn
+   * eigen afzender dragen. 0 = ok, <0 = fout.
+   *
+   * NB: in een MeshCore group-channel is die naam ALLEEN tekst -- een group-pakket
+   * draagt geen handtekening per afzender. Wie de kanaalsleutel heeft, kan elke
+   * naam voorzetten. Dat geldt voor het hele protocol en niet alleen hier; de
+   * echte afzenderbinding zit in DM's (ECDH), niet in kanalen. */
+  int  botSay(int b, int chan_idx, const char* text);
+
+  /* Kanaalindex op naam (zonder '#'). -1 = onbekend. */
+  int  ircChannelFindByName(const char* name) const { return channelFindByName(name); }
+
+  /* Een IRC-nick oplossen naar een pubkey. Zoekt op volgorde: een volledige hex-
+   * pubkey als nick, de companion-store, de buurtlijst. Retour 0 = eenduidig,
+   * 1 = meerdere nodes met die naam (de laatst gehoorde is gekozen), -1 = niets.
+   * `resolved` krijgt de naam die uiteindelijk gebruikt is. */
+  int  ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved, size_t resolved_len) const;
+
+  /* Een regel WHOIS-tekst over een mesh-node: pubkey, laatst gehoord, SNR, hops.
+   * false = die node is nooit gehoord. */
+  bool ircWhois(const char* nick, char* out, size_t out_len) const;
 
   /* ---- Bots: publieke API (CLI + intern). Alle bewerkingen zijn index-adresseerbaar
    * (b = slot 0..MAX_BOTS-1). ---- */
@@ -809,6 +846,7 @@ private:
   /* v2.5.1: de PushTask voor de INSTANT companion-push (kan NULL zijn: dan valt
    * MeshManager terug op de poll van /companions.json). */
   PushTask*     _push = nullptr;
+  IrcTask*      _irc  = nullptr;
 
   /* De actieve slot (room OF sensor-node) tijdens de dispatch. Zo delen room- en
    * sensor-node-verkeer dezelfde login/ACL/telemetrie-code. */
@@ -873,6 +911,7 @@ private:
 
   /* ---- bots: identiteit, advert, ontvangerslijst, beheer ---- */
   void          loadOrCreateBotIdentity(int b);   // bot #0 -> "/bot_id"; bot #i -> "/bot_id_i"
+  bool          saveBotIdentity(int b);           // schrijf het HUIDIGE sleutelpaar terug (BYOK)
   void          saveBotRecips(int b);             // bot #0 -> "/bot_recips"; bot #i -> "/bot_recips_i"
   void          loadBotRecips(int b);
   void          saveBotsConfig();                 // "/bots.cfg": actief/rol/naam per slot
@@ -918,6 +957,7 @@ private:
   void          sendBotAdvertisement(int b, int delay_millis, bool flood);
   void          handleBotCommand(char* args, char* reply);
   void          handleChannelCommand(char* args, char* reply);   // CLI: channel ...
+  void          handleIrcCommand(char* args, char* reply);       // CLI: irc ...
   /* Inkomende DM op de bot-identiteit: het kleine mesh-diagnose-commandoset
    * (ping/path/help). Antwoordt als schone DM VANAF de bot naar de afzender. De
    * antwoordbuffer is static (niet op de loopTask-stapel). */
@@ -928,6 +968,11 @@ private:
   void          loadChannels();
   void          saveChannels();
   int           channelFindByName(const char* name) const;   // -1 = niet gevonden
+  /* Welke kanaaltabel-ingang hoort bij een ONTSLEUTELD group-pakket. Op de hash
+   * matchen kan niet: die is één byte, dus twee kanalen kunnen hem delen -- en
+   * juist dan wijs je het bericht aan het verkeerde kanaal toe. Het GEHEIM is
+   * uniek, en het pakket is er al mee ontsleuteld. -1 = niet gevonden. */
+  int           channelFindBySecret(const mesh::GroupChannel& ch) const;
   void          channelComputeHash(BotChannel& c);           // hash uit secret+len
   /* Een binnengekomen kanaaltekst afhandelen (ping/test/path) en, indien herkend,
    * IN het kanaal antwoorden. Antwoordbuffer static (niet op de loopTask-stapel). */

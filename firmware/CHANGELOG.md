@@ -7,6 +7,67 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.9.0 — een IRC-server op de node
+
+Alleen de room-server-variant (`env:meshuptime_room`). Een gewone IRC-client
+(HexChat, irssi, WeeChat, mIRC) verbindt met poort 6667 en praat daarna op het
+mesh. Volledige uitleg: [`../docs/irc.md`](../docs/irc.md).
+
+**De bot-slots dragen de identiteit, niet de rooms.** Dat is de kern en het is
+geen nieuw mechanisme. `RoomMesh` droeg al drie soorten identiteit op één radio
+via de `self_id`-wissel in `onRecvPacket()`: rooms (server-rol, anderen loggen
+*in*), snodes (telemetrie) en bots (CHAT-identiteiten met een eigen sleutelpaar
+die DM's kunnen *initiëren* en kanalen meelezen). Een IRC-gebruiker is een
+chatdeelnemer, dus een bot. Er kwam geen tweede identiteitsstelsel bij; alleen de
+IRC-kant erop.
+
+Elk account houdt **permanent** hetzelfde bot-slot, ook uitgelogd. Je pubkey is je
+adres op het mesh: kwam een slot bij logout vrij en ging het later naar iemand
+anders, dan landden DM's die onderweg waren bij de verkeerde persoon en praatten
+contacten die jou toegevoegd hadden opeens met een ander. Prijs daarvan: het
+aantal accounts is hard begrensd op `MAX_BOTS` (4).
+
+**Nieuw in de firmware.**
+
+| | |
+|---|---|
+| `IrcTask.{h,cpp}` | de server: synchrone `WiFiServer`, geen async-stack — dezelfde regel als WebTask |
+| `RoomMesh::botSay()` | post in een kanaal onder de naam van bot *b*; `sendChannelReply()` kon dat niet, die zet altijd de alert-bot ervoor |
+| `RoomMesh::channelFindBySecret()` | welke kanaalingang bij een ontsleuteld pakket hoort — op de 1-byte hash matchen wijst bij een botsing juist het verkeerde kanaal aan |
+| `RoomMesh::ircResolveNick()` / `ircWhois()` | nick → pubkey via hex, companion-store of buurtlijst; meldt dubbelzinnigheid in plaats van stil de verkeerde te kiezen |
+| `RoomMesh::saveBotIdentity()` | tegenhanger van `loadOrCreateBotIdentity()`, nodig voor BYOK |
+| CLI `irc ...` | `list`, `user add/pass/del`, `key set` |
+
+**Kanaaltekst gaat naar IRC vóór de commandofilter.** De haak in
+`handleChannelText()` staat met opzet boven de vroege returns voor "geen
+bot-commando": dat onderscheid gaat over waar de *bot* op antwoordt, terwijl een
+IRC-gebruiker het hele gesprek wil zien.
+
+**Airtime is de begrenzing, niet het protocol.** 3 s tussen twee verzendingen per
+gebruiker, een gedeelde emmer van 6 berichten die per 10 s met één hervult, en
+160 tekens inclusief het `"<naam>: "`-voorvoegsel. `JOIN`/`PART`/`QUIT`/`TOPIC`/
+`NAMES` gaan nooit de lucht in, `NOTICE` evenmin, CTCP wordt genegeerd behalve
+`ACTION`. Een geweigerde regel komt terug als `NOTICE` met de wachttijd erbij —
+stilte laat iemand zijn regel opnieuw typen.
+
+**Wat een nick in een kanaal niet bewijst.** Een group-pakket draagt geen
+handtekening per afzender; `"<naam>: <bericht>"` is gewone tekst in de
+versleutelde payload. Wie de kanaalsleutel heeft kan elke naam voorzetten, en de
+sleutel van het publieke kanaal is algemeen bekend. DM's zijn wél gebonden (ECDH
++ MAC). Dat staat er zo bij in `botSay()` en in de docs, omdat de brug het anders
+suggereert.
+
+**BYOK kan, maar niet over IRC.** `irc key set <bot> <prv> <pub>` legt je eigen
+sleutelpaar in een slot, zodat je op IRC dezelfde identiteit bent als in de app.
+Alleen over serieel of de webinterface: IRC is onversleuteld, en een private key
+die je in een chatvenster typt staat daarna in je client-log en op elke switch
+onderweg. Wie hem zet, geeft de node bovendien de mogelijkheid hem permanent na te
+doen — MeshCore kent geen revocation.
+
+**Geen TLS**, met opzet: naast mesh, WiFi en de webserver is er geen heap voor
+TLS-sessies, en een halve TLS is erger dan geen. Vertrouwd LAN of VPN; 6667 niet
+open naar het internet.
+
 ## v2.8.2 — dezelfde node in twee rollen (en waarom dat een sessie stil liet mislukken)
 
 Alleen de room-server-variant (`env:meshuptime_room`). Een fix plus de logging die

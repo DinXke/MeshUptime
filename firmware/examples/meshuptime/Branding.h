@@ -167,6 +167,14 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.9.0 = IRC-SERVER OP DE NODE. Poort 6667; een gewone IRC-client praat op het
+ *            mesh. De BOT-SLOTS dragen de identiteit (eigen sleutelpaar, kunnen DM's
+ *            initieren en kanalen meelezen) -- rooms zijn de server-rol en snodes
+ *            telemetrie, allebei de verkeerde kant op voor een chatdeelnemer. Elk
+ *            account houdt permanent hetzelfde slot, want je pubkey is je adres:
+ *            een hergebruikt slot laat DM's die onderweg waren bij de verkeerde
+ *            persoon landen. Airtime is de begrenzing, niet het protocol -- zie
+ *            docs/irc.md.
  *   v2.8.2 = DEZELFDE NODE IN TWEE ROLLEN. Een repeater die ooit op onze room-server
  *            inlogde staat in de ACL van room 0; is diezelfde repeater ook het DOEL van
  *            een CLI-sessie, dan ontsleutelt zijn loginantwoord op die ACL-ingang en niet
@@ -201,7 +209,7 @@
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.8.2"
+  #define MESHUPTIME_VERSION   "v2.9.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

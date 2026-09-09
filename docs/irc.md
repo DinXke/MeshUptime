@@ -1,0 +1,178 @@
+# De IRC-server op de node
+
+Vanaf **v2.9.0** draagt de room-server-variant (`env:meshuptime_room`) een echte
+IRC-server op poort 6667. Een gewone IRC-client — HexChat, irssi, WeeChat, mIRC,
+Textual — verbindt ermee en praat daarna op het LoRa-mesh.
+
+Dit bestand beschrijft de brug zoals hij is. Waarom de bot-slots de identiteit
+dragen en niet de rooms staat hieronder bij *Identiteit*; wat er nog niet werkt
+in [openstaand.md](openstaand.md).
+
+## Wat er op wat afgebeeld wordt
+
+| IRC | MeshCore |
+|---|---|
+| account (wachtwoord bij inloggen) | een vast **bot-slot** met eigen sleutelpaar |
+| `#kanaal` zonder sleutel | hashtag-kanaal, geheim uit de naam afgeleid |
+| `#kanaal` met sleutel (`JOIN #x <hex>`) | group-channel met expliciet 16/32-byte geheim |
+| bericht in een kanaal | group-datagram, geflood |
+| `/msg <nick> tekst` | DM, ECDH vanaf jouw bot-sleutelpaar |
+| `/whois <nick>` | pubkey, SNR, hopcount, laatst gehoord |
+| `/list` | de kanaaltabel van de node |
+| `/join`, `/part`, `/names`, `/topic` | **puur lokaal**, kosten geen airtime |
+
+## Identiteit
+
+### Waarom de bot-slots
+
+`RoomMesh` draagt drie soorten identiteit op één radio, elk met een eigen
+sleutelpaar, via de `self_id`-wissel in `onRecvPacket()`:
+
+- **rooms** — server-rol; anderen loggen *in* en posten. Verkeerde kant op voor
+  een chatdeelnemer.
+- **snodes** — telemetriecontacten. Dragen geen gesprek.
+- **bots** — CHAT-identiteiten die DM's kunnen *initiëren* en kanalen meelezen.
+
+Een IRC-gebruiker is een chatdeelnemer, dus een bot. De machinerie bestond al
+(`botSendTo`, de kanaaltabel, de per-bot advertenties); `IrcTask` is de IRC-kant
+ervoor en niet een tweede identiteitsstelsel.
+
+### Vaste toewijzing
+
+Elk account heeft **permanent** hetzelfde bot-slot, ook als niemand ingelogd is.
+Dat is een keuze en geen implementatiegemak: je pubkey is je adres op het mesh.
+Zou een slot bij logout vrijkomen en later aan iemand anders gaan, dan komen DM's
+die onderweg waren bij de verkeerde persoon aan, en praten contacten die jou
+toegevoegd hebben opeens met een ander.
+
+Gevolg: **het aantal accounts is hard begrensd op `MAX_BOTS`** (standaard 4).
+
+### Wat een kanaalnaam wél en niet bewijst
+
+In een MeshCore group-channel is de afzendernaam **alleen tekst**. Een
+group-pakket draagt geen handtekening per afzender; het formaat is
+`"<naam>: <bericht>"` in de versleutelde payload. Wie de kanaalsleutel heeft, kan
+elke naam voorzetten — en de sleutel van het publieke kanaal is algemeen bekend.
+Een nick in een kanaal is dus een beleefdheid, geen bewijs.
+
+**DM's zijn wél gebonden.** Die lopen over een ECDH-geheim tussen twee
+sleutelparen, met een MAC. Zonder de private key van de afzender is een DM niet
+te vervalsen.
+
+## Accounts aanmaken
+
+Registratie kan **niet** over IRC: een account claimt een bot-slot, en dat is een
+beheerdaad. Het gaat via de CLI — serieel op 115200, of via `POST /cli` in de
+webinterface.
+
+```
+bot list                                  # welke bot-slots bestaan er
+bot add IRC-bjorn                         # nieuw slot met vers sleutelpaar
+irc user add bjorn hunter2xx IRC-bjorn    # account -> dat slot
+irc list                                  # wat staat er
+```
+
+Overige commando's:
+
+| Commando | Wat |
+|---|---|
+| `irc list` | sessies en accounts |
+| `irc user add <nick> <wachtwoord> <bot>` | account maken (wachtwoord ≥ 6 tekens) |
+| `irc user pass <nick> <wachtwoord>` | wachtwoord wijzigen |
+| `irc user del <nick>` | account weg; een open sessie wordt weggestuurd |
+| `irc key set <bot> <privhex> <pubhex>` | je **eigen** sleutelpaar in een slot leggen |
+
+Accounts staan in `/irc_accounts` op SPIFFS, als
+`nick⇥salt⇥sha256(salt, wachtwoord)⇥bot-slot`. Het wachtwoord zelf staat er niet.
+
+## Inloggen met een client
+
+Server: het IP van de node, poort **6667**, geen TLS. Nick = je accountnaam,
+serverwachtwoord = je accountwachtwoord.
+
+```
+/server add meshuptime <node-ip>/6667 -auto
+/set -clear password
+/connect meshuptime
+```
+
+In HexChat: *Netwerk toevoegen* → server `<node-ip>/6667`, *Wachtwoord* invullen,
+*Nick* op je accountnaam. Van nick wisselen na het inloggen wordt geweigerd — je
+nick zit vast aan je mesh-identiteit.
+
+Anderen voegen je toe met de `meshcore://contact/add`-link die in het bericht van
+de dag staat.
+
+## Je eigen sleutel meebrengen (BYOK)
+
+`irc key set` legt het sleutelpaar van je telefoon in een bot-slot. Daarna ben je
+op IRC dezelfde MeshCore-identiteit als in de app: je bestaande contacten
+bereiken je, zonder iets toe te voegen.
+
+**Lees eerst wat je weggeeft.** Vanaf dat moment:
+
+- staat je private key in SPIFFS op de node, en kan **wie de node of de
+  webinterface beheert je permanent nadoen** — ook als je nooit meer inlogt. Er
+  is in MeshCore geen revocation en geen manier om zo'n bericht te herkennen.
+- zit dezelfde sleutel op twee plaatsen tegelijk (telefoon en node), en dat is
+  precies het patroon dat een gestolen sleutel onzichtbaar maakt.
+
+Daarom kan het **niet over IRC**. IRC is onversleuteld: een private key die je in
+een chatvenster typt staat daarna in je client-log, in je scrollback en op elke
+switch onderweg. Zet hem over serieel of over de webinterface, of gebruik gewoon
+de sleutel die de node zelf gemaakt heeft.
+
+## Airtime
+
+Een matig druk IRC-kanaal produceert meer verkeer dan een LoRa-mesh kan dragen.
+EU868 kent 1% duty cycle en een MeshCore-tekstbericht is maximaal 160 tekens.
+Zonder rem is deze brug een zendmachine die het eigen netwerk platlegt. Daarom:
+
+| Rem | Standaard | Vlag |
+|---|---|---|
+| minimaal tussen twee verzendingen per gebruiker | 3 s | `IRC_TX_MIN_MS` |
+| gedeelde emmer over alle gebruikers | 6 berichten | `IRC_BUCKET_MAX` |
+| hervultempo van die emmer | 1 per 10 s | `IRC_BUCKET_MS` |
+| tekstlengte incl. `"<naam>: "` | 160 tekens | `BOT_MAX_TEXT_LEN` |
+
+`JOIN`, `PART`, `QUIT`, `TOPIC` en `NAMES` gaan **nooit** het mesh op. `NOTICE`
+evenmin — clients sturen daar automatische dingen mee. CTCP wordt genegeerd,
+behalve `ACTION` (`/me`), dat als gewone tekst met een `*` ervoor meegaat.
+
+Wat geweigerd wordt komt terug als `NOTICE` met de wachttijd erbij, niet als
+stilte: een client die niet weet dat zijn regel weggegooid is, typt hem opnieuw.
+
+## Beveiliging
+
+- **Geen TLS.** Wachtwoord en gesprek gaan in leesbare vorm over de lijn. Draai
+  dit op een vertrouwd LAN of achter een VPN; zet poort 6667 nooit open naar het
+  internet. Een ESP32-S3 die naast mesh, WiFi en de webserver ook TLS-sessies
+  moet dragen heeft de heap niet, en een halve TLS is erger dan geen.
+- **Eén sessie per account.** Een tweede login gooit de eerste eruit; twee
+  toetsenborden op één mesh-identiteit maakt onnavolgbaar wie wat verstuurde.
+- **De kanaalsleutel wordt nooit teruggegeven.** `MODE #x` zegt of er een sleutel
+  is (`+k`), niet welke — een MODE-antwoord belandt in elke client-log.
+- **Wachtwoorden** staan als `sha256(salt ‖ wachtwoord)` met een eigen 8-byte
+  salt per account.
+- **Sessies verlopen.** Na 2 minuten stilte een `PING`, na 3 minuten weg.
+
+## Wat het niet is
+
+Geen IRC-netwerk: geen server-naar-server-koppeling, geen NickServ/ChanServ, geen
+ban-lijsten, geen channel-operators, geen geschiedenis. `/names` toont de lokale
+sessies die een kanaal volgen — niet wie er op het mesh meeleest, want dat is niet
+te weten. Een mesh-afzender verschijnt zodra hij zendt.
+
+## Bouwvlaggen
+
+| Vlag | Standaard | Betekenis |
+|---|---|---|
+| `IRC_PORT` | 6667 | luisterpoort |
+| `IRC_MAX_CLIENTS` | `MAX_BOTS` | gelijktijdige sessies |
+| `IRC_NICK_MAX` | 20 | nicklengte |
+| `IRC_TX_MIN_MS` | 3000 | zendrem per gebruiker |
+| `IRC_BUCKET_MAX` / `IRC_BUCKET_MS` | 6 / 10000 | gedeelde emmer |
+
+Meer gebruikers = meer bot-slots. `MAX_BOTS` verhogen kost per slot een
+sleutelpaar, een naam, 16 ontvangers van 33 byte en de diagnose-instellingen; zie
+[metingen.md](metingen.md) voor het gemeten RAM-verbruik voordat je hem opdraait.

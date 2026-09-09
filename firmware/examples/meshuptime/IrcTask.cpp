@@ -1,0 +1,826 @@
+#include "IrcTask.h"
+
+#if defined(ESP32)
+
+#include <SPIFFS.h>
+#include <esp_system.h>
+#include <stdarg.h>
+
+/* Het servervoorvoegsel in numerieke antwoorden. IRC-clients tonen dit als de
+ * naam van het netwerk, dus de nodenaam is hier de juiste waarde en niet een
+ * verzonnen "irc.meshuptime". */
+static const char* IRC_HOST_FALLBACK = "meshuptime";
+
+/* De pseudo-host achter een mesh-nick. Clients tonen "nick!user@host" in /whois
+ * en in join-meldingen; "mesh" maakt in een oogopslag zichtbaar dat de afzender
+ * van de radio komt en niet van een tweede IRC-verbinding. */
+#define IRC_MESH_USERHOST  "mesh@mesh"
+
+/* ------------------------------------------------------------------------ */
+/*  Kleine hulpjes                                                           */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::sanitizeNick(const char* in, char* out, size_t out_len) {
+  size_t o = 0;
+  if (!in) { out[0] = 0; return; }
+  for (const char* p = in; *p && o + 1 < out_len; p++) {
+    unsigned char ch = (unsigned char)*p;
+    /* Alles wat het IRC-frame zou breken of een tweede parameter zou beginnen. */
+    bool bad = (ch <= ' ') || ch == ':' || ch == '!' || ch == '@' || ch == ',' ||
+               ch == '*' || ch == '?' || ch == '#' || ch >= 0x7f;
+    out[o++] = bad ? '_' : (char)ch;
+  }
+  out[o] = 0;
+  if (o == 0) { out[0] = '?'; out[1] = 0; }
+}
+
+bool IrcTask::nickValid(const char* n) {
+  if (!n || !n[0] || strlen(n) > IRC_NICK_MAX) return false;
+  for (const char* p = n; *p; p++) {
+    char ch = *p;
+    bool ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '[' ||
+              ch == ']' || ch == '\\' || ch == '`' || ch == '^' || ch == '{' || ch == '}';
+    if (!ok) return false;
+  }
+  /* Een nick die met een cijfer begint botst met de numerieke antwoorden. */
+  return !(n[0] >= '0' && n[0] <= '9');
+}
+
+/* Een IRC-parameterlijst splitsen. Retourneert het aantal parameters; de laatste
+ * parameter mag met ':' beginnen en loopt dan tot het einde van de regel. */
+static int ircSplit(char* line, char** argv, int max_args) {
+  int n = 0;
+  char* p = line;
+  while (*p && n < max_args) {
+    while (*p == ' ') p++;
+    if (!*p) break;
+    if (*p == ':') { argv[n++] = p + 1; break; }   // trailing parameter
+    argv[n++] = p;
+    while (*p && *p != ' ') p++;
+    if (*p) *p++ = 0;
+  }
+  return n;
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Levensloop                                                               */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::begin(RoomMesh* node, const char* firmware_version) {
+  _node = node;
+  _fw   = firmware_version;
+  if (!_node) return;   // zie de uitleg bij begin() in de header
+
+  memset(_accts, 0, sizeof(_accts));
+  for (int i = 0; i < MAX_BOTS; i++) _accts[i].bot = -1;
+  for (int i = 0; i < IRC_MAX_CLIENTS; i++) {
+    _cl[i].in_len = 0; _cl[i].overflow = false;
+    _cl[i].nick[0] = 0; _cl[i].user[0] = 0; _cl[i].pass[0] = 0;
+    _cl[i].have_pass = false; _cl[i].registered = false;
+    _cl[i].acct = -1; _cl[i].bot = -1; _cl[i].chan_mask = 0;
+    _cl[i].ping_sent = false;
+  }
+  loadAccounts();
+
+  _server.begin();
+  _server.setNoDelay(true);
+  _bucket = IRC_BUCKET_MAX;
+  _bucket_at = millis();
+  _running = true;
+  Serial.printf("[irc] server op poort %d, %d account(s)\n", IRC_PORT, acctCount());
+}
+
+int IrcTask::numClients() const {
+  int n = 0;
+  for (int i = 0; i < IRC_MAX_CLIENTS; i++)
+    if (const_cast<WiFiClient&>(_cl[i].sock).connected()) n++;
+  return n;
+}
+
+void IrcTask::loop() {
+  if (!_running) return;
+
+  /* De emmer hervullen. Eén bericht per IRC_BUCKET_MS erbij, tot het maximum. */
+  unsigned long now = millis();
+  while ((long)(now - _bucket_at) >= IRC_BUCKET_MS) {
+    _bucket_at += IRC_BUCKET_MS;
+    if (_bucket < IRC_BUCKET_MAX) _bucket++;
+  }
+
+  pollAccept();
+  for (int i = 0; i < IRC_MAX_CLIENTS; i++) pollClient(_cl[i]);
+}
+
+void IrcTask::pollAccept() {
+  WiFiClient nc = _server.available();
+  if (!nc) return;
+
+  for (int i = 0; i < IRC_MAX_CLIENTS; i++) {
+    if (_cl[i].sock.connected()) continue;
+    IrcClient& c = _cl[i];
+    c.sock = nc;
+    c.sock.setNoDelay(true);
+    c.in_len = 0; c.overflow = false;
+    c.nick[0] = 0; c.user[0] = 0; c.pass[0] = 0;
+    c.have_pass = false; c.registered = false;
+    c.acct = -1; c.bot = -1; c.chan_mask = 0;
+    c.last_rx = millis(); c.last_tx_mesh = 0; c.ping_sent = false;
+    return;
+  }
+
+  /* Vol. Zeg waarom -- een client die zonder uitleg de deur dicht krijgt, wordt
+   * als "server stuk" gerapporteerd terwijl er niets stuk is. */
+  nc.printf("ERROR :Alle %d sessies bezet (één per bot-slot)\r\n", IRC_MAX_CLIENTS);
+  nc.stop();
+}
+
+void IrcTask::closeClient(IrcClient& c, const char* quit_reason) {
+  if (c.sock.connected()) {
+    if (quit_reason && quit_reason[0]) c.sock.printf("ERROR :%s\r\n", quit_reason);
+    c.sock.flush();
+    c.sock.stop();
+  }
+  c.registered = false;
+  c.chan_mask = 0;
+  c.in_len = 0;
+  c.nick[0] = 0;
+  c.acct = -1;
+  c.bot = -1;
+}
+
+void IrcTask::pollClient(IrcClient& c) {
+  if (!c.sock.connected()) { if (c.registered) closeClient(c, NULL); return; }
+
+  unsigned long now = millis();
+
+  /* Lezen. Begrensd per ronde: de radio mag niet wachten op een client die een
+   * bestand in het venster plakt. */
+  int budget = 256;
+  while (c.sock.available() && budget-- > 0) {
+    char ch = (char)c.sock.read();
+    c.last_rx = now;
+    c.ping_sent = false;
+    if (ch == '\n' || ch == '\r') {
+      if (c.in_len == 0) { c.overflow = false; continue; }
+      c.in[c.in_len] = 0;
+      c.in_len = 0;
+      if (c.overflow) { c.overflow = false; continue; }   // rest van een te lange regel
+      handleLine(c, c.in);
+      if (!c.sock.connected()) return;
+      continue;
+    }
+    if (c.in_len + 1 >= IRC_LINE_MAX) { c.overflow = true; c.in_len = 0; continue; }
+    c.in[c.in_len++] = ch;
+  }
+
+  /* Stilte. Eerst een PING, en pas als die onbeantwoord blijft de sessie weg. */
+  if (c.registered) {
+    if (!c.ping_sent && (now - c.last_rx) > IRC_IDLE_PING_MS) {
+      raw(c, "PING :%s", _node->getNodeName());
+      c.ping_sent = true;
+    } else if ((now - c.last_rx) > IRC_IDLE_KILL_MS) {
+      closeClient(c, "Ping timeout");
+    }
+  } else if ((now - c.last_rx) > 60000UL) {
+    closeClient(c, "Registration timeout");
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Uitvoer                                                                  */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::raw(IrcClient& c, const char* fmt, ...) {
+  if (!c.sock.connected()) return;
+  char buf[IRC_LINE_MAX];
+  va_list ap; va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf) - 3, fmt, ap);
+  va_end(ap);
+  if (n < 0) return;
+  if (n > (int)sizeof(buf) - 3) n = sizeof(buf) - 3;
+  buf[n++] = '\r'; buf[n++] = '\n'; buf[n] = 0;
+  c.sock.write((const uint8_t*)buf, n);
+}
+
+void IrcTask::numeric(IrcClient& c, int code, const char* fmt, ...) {
+  char tail[IRC_LINE_MAX - 64];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(tail, sizeof(tail), fmt, ap);
+  va_end(ap);
+  const char* host = _node ? _node->getNodeName() : IRC_HOST_FALLBACK;
+  if (!host || !host[0]) host = IRC_HOST_FALLBACK;
+  raw(c, ":%s %03d %s %s", host, code, c.nick[0] ? c.nick : "*", tail);
+}
+
+void IrcTask::notice(IrcClient& c, const char* fmt, ...) {
+  char tail[IRC_LINE_MAX - 64];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(tail, sizeof(tail), fmt, ap);
+  va_end(ap);
+  const char* host = _node ? _node->getNodeName() : IRC_HOST_FALLBACK;
+  if (!host || !host[0]) host = IRC_HOST_FALLBACK;
+  raw(c, ":%s NOTICE %s :%s", host, c.nick[0] ? c.nick : "*", tail);
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Accounts                                                                 */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::hashPassword(const uint8_t* salt, const char* pw, uint8_t* out32) const {
+  /* De salt gaat als SLEUTEL mee in dezelfde sha256-helper die de rest van deze
+   * firmware gebruikt; zo komt er geen tweede hash-implementatie bij. */
+  mesh::Utils::sha256(out32, 32, (const uint8_t*)pw, (int)strlen(pw), salt, IRC_SALT_LEN);
+}
+
+void IrcTask::loadAccounts() {
+  File f = SPIFFS.open(IRC_ACCOUNTS_FILE, "r");
+  if (!f) return;
+  int n = 0;
+  while (f.available() && n < MAX_BOTS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || line[0] == '#') continue;
+    /* nick \t salthex \t hashhex \t botidx */
+    int t1 = line.indexOf('\t');
+    int t2 = t1 < 0 ? -1 : line.indexOf('\t', t1 + 1);
+    int t3 = t2 < 0 ? -1 : line.indexOf('\t', t2 + 1);
+    if (t3 < 0) continue;
+    String nick = line.substring(0, t1);
+    String sh   = line.substring(t1 + 1, t2);
+    String hh   = line.substring(t2 + 1, t3);
+    int bot     = line.substring(t3 + 1).toInt();
+    if (nick.length() == 0 || nick.length() > IRC_NICK_MAX) continue;
+    if (sh.length() != IRC_SALT_LEN * 2 || hh.length() != 64) continue;
+    if (bot < 0 || bot >= MAX_BOTS) continue;
+    IrcAccount& a = _accts[n];
+    StrHelper::strncpy(a.nick, nick.c_str(), sizeof(a.nick));
+    if (!mesh::Utils::fromHex(a.salt, IRC_SALT_LEN, sh.c_str())) continue;
+    if (!mesh::Utils::fromHex(a.hash, 32, hh.c_str())) continue;
+    a.bot = (int8_t)bot;
+    n++;
+  }
+  f.close();
+}
+
+void IrcTask::saveAccounts() {
+  File f = SPIFFS.open(IRC_ACCOUNTS_FILE, "w");
+  if (!f) { Serial.println("[irc] kan " IRC_ACCOUNTS_FILE " niet schrijven"); return; }
+  f.println("# nick\tsalt\tsha256(salt,wachtwoord)\tbot-slot -- NIET met de hand bewerken");
+  char sh[IRC_SALT_LEN * 2 + 1], hh[65];
+  for (int i = 0; i < MAX_BOTS; i++) {
+    if (_accts[i].bot < 0 || !_accts[i].nick[0]) continue;
+    mesh::Utils::toHex(sh, _accts[i].salt, IRC_SALT_LEN);
+    mesh::Utils::toHex(hh, _accts[i].hash, 32);
+    f.printf("%s\t%s\t%s\t%d\n", _accts[i].nick, sh, hh, (int)_accts[i].bot);
+  }
+  f.close();
+}
+
+int IrcTask::acctCount() const {
+  int n = 0;
+  for (int i = 0; i < MAX_BOTS; i++) if (_accts[i].bot >= 0 && _accts[i].nick[0]) n++;
+  return n;
+}
+
+bool IrcTask::acctGet(int i, char* nick, size_t nick_len, int* bot) const {
+  if (i < 0 || i >= MAX_BOTS || _accts[i].bot < 0 || !_accts[i].nick[0]) return false;
+  if (nick) StrHelper::strncpy(nick, _accts[i].nick, nick_len);
+  if (bot) *bot = _accts[i].bot;
+  return true;
+}
+
+int IrcTask::acctFind(const char* nick) const {
+  if (!nick) return -1;
+  for (int i = 0; i < MAX_BOTS; i++)
+    if (_accts[i].bot >= 0 && strcasecmp(_accts[i].nick, nick) == 0) return i;
+  return -1;
+}
+
+int IrcTask::acctAdd(const char* nick, const char* password, int bot) {
+  if (!nickValid(nick)) return -2;
+  if (!password || strlen(password) < 6) return -2;
+  if (acctFind(nick) >= 0) return -3;
+  if (!_node || bot < 0 || bot >= MAX_BOTS || !_node->webBotSlotUsed(bot)) return -4;
+  for (int i = 0; i < MAX_BOTS; i++)
+    if (_accts[i].bot == bot) return -4;   // slot al vergeven; zie de vaste-toewijzing-regel
+
+  for (int i = 0; i < MAX_BOTS; i++) {
+    if (_accts[i].bot >= 0) continue;
+    IrcAccount& a = _accts[i];
+    StrHelper::strncpy(a.nick, nick, sizeof(a.nick));
+    for (int k = 0; k < IRC_SALT_LEN; k++) a.salt[k] = (uint8_t)(esp_random() & 0xff);
+    hashPassword(a.salt, password, a.hash);
+    a.bot = (int8_t)bot;
+    saveAccounts();
+    return 0;
+  }
+  return -1;
+}
+
+int IrcTask::acctSetPassword(const char* nick, const char* password) {
+  int i = acctFind(nick);
+  if (i < 0) return -2;
+  if (!password || strlen(password) < 6) return -2;
+  for (int k = 0; k < IRC_SALT_LEN; k++) _accts[i].salt[k] = (uint8_t)(esp_random() & 0xff);
+  hashPassword(_accts[i].salt, password, _accts[i].hash);
+  saveAccounts();
+  return 0;
+}
+
+int IrcTask::acctDel(const char* nick) {
+  int i = acctFind(nick);
+  if (i < 0) return -2;
+  /* Een open sessie van dit account eerst netjes wegsturen. */
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+    if (_cl[k].acct == i) closeClient(_cl[k], "Account verwijderd");
+  memset(&_accts[i], 0, sizeof(IrcAccount));
+  _accts[i].bot = -1;
+  saveAccounts();
+  return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Registratie                                                              */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::tryRegister(IrcClient& c) {
+  if (c.registered || !c.nick[0] || !c.user[0]) return;
+
+  if (!c.have_pass) {
+    numeric(c, 464, ":Wachtwoord vereist. Stel het in je client in als serverwachtwoord (PASS).");
+    closeClient(c, "Geen wachtwoord");
+    return;
+  }
+  int a = acctFind(c.nick);
+  if (a < 0) {
+    numeric(c, 464, ":Onbekend account '%s'. Accounts maakt de beheerder met 'irc user add'.", c.nick);
+    closeClient(c, "Onbekend account");
+    return;
+  }
+  uint8_t want[32];
+  hashPassword(_accts[a].salt, c.pass, want);
+  if (memcmp(want, _accts[a].hash, 32) != 0) {
+    numeric(c, 464, ":Verkeerd wachtwoord");
+    closeClient(c, "Verkeerd wachtwoord");
+    return;
+  }
+  /* Eén sessie per account: een tweede login zou twee toetsenborden op één
+   * mesh-identiteit zetten en dan is niet meer te zien wie wat verstuurde. */
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+    if (&_cl[k] != &c && _cl[k].registered && _cl[k].acct == a)
+      closeClient(_cl[k], "Elders ingelogd op dit account");
+
+  c.acct = (int8_t)a;
+  c.bot  = _accts[a].bot;
+  memset(c.pass, 0, sizeof(c.pass));   // niet langer bewaren dan nodig
+  c.registered = true;
+  sendWelcome(c);
+}
+
+void IrcTask::sendWelcome(IrcClient& c) {
+  const char* host = _node->getNodeName();
+  if (!host || !host[0]) host = IRC_HOST_FALLBACK;
+  char pub[PUB_KEY_SIZE * 2 + 1] = {0};
+  _node->webBotSlotPubHex(c.bot, pub, sizeof(pub));
+  const char* bname = _node->webBotSlotName(c.bot);
+
+  numeric(c, 1, ":Welkom op het mesh, %s -- je bent hier de MeshCore-identiteit '%s'", c.nick, bname);
+  numeric(c, 2, ":Draait op %s, %s", host, _fw ? _fw : "MeshUptime");
+  numeric(c, 3, ":Bot-slot %d, pubkey %.12s...", c.bot, pub);
+  numeric(c, 4, "%s %s bot-slot %d kanalen", host, _fw ? _fw : "MeshUptime", c.bot);
+  numeric(c, 5, "CHANTYPES=# PREFIX= NICKLEN=%d TOPICLEN=0 CHANMODES=k :zijn ondersteund",
+          IRC_NICK_MAX);
+
+  numeric(c, 375, ":- %s bericht van de dag -", host);
+  numeric(c, 372, ":- Je praat op een LoRa-mesh. Airtime is schaars: hooguit één");
+  numeric(c, 372, ":- bericht per %lu s, en %d tekens per bericht.",
+          (unsigned long)(IRC_TX_MIN_MS / 1000), (int)BOT_MAX_TEXT_LEN);
+  numeric(c, 372, ":- JOIN #naam         volgt een hashtag-kanaal (sleutel uit de naam)");
+  numeric(c, 372, ":- JOIN #naam sleutel volgt een prive-kanaal (16/32 byte, hex)");
+  numeric(c, 372, ":- PRIVMSG nick       DM vanaf jouw eigen sleutelpaar");
+  numeric(c, 372, ":- WHOIS nick         pubkey, SNR en hopcount van de laatste hoor");
+  numeric(c, 372, ":- Anderen voegen je toe met deze link:");
+  char uri[160];
+  if (_node->webBotSlotJoinUri(c.bot, uri, sizeof(uri))) numeric(c, 372, ":-   %s", uri);
+  numeric(c, 376, ":Einde van het bericht van de dag");
+
+  notice(c, "Let op: IRC is onversleuteld. Alleen op een vertrouwd netwerk gebruiken.");
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Kanalen                                                                  */
+/* ------------------------------------------------------------------------ */
+
+int IrcTask::chanIndexFor(const char* irc_name) const {
+  if (!irc_name || irc_name[0] != '#') return -1;
+  return _node->ircChannelFindByName(irc_name + 1);
+}
+
+bool IrcTask::chanIrcName(int idx, char* out, size_t out_len) const {
+  char name[24]; int bits; bool en, derived, pub; uint8_t hash;
+  if (!_node->channelGet(idx, name, &bits, &en, &hash, &derived, &pub)) return false;
+  snprintf(out, out_len, "#%s", name);
+  return true;
+}
+
+void IrcTask::sendNames(IrcClient& c, int idx) {
+  char cname[28];
+  if (!chanIrcName(idx, cname, sizeof(cname))) return;
+
+  /* Wie "in" het kanaal zit is op een mesh niet te weten: er is geen ledenlijst,
+   * alleen wie toevallig zendt. We tonen daarom de lokale IRC-sessies die het
+   * kanaal volgen. Dat is eerlijk -- een verzonnen ledenlijst uit de buurtlijst
+   * zou nodes tonen die het kanaal misschien niet eens hebben. */
+  char line[IRC_LINE_MAX - 64];
+  int o = 0; line[0] = 0;
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
+    if (!_cl[k].registered || !(_cl[k].chan_mask & (1UL << idx))) continue;
+    o += snprintf(line + o, sizeof(line) - o, "%s%s", o ? " " : "", _cl[k].nick);
+    if (o > (int)sizeof(line) - 32) break;
+  }
+  numeric(c, 353, "= %s :%s", cname, line);
+  numeric(c, 366, "%s :Einde van /NAMES (mesh-deelnemers verschijnen zodra ze zenden)", cname);
+}
+
+void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
+  if (!name || name[0] != '#' || !name[1]) { numeric(c, 403, "%s :Geen geldige kanaalnaam", name ? name : ""); return; }
+  const char* bare = name + 1;
+  if (strlen(bare) > 23) { numeric(c, 403, "%s :Kanaalnaam te lang (max 23)", name); return; }
+
+  int idx = _node->ircChannelFindByName(bare);
+  if (idx < 0) {
+    /* Nieuw kanaal aanmaken. Zonder sleutel wordt het geheim uit de naam afgeleid
+     * (het hashtag-kanaal), met sleutel is het een prive-kanaal. */
+    int rc = _node->channelAdd(bare, (key && key[0]) ? key : NULL, true);
+    if (rc < 0) {
+      numeric(c, 403, "%s :Kan het kanaal niet toevoegen (tabel vol of ongeldige sleutel, code %d)", name, rc);
+      return;
+    }
+    idx = _node->ircChannelFindByName(bare);
+    if (idx < 0) { numeric(c, 403, "%s :Kanaal niet gevonden na toevoegen", name); return; }
+  }
+  if (idx >= 32) { numeric(c, 403, "%s :Kanaalindex buiten bereik", name); return; }
+
+  if (c.chan_mask & (1UL << idx)) return;   // al gejoind; stil
+  c.chan_mask |= (1UL << idx);
+
+  char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+  /* De JOIN echoën naar iedereen die het kanaal volgt -- ook lokaal, want het
+   * mesh draagt geen aanwezigheid. */
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+    if (_cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
+      raw(_cl[k], ":%s!%s JOIN %s", c.nick, IRC_MESH_USERHOST, cname);
+
+  char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
+  _node->channelGet(idx, nm, &bits, &en, &hash, &derived, &pub);
+  numeric(c, 332, "%s :%s-kanaal, %d-bit sleutel, kanaalhash %02X%s", cname,
+          pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash,
+          en ? "" : " (UITGESCHAKELD -- 'channel on' op de CLI)");
+  sendNames(c, idx);
+}
+
+void IrcTask::partChannel(IrcClient& c, const char* name, const char* reason) {
+  int idx = chanIndexFor(name);
+  if (idx < 0 || !(c.chan_mask & (1UL << idx))) {
+    numeric(c, 442, "%s :Je volgt dat kanaal niet", name ? name : "");
+    return;
+  }
+  char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+    if (_cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
+      raw(_cl[k], ":%s!%s PART %s :%s", c.nick, IRC_MESH_USERHOST, cname,
+          reason && reason[0] ? reason : "");
+  c.chan_mask &= ~(1UL << idx);
+  /* Het kanaal zelf blijft op de node staan. PART is "ik lees even niet mee",
+   * niet "gooi de sleutel weg" -- dat laatste is 'channel del' op de CLI. */
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Zenden                                                                   */
+/* ------------------------------------------------------------------------ */
+
+bool IrcTask::txAllowed(IrcClient& c, char* why, size_t why_len) {
+  unsigned long now = millis();
+  if (c.last_tx_mesh && (now - c.last_tx_mesh) < IRC_TX_MIN_MS) {
+    unsigned long wait = (IRC_TX_MIN_MS - (now - c.last_tx_mesh) + 999) / 1000;
+    snprintf(why, why_len, "Te snel achter elkaar -- nog %lu s. LoRa-airtime is gedeeld.", wait);
+    return false;
+  }
+  if (_bucket == 0) {
+    snprintf(why, why_len, "De zendemmer van de node is leeg (%d per %lu s, over alle gebruikers). Probeer zo opnieuw.",
+             (int)IRC_BUCKET_MAX, (unsigned long)(IRC_BUCKET_MS / 1000));
+    return false;
+  }
+  return true;
+}
+
+void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice) {
+  if (!target || !target[0]) { numeric(c, 411, ":Geen ontvanger opgegeven"); return; }
+  if (!text || !text[0]) { numeric(c, 412, ":Geen tekst om te versturen"); return; }
+
+  /* NOTICE gaat NOOIT het mesh op. Clients en bots sturen er automatische dingen
+   * mee (away-antwoorden, CTCP-replies) en die horen geen airtime te kosten. */
+  if (is_notice) return;
+
+  /* CTCP (\001...\001) evenmin: ACTION zou nog kunnen, maar VERSION/PING/TIME
+   * zijn client-onderhandeling en geen mesh-verkeer. Alleen ACTION laten we door
+   * als gewone tekst met een sterretje ervoor. */
+  char body[BOT_MAX_TEXT_LEN + 8];
+  if (text[0] == '\001') {
+    if (strncasecmp(text + 1, "ACTION ", 7) == 0) {
+      const char* act = text + 8;
+      size_t n = strlen(act);
+      if (n && act[n - 1] == '\001') n--;
+      snprintf(body, sizeof(body), "* %.*s", (int)n, act);
+    } else {
+      return;   // stil negeren; geen airtime
+    }
+  } else {
+    StrHelper::strncpy(body, text, sizeof(body));
+  }
+
+  char why[128];
+  if (!txAllowed(c, why, sizeof(why))) { notice(c, "%s", why); return; }
+
+  if (target[0] == '#') {
+    int idx = chanIndexFor(target);
+    if (idx < 0) { numeric(c, 403, "%s :Onbekend kanaal", target); return; }
+    if (!(c.chan_mask & (1UL << idx))) { numeric(c, 404, "%s :Je volgt dat kanaal niet", target); return; }
+
+    int rc = _node->botSay(c.bot, idx, body);
+    if (rc < 0) { notice(c, "Versturen mislukt (code %d)", rc); return; }
+    c.last_tx_mesh = millis();
+    if (_bucket) _bucket--;
+
+    /* Lokale weergalm: het mesh stuurt ons eigen group-pakket niet terug, dus de
+     * andere sessies op deze node zouden het bericht anders nooit zien. */
+    char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+    for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+      if (&_cl[k] != &c && _cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
+        raw(_cl[k], ":%s!%s PRIVMSG %s :%s", c.nick, IRC_MESH_USERHOST, cname, body);
+    return;
+  }
+
+  /* DM. De nick oplossen naar een pubkey: bekende companion, buur uit de
+   * advert-lijst, of gewoon een hex-pubkey als nick. */
+  uint8_t pub[PUB_KEY_SIZE];
+  char resolved[32];
+  int rr = _node->ircResolveNick(target, pub, resolved, sizeof(resolved));
+  if (rr < 0) {
+    numeric(c, 401, "%s :Onbekende nick. Gebruik de nodenaam, of plak de volledige pubkey als nick.", target);
+    return;
+  }
+  if (rr == 1)
+    notice(c, "Meerdere nodes heten '%s'; ik gebruik %s. Plak de pubkey om zeker te zijn.", target, resolved);
+
+  int rc = _node->botSendTo(c.bot, pub, body);
+  if (rc < 0) { notice(c, "DM versturen mislukt (code %d)", rc); return; }
+  c.last_tx_mesh = millis();
+  if (_bucket) _bucket--;
+  notice(c, "DM de lucht in naar %s (geen leesbevestiging op dit pad)", resolved);
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Commando's                                                               */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::handleLine(IrcClient& c, char* line) {
+  char* argv[8];
+  int argc = ircSplit(line, argv, 8);
+  if (argc == 0) return;
+  char* cmd = argv[0];
+  for (char* p = cmd; *p; p++) *p = toupper((unsigned char)*p);
+
+  /* --- Voor registratie --- */
+  if (!strcmp(cmd, "CAP")) {
+    /* Geen capabilities. Netjes antwoorden zodat clients niet in de CAP-onder-
+     * handeling blijven hangen (irssi en HexChat doen dat allebei bij stilte). */
+    if (argc >= 2 && !strcasecmp(argv[1], "LS")) raw(c, ":%s CAP * LS :", _node->getNodeName());
+    else if (argc >= 2 && !strcasecmp(argv[1], "REQ")) raw(c, ":%s CAP * NAK :%s", _node->getNodeName(), argc >= 3 ? argv[2] : "");
+    return;
+  }
+  if (!strcmp(cmd, "PASS")) {
+    if (c.registered) { numeric(c, 462, ":Je bent al ingelogd"); return; }
+    if (argc < 2) { numeric(c, 461, "PASS :Te weinig parameters"); return; }
+    StrHelper::strncpy(c.pass, argv[1], sizeof(c.pass));
+    c.have_pass = true;
+    return;
+  }
+  if (!strcmp(cmd, "NICK")) {
+    if (argc < 2) { numeric(c, 431, ":Geen nick opgegeven"); return; }
+    if (!nickValid(argv[1])) { numeric(c, 432, "%s :Ongeldige nick", argv[1]); return; }
+    if (c.registered) {
+      /* Van nick wisselen zou van MeshCore-identiteit wisselen betekenen, en die
+       * zit vast aan het account. Weigeren met de reden erbij. */
+      numeric(c, 484, "%s :Je nick is aan je mesh-identiteit gebonden en kan niet wijzigen", argv[1]);
+      return;
+    }
+    StrHelper::strncpy(c.nick, argv[1], sizeof(c.nick));
+    tryRegister(c);
+    return;
+  }
+  if (!strcmp(cmd, "USER")) {
+    if (c.registered) { numeric(c, 462, ":Je bent al ingelogd"); return; }
+    if (argc < 2) { numeric(c, 461, "USER :Te weinig parameters"); return; }
+    StrHelper::strncpy(c.user, argv[1], sizeof(c.user));
+    tryRegister(c);
+    return;
+  }
+  if (!strcmp(cmd, "QUIT")) { closeClient(c, argc >= 2 ? argv[1] : "Tot ziens"); return; }
+  if (!strcmp(cmd, "PING")) { raw(c, ":%s PONG %s :%s", _node->getNodeName(), _node->getNodeName(), argc >= 2 ? argv[1] : ""); return; }
+  if (!strcmp(cmd, "PONG")) return;
+
+  if (!c.registered) { numeric(c, 451, ":Je bent nog niet ingelogd"); return; }
+
+  /* --- Na registratie --- */
+  if (!strcmp(cmd, "JOIN")) {
+    if (argc < 2) { numeric(c, 461, "JOIN :Te weinig parameters"); return; }
+    /* "JOIN #a,#b sleutel1,sleutel2" -- de komma-vorm die elke client kent. */
+    char* chans = argv[1];
+    char* keys  = argc >= 3 ? argv[2] : NULL;
+    char* cs = chans;
+    while (cs && *cs) {
+      char* cnext = strchr(cs, ','); if (cnext) *cnext++ = 0;
+      char* k = NULL;
+      if (keys && *keys) { k = keys; char* knext = strchr(keys, ','); if (knext) { *knext = 0; keys = knext + 1; } else keys = NULL; }
+      joinChannel(c, cs, k);
+      cs = cnext;
+    }
+    return;
+  }
+  if (!strcmp(cmd, "PART")) {
+    if (argc < 2) { numeric(c, 461, "PART :Te weinig parameters"); return; }
+    char* cs = argv[1];
+    while (cs && *cs) {
+      char* cnext = strchr(cs, ','); if (cnext) *cnext++ = 0;
+      partChannel(c, cs, argc >= 3 ? argv[2] : NULL);
+      cs = cnext;
+    }
+    return;
+  }
+  if (!strcmp(cmd, "PRIVMSG") || !strcmp(cmd, "NOTICE")) {
+    if (argc < 3) { numeric(c, 461, "%s :Te weinig parameters", cmd); return; }
+    doPrivmsg(c, argv[1], argv[2], cmd[0] == 'N');
+    return;
+  }
+  if (!strcmp(cmd, "NAMES")) {
+    if (argc >= 2) { int i = chanIndexFor(argv[1]); if (i >= 0) sendNames(c, i); else numeric(c, 403, "%s :Onbekend kanaal", argv[1]); }
+    else for (int i = 0; i < _node->webChannelMax(); i++) if (c.chan_mask & (1UL << i)) sendNames(c, i);
+    return;
+  }
+  if (!strcmp(cmd, "LIST")) {
+    numeric(c, 321, "Kanaal :Gebruikers  Onderwerp");
+    for (int i = 0; i < _node->webChannelMax(); i++) {
+      char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
+      if (!_node->channelGet(i, nm, &bits, &en, &hash, &derived, &pub)) continue;
+      int here = 0;
+      for (int k = 0; k < IRC_MAX_CLIENTS; k++) if (_cl[k].registered && (_cl[k].chan_mask & (1UL << i))) here++;
+      numeric(c, 322, "#%s %d :%s, %d-bit, hash %02X%s", nm, here,
+              pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash, en ? "" : ", uit");
+    }
+    numeric(c, 323, ":Einde van /LIST");
+    return;
+  }
+  if (!strcmp(cmd, "TOPIC")) {
+    if (argc < 2) { numeric(c, 461, "TOPIC :Te weinig parameters"); return; }
+    if (argc >= 3) { numeric(c, 482, "%s :Een mesh-kanaal heeft geen onderwerp", argv[1]); return; }
+    int idx = chanIndexFor(argv[1]);
+    if (idx < 0) { numeric(c, 403, "%s :Onbekend kanaal", argv[1]); return; }
+    char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
+    _node->channelGet(idx, nm, &bits, &en, &hash, &derived, &pub);
+    numeric(c, 332, "%s :%s-kanaal, %d-bit sleutel, kanaalhash %02X", argv[1],
+            pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash);
+    return;
+  }
+  if (!strcmp(cmd, "MODE")) {
+    if (argc < 2) { numeric(c, 461, "MODE :Te weinig parameters"); return; }
+    if (argv[1][0] != '#') { numeric(c, 221, "+"); return; }
+    int idx = chanIndexFor(argv[1]);
+    if (idx < 0) { numeric(c, 403, "%s :Onbekend kanaal", argv[1]); return; }
+    if (argc >= 3) { numeric(c, 482, "%s :Kanaalinstellingen gaan via de node-CLI ('channel ...'), niet via MODE", argv[1]); return; }
+    char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
+    _node->channelGet(idx, nm, &bits, &en, &hash, &derived, &pub);
+    /* De sleutel zelf NOOIT teruggeven -- IRC is onversleuteld en een MODE-antwoord
+     * belandt in elke client-log. Alleen of er een is. */
+    numeric(c, 324, "%s %s", argv[1], derived ? "+" : "+k");
+    return;
+  }
+  if (!strcmp(cmd, "WHOIS")) {
+    if (argc < 2) { numeric(c, 431, ":Geen nick opgegeven"); return; }
+    /* Eerst de lokale sessies. */
+    for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
+      if (!_cl[k].registered || strcasecmp(_cl[k].nick, argv[1]) != 0) continue;
+      char pub[PUB_KEY_SIZE * 2 + 1] = {0};
+      _node->webBotSlotPubHex(_cl[k].bot, pub, sizeof(pub));
+      numeric(c, 311, "%s %s %s * :%s (bot-slot %d op deze node)", _cl[k].nick,
+              IRC_MESH_USERHOST, "mesh", _node->webBotSlotName(_cl[k].bot), _cl[k].bot);
+      numeric(c, 320, "%s :pubkey %s", _cl[k].nick, pub);
+      numeric(c, 318, "%s :Einde van /WHOIS", _cl[k].nick);
+      return;
+    }
+    /* Anders: een mesh-node uit de buurtlijst of de companion-store. */
+    char info[200];
+    if (_node->ircWhois(argv[1], info, sizeof(info))) {
+      numeric(c, 311, "%s %s * :mesh-node", argv[1], IRC_MESH_USERHOST);
+      numeric(c, 320, "%s :%s", argv[1], info);
+      numeric(c, 318, "%s :Einde van /WHOIS", argv[1]);
+    } else {
+      numeric(c, 401, "%s :Die node heb ik nog niet gehoord", argv[1]);
+      numeric(c, 318, "%s :Einde van /WHOIS", argv[1]);
+    }
+    return;
+  }
+  if (!strcmp(cmd, "WHO")) {
+    if (argc >= 2 && argv[1][0] == '#') {
+      int idx = chanIndexFor(argv[1]);
+      if (idx >= 0)
+        for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+          if (_cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
+            numeric(c, 352, "%s mesh mesh %s %s H :0 %s", argv[1], _node->getNodeName(),
+                    _cl[k].nick, _node->webBotSlotName(_cl[k].bot));
+      numeric(c, 315, "%s :Einde van /WHO", argv[1]);
+    } else {
+      numeric(c, 315, "%s :Einde van /WHO", argc >= 2 ? argv[1] : "*");
+    }
+    return;
+  }
+  if (!strcmp(cmd, "ISON")) {
+    char out[200]; int o = 0; out[0] = 0;
+    for (int i = 1; i < argc; i++)
+      for (int k = 0; k < IRC_MAX_CLIENTS; k++)
+        if (_cl[k].registered && !strcasecmp(_cl[k].nick, argv[i]))
+          o += snprintf(out + o, sizeof(out) - o, "%s%s", o ? " " : "", _cl[k].nick);
+    numeric(c, 303, ":%s", out);
+    return;
+  }
+  if (!strcmp(cmd, "MOTD")) { sendWelcome(c); return; }
+  if (!strcmp(cmd, "AWAY")) { numeric(c, argc >= 2 ? 306 : 305, ":Afwezigheid bestaat niet op het mesh"); return; }
+  if (!strcmp(cmd, "USERHOST")) { numeric(c, 302, ":"); return; }
+  if (!strcmp(cmd, "LUSERS")) {
+    numeric(c, 251, ":%d van %d sessies bezet, %d account(s), %d kanalen",
+            numClients(), IRC_MAX_CLIENTS, acctCount(), _node->webChannelCount());
+    return;
+  }
+
+  numeric(c, 421, "%s :Onbekend commando", cmd);
+}
+
+/* ------------------------------------------------------------------------ */
+/*  Mesh -> IRC                                                              */
+/* ------------------------------------------------------------------------ */
+
+void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* text,
+                                float snr, int rssi, int hops) {
+  if (!_running || chan_idx < 0 || chan_idx >= 32 || !text || !text[0]) return;
+
+  /* Van onszelf? Dan is het al lokaal weergalmd bij het verzenden. Zou hij hier
+   * alsnog binnenkomen (een repeater die ons eigen pakket terugkaatst), dan zou
+   * de afzender zijn eigen regel dubbel zien. */
+  for (int k = 0; k < MAX_BOTS; k++) {
+    if (!_node->webBotSlotUsed(k)) continue;
+    const char* bn = _node->webBotSlotName(k);
+    if (bn && bn[0] && sender && strcasecmp(bn, sender) == 0) return;
+  }
+
+  char nick[IRC_NICK_MAX + 1];
+  sanitizeNick(sender && sender[0] ? sender : "mesh", nick, sizeof(nick));
+  char cname[28];
+  if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
+
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
+    IrcClient& c = _cl[k];
+    if (!c.registered || !(c.chan_mask & (1UL << chan_idx))) continue;
+    raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, cname, text);
+    /* Het signaalrapport apart, als NOTICE in hetzelfde kanaalvenster. Zo blijft
+     * de gespreksregel schoon en is toch te zien hoe het pakket binnenkwam. */
+    raw(c, ":%s!%s NOTICE %s :[%s SNR %.1f dB, RSSI %d dBm, %d hop%s]",
+        nick, IRC_MESH_USERHOST, cname, nick, snr, rssi, hops, hops == 1 ? "" : "s");
+  }
+}
+
+void IrcTask::onMeshDm(int bot_idx, const uint8_t* sender_pub, const char* sender_name,
+                       const char* text, float snr, int rssi, int hops) {
+  if (!_running || bot_idx < 0 || !text || !text[0]) return;
+
+  char nick[IRC_NICK_MAX + 1];
+  if (sender_name && sender_name[0]) {
+    sanitizeNick(sender_name, nick, sizeof(nick));
+  } else {
+    /* Geen naam bekend -> de pubkey-prefix als nick. Kort genoeg om te typen en
+     * uniek genoeg om niet met een andere node te verwarren. */
+    char hex[PUB_KEY_SIZE * 2 + 1];
+    mesh::Utils::toHex(hex, sender_pub, PUB_KEY_SIZE);
+    snprintf(nick, sizeof(nick), "%.12s", hex);
+  }
+
+  for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
+    IrcClient& c = _cl[k];
+    if (!c.registered || c.bot != bot_idx) continue;
+    raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, c.nick, text);
+    raw(c, ":%s!%s NOTICE %s :[SNR %.1f dB, RSSI %d dBm, %d hop%s]",
+        nick, IRC_MESH_USERHOST, c.nick, snr, rssi, hops, hops == 1 ? "" : "s");
+  }
+}
+
+#endif  /* ESP32 */

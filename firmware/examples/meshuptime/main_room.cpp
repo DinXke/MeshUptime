@@ -45,6 +45,7 @@ static unsigned long g_reboot_at = 0;
   #include "WebTask.h"
   #include "PushTask.h"
   #include "Poller.h"
+  #include "IrcTask.h"
   static WifiTask wifi_task;
   static WebTask  web_task;
   static PushTask push_task;
@@ -52,6 +53,10 @@ static unsigned long g_reboot_at = 0;
    * in de room-variant met wifi -- hij leunt op PushTask (HTTP) en the_mesh.rcli
    * (RepeaterCli). Zie Poller.h. */
   static Poller   poller;
+  /* v2.9.0: de IRC-server. Alleen in de room-variant met wifi -- hij heeft zowel
+   * een IP-leven (poort 6667) als de bot-slots van RoomMesh nodig, en die twee
+   * bestaan alleen hier samen. Zie IrcTask.h. */
+  static IrcTask  irc_task;
 #endif
 
 #ifdef DISPLAY_CLASS
@@ -697,6 +702,17 @@ void setup() {
      * doel-wachtwoorden. */
     poller.begin(&SPIFFS, &push_task, &the_mesh.rcli);
     web_task.setPoller(&poller);
+
+    /* DE IRC-SERVER (v2.9.0). Twee koppelingen, allebei een pointer:
+     *  - irc_task krijgt de mesh, want daar zitten de bot-slots (identiteiten),
+     *    de kanaaltabel en de zendwegen (botSay/botSendTo);
+     *  - the_mesh krijgt irc_task, zodat gelezen kanaaltekst en binnenkomende
+     *    DM's bij de ingelogde sessies terechtkomen.
+     * De volgorde doet ertoe: setIrcTask() pas NA begin(), anders kan een pakket
+     * dat tussen die twee regels binnenkomt bij een server komen die zijn
+     * accounts nog niet gelezen heeft. */
+    irc_task.begin(&the_mesh, MESHUPTIME_BRAND_FULL(FIRMWARE_VERSION));
+    the_mesh.setIrcTask(&irc_task);
   }
   #ifdef HAS_MONITOR_SENSORS
     sensors.setWifiTask(&wifi_task);
@@ -742,6 +758,7 @@ void loop() {
   web_task.loop();
   push_task.loop();
   poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
+  irc_task.loop(); // v2.9.0: IRC-sessies; accept + leesronde, keert altijd terug
 #endif
 #ifdef DISPLAY_CLASS
   ui_task.loop();
