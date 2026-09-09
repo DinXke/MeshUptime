@@ -443,6 +443,17 @@ public:
     return (_state == RCLI_LOGIN || _state == RCLI_CMD || _state == RCLI_STATUS)
            && _target_pub[0] == hash[0];
   }
+  /* Is DIT de node waar nu een sessie mee loopt? Op de VOLLE sleutel, niet op de
+   * 1-byte hash zoals matchesSrcHash hierboven.
+   *
+   * Waarom er twee zijn. matchesSrcHash dient om een KANDIDAAT aan te bieden; een
+   * botsing kost daar hoogstens een mislukte ontsleuteling. Deze wordt gebruikt om
+   * een AL ONTSLEUTELD pakket naar de sessie te leiden, en dan is een botsing niet
+   * gratis: dan zou het pakket van een andere node als loginantwoord gelezen
+   * worden. Vandaar de hele sleutel. */
+  bool isTargetPub(const uint8_t* pub) const {
+    return busy() && memcmp(_target_pub, pub, PUB_KEY_SIZE) == 0;
+  }
   void fillSharedSecret(uint8_t* dest) const { memcpy(dest, _secret, PUB_KEY_SIZE); }
   bool onPeerData(uint8_t type, const uint8_t* data, size_t len);
   void onPath(const uint8_t* path, uint8_t path_len, uint8_t extra_type,

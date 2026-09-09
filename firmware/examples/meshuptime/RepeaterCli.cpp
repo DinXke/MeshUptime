@@ -8,6 +8,10 @@
   #define RESP_SERVER_LOGIN_OK   0
 #endif
 
+/* Zie de [rcli]-diagnose in RoomMesh.cpp: dit is stap 4, de laatste. Alleen tijdens
+ * een sessie, dus stil zolang er niets loopt. */
+#define RCLI_DIAG(...) do { if (busy()) { Serial.printf("[rcli] " __VA_ARGS__); Serial.println(); } } while (0)
+
 /* ------------------------------------------------------------------------
  * isMutating -- welke opdrachten VERANDEREN iets aan de tegenkant?
  *
@@ -558,6 +562,13 @@ void RepeaterCli::finishAnswer() {
  * ------------------------------------------------------------------------ */
 bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
   if (!busy()) return false;
+
+  /* STAP 4: wat rcli zelf te zien krijgt. De staat hoort erbij: login- en
+   * statusantwoord zijn hetzelfde payloadtype en worden alleen daardoor
+   * gescheiden. b4/b6 zijn de twee bytes waar het loginpad op beslist. */
+  RCLI_DIAG("data: state=%d type=%u len=%u b4=%u b6=%u",
+            (int)_state, (unsigned)type, (unsigned)len,
+            (unsigned)(len > 4 ? data[4] : 255), (unsigned)(len > 6 ? data[6] : 255));
 
   if (_state == RCLI_LOGIN && type == PAYLOAD_TYPE_RESPONSE && len >= 7) {
     if (data[4] != RESP_SERVER_LOGIN_OK) {
