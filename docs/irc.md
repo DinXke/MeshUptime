@@ -132,18 +132,21 @@ webinterface (`POST /cli`). Alleen `irc key set` kan **niet** over het web; zie
 *Je eigen sleutel meebrengen*.
 
 ```
-bot list                                  # welke bot-slots bestaan er
-bot add IRC-bjorn                         # nieuw slot met vers sleutelpaar
-irc user add bjorn hunter2xx IRC-bjorn    # account -> dat slot
+irc user add bjorn hunter2xx              # slot + account in een keer
 irc list                                  # wat staat er
 ```
+
+`irc user add` maakt het bot-slot zelf; de botnaam is optioneel en wordt anders
+`IRC-<nick>`. Mislukt het account, dan wordt het zojuist gemaakte slot weer
+opgeruimd &mdash; anders blijft er een identiteit achter die al geadverteerd heeft
+en die niemand kan gebruiken.
 
 Overige commando's:
 
 | Commando | Wat |
 |---|---|
 | `irc list` | sessies en accounts |
-| `irc user add <nick> <wachtwoord> <bot>` | account maken (wachtwoord ≥ 6 tekens) |
+| `irc user add <nick> <wachtwoord> [botnaam]` | bot-slot + account maken (wachtwoord ≥ 6 tekens) |
 | `irc user pass <nick> <wachtwoord>` | wachtwoord wijzigen |
 | `irc user del <nick>` | account weg; een open sessie wordt weggestuurd |
 | `irc key set <bot> <privhex> <pubhex>` | je **eigen** sleutelpaar in een slot leggen |
@@ -200,21 +203,22 @@ onomkeerbaar in de zin dat je de sleutel niet kunt terugtrekken.
 back-up. Op een companion met CLI: `get prv.key` en `get pub.key` over serieel.
 Je hebt beide nodig: 64 hextekens privaat, 64 hextekens publiek.
 
-**2. Maak een bot-slot** op de node, over serieel (115200, regels afsluiten met CR):
+**2. Maak de gebruiker** op de node, over serieel (115200, regels afsluiten met CR):
 
 ```
-bot list
-bot add IRC-<jouwnaam>
+irc user add <nick> <wachtwoord> IRC-<jouwnaam>
 ```
 
-**3. Leg je eigen sleutel in dat slot.** Alleen serieel — de webinterface weigert
-dit, en over IRC kan het niet:
+Dit maakt het bot-slot en het account in een keer.
+
+**3. Leg je eigen sleutel in dat slot:**
 
 ```
 irc key set IRC-<jouwnaam> <privhex64> <pubhex64>
 ```
 
-De node antwoordt `OK bot <n> draagt nu jouw sleutel; advert de lucht in`.
+De node antwoordt `OK bot <n> draagt nu jouw sleutel; advert de lucht in`. Dit kan
+ook met de importknop op de irc-tab; dan hoef je de sleutel niet over te typen.
 
 **4. Zet je telefoon-identiteit stil.** Vanaf nu adverteren twee apparaten
 dezelfde pubkey. Repeaters cachen routes per pubkey, dus twee zenders op één
@@ -222,12 +226,7 @@ identiteit laat het pad heen en weer klappen en dan komen DM's soms op het
 verkeerde toestel aan. Kies er één: laat de telefoon niet meer adverteren, of
 gebruik op de node een nieuwe sleutel in plaats van BYOK.
 
-**5. Maak het IRC-account:**
-
-```
-irc user add <nick> <wachtwoord> IRC-<jouwnaam>
-irc list
-```
+**5. Controleer met `irc list` dat het account er staat.**
 
 **6. Zoek het IP van de node** (webinterface, of je router) en verbind. In irssi:
 

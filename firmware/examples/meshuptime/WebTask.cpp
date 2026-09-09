@@ -3966,7 +3966,7 @@ function botSelQ(pre){return (BOTSEL!==""?pre+"bot="+encodeURIComponent(BOTSEL):
    contacten is ~126 kB, en de synchrone webserver houdt een POST-body in RAM.
    De browser stuurt alleen wat de node kan opslaan; radio-instellingen en
    positie uit dat bestand blijven waar ze zijn. */
-var IRCIMP=null;
+var IRCIMP=null,CHFAIL=[];
 function ircBind(){if(!document.getElementById("irc-add"))return;
 document.getElementById("irc-add").onclick=ircAdd;
 document.getElementById("irc-names-clear").onclick=ircNamesClear;
@@ -4073,17 +4073,25 @@ if(!wantkey)return{ok:true};
 return ircPost("irc/key","nick="+encodeURIComponent(nick)+"&prv="+d.private_key+"&pub="+d.public_key,null)
 .then(function(k){if(!k.ok)throw new Error(k.error||"sleutel zetten mislukt");return k})})
 .then(function(){var p=Promise.resolve();
+/* Mislukte kanalen apart bijhouden: de kanaaltabel van de node is eindig, en
+   stil doorgaan zou de indruk wekken dat alles binnen is. */
+CHFAIL=[];
 chans.forEach(function(c){p=p.then(function(){
 return fetch("channel/add",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"name="+encodeURIComponent(String(c.name).slice(0,23))+"&secret="+encodeURIComponent(c.secret)+"&enabled=1"})})});
+body:"name="+encodeURIComponent(String(c.name).slice(0,23))+"&secret="+encodeURIComponent(c.secret)+"&enabled=1"})
+.then(function(r){if(!r.ok)CHFAIL.push(c.name)})
+.catch(function(){CHFAIL.push(c.name)})})});
 names.forEach(function(c){if(!c.public_key||!c.name)return;p=p.then(function(){
 return fetch("irc/name",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"key="+encodeURIComponent(c.public_key)+"&name="+encodeURIComponent(
 String(c.custom_name||c.name).replace(/[^ -~]/g,"").slice(0,19))})})});
 return p})
-.then(function(){bmsg("impmsg","import klaar",1);IRCIMP=null;
+.then(function(){bmsg("impmsg",CHFAIL.length?
+("import klaar, maar deze kanalen pasten niet meer in de tabel van de node: "+CHFAIL.join(", ")+
+" — ruim er een op met 'channel del <naam>' en probeer opnieuw"):"import klaar",
+CHFAIL.length?0:1);IRCIMP=null;
 document.getElementById("irc-file").value="";document.getElementById("irc-prev").innerHTML="";ircLoad()})
 .catch(function(e){bmsg("impmsg","mislukt: "+(e.message||e),0);ircLoad()})}
 

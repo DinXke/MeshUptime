@@ -25,13 +25,22 @@ void IrcTask::sanitizeNick(const char* in, char* out, size_t out_len) {
   if (!in) { out[0] = 0; return; }
   for (const char* p = in; *p && o + 1 < out_len; p++) {
     unsigned char ch = (unsigned char)*p;
-    /* Alles wat het IRC-frame zou breken of een tweede parameter zou beginnen. */
+    /* NIET-ASCII WEGLATEN, NIET ONDERSTREPEN. Een naam als "🇧🇪BE-HSS-DinX" begint met
+     * een vlag-emoji van acht UTF-8-bytes; die stuk voor stuk vervangen gaf
+     * "________BE-HSS-DinX" -- onleesbaar, en niet over te typen in een /msg. */
+    if (ch >= 0x7f) continue;
+    /* Wat het IRC-frame zou breken of een tweede parameter zou beginnen. Een reeks
+     * daarvan wordt EEN underscore, zodat "Jan  de  Boer" niet "Jan__de__Boer" wordt. */
     bool bad = (ch <= ' ') || ch == ':' || ch == '!' || ch == '@' || ch == ',' ||
-               ch == '*' || ch == '?' || ch == '#' || ch >= 0x7f;
-    out[o++] = bad ? '_' : (char)ch;
+               ch == '*' || ch == '?' || ch == '#';
+    if (bad) { if (o > 0 && out[o - 1] == '_') continue; out[o++] = '_'; continue; }
+    out[o++] = (char)ch;
   }
+  while (o > 0 && out[o - 1] == '_') o--;      /* geen underscore op het eind */
   out[o] = 0;
-  if (o == 0) { out[0] = '?'; out[1] = 0; }
+  size_t lead = 0; while (out[lead] == '_') lead++;
+  if (lead) memmove(out, out + lead, o - lead + 1);
+  if (out[0] == 0) { out[0] = '?'; out[1] = 0; }
 }
 
 bool IrcTask::nickValid(const char* n) {
@@ -412,7 +421,10 @@ void IrcTask::sendWelcome(IrcClient& c) {
   numeric(c, 1, ":Welkom op het mesh, %s -- je bent hier de MeshCore-identiteit '%s'", c.nick, bname);
   numeric(c, 2, ":Draait op %s, %s", host, _fw ? _fw : "MeshUptime");
   numeric(c, 3, ":Bot-slot %d, pubkey %.12s...", c.bot, pub);
-  numeric(c, 4, "%s %s bot-slot %d kanalen", host, _fw ? _fw : "MeshUptime", c.bot);
+  /* RPL_MYINFO is <server> <versie> <usermodes> <chanmodes>; daar hoort geen proza
+   * in, sommige clients parsen deze regel. Wij kennen geen usermodes en op een
+   * kanaal alleen +k. */
+  numeric(c, 4, "%s %s - k", host, _fw ? _fw : "MeshUptime");
   numeric(c, 5, "CHANTYPES=# PREFIX= NICKLEN=%d TOPICLEN=0 CHANMODES=k :zijn ondersteund",
           IRC_NICK_MAX);
 
@@ -437,16 +449,56 @@ void IrcTask::sendWelcome(IrcClient& c) {
 /*  Kanalen                                                                  */
 /* ------------------------------------------------------------------------ */
 
-int IrcTask::chanIndexFor(const char* irc_name) const {
-  if (!irc_name || irc_name[0] != '#') return -1;
-  return _node->ircChannelFindByName(irc_name + 1);
+bool IrcTask::chanIrcNameRaw(int idx, char* out, size_t out_len) const {
+  char name[24]; int bits; bool en, derived, pub; uint8_t hash;
+  if (!_node->channelGet(idx, name, &bits, &en, &hash, &derived, &pub)) return false;
+  const char* p = name;
+  if (*p == '#') p++;                 /* geen "##dinx" */
+  size_t o = 0;
+  if (o + 1 < out_len) out[o++] = '#';
+  for (; *p && o + 1 < out_len; p++) {
+    unsigned char ch = (unsigned char)*p;
+    if (ch >= 0x7f) continue;                  /* emoji weg, niet onderstrepen */
+    /* Wat RFC 1459 verbiedt in een kanaalnaam: spatie, komma, ':' en BEL. Een reeks
+     * ervan wordt EEN underscore; twee kanalen die daardoor toch dezelfde IRC-naam
+     * krijgen, krijgen allebei de hash erachter (zie chanIrcName). */
+    bool bad = ch <= ' ' || ch == ',' || ch == ':' || ch == 7;
+    if (bad) { if (o > 1 && out[o - 1] == '_') continue; out[o++] = '_'; continue; }
+    out[o++] = (char)ch;
+  }
+  while (o > 1 && out[o - 1] == '_') o--;
+  out[o] = 0;
+  return o > 1;
 }
 
 bool IrcTask::chanIrcName(int idx, char* out, size_t out_len) const {
-  char name[24]; int bits; bool en, derived, pub; uint8_t hash;
-  if (!_node->channelGet(idx, name, &bits, &en, &hash, &derived, &pub)) return false;
-  snprintf(out, out_len, "#%s", name);
+  if (!chanIrcNameRaw(idx, out, out_len)) return false;
+  /* Botsing? Dan de kanaalhash erachter -- bij ALLEBEI, zie de header. */
+  char other[32];
+  for (int j = 0; j < MAX_CHANNELS; j++) {
+    if (j == idx) continue;
+    if (!chanIrcNameRaw(j, other, sizeof(other))) continue;
+    if (strcasecmp(other, out) != 0) continue;
+    char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
+    if (_node->channelGet(idx, nm, &bits, &en, &hash, &derived, &pub)) {
+      size_t o = strlen(out);
+      snprintf(out + o, out_len - o, "~%02x", hash);
+    }
+    break;
+  }
   return true;
+}
+
+/* Zoeken door te vergelijken met de IRC-vorm van elke ingang: de mangeling hoeft
+ * dan niet omkeerbaar te zijn. O(n) over hoogstens MAX_CHANNELS. */
+int IrcTask::chanIndexFor(const char* irc_name) const {
+  if (!irc_name || irc_name[0] != '#' || !irc_name[1]) return -1;
+  char cn[36];
+  for (int i = 0; i < MAX_CHANNELS; i++) {
+    if (!chanIrcName(i, cn, sizeof(cn))) continue;
+    if (strcasecmp(cn, irc_name) == 0) return i;
+  }
+  return -1;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -488,7 +540,7 @@ uint32_t IrcTask::replaySince(const IrcClient& c) const {
  * zouden schrijven (de oudste) en loop rond. Zo komt het gesprek in de juiste
  * volgorde binnen en niet omgekeerd. */
 void IrcTask::replayChannel(IrcClient& c, int chan_idx) {
-  char cname[28];
+  char cname[32];
   if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
   uint32_t since = replaySince(c);
   int n = 0;
@@ -521,7 +573,7 @@ void IrcTask::replayDms(IrcClient& c) {
 
 /* Naar iedereen die dit kanaal volgt: nick komt binnen of gaat weg. */
 void IrcTask::seenBroadcast(int chan_idx, const char* nick, bool joining) {
-  char cname[28];
+  char cname[32];
   if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     if (!_cl[k].registered || !(_cl[k].chan_mask & (1UL << chan_idx))) continue;
@@ -565,7 +617,7 @@ void IrcTask::seenExpire() {
 }
 
 void IrcTask::sendNames(IrcClient& c, int idx) {
-  char cname[28];
+  char cname[32];
   if (!chanIrcName(idx, cname, sizeof(cname))) return;
 
   /* Wie "in" het kanaal zit is op een mesh niet te weten: er is geen ledenlijst,
@@ -593,19 +645,31 @@ void IrcTask::sendNames(IrcClient& c, int idx) {
 
 void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
   if (!name || name[0] != '#' || !name[1]) { numeric(c, 403, "%s :Geen geldige kanaalnaam", name ? name : ""); return; }
-  const char* bare = name + 1;
-  if (strlen(bare) > 23) { numeric(c, 403, "%s :Kanaalnaam te lang (max 23)", name); return; }
-
-  int idx = _node->ircChannelFindByName(bare);
+  /* EERST opzoeken, DAN pas de lengte keuren. Een kanaal dat al op de node staat
+   * mag een naam hebben die wij zelf niet meer zouden aanmaken -- hem weigeren op
+   * een grens die alleen over aanmaken gaat, sluit je buiten je eigen kanaal. */
+  int idx = chanIndexFor(name);
   if (idx < 0) {
-    /* Nieuw kanaal aanmaken. Zonder sleutel wordt het geheim uit de naam afgeleid
-     * (het hashtag-kanaal), met sleutel is het een prive-kanaal. */
-    int rc = _node->channelAdd(bare, (key && key[0]) ? key : NULL, true);
-    if (rc < 0) {
-      numeric(c, 403, "%s :Kan het kanaal niet toevoegen (tabel vol of ongeldige sleutel, code %d)", name, rc);
+    if (strlen(name) > 23) {
+      numeric(c, 403, "%s :Kanaalnaam te lang om aan te maken (hoogstens 22 tekens na de #)", name);
       return;
     }
-    idx = _node->ircChannelFindByName(bare);
+    /* Nieuw kanaal. De naam gaat MET de '#' de tabel in: dat is de vorm die de
+     * MeshCore-apps gebruiken, en bij een hashtag-kanaal zit hij in het geheim
+     * (sha256 over de hele naam). Hem weglaten zou een kanaal opleveren dat
+     * niemand anders kan lezen. */
+    int rc = _node->channelAdd(name, (key && key[0]) ? key : NULL, true);
+    if (rc == -3) {
+      numeric(c, 403, "%s :De kanaaltabel van de node is vol (%d slots). Ruim er een "
+                      "op met 'channel del <naam>' voor je een nieuw kanaal joint.",
+              name, (int)MAX_CHANNELS);
+      return;
+    }
+    if (rc < 0) {
+      numeric(c, 403, "%s :Kan het kanaal niet toevoegen (sleutel moet 32 of 64 hex zijn), code %d", name, rc);
+      return;
+    }
+    idx = chanIndexFor(name);
     if (idx < 0) { numeric(c, 403, "%s :Kanaal niet gevonden na toevoegen", name); return; }
   }
   if (idx >= 32) { numeric(c, 403, "%s :Kanaalindex buiten bereik", name); return; }
@@ -613,7 +677,7 @@ void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
   if (c.chan_mask & (1UL << idx)) return;   // al gejoind; stil
   c.chan_mask |= (1UL << idx);
 
-  char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+  char cname[32]; chanIrcName(idx, cname, sizeof(cname));
   /* De JOIN echoën naar iedereen die het kanaal volgt -- ook lokaal, want het
    * mesh draagt geen aanwezigheid. */
   for (int k = 0; k < IRC_MAX_CLIENTS; k++)
@@ -635,7 +699,7 @@ void IrcTask::partChannel(IrcClient& c, const char* name, const char* reason) {
     numeric(c, 442, "%s :Je volgt dat kanaal niet", name ? name : "");
     return;
   }
-  char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+  char cname[32]; chanIrcName(idx, cname, sizeof(cname));
   for (int k = 0; k < IRC_MAX_CLIENTS; k++)
     if (_cl[k].registered && (_cl[k].chan_mask & (1UL << idx)))
       raw(_cl[k], ":%s!%s PART %s :%s", c.nick, IRC_MESH_USERHOST, cname,
@@ -704,7 +768,7 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
 
     /* Lokale weergalm: het mesh stuurt ons eigen group-pakket niet terug, dus de
      * andere sessies op deze node zouden het bericht anders nooit zien. */
-    char cname[28]; chanIrcName(idx, cname, sizeof(cname));
+    char cname[32]; chanIrcName(idx, cname, sizeof(cname));
     /* Ook onze EIGEN regel in de ring: wie later joint hoort het gesprek te zien
      * zoals het gevoerd is, niet met alleen de andere kant erin. */
     logAdd(idx, -1, _node->webBotSlotName(c.bot), body);
@@ -826,10 +890,16 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
     for (int i = 0; i < _node->webChannelMax(); i++) {
       char nm[24]; int bits; bool en, derived, pub; uint8_t hash;
       if (!_node->channelGet(i, nm, &bits, &en, &hash, &derived, &pub)) continue;
+      char cn[36];
+      if (!chanIrcName(i, cn, sizeof(cn))) continue;
       int here = 0;
       for (int k = 0; k < IRC_MAX_CLIENTS; k++) if (_cl[k].registered && (_cl[k].chan_mask & (1UL << i))) here++;
-      numeric(c, 322, "#%s %d :%s, %d-bit, hash %02X%s", nm, here,
-              pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash, en ? "" : ", uit");
+      /* De naam op de node erbij als de IRC-vorm ervan afwijkt -- anders zie je
+       * "#NodeNet_FireMesh_Limbur" en vind je hem nergens terug in 'channel list'. */
+      bool mangled = (strcasecmp(cn + 1, nm) != 0) && (strcasecmp(cn + 1, nm[0] == '#' ? nm + 1 : nm) != 0);
+      numeric(c, 322, "%s %d :%s, %d-bit, hash %02X%s%s%s", cn, here,
+              pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash,
+              en ? "" : ", uit", mangled ? ", op de node: " : "", mangled ? nm : "");
     }
     numeric(c, 323, ":Einde van /LIST");
     return;
@@ -937,7 +1007,7 @@ void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* te
 
   char nick[IRC_NICK_MAX + 1];
   sanitizeNick(sender && sender[0] ? sender : "mesh", nick, sizeof(nick));
-  char cname[28];
+  char cname[32];
   if (!chanIrcName(chan_idx, cname, sizeof(cname))) return;
 
   /* Eerst de ledenlijst bijwerken: wie nu zendt is "aanwezig", en de JOIN moet

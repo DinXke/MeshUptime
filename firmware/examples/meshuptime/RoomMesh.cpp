@@ -3314,11 +3314,21 @@ int RoomMesh::botSay(int b, int chan_idx, const char* text) {
 /*  De gedeelde naamtabel (v2.9.0)                                            */
 /* ------------------------------------------------------------------------ */
 
+/* Vergelijkt een opgeslagen mesh-naam met een getypte IRC-nick: eerst letterlijk,
+ * en anders na dezelfde mangeling die IrcTask op uitgaande nicks toepast. */
+bool RoomMesh::ircNickEq(const char* stored, const char* typed) {
+  if (!stored || !typed) return false;
+  if (strcasecmp(stored, typed) == 0) return true;
+  char san[40];
+  IrcTask::sanitizeNick(stored, san, sizeof(san));
+  return strcasecmp(san, typed) == 0;
+}
+
 int RoomMesh::nameTableFind(const char* name, uint8_t* pub_out) const {
   if (!name || !name[0]) return -1;
   for (int i = 0; i < MAX_NAMES; i++) {
     if (!_names[i].used) continue;
-    if (strcasecmp(_names[i].name, name) != 0) continue;
+    if (!ircNickEq(_names[i].name, name)) continue;
     if (pub_out) memcpy(pub_out, _names[i].pub_key, PUB_KEY_SIZE);
     return i;
   }
@@ -3506,10 +3516,16 @@ int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
     return 0;
   }
 
+  /* Namen op het mesh mogen spaties en accenten dragen; een IRC-nick niet. De
+   * gebruiker typt dus de GEMANGELDE vorm ("NodeNet_Gateway"), en die moeten we
+   * hier vergelijken -- met exact dezelfde functie die de nick ook naar de client
+   * stuurt. Anders is de nick die je ziet niet de nick die werkt. */
+  #define IRC_NICK_EQ(stored) ircNickEq((stored), nick)
+
   /* 2. De companion-store: apparaten die wij zelf beheren, dus de meest bedoelde
    *    ontvanger als de naam matcht. */
   for (int i = 0; i < MAX_COMPANIONS; i++) {
-    if (!_companions[i].used || strcasecmp(_companions[i].name, nick) != 0) continue;
+    if (!_companions[i].used || !IRC_NICK_EQ(_companions[i].name)) continue;
     memcpy(pub_out, _companions[i].pub_key, PUB_KEY_SIZE);
     if (resolved) StrHelper::strncpy(resolved, _companions[i].name, resolved_len);
     return 0;
@@ -3534,7 +3550,7 @@ int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
   int best = -1, hits = 0;
   for (int k = 0; k < neighbours.getNumEntries(); k++) {
     const NeighbourEntry* e = neighbours.getEntryByIdx(k);
-    if (!e || !e->name[0] || strcasecmp(e->name, nick) != 0) continue;
+    if (!e || !e->name[0] || !IRC_NICK_EQ(e->name)) continue;
     hits++;
     if (best < 0 || e->heard_at > neighbours.getEntryByIdx(best)->heard_at) best = k;
   }
@@ -3544,6 +3560,7 @@ int RoomMesh::ircResolveNick(const char* nick, uint8_t* pub_out, char* resolved,
     if (resolved) StrHelper::strncpy(resolved, e->name, resolved_len);
     return hits > 1 ? 1 : 0;
   }
+  #undef IRC_NICK_EQ
   return -1;
 }
 
@@ -4099,23 +4116,31 @@ void RoomMesh::handleIrcCommand(char* args, char* reply) {
     return;
   }
 
+  /* `irc user add <nick> <wachtwoord> [botnaam]` -- de botnaam is OPTIONEEL en het
+   * slot wordt hier gemaakt. Dat moet wel: de bot-CLI kent geen verb om een slot
+   * aan te maken (`bot add` voegt een ONTVANGER toe), dus zonder dit kon je op de
+   * seriele console geen gebruiker aanmaken en op de webpagina wel. Zelfde weg als
+   * de irc-tab: webIrcUserAdd() maakt slot + account en draait het slot terug als
+   * het account faalt. */
   if (memcmp(args, "user add ", 9) == 0) {
     char* nick = args + 9; while (*nick == ' ') nick++;
     char* pw = strchr(nick, ' ');
-    if (!pw) { strcpy(reply, "gebruik: irc user add <nick> <wachtwoord> <botnaam-of-index>"); return; }
+    if (!pw) { strcpy(reply, "gebruik: irc user add <nick> <wachtwoord> [botnaam]"); return; }
     *pw++ = 0; while (*pw == ' ') pw++;
     char* botsel = strchr(pw, ' ');
-    if (!botsel) { strcpy(reply, "gebruik: irc user add <nick> <wachtwoord> <botnaam-of-index>"); return; }
-    *botsel++ = 0; while (*botsel == ' ') botsel++;
-    int b = botResolve(botsel);
-    if (b < 0) { sprintf(reply, "ERR onbekende bot '%s' (zie 'bot list')", botsel); return; }
-    int rc = _irc->acctAdd(nick, pw, b);
+    if (botsel) { *botsel++ = 0; while (*botsel == ' ') botsel++; }
+    int rc = webIrcUserAdd(nick, pw, botsel);
     switch (rc) {
-      case 0:  sprintf(reply, "OK %s -> bot %d (%s)", nick, b, webBotSlotName(b)); break;
-      case -1: strcpy(reply, "ERR accounttabel vol"); break;
+      case 0: {
+        int b = -1, ai = _irc->acctFind(nick);
+        char tmp[IRC_NICK_MAX + 1];
+        if (ai >= 0) _irc->acctGet(ai, tmp, sizeof(tmp), &b);
+        sprintf(reply, "OK %s -> bot %d (%s)", nick, b, b >= 0 ? webBotSlotName(b) : "?");
+        break;
+      }
+      case -1: strcpy(reply, "ERR geen vrij bot-slot (MAX_BOTS bereikt)"); break;
       case -2: strcpy(reply, "ERR ongeldige nick of wachtwoord korter dan 6 tekens"); break;
       case -3: strcpy(reply, "ERR die nick bestaat al"); break;
-      case -4: strcpy(reply, "ERR bot bestaat niet of is al aan een account vergeven"); break;
       default: sprintf(reply, "ERR code %d", rc); break;
     }
     return;
@@ -4162,7 +4187,8 @@ void RoomMesh::handleIrcCommand(char* args, char* reply) {
     return;
   }
 
-  strcpy(reply, "gebruik: irc list | user add|pass|del ... | key set <bot> <prv> <pub>");
+  strcpy(reply, "gebruik: irc list | user add <nick> <pw> [botnaam] | user pass|del <nick> "
+                "| key set <bot> <prv> <pub>");
 }
 
 void RoomMesh::handleChannelCommand(char* args, char* reply) {

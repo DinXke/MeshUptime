@@ -240,6 +240,13 @@ public:
   void onMeshDm(int bot_idx, const uint8_t* sender_pub, const char* sender_name,
                 const char* text, float snr, int rssi, int hops);
 
+  /* EEN MESH-NAAM VEILIG MAKEN ALS IRC-NICK. Publiek en statisch, want RoomMesh
+   * gebruikt hem ook: wie in zijn client `/msg NodeNet_Gateway` typt, moet de
+   * contact "NodeNet Gateway" uit de naamtabel te pakken krijgen. Als de mangeling
+   * op twee plaatsen anders zou zijn, is de nick die je ziet niet de nick die
+   * werkt -- en dat is precies het soort fout dat niemand meer terugvindt. */
+  static void sanitizeNick(const char* in, char* out, size_t out_len);
+
   /* ---- Accountbeheer. Aangeroepen vanuit de CLI (`irc ...`) en het web. ---- */
   int  acctCount() const;
   bool acctGet(int i, char* nick, size_t nick_len, int* bot) const;
@@ -290,9 +297,25 @@ private:
   void numeric(IrcClient& c, int code, const char* fmt, ...);
   void notice(IrcClient& c, const char* fmt, ...);
 
-  /* IRC-kanaalnaam <-> BotChannel-index. "#belimburg" <-> "belimburg". */
+  /* IRC-KANAALNAAM <-> KANAALTABEL.
+   *
+   * Dit is NIET "de '#' eraf knippen", en die aanname was fout: op de node heet
+   * een hashtag-kanaal letterlijk "#dinx". De '#' hoort BIJ de naam en gaat mee in
+   * sha256(naam), dus wie hem eraf haalt en het kanaal opnieuw aanmaakt krijgt een
+   * ANDER geheim en praat stil in het niets.
+   *
+   * En een mesh-kanaal mag heten wat het wil -- "NodeNet FireMesh Limbur" staat er
+   * echt in -- terwijl een IRC-kanaalnaam geen spatie, komma of ':' mag dragen.
+   * Die tekens worden '_'. Dat is niet omkeerbaar, dus we zoeken NIET door terug te
+   * vertalen maar door de IRC-vorm van elke ingang te vergelijken.
+   *
+   * Botsen twee kanalen daardoor op dezelfde IRC-naam ("A B" en "A_B"), dan krijgen
+   * ZE ALLEBEI de kanaalhash achteraan ("#A_B~3f"). Allebei, want anders hangt het
+   * van de tabelvolgorde af wie de kale naam houdt en verspringt die bij de
+   * volgende import. De hash staat ook in /LIST, dus hij is over te typen. */
   int  chanIndexFor(const char* irc_name) const;
   bool chanIrcName(int idx, char* out, size_t out_len) const;
+  bool chanIrcNameRaw(int idx, char* out, size_t out_len) const;   // zonder botsingsachtervoegsel
   void joinChannel(IrcClient& c, const char* name, const char* key);
   void partChannel(IrcClient& c, const char* name, const char* reason);
   void sendNames(IrcClient& c, int idx);
@@ -316,7 +339,5 @@ private:
   void doPrivmsg(IrcClient& c, char* target, const char* text, bool is_notice);
   bool txAllowed(IrcClient& c, char* why, size_t why_len);
 
-  /* Een mesh-naam veilig maken als IRC-nick: geen spatie, ':', '!', '@' of CR-LF. */
-  static void sanitizeNick(const char* in, char* out, size_t out_len);
   static bool nickValid(const char* n);
 };

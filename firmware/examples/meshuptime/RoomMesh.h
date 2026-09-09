@@ -178,8 +178,11 @@ class IrcTask;
 /* HASHTAG-/PUBLIEKE KANALEN die de bot meeleest. Een MeshCore group-channel is een
  * gedeeld geheim (16 of 32 byte); de kanaal-hash = eerste byte van sha256(secret).
  * De bot antwoordt IN het kanaal op ping/test/path. Bescheiden aantal i.v.m. RAM. */
+/* 16 en niet 8 sinds v2.9.0: een MeshCore-app-config brengt er zo negen mee, en
+ * met een tweede gebruiker die importeert loopt een tabel van acht meteen vol.
+ * Een BotChannel is ~62 byte, dus acht slots erbij kosten een halve kB. */
 #ifndef MAX_CHANNELS
-  #define MAX_CHANNELS  8
+  #define MAX_CHANNELS  16
 #endif
 
 /* GEDEELDE NAAMTABEL (v2.9.0). Naam -> pubkey, gevuld uit de app-config die een
@@ -707,6 +710,9 @@ public:
    * de oudste ingang eruit. 0 = ok, <0 = ongeldig. */
   int  nameTableAdd(const uint8_t* pubkey, const char* name);
   int  nameTableCount() const;
+  /* Een opgeslagen mesh-naam vergelijken met een getypte IRC-nick, met dezelfde
+   * mangeling die IrcTask op uitgaande nicks toepast. */
+  static bool ircNickEq(const char* stored, const char* typed);
   void nameTableClear();
   bool nameTableGet(int i, char* name, size_t name_len, char* pub64, size_t pub_len) const;
 
