@@ -391,6 +391,15 @@ private:
   void raw(IrcClient& c, const char* fmt, ...);
   void numeric(IrcClient& c, int code, const char* fmt, ...);
   void notice(IrcClient& c, const char* fmt, ...);
+  /* Een NOTICE die in het venster van `target` landt: bij een kanaal dus in dat
+   * kanaalvenster, waar de regel stond die je net probeerde te sturen. Bij een DM
+   * valt hij terug op notice() -- een NOTICE met de naam van de tegenpartij ervoor
+   * zou in het queryvenster landen, maar dan doen we alsof die persoon iets zei. */
+  void noticeTo(IrcClient& c, const char* target, const char* fmt, ...);
+
+  /* Hoeveel tekens er in dit doel passen. Bij een kanaal gaat "<botnaam>: " er nog
+   * voor, en dat telt mee in de 160 van een MeshCore-tekstbericht. */
+  size_t meshRoomFor(const IrcClient& c, const char* target) const;
 
   /* IRC-KANAALNAAM <-> KANAALTABEL.
    *

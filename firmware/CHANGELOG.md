@@ -137,7 +137,10 @@ bovenop. Nieuw:
 - **opmaak en controltekens eruit** — kleur, vetdruk, cursief, reset. Op een mesh
   betekenen ze niets en in de app zijn ze vuil. Blijft er niets over, dan geen
   pakket;
-- **afkappen op een UTF-8-grens**, want een halve reeks toont als blokje;
+- **te lang wordt GEWEIGERD**, niet afgekapt: op het mesh is aan een halve zin niet
+  te zien dat er iets miste. De melding landt in het kanaalvenster, noemt tekens en
+  bytes apart zodra ze verschillen (accenten tellen dubbel), en `JOIN` zegt vooraf
+  hoeveel er in dat kanaal passen;
 - een **herhalingsrem**: exact dezelfde regel naar hetzelfde doel binnen 10 minuten
   wordt geweigerd. Dit is de rem tegen precies het soort koppeling dat eerder op dit
   mesh kanalen volpompte;

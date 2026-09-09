@@ -239,6 +239,17 @@ void IrcTask::numeric(IrcClient& c, int code, const char* fmt, ...) {
   raw(c, ":%s %03d %s %s", host, code, c.nick[0] ? c.nick : "*", tail);
 }
 
+void IrcTask::noticeTo(IrcClient& c, const char* target, const char* fmt, ...) {
+  char tail[IRC_LINE_MAX - 64];
+  va_list ap; va_start(ap, fmt);
+  vsnprintf(tail, sizeof(tail), fmt, ap);
+  va_end(ap);
+  if (!target || target[0] != '#') { notice(c, "%s", tail); return; }
+  const char* host = _node ? _node->getNodeName() : IRC_HOST_FALLBACK;
+  if (!host || !host[0]) host = IRC_HOST_FALLBACK;
+  raw(c, ":%s NOTICE %s :%s", host, target, tail);
+}
+
 void IrcTask::notice(IrcClient& c, const char* fmt, ...) {
   char tail[IRC_LINE_MAX - 64];
   va_list ap; va_start(ap, fmt);
@@ -775,6 +786,9 @@ void IrcTask::joinChannel(IrcClient& c, const char* name, const char* key) {
           pub ? "publiek" : (derived ? "hashtag" : "prive"), bits, hash,
           en ? "" : " (UITGESCHAKELD -- 'channel on' op de CLI)");
   sendNames(c, idx);
+  noticeTo(c, cname, "Hier passen %u tekens per bericht (160 min '%s: '). Langere "
+                     "regels worden geweigerd, niet afgekapt.",
+           (unsigned)meshRoomFor(c, cname), _node->webBotSlotName(c.bot));
   replayChannel(c, idx);
 }
 
@@ -893,7 +907,8 @@ uint32_t IrcTask::quoteLookup(const char* text, const char** body) const {
 size_t IrcTask::meshClean(const char* in, char* out, size_t out_len) {
   size_t o = 0;
   bool sp = true;                      /* leidende spaties overslaan */
-  for (const unsigned char* p = (const unsigned char*)in; *p && o + 1 < out_len; p++) {
+  const unsigned char* p = (const unsigned char*)in;
+  for (; *p && o + 1 < out_len; p++) {
     unsigned char ch = *p;
     if (ch == 0x03) {                  /* kleur: [cijfer][cijfer][,cijfer[cijfer]] */
       int d = 0;
@@ -915,11 +930,23 @@ size_t IrcTask::meshClean(const char* in, char* out, size_t out_len) {
     out[o++] = (char)ch;
   }
   while (o > 0 && out[o - 1] == ' ') o--;          /* achterliggende spaties weg */
-  /* Zit het laatste teken midden in een UTF-8-reeks, dan die reeks helemaal weg. */
-  while (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0x80) o--;
-  if (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0xC0) o--;
+  /* ALLEEN als de uitvoerbuffer vol raakte kan er een halve UTF-8-reeks achteraan
+   * staan; dan die reeks helemaal weg. Deze correctie ONVOORWAARDELIJK doen was
+   * fout en at het laatste teken op van elk bericht dat op een accent of emoji
+   * eindigde: 100 keer "e-accent" kwam er als 99 uit. */
+  if (*p != 0) {
+    while (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0x80) o--;
+    if (o > 0 && ((unsigned char)out[o - 1] & 0xC0) == 0xC0) o--;
+  }
   out[o] = 0;
   return o;
+}
+
+size_t IrcTask::meshRoomFor(const IrcClient& c, const char* target) const {
+  if (!target || target[0] != '#') return BOT_MAX_TEXT_LEN - 1;
+  const char* bn = _node->webBotSlotName(c.bot);
+  size_t pre = (bn && bn[0]) ? strlen(bn) + 2 : 5;      /* "<naam>: " */
+  return (BOT_MAX_TEXT_LEN > pre + 1) ? (BOT_MAX_TEXT_LEN - pre - 1) : 16;
 }
 
 /* Dezelfde regel nog eens, binnen het venster? Dat is geen gesprek. Precies het
@@ -998,7 +1025,11 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
   /* CTCP (\001...\001) evenmin: ACTION zou nog kunnen, maar VERSION/PING/TIME
    * zijn client-onderhandeling en geen mesh-verkeer. Alleen ACTION laten we door
    * als gewone tekst met een sterretje ervoor. */
-  char body[BOT_MAX_TEXT_LEN + 8];
+  /* Ruim genoeg voor een hele IRC-regel. Krapper zou de tekst afkappen VOOR we
+   * hem meten, en dan meldt de foutboodschap een ander getal dan de gebruiker
+   * getypt heeft -- precies het soort verwarring dat een foutboodschap hoort weg
+   * te nemen. */
+  char body[IRC_LINE_MAX];
   if (text[0] == '\001') {
     if (strncasecmp(text + 1, "ACTION ", 7) == 0) {
       const char* act = text + 8;
@@ -1018,7 +1049,8 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
   {
     char cleaned[sizeof(body)];
     if (meshClean(body, cleaned, sizeof(cleaned)) == 0) {
-      numeric(c, 412, ":Na het weghalen van opmaak en controltekens bleef er geen tekst over");
+      noticeTo(c, target, "Na het weghalen van opmaak en controltekens bleef er geen "
+                          "tekst over; er is niets verstuurd.");
       return;
     }
     memcpy(body, cleaned, sizeof(body));
@@ -1027,6 +1059,8 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
   /* Een antwoord uit de client (+draft/reply=<msgid>) wordt hier een quote op de
    * draad. Kan het origineel niet meer gevonden worden -- uit de ring gerold --
    * dan gaat het bericht gewoon zonder quote weg; dat is beter dan weigeren. */
+  bool quoted = false;
+  size_t reply_len = strlen(body);
   char tagbuf[40];
   const char* rt = tags ? ircTagValue(tags, "+draft/reply", tagbuf, sizeof(tagbuf)) : NULL;
   if (!rt && tags) rt = ircTagValue(tags, "draft/reply", tagbuf, sizeof(tagbuf));
@@ -1034,46 +1068,59 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     uint32_t id = (uint32_t)strtoul(rt[0] == 'm' ? rt + 1 : rt, NULL, 16);
     int oi = logFindById(id);
     if (oi >= 0) {
-      char q[BOT_MAX_TEXT_LEN + 16];
+      char q[IRC_LINE_MAX + 48];
       /* De naam alleen in een kanaal: in een DM weet je met wie je praat. */
       ircBuildQuote(_log[oi].nick, _log[oi].text, body, target[0] == '#', q, sizeof(q));
       StrHelper::strncpy(body, q, sizeof(body));
+      quoted = true;
     } else {
       notice(c, "Het bericht waarop je antwoordt is uit de buffer gerold; "
                 "je regel gaat zonder quote de lucht in.");
     }
   }
 
-  /* Afkappen op het mesh-budget en op een UTF-8-grens. botSay() zet er nog
-   * "<botnaam>: " voor, dus dat gaat er hier al af -- laten we dat aan snprintf
-   * over, dan knipt hij midden in een teken. */
+  /* TE LANG = NIET VERSTUREN. Eerder kapte de brug af, en dat is erger dan
+   * weigeren: op het mesh is aan een afgekapte regel niet te zien dat er iets
+   * miste, dus de lezer krijgt een halve zin als hele zin. Nu blijft de regel in je
+   * client staan en zeggen we hoeveel eraf moet -- in het KANAALVENSTER, want daar
+   * typte je hem. Een MeshCore-tekstbericht is 160 tekens, en in een kanaal gaat
+   * "<botnaam>: " daar nog van af. */
   {
-    size_t room = BOT_MAX_TEXT_LEN - 2;
-    if (target[0] == '#') {
-      const char* bn = _node->webBotSlotName(c.bot);
-      size_t pre = (bn && bn[0]) ? strlen(bn) + 2 : 5;
-      room = (BOT_MAX_TEXT_LEN > pre + 1) ? (BOT_MAX_TEXT_LEN - pre - 1) : 16;
-    }
-    if (strlen(body) > room) {
-      body[room] = 0;
-      size_t o = strlen(body);
-      while (o > 0 && ((unsigned char)body[o - 1] & 0xC0) == 0x80) o--;
-      if (o > 0 && ((unsigned char)body[o - 1] & 0xC0) == 0xC0) o--;
-      body[o] = 0;
-      notice(c, "Je regel was te lang voor een mesh-bericht en is op %u tekens afgekapt.",
-             (unsigned)o);
+    size_t room = meshRoomFor(c, target);
+    size_t len = strlen(body);
+    if (len > room) {
+      /* De grens is in BYTES -- dat is wat er in het pakket past. Voor wie accenten
+       * of emoji typt is dat niet hetzelfde als het aantal tekens, en "je hebt er 12
+       * te veel" op een regel die er maar 6 te lang lijkt, is onnavolgbaar. Dus
+       * allebei noemen, en alleen als ze verschillen. */
+      size_t chars = 0;
+      for (const char* p = body; *p; p++) if (((unsigned char)*p & 0xC0) != 0x80) chars++;
+      char meting[80];
+      if (chars == len) snprintf(meting, sizeof(meting), "%u tekens", (unsigned)len);
+      else snprintf(meting, sizeof(meting), "%u tekens (%u bytes; accenten tellen dubbel)",
+                    (unsigned)chars, (unsigned)len);
+      if (quoted)
+        noticeTo(c, target, "Te lang: %s, er passen er %u. Het citaat vooraan kost %u "
+                            "bytes -- antwoord zonder quote, of kort %u bytes in. "
+                            "Er is niets verstuurd.",
+                 meting, (unsigned)room, (unsigned)(len - reply_len), (unsigned)(len - room));
+      else
+        noticeTo(c, target, "Te lang: %s, er passen er %u in een mesh-bericht. "
+                            "Kort %u bytes in; er is niets verstuurd.",
+                 meting, (unsigned)room, (unsigned)(len - room));
+      return;
     }
   }
 
   if (isRepeat(c, target, body)) {
-    notice(c, "Exact dezelfde regel stuurde je net al naar %s. Herhalingen kosten "
-              "airtime die iedereen deelt; wacht %lu minuten of typ iets anders.",
-           target, (unsigned long)(IRC_REPEAT_MS / 60000UL));
+    noticeTo(c, target, "Exact dezelfde regel stuurde je net al. Herhalingen kosten "
+                        "airtime die iedereen deelt; wacht %lu minuten of typ iets anders.",
+             (unsigned long)(IRC_REPEAT_MS / 60000UL));
     return;
   }
 
   char why[224];
-  if (!txAllowed(c, why, sizeof(why))) { notice(c, "%s", why); return; }
+  if (!txAllowed(c, why, sizeof(why))) { noticeTo(c, target, "%s", why); return; }
   {
     /* Een DM wordt door botSendTo() in stukken van MAX_POST_TEXT_LEN geknipt en
      * elk stuk is een eigen pakket -- die tellen allemaal mee in de begroting. */
@@ -1083,7 +1130,7 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
       chunks = (int)((n + MAX_POST_TEXT_LEN - 1) / MAX_POST_TEXT_LEN);
       if (chunks < 1) chunks = 1;
     }
-    if (!dutyOk((int)strlen(body) + 12, chunks, why, sizeof(why))) { notice(c, "%s", why); return; }
+    if (!dutyOk((int)strlen(body) + 12, chunks, why, sizeof(why))) { noticeTo(c, target, "%s", why); return; }
   }
 
   if (target[0] == '#') {
@@ -1468,7 +1515,9 @@ void IrcTask::sendHelp(IrcClient& c, const char* topic) {
     HELP("AIRTIME :    voor gekoppelde scripts en sensoren die blijven herhalen;");
     HELP("AIRTIME :  - opmaak (kleuren, vetdruk) en controltekens gaan eruit: op een");
     HELP("AIRTIME :    mesh betekenen ze niets en in de app zijn ze vuil;");
-    HELP("AIRTIME :  - langere tekst wordt afgekapt, op een UTF-8-grens.");
+    HELP("AIRTIME :  - te lange tekst wordt GEWEIGERD, niet afgekapt: op het mesh is");
+    HELP("AIRTIME :    aan een halve zin niet te zien dat er iets miste. Bij JOIN zegt");
+    HELP("AIRTIME :    de node hoeveel tekens er in dat kanaal passen.");
     HELP("AIRTIME :");
     HELP("AIRTIME :Wat geweigerd wordt komt terug als NOTICE met de wachttijd erbij,");
     HELP("AIRTIME :niet als stilte. JOIN, PART, QUIT, TOPIC en NAMES gaan nooit de");

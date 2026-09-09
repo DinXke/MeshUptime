@@ -337,8 +337,15 @@ zonder dat er iemand iets getypt had.
   vetdruk (`0x02`), cursief, onderstrepen en reset mee. Op een mesh betekent dat
   niets: in de MeshCore-app is het vuil in de tekst, en het kost airtime. Blijft er
   na het schoonmaken niets over, dan gaat er geen pakket de lucht in.
-- **Afkappen op een UTF-8-grens.** Halverwege een meerbytes-teken knippen levert een
-  ongeldige reeks op en dan toont de app een blokje of slikt de regel.
+- **Te lang wordt geweigerd, niet afgekapt.** Op het mesh is aan een halve zin niet
+  te zien dat er iets miste, dus de lezer krijgt een halve zin als hele zin. De
+  melding komt in het **kanaalvenster** — daar typte je hem — en zegt hoeveel eraf
+  moet. Bij `JOIN` meldt de node meteen hoeveel tekens er in dat kanaal passen
+  (160 min `"<botnaam>: "`).
+
+  De grens is in **bytes**, want dat is wat er in het pakket past. Voor accenten en
+  emoji is dat niet hetzelfde als het aantal tekens, dus de melding noemt allebei
+  zodra ze verschillen.
 - **Herhalingsrem.** Exact dezelfde regel naar hetzelfde doel binnen 10 minuten
   wordt geweigerd — per gebruiker, want dezelfde tekst in twee kanalen kan legitiem
   zijn. Dit is de rem tegen gekoppelde scripts en sensoren die blijven doorpompen.
