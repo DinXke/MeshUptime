@@ -167,6 +167,20 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.8.2 = DEZELFDE NODE IN TWEE ROLLEN. Een repeater die ooit op onze room-server
+ *            inlogde staat in de ACL van room 0; is diezelfde repeater ook het DOEL van
+ *            een CLI-sessie, dan ontsleutelt zijn loginantwoord op die ACL-ingang en niet
+ *            op de rcli-kandidaat -- dezelfde sleutel, want rcli logt in met de identiteit
+ *            van room 0. Het antwoord belandde dan in de client-tak, die alleen het pad
+ *            bewaart en verder enkel naar een ACK kijkt: het RESPONSE werd stil weggegooid
+ *            en elke sessie liep in zijn time-out ('geen loginantwoord na 3 pogingen').
+ *            Nu wordt zo'n pakket eerst aan de lopende sessie aangeboden (op de VOLLE
+ *            sleutel, zie isTargetPub) en pas daarna als clientverkeer verwerkt.
+ *   v2.8.1 = [rcli]-DIAGNOSE. Een repeater kan een login keurig antwoorden terwijl
+ *            deze kant 'geen loginantwoord' meldt (gemeten op JessaZH.VIR02). De vier
+ *            stappen ertussen -- pakket binnen, sessie als kandidaat, ontsleuteld,
+ *            inhoud -- waren van buiten niet te zien omdat MESH_DEBUG uit staat.
+ *            Altijd-aan logging met prefix [rcli], stil zolang er geen sessie loopt.
  *   v2.8.0 = DE KLOK VAN EEN REPEATER RECHTZETTEN, als EEN job (cmd:clockfix uit de
  *            MeshManager-wachtrij). De firmware van de tegenkant weigert een klok
  *            achteruit ("ERR: clock cannot go backwards", CommonCLI), dus bij een
@@ -187,7 +201,7 @@
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.8.0"
+  #define MESHUPTIME_VERSION   "v2.8.2"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

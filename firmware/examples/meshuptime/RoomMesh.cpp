@@ -10,6 +10,18 @@
  * mag pakketten missen -- dat is inherent, geen bug: dan verschijnt hier NIETS). */
 #define CHAN_DIAG(...) do { Serial.printf("[chan] " __VA_ARGS__); Serial.println(); } while (0)
 
+/* === CLI-SESSIE-DIAGNOSE ====================================================
+ * Waarom dit bestaat. Een repeater kan een loginverzoek keurig ANTWOORDEN
+ * (meetbaar in het pakketarchief van een node die het hoort) terwijl deze kant
+ * "geen loginantwoord" meldt. Dan is de vraag: kwam het pakket hier aan, werd
+ * de sessie als kandidaat aangeboden, ontsleutelde het, en wat zat erin? Die
+ * vier stappen zijn van buitenaf niet te zien -- MESH_DEBUG staat uit -- en
+ * juist daartussen zit het verschil tussen RF-verlies en een fout bij ons.
+ *
+ * STIL TENZIJ ER EEN SESSIE LOOPT: buiten een CLI-sessie print dit niets, dus
+ * het kan blijven staan zonder de console vol te zetten. */
+#define RCLI_DIAG(...) do { if (rcli.busy()) { Serial.printf("[rcli] " __VA_ARGS__); Serial.println(); } } while (0)
+
 /* ============================================================================
  * RoomMesh -- implementatie. Zie RoomMesh.h voor het waarom.
  *
@@ -731,6 +743,13 @@ mesh::DispatcherAction RoomMesh::onRecvPacket(mesh::Packet* pkt) {
        ptype == PAYLOAD_TYPE_REQ || ptype == PAYLOAD_TYPE_RESPONSE ||
        ptype == PAYLOAD_TYPE_TXT_MSG)) {
     uint8_t dest_hash = pkt->payload[0];
+    /* STAP 1: is het pakket hier binnengekomen? Met wie het voor is (dest) en van
+     * wie het lijkt te komen (src, tweede byte bij PATH/REQ/RESPONSE/TXT). */
+    RCLI_DIAG("in: ptype=%u dest=%02X src=%02X route=%u hops=%u plen=%u",
+              (unsigned)ptype, dest_hash,
+              (unsigned)(pkt->payload_len >= 2 ? pkt->payload[1] : 0),
+              (unsigned)pkt->getRouteType(), (unsigned)pkt->path_len,
+              (unsigned)pkt->payload_len);
     for (int s = 0; s < MAX_ROOMS; s++) {
       if (!rooms[s].active) continue;
       if (rooms[s].id.isHashMatch(&dest_hash)) {
@@ -846,9 +865,16 @@ int RoomMesh::searchPeersByHash(const uint8_t* hash) {
    * probeert elk gevonden geheim en houdt alleen wat de MAC-controle overleeft.
    * Een toevallige botsing op de 1-byte afzenderhash kost dus hoogstens een
    * mislukte ontsleuteling. */
+  bool rcli_kandidaat = false;
   if (n < MAX_CLIENTS && _active_snode < 0 && _active_slot == 0 && rcli.matchesSrcHash(hash)) {
     matching_peer_indexes[n++] = RCLI_PEER_IDX;
+    rcli_kandidaat = true;
   }
+  /* STAP 2: werd de lopende sessie als kandidaat aangeboden? Zo niet, dan komt het
+   * pakket nooit bij rcli terecht en is de reden hier te zien (slot/snode/hash). */
+  RCLI_DIAG("zoek: hash=%02X acl-treffers=%d rcli=%d (slot=%d snode=%d bot=%d)",
+            (unsigned)hash[0], n - (rcli_kandidaat ? 1 : 0), rcli_kandidaat ? 1 : 0,
+            _active_slot, _active_snode, _active_is_bot ? 1 : 0);
   return n;
 }
 
@@ -1001,6 +1027,18 @@ void RoomMesh::onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx
   if (i < 0 || i >= slot.acl.getNumClients()) return;
   ClientInfo* client = slot.acl.getClientByIdx(i);
 
+  /* Dezelfde twee rollen als in onPeerPathRecv hierboven, nu voor een gewoon
+   * datagram: het login- of statusantwoord van een repeater die ook client van
+   * ons is. onPeerData() geeft true als de lopende sessie het pakket OPGEEIST
+   * heeft; alleen dan houden we het hier tegen. Zegt de sessie nee (een kanaal-
+   * of roompost van diezelfde node, of geen sessie), dan loopt het door de
+   * gewone machinerie hieronder zoals altijd. */
+  if (rcli.isTargetPub(client->id.pub_key) && rcli.onPeerData(type, data, len)) {
+    RCLI_DIAG("data via ACL-ingang %d opgeeist (type=%u len=%u)",
+              i, (unsigned)type, (unsigned)len);
+    return;
+  }
+
   if (type == PAYLOAD_TYPE_TXT_MSG && len > 5) {
     uint32_t sender_timestamp;
     memcpy(&sender_timestamp, data, 4);
@@ -1151,12 +1189,33 @@ bool RoomMesh::onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_
    * klein pakket nu tegen een flood door het hele mesh straks. Het is precies wat
    * BaseChatMesh::onContactPathRecv voor een gewone client ook doet. */
   if (i == RCLI_PEER_IDX) {
+    /* STAP 3: ontsleuteld EN doorgegeven. Wat erin zat bepaalt of het loginantwoord
+     * meekwam: extra_type 2 (RESPONSE) met extra_len > 0. */
+    RCLI_DIAG("pad: path_len=%u extra_type=%u extra_len=%u",
+              (unsigned)path_len, (unsigned)extra_type, (unsigned)extra_len);
     rcli.onPath(path, path_len, extra_type, extra, extra_len);
     return true;
   }
 
   if (i >= 0 && i < slot.acl.getNumClients()) {
     ClientInfo* client = slot.acl.getClientByIdx(i);
+    /* DEZELFDE NODE IN TWEE ROLLEN -- en dat is geen randgeval maar de normale
+     * gang van zaken op één mesh: een repeater die ooit op onze room-server
+     * inlogde staat in deze ACL, en tegelijk kunnen wij CLIENT van diezelfde
+     * repeater zijn. Dan ontsleutelt zijn loginantwoord op DEZE ingang en niet op
+     * de rcli-kandidaat -- de sleutel is immers dezelfde, want rcli logt in met
+     * de identiteit van room 0. Zonder de regel hieronder verdwijnt het
+     * loginantwoord hier: deze tak bewaart alleen het pad en kijkt verder enkel
+     * naar een ACK, dus het RESPONSE erin wordt stil weggegooid en de sessie
+     * loopt in zijn time-out. Gemeten op BE-HSS-JessaZH.VIR02, die zowel client
+     * als doel was; Jessa stond niet in de ACL en werkte daarom wel.
+     *
+     * De volle sleutel en niet de hash: zie isTargetPub(). */
+    if (rcli.isTargetPub(client->id.pub_key)) {
+      RCLI_DIAG("pad via ACL-ingang %d: path_len=%u extra_type=%u extra_len=%u",
+                i, (unsigned)path_len, (unsigned)extra_type, (unsigned)extra_len);
+      rcli.onPath(path, path_len, extra_type, extra, extra_len);
+    }
     client->out_path_len = mesh::Packet::copyPath(client->out_path, path, path_len);
     client->last_activity = getRTCClock()->getCurrentTime();
   }

@@ -7,6 +7,66 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.8.2 — dezelfde node in twee rollen (en waarom dat een sessie stil liet mislukken)
+
+Alleen de room-server-variant (`env:meshuptime_room`). Een fix plus de logging die
+hem zichtbaar maakte; niets aan de bewaking, de opvragingen of de klok-job.
+
+**Het verschijnsel.** Elke CLI-sessie naar `BE-HSS-JessaZH.VIR02` eindigde in
+`geen loginantwoord na 3 pogingen`, twaalf keer op rij. Tegelijk lag in het
+pakketarchief van een node die het meehoorde het bewijs dat VIR02 **elk** verzoek
+binnen een seconde antwoordde:
+
+```
+19:52:50 ANON_REQ  hops=0  ->cb   len=57
+19:52:52 PATH      hops=0  cb->48 len=26
+```
+
+Dat tweede pakket is een `createPathReturn` met het loginantwoord als `extra`
+erin. Naar `JessaZH.VIR` (dezelfde firmware, hetzelfde wachtwoord, dezelfde weg)
+werkte de oefening wél. Met een verkeerd wachtwoord bleef VIR02 volledig stil, dus
+het wachtwoord was juist en het verzoek kwam aan.
+
+**De oorzaak.** VIR02 is **zowel een client van onze room-server als de repeater
+waar wij client van zijn**. Dat is geen randgeval maar de normale gang van zaken op
+één mesh. Zijn loginantwoord ontsleutelt daarom op zijn **ACL-ingang** en niet op de
+rcli-kandidaat: de sleutel is dezelfde, want `rcliUseClientIdentity()` logt in met de
+identiteit van room 0, en `Mesh::onRecvPacket` neemt de eerste kandidaat die de
+MAC-controle overleeft. Het pakket belandde zo in de client-tak van
+`onPeerPathRecv`, en die bewaart alleen het pad en kijkt verder enkel naar een
+`ACK` — het `RESPONSE` erin werd stil weggegooid. Jessa stond niet in die ACL, dus
+daar bleef alleen de rcli-kandidaat over en liep alles langs de bedoelde weg.
+
+**De fix.** Is de al ontsleutelde afzender de node waarmee nu een sessie loopt, dan
+krijgt de sessie het pakket eerst — en pas daarna loopt het door de gewone
+clientmachinerie. In `onPeerPathRecv` (het pad-antwoord) en in `onPeerDataRecv` (het
+gewone datagram, dat `onPeerData` opeist door `true` te geven).
+
+Op de **volle sleutel** en niet op de 1-byte hash, en dat onderscheid is de moeite:
+`matchesSrcHash()` biedt een *kandidaat* aan en een botsing kost daar hoogstens een
+mislukte ontsleuteling, maar `isTargetPub()` leidt een **al ontsleuteld** pakket
+ergens naartoe. Een botsing zou daar het pakket van een andere node als loginantwoord
+laten lezen.
+
+**`[rcli]`-diagnose (blijft staan).** `MESH_DEBUG` staat in deze build uit, dus van
+de vier stappen tussen "de repeater antwoordt" en "de sessie loopt in zijn time-out"
+was er geen enkel spoor. Deze logging maakt ze alle vier zichtbaar — pakket binnen,
+kandidaat aangeboden, ontsleuteld, en wat erin zat — en print **alleen tijdens een
+sessie**, dus ze kan blijven zonder de console vol te zetten. Het beslissende
+fragment was:
+
+```
+[rcli] in: ptype=8 dest=48 src=CB route=0 hops=64 plen=20
+[rcli] zoek: hash=CB acl-treffers=1 rcli=1 (slot=0 snode=-1 bot=0)
+```
+
+`acl-treffers=1`: er was een ACL-ingang met dezelfde hash, en die won.
+
+**Geverifieerd op de lucht.** `ver` naar VIR02 geeft
+`v1.17.1-PS+filter+rollback (Build: 14 Aug 2026)`; de vijf filtercommando's uit
+MeshManager komen alle vijf beantwoord terug (filter aan, 118 pakketten weg op de
+hoplimiet, beide limiettabellen en de kanaallijst).
+
 ## v2.8.0 — de klok van een repeater rechtzetten, als één job
 
 Alleen de room-server-variant (`env:meshuptime_room`). Additief; de bewaking, de
