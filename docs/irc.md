@@ -152,6 +152,33 @@ weigeren.
 Met `server-time` zet je client zelf het juiste tijdstip bij een teruggespeelde
 regel; dan laat de node zijn eigen `[uu:mm]` weg.
 
+## Signaalgegevens: in WHOIS, niet in het kanaal
+
+Van elk bericht dat van de radio komt weet de node hoe het binnenkwam: SNR, RSSI en
+het aantal hops. Dat stond eerst als **tweede regel achter ieder kanaalbericht**, en
+dat verdubbelt een kanaalvenster — onbruikbaar zodra er meer dan af en toe iets
+langskomt. Het wordt nu **per afzender bijgehouden en bij elk bericht bijgewerkt**,
+en je vraagt het op met `WHOIS <nick>`:
+
+```
+-!- BE-HSS-DinX :laatste bericht: SNR 12.5 dB, RSSI -67 dBm, 3 hops
+                 (42 s geleden, in #dinx, 17 berichten)
+-!- BE-HSS-DinX :pubkey 2CB0…126F | SNR 11.0 dB | 2 hops | 340 s geleden gehoord
+```
+
+Twee regels uit **twee bronnen**, want ze weten iets anders. De eerste komt uit de
+ledenlijst per kanaal, bijgewerkt bij elk bericht. De tweede uit de buurtlijst van
+de node, die zich met **adverts** vult — wie in een kanaal praat zonder te
+adverteren staat daar niet in. Ze zijn ook niet aan elkaar te knopen: een
+kanaalafzender kennen we alleen bij **naam** (uit de `"<naam>: "`-prefix), niet bij
+pubkey.
+
+Heeft je client `message-tags`, dan komen de gegevens bij élk bericht mee als
+`+meshuptime.be/snr`, `/rssi` en `/hops`. Onzichtbaar tenzij je client ze toont, en
+gratis — tags gaan alleen over TCP.
+
+Onze eigen berichten hebben geen signaalgegevens: die kwamen niet van de radio.
+
 ## Ledenlijst en geschiedenis
 
 Twee dingen die IRC verwacht en een mesh niet heeft, en hoe ze nagebootst worden.
@@ -198,7 +225,9 @@ Overige commando's:
 | `irc list` | sessies en accounts |
 | `irc user add <nick> <wachtwoord> [botnaam]` | bot-slot + account maken (wachtwoord ≥ 6 tekens) |
 | `irc user pass <nick> <wachtwoord>` | wachtwoord wijzigen |
-| `irc user del <nick>` | account weg; een open sessie wordt weggestuurd |
+| `irc user del <nick> [slot]` | account weg; met `slot` gaat het bot-slot (en het sleutelpaar) mee |
+| `irc slot list` | welke bot-slots er zijn en bij welk account ze horen |
+| `irc slot del <idx>` | een bot-slot zonder account opruimen |
 | `irc key set <bot> <privhex> <pubhex>` | je **eigen** sleutelpaar in een slot leggen |
 
 Accounts staan in `/irc_accounts` op SPIFFS, als

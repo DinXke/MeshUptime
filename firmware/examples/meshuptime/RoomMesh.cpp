@@ -4569,10 +4569,66 @@ void RoomMesh::handleIrcCommand(char* args, char* reply) {
     return;
   }
 
+  /* `irc user del <nick> [slot]` -- zonder 'slot' blijft de IDENTITEIT staan (de
+   * contacten van die gebruiker blijven hem kunnen bereiken, en heraanmaken op
+   * hetzelfde slot geeft dezelfde pubkey terug). MET 'slot' gaat het sleutelpaar
+   * mee en komt het slot vrij.
+   *
+   * Dat dit erbij moest, bleek uit de praktijk: `irc user add` maakt het slot zelf
+   * aan, maar `irc user del` ruimde alleen het account op. Vijf keer een testaccount
+   * maken en weggooien liet dus vijf onbruikbare slots achter en dan zit MAX_BOTS
+   * vol -- terwijl 'irc list' niets meer laat zien. */
   if (memcmp(args, "user del ", 9) == 0) {
     char* nick = args + 9; while (*nick == ' ') nick++;
-    int rc = _irc->acctDel(nick);
-    strcpy(reply, rc == 0 ? "OK" : "ERR onbekende nick");
+    char* opt = strchr(nick, ' ');
+    bool drop = false;
+    if (opt) { *opt++ = 0; while (*opt == ' ') opt++; drop = (strcasecmp(opt, "slot") == 0); }
+    int rc = webIrcUserDel(nick, drop ? 1 : 0);
+    if (rc != 0) { strcpy(reply, "ERR onbekende nick"); return; }
+    strcpy(reply, drop ? "OK account en bot-slot gewist" : "OK account gewist (bot-slot blijft)");
+    return;
+  }
+
+  /* `irc slot del <naam-of-index>` -- een bot-slot opruimen dat GEEN account meer
+   * heeft. Bewust apart, en met de weigering erin: eerst het account, dan het slot.
+   * Andersom zou een account naar een leeg slot wijzen en kon niemand meer inloggen
+   * zonder dat er iets fout leek. */
+  if (memcmp(args, "slot del ", 9) == 0) {
+    char* sel = args + 9; while (*sel == ' ') sel++;
+    int b = botResolve(sel);
+    if (b < 0) { sprintf(reply, "ERR onbekend slot '%s' (zie 'bot bots')", sel); return; }
+    if (b == alertBotIndex()) { strcpy(reply, "ERR dat is de alert-bot; die kan niet weg"); return; }
+    int ai = _irc->acctFindByBot(b);
+    if (ai >= 0) {
+      char nick[IRC_NICK_MAX + 1]; int dummy;
+      _irc->acctGet(ai, nick, sizeof(nick), &dummy);
+      sprintf(reply, "ERR slot %d hoort bij account '%s' -- eerst 'irc user del %s slot'", b, nick, nick);
+      return;
+    }
+    char nm[24]; StrHelper::strncpy(nm, webBotSlotName(b), sizeof(nm));
+    if (!webBotDel(b)) { sprintf(reply, "ERR slot %d kon niet gewist worden", b); return; }
+    sprintf(reply, "OK slot %d (%s) gewist", b, nm);
+    return;
+  }
+
+  /* `irc slot list` -- welke slots bestaan er en horen ze bij een account. Zonder
+   * dit is een verweesd slot niet te zien: 'irc list' toont accounts, 'bot bots'
+   * toont slots, en het verband ertussen stond nergens. */
+  if (memcmp(args, "slot list", 9) == 0) {
+    char* p = reply;
+    p += sprintf(p, "slots:");
+    for (int b = 0; b < MAX_BOTS; b++) {
+      if (!webBotSlotUsed(b)) continue;
+      if ((p - reply) > 170) { p += sprintf(p, " ..."); break; }
+      int ai = _irc->acctFindByBot(b);
+      char nick[IRC_NICK_MAX + 1] = {0}; int dummy;
+      if (ai >= 0) _irc->acctGet(ai, nick, sizeof(nick), &dummy);
+      /* "geen account" en NIET "verweesd": de MGMT-bot en de alert-bot horen bij
+       * geen IRC-gebruiker en dat is precies goed. Ze als wees aanmerken nodigt uit
+       * om een werkende service-bot te wissen. */
+      p += sprintf(p, " [%d]%s=%s", b, webBotSlotName(b),
+                   ai >= 0 ? nick : (b == alertBotIndex() ? "alert-bot" : "geen account"));
+    }
     return;
   }
 
@@ -4600,7 +4656,8 @@ void RoomMesh::handleIrcCommand(char* args, char* reply) {
     return;
   }
 
-  strcpy(reply, "gebruik: irc list | user add <nick> <pw> [botnaam] | user pass|del <nick> "
+  strcpy(reply, "gebruik: irc list | user add <nick> <pw> [botnaam] | user pass <nick> <pw> "
+                "| user del <nick> [slot] | slot list | slot del <idx> "
                 "| key set <bot> <prv> <pub>");
 }
 

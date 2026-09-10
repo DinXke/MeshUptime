@@ -527,7 +527,8 @@ int IrcTask::chanIndexFor(const char* irc_name) const {
 /*  Terugspoelen                                                              */
 /* ------------------------------------------------------------------------ */
 
-int IrcTask::logAdd(int chan, int bot, const char* nick, const char* text) {
+int IrcTask::logAdd(int chan, int bot, const char* nick, const char* text,
+                    int8_t snr4, int16_t rssi, uint8_t hops) {
   if (!text || !text[0]) return -1;
   uint32_t now = _node->getRTCClock()->getCurrentTime();
   if (now == 0) now = 1;                 /* 0 betekent "leeg slot" */
@@ -538,6 +539,9 @@ int IrcTask::logAdd(int chan, int bot, const char* nick, const char* text) {
   e.id = ++_msg_seq;
   e.chan = (int8_t)chan;
   e.bot = (int8_t)bot;
+  e.snr4 = snr4;
+  e.rssi = rssi;
+  e.hops = hops;
   StrHelper::strncpy(e.nick, (nick && nick[0]) ? nick : "mesh", sizeof(e.nick));
   StrHelper::strncpy(e.text, text, sizeof(e.text));
   return idx;
@@ -584,9 +588,17 @@ void IrcTask::isoTime(uint32_t ts, char* out, size_t out_len) const {
 /* Een PRIVMSG met de tags die DEZE client gevraagd heeft. Wie geen message-tags
  * negotieerde krijgt precies wat hij altijd kreeg -- de tags weglaten is hier geen
  * verlies maar de hele reden dat dit degradeert. */
+void IrcTask::signalText(const IrcLogEntry* e, char* out, size_t out_len) const {
+  out[0] = 0;
+  if (!e || e->hops == IRC_SIG_NONE) return;
+  snprintf(out, out_len, "[SNR %.1f dB, RSSI %d dBm, %u hop%s]",
+           ((float)e->snr4) / 4.0f, (int)e->rssi, (unsigned)e->hops,
+           e->hops == 1 ? "" : "s");
+}
+
 void IrcTask::sendMsg(IrcClient& c, const IrcLogEntry* e, const char* nick,
                       const char* target, const char* text, uint32_t reply_to) {
-  char tags[96]; tags[0] = 0;
+  char tags[192]; tags[0] = 0;
   int t = 0;
   if (c.cap_tags && e && e->id)
     t += snprintf(tags + t, sizeof(tags) - t, "%smsgid=m%lx", t ? ";" : "@", (unsigned long)e->id);
@@ -596,6 +608,14 @@ void IrcTask::sendMsg(IrcClient& c, const IrcLogEntry* e, const char* nick,
     char iso[32]; isoTime(e->ts, iso, sizeof(iso));
     if (iso[0]) t += snprintf(tags + t, sizeof(tags) - t, "%stime=%s", t ? ";" : "@", iso);
   }
+  /* De radiogegevens als CLIENT-ONLY tag (de '+'): onzichtbaar voor wie er niets
+   * mee doet, en gratis -- tags gaan alleen over TCP. Zo hoeft er geen tweede
+   * regel per bericht in het kanaalvenster te staan. */
+  if (c.cap_tags && e && e->hops != IRC_SIG_NONE)
+    t += snprintf(tags + t, sizeof(tags) - t,
+                  "%s+meshuptime.be/snr=%.1f;+meshuptime.be/rssi=%d;+meshuptime.be/hops=%u",
+                  t ? ";" : "@", ((float)e->snr4) / 4.0f, (int)e->rssi, (unsigned)e->hops);
+
   if (t) raw(c, "%s :%s!%s PRIVMSG %s :%s", tags, nick, IRC_MESH_USERHOST, target, text);
   else   raw(c, ":%s!%s PRIVMSG %s :%s", nick, IRC_MESH_USERHOST, target, text);
 }
@@ -679,7 +699,20 @@ void IrcTask::seenBroadcast(int chan_idx, const char* nick, bool joining) {
   }
 }
 
-void IrcTask::seenTouch(int chan_idx, const char* nick) {
+int IrcTask::seenFindNick(const char* nick, int* row) const {
+  int best_c = -1, best_i = -1;
+  unsigned long best = 0;
+  for (int c = 0; c < MAX_CHANNELS; c++)
+    for (int i = 0; i < IRC_SEEN_PER_CHAN; i++) {
+      if (_seen[c][i].last == 0) continue;
+      if (strcasecmp(_seen[c][i].nick, nick) != 0) continue;
+      if (best_c < 0 || _seen[c][i].last > best) { best = _seen[c][i].last; best_c = c; best_i = i; }
+    }
+  if (row) *row = best_i;
+  return best_c;
+}
+
+void IrcTask::seenTouch(int chan_idx, const char* nick, int8_t snr4, int16_t rssi, uint8_t hops) {
   if (chan_idx < 0 || chan_idx >= MAX_CHANNELS || !nick || !nick[0]) return;
   IrcSeen* row = _seen[chan_idx];
   unsigned long now = millis();
@@ -688,7 +721,12 @@ void IrcTask::seenTouch(int chan_idx, const char* nick) {
   int free_i = -1, oldest = 0;
   for (int i = 0; i < IRC_SEEN_PER_CHAN; i++) {
     if (row[i].last == 0) { if (free_i < 0) free_i = i; continue; }
-    if (strcasecmp(row[i].nick, nick) == 0) { row[i].last = now; return; }   // al lid
+    if (strcasecmp(row[i].nick, nick) == 0) {          // al lid -> bijwerken
+      row[i].last = now;
+      row[i].snr4 = snr4; row[i].rssi = rssi; row[i].hops = hops;
+      if (row[i].msgs < 0xffff) row[i].msgs++;
+      return;
+    }
     if (row[i].last < row[oldest].last) oldest = i;
   }
   /* Vol -> de langst stille eruit. Die krijgt een PART, anders blijft hij in de
@@ -697,6 +735,8 @@ void IrcTask::seenTouch(int chan_idx, const char* nick) {
   if (idx < 0) { idx = oldest; seenBroadcast(chan_idx, row[idx].nick, false); }
   StrHelper::strncpy(row[idx].nick, nick, sizeof(row[idx].nick));
   row[idx].last = now;
+  row[idx].snr4 = snr4; row[idx].rssi = rssi; row[idx].hops = hops;
+  row[idx].msgs = 1;
   seenBroadcast(chan_idx, nick, true);
 }
 
@@ -1148,7 +1188,7 @@ void IrcTask::doPrivmsg(IrcClient& c, char* target, const char* text, bool is_no
     char cname[32]; chanIrcName(idx, cname, sizeof(cname));
     /* Ook onze EIGEN regel in de ring: wie later joint hoort het gesprek te zien
      * zoals het gevoerd is, niet met alleen de andere kant erin. */
-    int mi = logAdd(idx, -1, _node->webBotSlotName(c.bot), body);
+    int mi = logAdd(idx, -1, _node->webBotSlotName(c.bot), body, 0, 0, IRC_SIG_NONE);
     const IrcLogEntry* me = (mi >= 0) ? &_log[mi] : NULL;
     /* Ook de afzender krijgt het msgid terug, zodat zijn eigen regel een geldig
      * antwoorddoel is -- in een echt IRC-netwerk komt je eigen bericht ook langs. */
@@ -1363,16 +1403,39 @@ void IrcTask::handleLine(IrcClient& c, char* line) {
       numeric(c, 318, "%s :Einde van /WHOIS", _cl[k].nick);
       return;
     }
-    /* Anders: een mesh-node uit de buurtlijst of de companion-store. */
+    /* WAT WE VAN DEZE NICK ZELF GEHOORD HEBBEN. Bijgehouden bij elk bericht, en
+     * dat is iets anders dan de buurtlijst van de node: die vult zich met ADVERTS,
+     * dus een node die in een kanaal praat zonder recent te adverteren staat er
+     * niet in. Hier stond eerder een tweede regel achter elk kanaalbericht; die
+     * informatie hoort niet in het gesprek maar hier. */
+    int srow = -1;
+    int schan = seenFindNick(argv[1], &srow);
+    bool any = false;
+    if (schan >= 0 && srow >= 0) {
+      const IrcSeen& sv = _seen[schan][srow];
+      char cn[36]; chanIrcName(schan, cn, sizeof(cn));
+      numeric(c, 311, "%s %s * :mesh-node", argv[1], IRC_MESH_USERHOST);
+      any = true;
+      if (sv.hops == IRC_SIG_NONE)
+        numeric(c, 320, "%s :laatst gehoord in %s, %u bericht%s", argv[1], cn,
+                (unsigned)sv.msgs, sv.msgs == 1 ? "" : "en");
+      else
+        numeric(c, 320, "%s :laatste bericht: SNR %.1f dB, RSSI %d dBm, %u hop%s "
+                        "(%lu s geleden, in %s, %u bericht%s)",
+                argv[1], ((float)sv.snr4) / 4.0f, (int)sv.rssi, (unsigned)sv.hops,
+                sv.hops == 1 ? "" : "s",
+                (unsigned long)((millis() - sv.last) / 1000UL), cn,
+                (unsigned)sv.msgs, sv.msgs == 1 ? "" : "en");
+    }
+    /* En daarnaast wat de node zelf van hem weet: pubkey, adverts, hoe lang terug. */
     char info[200];
     if (_node->ircWhois(argv[1], info, sizeof(info))) {
-      numeric(c, 311, "%s %s * :mesh-node", argv[1], IRC_MESH_USERHOST);
+      if (!any) numeric(c, 311, "%s %s * :mesh-node", argv[1], IRC_MESH_USERHOST);
       numeric(c, 320, "%s :%s", argv[1], info);
-      numeric(c, 318, "%s :Einde van /WHOIS", argv[1]);
-    } else {
-      numeric(c, 401, "%s :Die node heb ik nog niet gehoord", argv[1]);
-      numeric(c, 318, "%s :Einde van /WHOIS", argv[1]);
+      any = true;
     }
+    if (!any) numeric(c, 401, "%s :Die node heb ik nog niet gehoord", argv[1]);
+    numeric(c, 318, "%s :Einde van /WHOIS", argv[1]);
     return;
   }
   if (!strcmp(cmd, "WHO")) {
@@ -1432,6 +1495,7 @@ void IrcTask::sendHelp(IrcClient& c, const char* topic) {
     HELP("* :  HELP IDENTITEIT   je sleutelpaar, je pubkey, wie je kan nadoen");
     HELP("* :  HELP LEDEN        waarom /NAMES iets anders betekent dan je denkt");
     HELP("* :  HELP GEMIST       wat je terugkrijgt na het inloggen");
+    HELP("* :  HELP SIGNAAL      SNR, RSSI en hopcount opvragen met WHOIS");
     HELP("* :");
     HELP("* :In HexChat en irssi bereik je dit met /quote HELP <onderwerp> --");
     HELP("* :/help is daar een commando van de client zelf.");
@@ -1573,6 +1637,35 @@ void IrcTask::sendHelp(IrcClient& c, const char* topic) {
     return;
   }
 
+  if (!strcasecmp(t, "SIGNAAL") || !strcasecmp(t, "SIGNAL")) {
+    numeric(c, 704, "SIGNAAL :SNR, RSSI en hopcount");
+    HELP("SIGNAAL :Van elk bericht dat van de radio komt weet de node hoe het");
+    HELP("SIGNAAL :binnenkwam: SNR, RSSI en het aantal hops. Dat staat NIET in het");
+    HELP("SIGNAAL :kanaal -- een tweede regel achter elk bericht verdubbelt het");
+    HELP("SIGNAAL :gesprek. Het wordt per afzender bijgehouden en bij elk bericht");
+    HELP("SIGNAAL :bijgewerkt, en je vraagt het op met:");
+    HELP("SIGNAAL :");
+    HELP("SIGNAAL :  WHOIS <nick>");
+    HELP("SIGNAAL :");
+    HELP("SIGNAAL :Dat geeft het laatste bericht (SNR, RSSI, hops, hoe lang geleden,");
+    HELP("SIGNAAL :in welk kanaal, hoeveel berichten) en daarnaast wat de node zelf");
+    HELP("SIGNAAL :van die node weet: de pubkey en zijn adverts.");
+    HELP("SIGNAAL :");
+    HELP("SIGNAAL :Twee bronnen, want ze weten iets anders. De buurtlijst van de node");
+    HELP("SIGNAAL :vult zich met ADVERTS; wie in een kanaal praat zonder te adverteren");
+    HELP("SIGNAAL :staat daar niet in. En een kanaalafzender kennen we alleen bij NAAM,");
+    HELP("SIGNAAL :niet bij pubkey, dus die twee zijn niet aan elkaar te knopen.");
+    HELP("SIGNAAL :");
+    HELP("SIGNAAL :Heeft je client message-tags, dan komen de gegevens bij ELK bericht");
+    HELP("SIGNAAL :mee als +meshuptime.be/snr, /rssi en /hops. Onzichtbaar tenzij je");
+    HELP("SIGNAAL :client ze toont, en gratis -- tags gaan alleen over TCP.");
+    HELP("SIGNAAL :");
+    HELP("SIGNAAL :Onze EIGEN berichten hebben geen signaalgegevens: die kwamen niet");
+    HELP("SIGNAAL :van de radio.");
+    numeric(c, 706, "SIGNAAL :Einde van de help");
+    return;
+  }
+
   numeric(c, 524, "%s :Geen help over dat onderwerp. Typ HELP voor de lijst.", t);
   #undef HELP
 }
@@ -1602,7 +1695,8 @@ void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* te
   /* Eerst de ledenlijst bijwerken: wie nu zendt is "aanwezig", en de JOIN moet
    * VOOR het bericht komen -- een PRIVMSG van iemand die de client niet in het
    * kanaal ziet staan, laten sommige clients in een apart venster belanden. */
-  seenTouch(chan_idx, nick);
+  seenTouch(chan_idx, nick, (int8_t)lroundf(snr * 4.0f), (int16_t)rssi,
+            (uint8_t)(hops > 254 ? 254 : hops));
   /* Een binnenkomende regel die met een quote begint koppelen we terug aan het
    * origineel in de ring; clients met message-tags krijgen er dan echte threading
    * van. De quote blijft WEL in de tekst staan -- wie de tag niet snapt (en dat is
@@ -1610,17 +1704,16 @@ void IrcTask::onMeshChannelText(int chan_idx, const char* sender, const char* te
   const char* body = text;
   uint32_t rt = quoteLookup(text, &body);
 
-  int li = logAdd(chan_idx, -1, nick, text);
+  int li = logAdd(chan_idx, -1, nick, text, (int8_t)lroundf(snr * 4.0f),
+                  (int16_t)rssi, (uint8_t)(hops > 254 ? 254 : hops));
   const IrcLogEntry* le = (li >= 0) ? &_log[li] : NULL;
 
+  /* Geen tweede regel per bericht meer. De radiogegevens gaan als tag mee (en op
+   * verzoek als NOTICE) -- zie sendMsg(). */
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];
     if (!c.registered || !(c.chan_mask & (1UL << chan_idx))) continue;
     sendMsg(c, le, nick, cname, text, rt);
-    /* Het signaalrapport apart, als NOTICE in hetzelfde kanaalvenster. Zo blijft
-     * de gespreksregel schoon en is toch te zien hoe het pakket binnenkwam. */
-    raw(c, ":%s!%s NOTICE %s :[%s SNR %.1f dB, RSSI %d dBm, %d hop%s]",
-        nick, IRC_MESH_USERHOST, cname, nick, snr, rssi, hops, hops == 1 ? "" : "s");
   }
 }
 
@@ -1641,15 +1734,14 @@ void IrcTask::onMeshDm(int bot_idx, const uint8_t* sender_pub, const char* sende
 
   const char* dbody = text;
   uint32_t drt = quoteLookup(text, &dbody);
-  int dli = logAdd(IRC_LOG_DM, bot_idx, nick, text);
+  int dli = logAdd(IRC_LOG_DM, bot_idx, nick, text, (int8_t)lroundf(snr * 4.0f),
+                   (int16_t)rssi, (uint8_t)(hops > 254 ? 254 : hops));
   const IrcLogEntry* dle = (dli >= 0) ? &_log[dli] : NULL;
 
   for (int k = 0; k < IRC_MAX_CLIENTS; k++) {
     IrcClient& c = _cl[k];
     if (!c.registered || c.bot != bot_idx) continue;
     sendMsg(c, dle, nick, c.nick, text, drt);
-    raw(c, ":%s!%s NOTICE %s :[SNR %.1f dB, RSSI %d dBm, %d hop%s]",
-        nick, IRC_MESH_USERHOST, c.nick, snr, rssi, hops, hops == 1 ? "" : "s");
   }
 }
 

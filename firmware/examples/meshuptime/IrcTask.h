@@ -186,9 +186,22 @@
   #define IRC_SEEN_TTL_MS  (45UL * 60UL * 1000UL)   /* 45 min stilte -> PART */
 #endif
 
+/* Naast WIE er gehoord is ook HOE het binnenkwam. Dat hoort niet in het
+ * kanaalvenster -- een tweede regel achter elk bericht verdubbelt het gesprek --
+ * maar het is wel de informatie waarvoor je een mesh in de gaten houdt. Dus:
+ * bijwerken bij ELK bericht, en opvraagbaar met WHOIS.
+ *
+ * Waarom hier en niet in de buurtlijst van de node: die vult zich met ADVERTS, en
+ * een node die in een kanaal praat zonder recent te adverteren staat er niet in.
+ * Bovendien kennen we een kanaalafzender alleen bij NAAM (de "<naam>: "-prefix),
+ * niet bij pubkey, dus er is geen betrouwbare weg van kanaalbericht naar buur. */
 struct IrcSeen {
   char          nick[IRC_NICK_MAX + 1];
   unsigned long last;      // millis() van de laatste keer gehoord; 0 = leeg
+  int8_t        snr4;      // SNR x 4 van het LAATSTE bericht
+  int16_t       rssi;
+  uint8_t       hops;
+  uint16_t      msgs;      // hoeveel berichten we van hem zagen in dit kanaal
 };
 
 /* TERUGSPOELEN NA HET INLOGGEN (v2.9.0). Een LoRa-mesh heeft geen geschiedenis:
@@ -252,11 +265,18 @@ struct IrcSeen {
 #endif
 #define IRC_QUOTE_SEP  ".. "       /* scheidt de quote van het antwoord */
 
+/* IRC_SIG_NONE in `hops` betekent: dit bericht kwam niet van de radio (we hebben
+ * het zelf verstuurd), dus er is geen signaalrapport. */
+#define IRC_SIG_NONE  0xFF
+
 struct IrcLogEntry {
   uint32_t ts;                      /* RTC-seconden; 0 = leeg slot */
   uint32_t id;                      /* msgid, oplopend; 0 = leeg */
   int8_t   chan;                    /* BotChannel-index, of IRC_LOG_DM */
   int8_t   bot;                     /* bij een DM: voor welk bot-slot */
+  int8_t   snr4;                    /* SNR x 4, zoals mesh::Packet het bewaart */
+  int16_t  rssi;
+  uint8_t  hops;                    /* IRC_SIG_NONE = geen radiogegevens */
   char     nick[IRC_NICK_MAX + 1];
   char     text[BOT_MAX_TEXT_LEN];
 };
@@ -426,14 +446,18 @@ private:
 
   /* Ledenlijst per kanaal. seenTouch() zet een JOIN voor wie nieuw is; seenExpire()
    * draait in loop() en zet de PART voor wie te lang stil was. */
-  void seenTouch(int chan_idx, const char* nick);
+  void seenTouch(int chan_idx, const char* nick, int8_t snr4, int16_t rssi, uint8_t hops);
+  /* De VERSTE ledenlijst-ingang voor deze nick, over alle kanalen. Retour: het
+   * kanaal, of -1; `row` krijgt de index erin. */
+  int  seenFindNick(const char* nick, int* row) const;
   void seenExpire();
   void seenBroadcast(int chan_idx, const char* nick, bool joining);
 
   /* De ringbuffer. logAdd() bewaart, replay*() speelt terug naar een client. */
   /* Retour: de index in de ring, of -1. De beller heeft hem nodig om het msgid
    * mee te sturen dat hij zojuist heeft laten aanmaken. */
-  int  logAdd(int chan, int bot, const char* nick, const char* text);
+  int  logAdd(int chan, int bot, const char* nick, const char* text,
+              int8_t snr4, int16_t rssi, uint8_t hops);
   int  logFindById(uint32_t id) const;
   /* De ring-ingang waarvan de tekst met `snip` begint -- zo koppelen we een
    * binnenkomende ">quote.. " terug aan het origineel. -1 = niet gevonden. */
@@ -445,6 +469,8 @@ private:
    * msgid), `reply_to` is 0 of het msgid waarop dit een antwoord is. */
   void sendMsg(IrcClient& c, const IrcLogEntry* e, const char* nick,
                const char* target, const char* text, uint32_t reply_to);
+  /* "[SNR 12.5 dB, RSSI -67 dBm, 3 hops]", of leeg als er geen radiogegevens zijn. */
+  void signalText(const IrcLogEntry* e, char* out, size_t out_len) const;
   void isoTime(uint32_t ts, char* out, size_t out_len) const;
   void replayChannel(IrcClient& c, int chan_idx);
   void replayDms(IrcClient& c);
