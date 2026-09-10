@@ -495,6 +495,10 @@ void web_route_channelsjson() { if (g_self) g_self->handleChannelsJson(); }
 void web_route_channeladd()   { if (g_self) g_self->handleChannelAdd(); }
 void web_route_channeldel()   { if (g_self) g_self->handleChannelDel(); }
 void web_route_channeltoggle(){ if (g_self) g_self->handleChannelToggle(); }
+void web_route_annjson()      { if (g_self) g_self->handleAnnouncesJson(); }
+void web_route_annset()       { if (g_self) g_self->handleAnnounceSet(); }
+void web_route_anndel()       { if (g_self) g_self->handleAnnounceDel(); }
+void web_route_anntest()      { if (g_self) g_self->handleAnnounceTest(); }
 void web_route_companionsjson(){ if (g_self) g_self->handleCompanionsJson(); }
 void web_route_companion()    { if (g_self) g_self->handleCompanion(); }
 void web_route_messagesjson() { if (g_self) g_self->handleMessagesJson(); }
@@ -1994,6 +1998,48 @@ zodat je op het ECHTE publieke kanaal uitkomt. Geef je wél een secret op (32 he
 afgeleide sleutel is <b>niet geheim</b> (wie de naam kent leidt hem af); een eigen
 secret wordt hier niet teruggetoond. Zet een kanaal op <b>uit</b> om te stoppen met
 meelezen zonder het te wissen.</p>
+
+<h2>Geplande kanaalberichten &mdash; zelf iets zeggen, op tijd</h2>
+<p class="why"><b>Waarom dit er is:</b> de bot antwoordt op wat hij <i>hoort</i>
+(<code>ping</code>/<code>test</code>/<code>path</code>, met het oordeel over
+pad-hash en scope erachter). Daarmee bereikt dat advies alleen wie de bot
+aanspreekt &mdash; en dat is precies niet de groep die het nodig heeft. Hier zet je
+het omgekeerde: op een vast tijdstip zelf een bericht in een of meer kanalen.</p>
+<div class="card pad0"><table id="annl"></table></div>
+<div id="annmsg"></div>
+<div class="card" style="margin-top:.4rem">
+<div class="frow">
+<label style="align-self:center;color:var(--muted);font-size:.85rem">ingang</label>
+<select id="an-i" style="width:auto"></select>
+<label style="align-self:center;color:var(--muted);font-size:.85rem">tijd</label>
+<input id="an-hh" type="number" min="0" max="23" value="9" style="width:4rem" title="uur (lokale tijd van de node)">
+<input id="an-mm" type="number" min="0" max="59" value="0" style="width:4rem" title="minuut">
+<label class="cb"><input id="an-en" type="checkbox" checked> aan</label>
+</div>
+<div class="frow" style="margin-top:.35rem" id="an-days"></div>
+<div class="frow" style="margin-top:.35rem" id="an-chans"></div>
+<div class="frow" style="margin-top:.35rem">
+<input id="an-text" placeholder="tekst leeg = de ingebouwde adviestekst + de uitleg-URL" maxlength="160" spellcheck="false" style="flex:1;min-width:14rem">
+<button type="button" id="an-save">opslaan</button>
+</div>
+<div class="note" id="an-eff" style="margin-top:.3rem"></div>
+</div>
+<p class="note">De tijd is de <b>lokale</b> tijd van de node (zie de tijdzone op
+het tabblad <i>Tijd</i>); de node zelf houdt UTC bij. Zolang de klok
+<b>niet gesynchroniseerd</b> is gaat er niets uit &mdash; een bericht op het
+verkeerde moment is erger dan geen bericht, en na een stroomstoring zou de node
+anders alle geplande berichten tegelijk uitspuwen. Hetzelfde tijdstip wordt nooit
+twee keer verstuurd, ook niet na een herstart binnen die minuut: het moment van de
+laatste verzending staat in <code>/announce.cfg</code>.
+<b>De kanalen hier zijn een eigen keuze</b> en niet de lijst waarop de bot
+meeleest: een kanaal mag aankondigingen krijgen zonder dat de bot er meeleest, en
+omgekeerd. Ook een <i>uitgeschakeld</i> kanaal kan dus aangekondigd worden.
+Meerdere kanalen krijgen het bericht met vier seconden tussenruimte, zodat de
+radio niet in één keer volgeblazen wordt. <b>nu sturen</b> verstuurt meteen, wat
+de klok ook zegt, en laat het geplande tijdstip van vandaag staan &mdash; de enige
+manier om te zien of het aankomt zonder tot morgen te wachten. De tekst kapt op
+160 byte inclusief de botnaam die ervoor komt; wat er precies uitgaat staat onder
+het invulveld.</p>
 </section>
 
 <section id="p7" hidden>
@@ -3956,7 +4002,7 @@ document.getElementById("dg-url").value=d.durl||"";
 DFIT=d.dfit||[0,0,0];DURLMAX=d.durlmax||0;dgFit();
 try{drawQRon("bqr",d.uri)}catch(e){}
 botRender(d.recips||[],d.max)}).catch(function(){bmsg("botmsg","kon bot niet laden",0)});
-channelsLoad()}
+channelsLoad();annLoad()}
 function botRender(list,max){var e=document.getElementById("botrl");e.innerHTML="";
 var h=e.insertRow();["ontvanger","",""].forEach(function(t){
 var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
@@ -4087,6 +4133,102 @@ body:"name="+encodeURIComponent(name)+"&secret="+encodeURIComponent(sec)+"&enabl
 if(j.ok){document.getElementById("ch-name").value="";document.getElementById("ch-secret").value="";
 bmsg("chmsg","kanaal toegevoegd - "+(j.public?"publiek kanaal (vaste sleutel)":(j.derived?"sleutel afgeleid uit naam":"eigen sleutel"))+" ("+j.bits+"-bit #"+j.h+")",1);channelsLoad()}
 else bmsg("chmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("chmsg","mislukt",0)})};
+
+/* ============== geplande kanaalberichten (aankondigingen) ==============
+   Een ingang is een tijdstip + dagen + kanaalmasker + tekst. De kanalen komen
+   met hun INDEX uit /announce.json, want het masker wijst naar die indexen --
+   niet naar de naam, want een naam kan veranderen. */
+var ANNCH=[],ANNMAX=0,ANNSEL=-1;
+var DAGEN=["zo","ma","di","wo","do","vr","za"];
+function annLoad(){fetch("announce.json",{credentials:"include"})
+.then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})
+.then(function(d){if(!d)return;ANNCH=d.chans||[];ANNMAX=d.max||0;
+annRender(d.items||[],d.now||"");annForm()})
+.catch(function(){bmsg("annmsg","kon geplande berichten niet laden",0)})}
+function annRender(list,now){var e=document.getElementById("annl");if(!e)return;e.innerHTML="";
+var h=e.insertRow();["#","tijd","dagen","kanalen","tekst","laatst",""].forEach(function(t){
+var th=document.createElement("th");th.textContent=t;h.appendChild(th)});
+list.forEach(function(a){var r=e.insertRow();
+if(!a.en)r.style.opacity=".55";
+r.insertCell().textContent=a.i;
+var tc=r.insertCell();tc.className="num";
+tc.textContent=("0"+a.hh).slice(-2)+":"+("0"+a.mm).slice(-2)+(a.en?"":" (uit)");
+var dc=r.insertCell();var dl=[];for(var k=0;k<7;k++)if(a.dow&(1<<k))dl.push(DAGEN[k]);
+dc.textContent=dl.length==7?"elke dag":dl.join(" ");
+var cc=r.insertCell();var cl=[];ANNCH.forEach(function(c){if(a.cm&(1<<c.i))cl.push(c.n)});
+cc.textContent=cl.length?cl.join(", "):"(geen kanaal!)";
+if(!cl.length)cc.style.color="var(--red)";
+var xc=r.insertCell();xc.textContent=a.eff.length>44?a.eff.slice(0,44)+"…":a.eff;
+xc.title=a.eff;
+var lc=r.insertCell();lc.textContent=a.last||"nooit";
+var ac=r.insertCell();ac.className="acts";
+var b1=document.createElement("button");b1.textContent="wijzig";
+b1.onclick=function(){annEdit(a)};ac.appendChild(b1);
+var b2=document.createElement("button");b2.textContent="nu sturen";
+b2.onclick=function(){annTest(a.i)};ac.appendChild(b2);
+var b3=document.createElement("button");b3.textContent="wis";
+b3.onclick=function(){annDel(a.i)};ac.appendChild(b3)});
+if(!list.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=7;
+c.textContent="(geen geplande berichten \u2014 vul hieronder een tijdstip in)";
+c.style.color="var(--muted)"}
+var nf=document.getElementById("an-eff");
+if(nf)nf.textContent="Klok van de node: "+(now||"onbekend")+" \u2014 de tijd hieronder is in die tijd.";}
+/* Het invulblok: de ingangkeuze, de dagvinkjes en de kanaalvinkjes komen uit de
+   data en niet uit vaste HTML -- een kanaal dat erbij komt hoort hier meteen te
+   staan zonder dat er een lijst bijgewerkt moet worden. */
+function annForm(){var si=document.getElementById("an-i");
+if(si&&si.options.length!=ANNMAX){si.innerHTML="";
+for(var i=0;i<ANNMAX;i++){var o=document.createElement("option");o.value=i;o.textContent="#"+i;si.appendChild(o)}}
+var dd=document.getElementById("an-days");
+if(dd&&!dd.childElementCount){dd.appendChild(document.createTextNode("dagen:"));
+DAGEN.forEach(function(n,k){var l=document.createElement("label");l.className="cb";
+var cb=document.createElement("input");cb.type="checkbox";cb.checked=true;cb.id="an-d"+k;
+l.appendChild(cb);l.appendChild(document.createTextNode(" "+n));dd.appendChild(l)})}
+var cd=document.getElementById("an-chans");if(!cd)return;cd.innerHTML="";
+cd.appendChild(document.createTextNode("kanalen:"));
+if(!ANNCH.length){var sp=document.createElement("span");sp.className="note";
+sp.textContent=" geen kanalen \u2014 voeg er eerst een toe (hierboven)";cd.appendChild(sp);return}
+ANNCH.forEach(function(c){var l=document.createElement("label");l.className="cb";
+var cb=document.createElement("input");cb.type="checkbox";cb.id="an-c"+c.i;
+l.appendChild(cb);l.appendChild(document.createTextNode(" "+c.n+(c.en?"":" (leest niet mee)")));
+cd.appendChild(l)})}
+function annEdit(a){document.getElementById("an-i").value=String(a.i);
+document.getElementById("an-hh").value=String(a.hh);
+document.getElementById("an-mm").value=String(a.mm);
+document.getElementById("an-en").checked=!!a.en;
+for(var k=0;k<7;k++){var e=document.getElementById("an-d"+k);if(e)e.checked=!!(a.dow&(1<<k))}
+ANNCH.forEach(function(c){var e=document.getElementById("an-c"+c.i);if(e)e.checked=!!(a.cm&(1<<c.i))});
+document.getElementById("an-text").value=a.text||"";
+bmsg("annmsg","ingang #"+a.i+" overgenomen in het formulier",1)}
+function annSave(){var i=parseInt(document.getElementById("an-i").value,10)||0,
+hh=parseInt(document.getElementById("an-hh").value,10),
+mm=parseInt(document.getElementById("an-mm").value,10),
+en=document.getElementById("an-en").checked?1:0,dow=0,cm=0;
+for(var k=0;k<7;k++){var e=document.getElementById("an-d"+k);if(e&&e.checked)dow|=(1<<k)}
+ANNCH.forEach(function(c){var e=document.getElementById("an-c"+c.i);if(e&&e.checked)cm|=(1<<c.i)});
+if(!dow){bmsg("annmsg","kies minstens een dag",0);return}
+if(!cm){bmsg("annmsg","kies minstens een kanaal",0);return}
+var t=document.getElementById("an-text").value;
+fetch("announce",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"i="+i+"&enabled="+en+"&hh="+hh+"&mm="+mm+"&dow="+dow+"&cm="+cm+"&text="+encodeURIComponent(t)})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("annmsg",j.ok?"opgeslagen":"mislukt: "+(j.error||""),j.ok?1:0);annLoad()})
+.catch(function(){bmsg("annmsg","mislukt",0)})}
+function annDel(i){if(!confirm("Gepland bericht #"+i+" verwijderen?"))return;
+fetch("announce/del",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"i="+i})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("annmsg",j.ok?"weg":"mislukt: "+(j.error||""),j.ok?1:0);annLoad()})
+.catch(function(){bmsg("annmsg","mislukt",0)})}
+function annTest(i){if(!confirm("Bericht #"+i+" NU naar de gekozen kanalen sturen?"))return;
+fetch("announce/test",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"i="+i})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("annmsg",j.ok?("verstuurd naar "+j.sent+" kanaal(en)"):"mislukt: "+(j.error||""),
+j.ok&&j.sent>0?1:0);annLoad()})
+.catch(function(){bmsg("annmsg","mislukt",0)})}
+document.getElementById("an-save").onclick=annSave;
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
    Dezelfde rm/sn-maskers als per-sensor, maar PER room/sensor-node getoond.
@@ -4586,6 +4728,13 @@ void WebTask::routes() {
   _server->on("/channel/add", HTTP_POST, web_route_channeladd);
   _server->on("/channel/del", HTTP_POST, web_route_channeldel);
   _server->on("/channel/toggle", HTTP_POST, web_route_channeltoggle);
+  /* Geplande kanaalberichten. De leeskant is GET, elke wijziging POST -- en
+   * /announce/test verstuurt echt, dus die is met opzet geen GET: een link die
+   * een browser of linkchecker kan volgen mag geen bericht de mesh in zetten. */
+  _server->on("/announce.json", HTTP_GET, web_route_annjson);
+  _server->on("/announce", HTTP_POST, web_route_annset);
+  _server->on("/announce/del", HTTP_POST, web_route_anndel);
+  _server->on("/announce/test", HTTP_POST, web_route_anntest);
   /* Companions (v2.4.0): leeskant /companions.json (GET, ook voor MeshManager),
    * mutaties via /companion (POST: key+name toevoegen/wijzigen, of del=prefix). */
   _server->on("/companions.json", HTTP_GET, web_route_companionsjson);
@@ -6576,6 +6725,158 @@ void WebTask::handleBotDiag() {
       "{\"ok\":true,\"diag\":%d,\"durlmode\":%d,\"durl\":\"%s\",\"dfit\":[%d,%d,%d]}",
       _acl->webBotSlotDiagMask(i), _acl->webBotSlotDiagUrlMode(i), eurl,
       _acl->webBotSlotDiagUrlBudget(i, 0), _acl->webBotSlotDiagUrlBudget(i, 1), _acl->webBotSlotDiagUrlBudget(i, 2));
+  _server->send(200, "application/json", out);
+}
+
+/* ================================================================== */
+/*  Geplande kanaalberichten (v2.9.0)                                  */
+/* ================================================================== */
+
+/* GET /announce.json -- de lijst, plus wat de GUI nodig heeft om hem te tonen:
+ * de kanaalingangen (met hun INDEX, want daar wijst het masker naar) en de
+ * huidige lokale tijd van de node. Die tijd staat erbij omdat een tijdstip zonder
+ * de klok van de node ernaast een gok is: staat de node op UTC en de bezoeker in
+ * Brussel, dan zou "08:00" twee verschillende dingen kunnen betekenen. */
+void WebTask::handleAnnouncesJson() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr || _acl->webAnnounceMax() == 0) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"geen geplande berichten op deze variant\"}");
+    return;
+  }
+
+  char nu[40];
+  fmtLocalDateTime(_acl->nowSecs(), nu, sizeof(nu));
+  char nuesc[80]; jsonEscape(nu, nuesc, sizeof(nuesc));
+
+  int n = snprintf(g_json, sizeof(g_json),
+                   "{\"max\":%d,\"now\":\"%s\",\"chans\":[",
+                   _acl->webAnnounceMax(), nuesc);
+
+  /* De kanaalingangen op index. Ook de uitgeschakelde: daar mag aangekondigd
+   * worden, want meelezen en aankondigen zijn losse keuzes. */
+  char nm[24], nesc[24 * 6 + 1];
+  bool eerste = true;
+  for (int i = 0; i < _acl->webChannelMax(); i++) {
+    bool en = false;
+    if (!_acl->webChannelSlot(i, nm, sizeof(nm), &en)) continue;
+    if ((size_t)n > sizeof(g_json) - 200) break;
+    jsonEscape(nm, nesc, sizeof(nesc));
+    n += snprintf(g_json + n, sizeof(g_json) - n, "%s{\"i\":%d,\"n\":\"%s\",\"en\":%s}",
+                  eerste ? "" : ",", i, nesc, en ? "true" : "false");
+    eerste = false;
+  }
+  n += snprintf(g_json + n, sizeof(g_json) - n, "],\"items\":[");
+
+  eerste = true;
+  for (int i = 0; i < _acl->webAnnounceMax(); i++) {
+    int en = 0, hh = 0, mm = 0, dow = 0, cm = 0;
+    unsigned long lf = 0;
+    char txt[200], eff[200];
+    if (!_acl->webAnnounceGet(i, &en, &hh, &mm, &dow, &cm, txt, sizeof(txt), &lf,
+                              eff, sizeof(eff))) continue;
+    if ((size_t)n > sizeof(g_json) - 700) break;
+    char tesc[200 * 2], eesc[200 * 2], lfs[40];
+    jsonEscape(txt, tesc, sizeof(tesc));
+    jsonEscape(eff, eesc, sizeof(eesc));
+    if (lf) fmtLocalDateTime((uint32_t)lf, lfs, sizeof(lfs)); else lfs[0] = 0;
+    char lesc[80]; jsonEscape(lfs, lesc, sizeof(lesc));
+    n += snprintf(g_json + n, sizeof(g_json) - n,
+                  "%s{\"i\":%d,\"en\":%s,\"hh\":%d,\"mm\":%d,\"dow\":%d,\"cm\":%d,"
+                  "\"text\":\"%s\",\"eff\":\"%s\",\"last\":\"%s\"}",
+                  eerste ? "" : ",", i, en ? "true" : "false", hh, mm, dow, cm,
+                  tesc, eesc, lesc);
+    eerste = false;
+  }
+  strlcat(g_json, "]}", sizeof(g_json));
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /announce  (i, enabled, hh, mm, dow, cm, text)
+ *
+ * `text` mag leeg: dan gaat de ingebouwde adviestekst de lucht in (plus de
+ * uitleg-URL van de bot). Regeleindes worden geweigerd en niet stil vervangen:
+ * het configbestand is regelgebaseerd, en een tekst met een newline erin zou bij
+ * het volgende inlezen de rest van de regel opeten. */
+void WebTask::handleAnnounceSet() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr || _acl->webAnnounceMax() == 0) {
+    _server->send(501, "application/json", "{\"ok\":false,\"error\":\"niet beschikbaar\"}");
+    return;
+  }
+  char buf[16], text[200];
+  if (!getArg(*_server, "i", buf, sizeof(buf))) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"i ontbreekt\"}"); return;
+  }
+  int i = atoi(buf);
+  int hh = getArg(*_server, "hh", buf, sizeof(buf)) ? atoi(buf) : -1;
+  int mm = getArg(*_server, "mm", buf, sizeof(buf)) ? atoi(buf) : -1;
+  int dow = getArg(*_server, "dow", buf, sizeof(buf)) ? atoi(buf) : 0x7F;
+  int cm  = getArg(*_server, "cm", buf, sizeof(buf)) ? atoi(buf) : 0;
+  int en  = getArg(*_server, "enabled", buf, sizeof(buf)) ? atoi(buf) : 1;
+  text[0] = 0;
+  getArg(*_server, "text", text, sizeof(text));
+  for (char* p = text; *p; p++) {
+    if (*p == '\r' || *p == '\n') {
+      _server->send(400, "application/json",
+          "{\"ok\":false,\"error\":\"geen regeleindes in de tekst\"}");
+      return;
+    }
+  }
+
+  int r = _acl->webAnnounceSet(i, en, hh, mm, dow, cm, text);
+  if (r != 0) {
+    const char* fout = (r == -4)
+        ? "{\"ok\":false,\"error\":\"kies minstens een kanaal\"}"
+        : "{\"ok\":false,\"error\":\"ongeldig: index, tijd (00:00-23:59) of dagen\"}";
+    _server->send(400, "application/json", fout);
+    return;
+  }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /announce/del  (i) */
+void WebTask::handleAnnounceDel() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr || _acl->webAnnounceMax() == 0) {
+    _server->send(501, "application/json", "{\"ok\":false,\"error\":\"niet beschikbaar\"}");
+    return;
+  }
+  char buf[16];
+  if (!getArg(*_server, "i", buf, sizeof(buf))) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"i ontbreekt\"}"); return;
+  }
+  int r = _acl->webAnnounceDel(atoi(buf));
+  if (r < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige index\"}"); return; }
+  _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /announce/test  (i) -- nu versturen, wat de klok ook zegt.
+ *
+ * Dit is de enige weg om te zien of een aankondiging aankomt zonder tot morgen te
+ * wachten. Hij raakt het "laatst verzonden"-moment NIET aan, zodat een proef het
+ * echte tijdstip van vandaag niet overslaat. Het antwoord meldt naar hoeveel
+ * kanalen het bericht werkelijk de lucht in ging -- nul is een antwoord en geen
+ * fout: dan wijst het masker naar ingangen zonder kanaal. */
+void WebTask::handleAnnounceTest() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr || _acl->webAnnounceMax() == 0) {
+    _server->send(501, "application/json", "{\"ok\":false,\"error\":\"niet beschikbaar\"}");
+    return;
+  }
+  char buf[16];
+  if (!getArg(*_server, "i", buf, sizeof(buf))) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"i ontbreekt\"}"); return;
+  }
+  int r = _acl->webAnnounceFireNow(atoi(buf));
+  if (r < 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"niets te versturen (lege ingang of lege tekst)\"}");
+    return;
+  }
+  char out[64];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"sent\":%d}", r);
   _server->send(200, "application/json", out);
 }
 

@@ -167,6 +167,15 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.9.0 = GEPLANDE KANAALBERICHTEN. De bot antwoordde alleen op wat hij HOORDE, dus
+ *            het advies over pad-hashes en scope bereikte alleen wie hem aansprak.
+ *            Nu ook de andere richting: tot vier tijdstippen (lokale tijd, dagmasker)
+ *            die zelf een bericht in gekozen kanalen zetten. EIGEN kanaalkeuze, los van
+ *            de kanalen waar hij meeleest. Zwijgt zolang de klok niet gesynct is en
+ *            stuurt hetzelfde tijdstip nooit twee keer (ook niet na een herstart).
+ *            /announce.cfg, /announce.json + /announce[/del|/test], GUI op het
+ *            bot-tabblad. sendChannelReply() meldt nu of het pakket echt de lucht in
+ *            ging -- dat mislukte voorheen stil bij een te lange tekst.
  *   v2.8.2 = DEZELFDE NODE IN TWEE ROLLEN. Een repeater die ooit op onze room-server
  *            inlogde staat in de ACL van room 0; is diezelfde repeater ook het DOEL van
  *            een CLI-sessie, dan ontsleutelt zijn loginantwoord op die ACL-ingang en niet
@@ -201,7 +210,7 @@
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.8.2"
+  #define MESHUPTIME_VERSION   "v2.9.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
