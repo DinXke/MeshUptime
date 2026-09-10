@@ -311,6 +311,21 @@ Zonder rem is deze brug een zendmachine die het eigen netwerk platlegt. Daarom:
 | dezelfde regel opnieuw naar hetzelfde doel | 10 min | `IRC_REPEAT_MS` |
 | tekstlengte incl. `"<naam>: "` | 160 tekens | `BOT_MAX_TEXT_LEN` |
 
+### Samen met de geplande aankondigingen
+
+Sinds v2.10.0 draaien er twee zenders op dezelfde radio: deze brug en de geplande
+kanaalberichten (`announce`). Ze bijten elkaar niet, maar ze zijn ook niet
+gelijkwaardig.
+
+De luchtbegroting hierboven meet `getTotalAirTime()` van de radio — dus **de
+aankondigingen tellen er vanzelf in mee**. Staat er een reeks aankondigingen in de
+wachtrij, dan kan een IRC-regel geweigerd worden met "luchtbegroting op", terwijl
+er in het kanaal niets te zien was. Dat is de bedoeling: chat wijkt voor wat
+gepland is.
+
+Andersom gebeurt het niet — een aankondiging gaat altijd door. Ook dat is de
+bedoeling: die is op een tijdstip gezet en chat is dat niet.
+
 ### Waarom een berichtenteller niet genoeg was
 
 De eerste versie telde alleen berichten. Dat is een tempo, geen bescherming.
