@@ -7,6 +7,39 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.9.1 — een kanaal per keer (waarom sommige kanalen het bericht niet kregen)
+
+Gemeld door de eigenaar: "ik zie het in sommige kanalen wel en sommige niet". Dat
+was geen RF-pech maar een fout in v2.9.0.
+
+**Wat er mis was.** fireAnnounce() zette alle kanalen in EEN keer in de
+zendwachtrij, met 4000 ms verschil in hun scheduled_for. Dat is geen zendritme
+maar een wachtrij. De dispatcher rekent met een **luchtbudget**
+(airtime_factor, op deze node 9,0 → een duty cycle van 1/(1+9) = 10 %), dus na
+een flood van ~1,5 s mag de radio ~15 s niets. De pakketten kwamen dus bij een
+radio die ze niet mocht sturen, en StaticPoolPacketManager::queueOutbound()
+**gooit weg** wat niet meer in de wachtrij past ("send queue full, dropping
+packet"). Vandaar: in het ene kanaal wel, in het andere niet.
+
+En de log loog mee. "4 kanaal(en) verzonden" betekende "vier keer in de wachtrij
+gezet" — niet hetzelfde, en het verhulde precies wat er gebeurde.
+
+**Wat er nu gebeurt.** Eén kanaal per keer, aangestuurd vanuit
+loopAnnounces(), met een instelbare pauze (standaard **30 s**, 5–900) tussen
+twee kanalen. Elk bericht is dan het enige nieuwe pakket in de wachtrij en het
+budget heeft tijd om bij te komen. Een lopende reeks gaat vóór een nieuwe: er
+staat nooit meer dan één aankondiging per ronde in de wachtrij. Wat nog te doen is
+staat alleen in RAM — na een herstart halverwege is de helft al verstuurd, en de
+rest een uur later nasturen is vreemder dan hem overslaan.
+
+De woorden zijn rechtgezet: log, JSON en GUI zeggen nu **"in de wachtrij"** waar
+ze "verzonden" zeiden. Of een pakket de lucht in gaat beslist de dispatcher, en
+dat weet de aanroeper niet.
+
+**Geverifieerd op de lucht** (10 sep): twee privékanalen, nu sturen gaf
+{"ok":true,"queued":2,"gap":30} en de log toont 15:54:19 (kanaal 8) en
+15:54:52 (kanaal 9) — 33 s ertussen (30 s pauze plus de tick van 5 s).
+
 ## v2.9.0 — geplande kanaalberichten (de bot zegt ook zelf iets, op tijd)
 
 Alleen de room-server-variant (`env:meshuptime_room`). Additief: de bewaking, de

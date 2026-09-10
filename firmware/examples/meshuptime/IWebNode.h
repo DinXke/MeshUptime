@@ -220,6 +220,15 @@ public:
                                  { (void)i; (void)enabled; (void)hh; (void)mm; (void)dow_mask;
                                    (void)chan_mask; (void)text; return -1; }
   virtual int  webAnnounceDel(int i)      { (void)i; return -1; }
+  /* Hoeveel tekst er in een aankondiging past: de mesh-tekstlimiet min de
+   * "<botnaam>: " die er bij het versturen voor komt. De GUI toont die grens,
+   * dus hij hoort van de node te komen en niet uit een vast getal. */
+  virtual size_t webAnnounceRoom()        { return 0; }
+  /* De pauze tussen twee kanalen van dezelfde aankondiging (seconden). Eén
+   * instelling voor de hele node: hij gaat over de radio en niet over een
+   * bericht. */
+  virtual int  webAnnounceGap()           { return 0; }
+  virtual int  webAnnounceSetGap(int s)   { (void)s; return -1; }
   virtual int  webAnnounceFireNow(int i)  { (void)i; return -1; }
 
   /* ---- COMPANIONS (web-GUI, v2.4.0) -----------------------------------------

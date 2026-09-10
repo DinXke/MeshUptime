@@ -194,6 +194,17 @@ class PushTask;
   #define MAX_ANNOUNCES   4
 #endif
 
+/* Seconden tussen twee KANALEN van dezelfde aankondiging. Waarom dit niet klein
+ * mag zijn: de dispatcher rekent met een luchtbudget (``airtime_factor``, op deze
+ * node 9,0 -- een duty cycle van 10 %), dus na een flood van ~1,5 s mag de radio
+ * ~15 s niets. Zet je ze sneller achter elkaar, dan staan ze in de zendwachtrij
+ * te wachten en gooit de pakketbeheerder weg wat er niet meer in past -- dan komt
+ * de aankondiging in het ene kanaal aan en in het andere niet. 30 s is ruim voor
+ * een tekstbericht op SF8 en vier kanalen zijn dan in anderhalve minuut rond. */
+#ifndef ANNOUNCE_GAP_DEFAULT_S
+  #define ANNOUNCE_GAP_DEFAULT_S   30
+#endif
+
 /* Gedeelde post-begroting over alle rooms. Per-room quota = totaal / actief.
  * Elke PostInfo ~= 32 (author) + 4 + 152 + 2 = ~190 byte; 48 * 190 = ~9 kB. */
 #ifndef MAX_TOTAL_POSTS
@@ -427,6 +438,13 @@ struct Announce {
   uint16_t chan_mask;       // bit i = kanaalingang i uit _channels
   uint32_t last_fired;      // UTC-epoch van de laatste verzending (0 = nooit)
   char     text[BOT_MAX_TEXT_LEN + 1];   // leeg = de ingebouwde adviestekst
+  /* Wat er nog te doen is, alleen in RAM. Een aankondiging naar meerdere kanalen
+   * gaat EEN KANAAL PER KEER de lucht in (zie ANNOUNCE_GAP_DEFAULT_S); dit is het
+   * masker van wat er nog moet en wanneer het volgende mag. Niet in het bestand:
+   * na een herstart halverwege is de helft al verstuurd, en de rest een uur later
+   * nasturen is vreemder dan hem overslaan tot het volgende tijdstip. */
+  uint16_t pending;
+  unsigned long next_send;
 };
 
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode,
@@ -664,6 +682,9 @@ public:
                        (uint16_t)chan_mask, text);
   }
   int  webAnnounceDel(int i) override     { return announceDel(i); }
+  size_t webAnnounceRoom() override      { return announceRoom(); }
+  int  webAnnounceGap() override         { return announceGap(); }
+  int  webAnnounceSetGap(int s) override { return announceSetGap(s); }
   int  webAnnounceFireNow(int i) override { return announceFireNow(i); }
 
   /* ---- IWebNode: companions (v2.4.0) ---- */
@@ -729,6 +750,9 @@ public:
   int  announceSet(int i, bool enabled, int hh, int mm, uint8_t dow_mask,
                    uint16_t chan_mask, const char* text);
   int  announceDel(int i);                       // 1 ok, -2 ongeldige index
+  /* De pauze tussen twee kanalen van dezelfde aankondiging (seconden). */
+  uint16_t announceGap() const { return _ann_gap_s; }
+  int  announceSetGap(int secs);                 // 0 ok, -2 buiten 5..900
   /* Nu versturen, wat de klok ook zegt -- de "proef"-knop. Retour: het aantal
    * kanalen waar het bericht de lucht in ging, of <0 bij een fout. */
   int  announceFireNow(int i);
@@ -875,6 +899,7 @@ private:
   BotChannel    _channels[MAX_CHANNELS];
   Announce      _announces[MAX_ANNOUNCES];
   unsigned long _next_announce_tick;   // millis van de volgende klokcontrole
+  uint16_t      _ann_gap_s;            // seconden tussen twee kanalen
 
   /* Companions (v2.4.0): de bot stuurt hen `!`-commando's, de node ontvangt hun
    * #LOC-locatierapporten. Persistent in /companions.cfg (zie Companion). */
@@ -1020,6 +1045,7 @@ private:
   void          saveAnnounces();
   void          loopAnnounces();
   int           fireAnnounce(int i, uint32_t now);
+  bool          sendNextAnnounceChannel(int i);
   /* true = het pakket is de lucht in gegaan. false = het kon niet gemaakt worden
    * (te lange tekst, lege pakketpool); dat werd voorheen stil genegeerd. */
   bool          sendChannelReply(const mesh::GroupChannel& channel, const char* reply,

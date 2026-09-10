@@ -499,6 +499,7 @@ void web_route_annjson()      { if (g_self) g_self->handleAnnouncesJson(); }
 void web_route_annset()       { if (g_self) g_self->handleAnnounceSet(); }
 void web_route_anndel()       { if (g_self) g_self->handleAnnounceDel(); }
 void web_route_anntest()      { if (g_self) g_self->handleAnnounceTest(); }
+void web_route_anngap()       { if (g_self) g_self->handleAnnounceGap(); }
 void web_route_companionsjson(){ if (g_self) g_self->handleCompanionsJson(); }
 void web_route_companion()    { if (g_self) g_self->handleCompanion(); }
 void web_route_messagesjson() { if (g_self) g_self->handleMessagesJson(); }
@@ -2019,10 +2020,16 @@ het omgekeerde: op een vast tijdstip zelf een bericht in een of meer kanalen.</p
 <div class="frow" style="margin-top:.35rem" id="an-days"></div>
 <div class="frow" style="margin-top:.35rem" id="an-chans"></div>
 <div class="frow" style="margin-top:.35rem">
-<input id="an-text" placeholder="tekst leeg = de ingebouwde adviestekst + de uitleg-URL" maxlength="160" spellcheck="false" style="flex:1;min-width:14rem">
+<input id="an-text" placeholder="tekst leeg = de ingebouwde adviestekst + de uitleg-URL" maxlength="160" spellcheck="false" style="flex:1;min-width:14rem" oninput="annCount()">
 <button type="button" id="an-save">opslaan</button>
 </div>
-<div class="note" id="an-eff" style="margin-top:.3rem"></div>
+<div class="frow" style="margin-top:.35rem">
+<label style="align-self:center;color:var(--muted);font-size:.85rem">pauze tussen kanalen (s)</label>
+<input id="an-gap" type="number" min="5" max="900" style="width:5rem" title="seconden tussen twee kanalen van dezelfde aankondiging">
+<button type="button" id="an-gapsave" class="secondary">pauze opslaan</button>
+</div>
+<div class="note" id="an-cnt" style="margin-top:.3rem"></div>
+<div class="note" id="an-eff" style="margin-top:.2rem"></div>
 </div>
 <p class="note">De tijd is de <b>lokale</b> tijd van de node (zie de tijdzone op
 het tabblad <i>Tijd</i>); de node zelf houdt UTC bij. Zolang de klok
@@ -2034,12 +2041,20 @@ laatste verzending staat in <code>/announce.cfg</code>.
 <b>De kanalen hier zijn een eigen keuze</b> en niet de lijst waarop de bot
 meeleest: een kanaal mag aankondigingen krijgen zonder dat de bot er meeleest, en
 omgekeerd. Ook een <i>uitgeschakeld</i> kanaal kan dus aangekondigd worden.
-Meerdere kanalen krijgen het bericht met vier seconden tussenruimte, zodat de
-radio niet in één keer volgeblazen wordt. <b>nu sturen</b> verstuurt meteen, wat
+Meerdere kanalen krijgen het bericht <b>één voor één</b>, met de pauze die je
+hieronder instelt (standaard 30 s). Dat is geen luxe: de radio heeft een
+luchtbudget (<code>airtime_factor</code>, hier 9 &mdash; een duty cycle van 10 %),
+dus na een bericht van ~1,5 s mag hij ~15 s niets. Zet je ze sneller achter
+elkaar, dan staan ze in de zendwachtrij te wachten en gooit de node weg wat er
+niet meer in past &mdash; dan komt de aankondiging in het ene kanaal aan en in het
+andere niet. <b>nu sturen</b> verstuurt meteen, wat
 de klok ook zegt, en laat het geplande tijdstip van vandaag staan &mdash; de enige
-manier om te zien of het aankomt zonder tot morgen te wachten. De tekst kapt op
-160 byte inclusief de botnaam die ervoor komt; wat er precies uitgaat staat onder
-het invulveld.</p>
+manier om te zien of het aankomt zonder tot morgen te wachten. Een <b>te lange
+tekst wordt geweigerd</b> en niet afgekapt: aan een halve zin is op het mesh niet
+te zien dat er iets miste, dus de lezer zou hem als hele zin lezen. De grens onder
+het invulveld komt van de node zelf &mdash; de botnaam komt voor het bericht en eet
+dus mee van de 160 byte. Laat je het veld leeg, dan gaat de ingebouwde adviestekst
+uit met de uitleg-URL erachter (en die komt er heel bij of helemaal niet).</p>
 </section>
 
 <section id="p7" hidden>
@@ -4138,11 +4153,12 @@ else bmsg("chmsg","mislukt: "+(j.error||""),0)}).catch(function(){bmsg("chmsg","
    Een ingang is een tijdstip + dagen + kanaalmasker + tekst. De kanalen komen
    met hun INDEX uit /announce.json, want het masker wijst naar die indexen --
    niet naar de naam, want een naam kan veranderen. */
-var ANNCH=[],ANNMAX=0,ANNSEL=-1;
+var ANNCH=[],ANNMAX=0,ANNROOM=0;
 var DAGEN=["zo","ma","di","wo","do","vr","za"];
 function annLoad(){fetch("announce.json",{credentials:"include"})
 .then(function(r){if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})
-.then(function(d){if(!d)return;ANNCH=d.chans||[];ANNMAX=d.max||0;
+.then(function(d){if(!d)return;ANNCH=d.chans||[];ANNMAX=d.max||0;ANNROOM=d.room||0;
+var g=document.getElementById("an-gap");if(g&&d.gap)g.value=String(d.gap);
 annRender(d.items||[],d.now||"");annForm()})
 .catch(function(){bmsg("annmsg","kon geplande berichten niet laden",0)})}
 function annRender(list,now){var e=document.getElementById("annl");if(!e)return;e.innerHTML="";
@@ -4172,7 +4188,15 @@ if(!list.length){var r=e.insertRow();var c=r.insertCell();c.colSpan=7;
 c.textContent="(geen geplande berichten \u2014 vul hieronder een tijdstip in)";
 c.style.color="var(--muted)"}
 var nf=document.getElementById("an-eff");
-if(nf)nf.textContent="Klok van de node: "+(now||"onbekend")+" \u2014 de tijd hieronder is in die tijd.";}
+if(nf)nf.textContent="Klok van de node: "+(now||"onbekend")+" \u2014 de tijd hieronder is in die tijd.";
+annCount()}
+/* Het tellertje onder het tekstveld. De grens komt van de NODE (de botnaam die
+   voor het bericht komt bepaalt hem), niet uit een hier hardgecodeerd getal. */
+function annCount(){var t=document.getElementById("an-text"),o=document.getElementById("an-cnt");
+if(!t||!o)return;var n=t.value.length;
+if(!n){o.textContent="leeg = de ingebouwde adviestekst (past altijd)";o.style.color="var(--muted)";return}
+o.textContent=n+" / "+ANNROOM+" tekens";
+o.style.color=(ANNROOM&&n>ANNROOM)?"var(--red)":"var(--muted)"}
 /* Het invulblok: de ingangkeuze, de dagvinkjes en de kanaalvinkjes komen uit de
    data en niet uit vaste HTML -- een kanaal dat erbij komt hoort hier meteen te
    staan zonder dat er een lijst bijgewerkt moet worden. */
@@ -4225,10 +4249,17 @@ function annTest(i){if(!confirm("Bericht #"+i+" NU naar de gekozen kanalen sture
 fetch("announce/test",{method:"POST",credentials:"include",
 headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"i="+i})
 .then(function(r){return r.json()}).then(function(j){
-bmsg("annmsg",j.ok?("verstuurd naar "+j.sent+" kanaal(en)"):"mislukt: "+(j.error||""),
-j.ok&&j.sent>0?1:0);annLoad()})
+bmsg("annmsg",j.ok?(j.queued+" kanaal(en) in de wachtrij, "+j.gap+" s ertussen \u2014 kijk in de kanalen"):"mislukt: "+(j.error||""),
+j.ok&&j.queued>0?1:0);annLoad()})
 .catch(function(){bmsg("annmsg","mislukt",0)})}
 document.getElementById("an-save").onclick=annSave;
+document.getElementById("an-gapsave").onclick=function(){
+var s=parseInt(document.getElementById("an-gap").value,10)||0;
+fetch("announce/gap",{method:"POST",credentials:"include",
+headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"secs="+s})
+.then(function(r){return r.json()}).then(function(j){
+bmsg("annmsg",j.ok?("pauze op "+j.gap+" s"):"mislukt: "+(j.error||""),j.ok?1:0);annLoad()})
+.catch(function(){bmsg("annmsg","mislukt",0)})};
 
 /* ===================== kanaalbeheer (node-centrisch) ===================
    Dezelfde rm/sn-maskers als per-sensor, maar PER room/sensor-node getoond.
@@ -4735,6 +4766,7 @@ void WebTask::routes() {
   _server->on("/announce", HTTP_POST, web_route_annset);
   _server->on("/announce/del", HTTP_POST, web_route_anndel);
   _server->on("/announce/test", HTTP_POST, web_route_anntest);
+  _server->on("/announce/gap", HTTP_POST, web_route_anngap);
   /* Companions (v2.4.0): leeskant /companions.json (GET, ook voor MeshManager),
    * mutaties via /companion (POST: key+name toevoegen/wijzigen, of del=prefix). */
   _server->on("/companions.json", HTTP_GET, web_route_companionsjson);
@@ -6750,8 +6782,9 @@ void WebTask::handleAnnouncesJson() {
   char nuesc[80]; jsonEscape(nu, nuesc, sizeof(nuesc));
 
   int n = snprintf(g_json, sizeof(g_json),
-                   "{\"max\":%d,\"now\":\"%s\",\"chans\":[",
-                   _acl->webAnnounceMax(), nuesc);
+                   "{\"max\":%d,\"room\":%d,\"gap\":%d,\"now\":\"%s\",\"chans\":[",
+                   _acl->webAnnounceMax(), (int)_acl->webAnnounceRoom(),
+                   _acl->webAnnounceGap(), nuesc);
 
   /* De kanaalingangen op index. Ook de uitgeschakelde: daar mag aangekondigd
    * worden, want meelezen en aankondigen zijn losse keuzes. */
@@ -6827,9 +6860,21 @@ void WebTask::handleAnnounceSet() {
 
   int r = _acl->webAnnounceSet(i, en, hh, mm, dow, cm, text);
   if (r != 0) {
-    const char* fout = (r == -4)
-        ? "{\"ok\":false,\"error\":\"kies minstens een kanaal\"}"
-        : "{\"ok\":false,\"error\":\"ongeldig: index, tijd (00:00-23:59) of dagen\"}";
+    char fout[160];
+    if (r == -4) {
+      snprintf(fout, sizeof(fout), "{\"ok\":false,\"error\":\"kies minstens een kanaal\"}");
+    } else if (r == -5) {
+      /* Met de MAAT erbij: "te lang" zonder te zeggen hoeveel is een foutmelding
+       * waar niemand iets aan heeft. */
+      int over = (int)strlen(text) - (int)_acl->webAnnounceRoom();
+      snprintf(fout, sizeof(fout),
+               "{\"ok\":false,\"error\":\"tekst is %d teken(s) te lang; er past %d "
+               "(de botnaam komt ervoor)\"}", over > 0 ? over : 1,
+               (int)_acl->webAnnounceRoom());
+    } else {
+      snprintf(fout, sizeof(fout),
+               "{\"ok\":false,\"error\":\"ongeldig: index, tijd (00:00-23:59) of dagen\"}");
+    }
     _server->send(400, "application/json", fout);
     return;
   }
@@ -6852,6 +6897,29 @@ void WebTask::handleAnnounceDel() {
   _server->send(200, "application/json", "{\"ok\":true}");
 }
 
+/* POST /announce/gap  (secs) -- de pauze tussen twee kanalen van dezelfde
+ * aankondiging. Eén instelling voor de hele node: het gaat over de radio en niet
+ * over een bericht. Zie ANNOUNCE_GAP_DEFAULT_S voor waarom hij niet klein mag. */
+void WebTask::handleAnnounceGap() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr || _acl->webAnnounceMax() == 0) {
+    _server->send(501, "application/json", "{\"ok\":false,\"error\":\"niet beschikbaar\"}");
+    return;
+  }
+  char buf[16];
+  if (!getArg(*_server, "secs", buf, sizeof(buf))) {
+    _server->send(400, "application/json", "{\"ok\":false,\"error\":\"secs ontbreekt\"}"); return;
+  }
+  if (_acl->webAnnounceSetGap(atoi(buf)) != 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"5 tot 900 seconden\"}");
+    return;
+  }
+  char out[48];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"gap\":%d}", _acl->webAnnounceGap());
+  _server->send(200, "application/json", out);
+}
+
 /* POST /announce/test  (i) -- nu versturen, wat de klok ook zegt.
  *
  * Dit is de enige weg om te zien of een aankondiging aankomt zonder tot morgen te
@@ -6872,11 +6940,16 @@ void WebTask::handleAnnounceTest() {
   int r = _acl->webAnnounceFireNow(atoi(buf));
   if (r < 0) {
     _server->send(400, "application/json",
-        "{\"ok\":false,\"error\":\"niets te versturen (lege ingang of lege tekst)\"}");
+        r == -5 ? "{\"ok\":false,\"error\":\"tekst te lang -- niets verzonden\"}"
+                : "{\"ok\":false,\"error\":\"niets te versturen (lege ingang of lege tekst)\"}");
     return;
   }
-  char out[64];
-  snprintf(out, sizeof(out), "{\"ok\":true,\"sent\":%d}", r);
+  /* `queued` en niet `sent`: het eerste kanaal staat in de zendwachtrij, de rest
+   * volgt met de ingestelde pauze. Of een pakket de LUCHT in gaat beslist de
+   * dispatcher (luchtbudget, CAD) en dat weet deze route niet. */
+  char out[80];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"queued\":%d,\"gap\":%d}",
+           r, _acl->webAnnounceGap());
   _server->send(200, "application/json", out);
 }
 

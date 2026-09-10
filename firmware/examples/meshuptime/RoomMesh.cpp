@@ -3133,11 +3133,16 @@ void RoomMesh::announceText(int i, char* out, size_t out_len) const {
   if (i < 0 || i >= MAX_ANNOUNCES) return;
   const Announce& a = _announces[i];
 
-  /* Nooit meer dan wat er in een bericht past. */
+  /* Een EIGEN tekst komt er onverkort in, ook als hij te lang is: hij wordt bij
+   * het opslaan geweigerd en bij het versturen niet verzonden, en dan hoort de
+   * GUI te tonen wat er staat -- niet een ingekorte versie die suggereert dat
+   * het zo wel gaat. Zie announceSet() en fireAnnounce(). */
+  if (a.text[0]) { StrHelper::strncpy(out, a.text, out_len); return; }
+
+  /* De ingebouwde tekst past binnen de zendruimte; de URL komt er heel bij of
+   * helemaal niet. Dat laat een ELEMENT weg en kapt geen zin af. */
   size_t ruimte = announceRoom();
   if (out_len > ruimte + 1) out_len = ruimte + 1;
-
-  if (a.text[0]) { StrHelper::strncpy(out, a.text, out_len); return; }
 
   /* De ingebouwde tekst plus de uitleg-URL van de alert-bot, als die past. Alles
    * of niets voor die URL: een halve link is geen link. */
@@ -3167,6 +3172,7 @@ int RoomMesh::announceSet(int i, bool enabled, int hh, int mm, uint8_t dow_mask,
   /* Wijst het masker naar een ingang die niet bestaat, dan is dat geen fout maar
    * wel iets om te weten: die bit doet niets tot daar een kanaal komt. */
   Announce& a = _announces[i];
+  const Announce vorige = a;      // om terug te zetten als de tekst niet past
   memset(&a, 0, sizeof(a));
   a.used = true;
   a.enabled = enabled;
@@ -3176,6 +3182,13 @@ int RoomMesh::announceSet(int i, bool enabled, int hh, int mm, uint8_t dow_mask,
   a.chan_mask = chan_mask;
   a.last_fired = 0;
   if (text && text[0]) StrHelper::strncpy(a.text, text, sizeof(a.text));
+  /* Te lang? Dan NIET opslaan -- en de oude ingang blijft staan zoals hij was,
+   * want een half doorgevoerde wijziging is de derde manier om iemand voor de
+   * gek te houden. De aanroeper krijgt de maat mee via announceRoom(). */
+  if (a.text[0] && strlen(a.text) > announceRoom()) {
+    memcpy(&a, &vorige, sizeof(a));
+    return -5;
+  }
   saveAnnounces();
   ANN_DIAG("ingang %d gezet: %02u:%02u dagen=0x%02X kanalen=0x%04X %s",
            i, (unsigned)a.hh, (unsigned)a.mm, (unsigned)a.dow_mask,
@@ -3214,32 +3227,89 @@ int RoomMesh::fireAnnounce(int i, uint32_t now) {
   announceText(i, tekst, sizeof(tekst));
   if (tekst[0] == 0) { ANN_DIAG("ingang %d: lege tekst -- niets verzonden", i); return -3; }
 
-  /* Vangnet. announceText() houdt zich al aan announceRoom(), dus hier hoort
-   * niets meer af te vallen; gebeurt het toch, dan staat het in de log en gaat er
-   * nog altijd iets uit -- liever een afgekapte tekst dan stilte. */
+  /* Te lang gaat NIET de lucht in. Afkappen zou een halve zin als hele zin
+   * afleveren en daar is op het mesh niets van te zien -- hetzelfde beleid als
+   * voor de kanaalberichten die iemand zelf typt. Dit hoort niet te kunnen
+   * gebeuren (announceSet weigert het al), dus als het gebeurt is er iets anders
+   * mis en hoort dat luid in de log te staan. */
   size_t ruimte = announceRoom();
   if (strlen(tekst) > ruimte) {
-    ANN_DIAG("ingang %d: tekst nog afgekapt van %d naar %d byte",
-             i, (int)strlen(tekst), (int)ruimte);
-    tekst[ruimte] = 0;
+    ANN_DIAG("ingang %d NIET verzonden: tekst is %d byte, er past %d "
+             "(botnaam kost de rest)", i, (int)strlen(tekst), (int)ruimte);
+    return -5;
   }
 
-  int verzonden = 0, gemist = 0;
-  uint32_t vertraging = 0;
+  /* Alleen de kanalen die ECHT bestaan; een masker-bit zonder kanaal is geen
+   * fout maar hoort wel gemeld te worden. */
+  uint16_t doelen = 0;
+  int gemist = 0;
   for (int c = 0; c < MAX_CHANNELS; c++) {
     if (!(a.chan_mask & (1u << c))) continue;
-    if (!_channels[c].used) { gemist++; continue; }
-    mesh::GroupChannel ch;
-    memset(&ch, 0, sizeof(ch));
-    ch.hash[0] = _channels[c].hash;
-    memcpy(ch.secret, _channels[c].secret, PUB_KEY_SIZE);
-    if (sendChannelReply(ch, tekst, vertraging)) verzonden++;
-    vertraging += 4000;   // vier seconden tussen twee kanalen
+    if (_channels[c].used) doelen |= (uint16_t)(1u << c);
+    else gemist++;
   }
+  if (!doelen) {
+    ANN_DIAG("ingang %d: geen bestaand kanaal in het masker (%d bit(s) leeg)", i, gemist);
+    return 0;
+  }
+
+  /* EEN KANAAL NU, de rest laat loopAnnounces() volgen met announceGap()
+   * seconden ertussen. Alles tegelijk in de wachtrij zetten was de fout: het
+   * luchtbudget laat dat niet toe en de pakketbeheerder gooit weg wat niet past.
+   * Zie de toelichting bij ANNOUNCE_GAP_DEFAULT_S. */
+  a.pending = doelen;
+  a.next_send = 0;
+  int gestuurd = sendNextAnnounceChannel(i) ? 1 : 0;
+  int te_gaan = 0;
+  for (int c = 0; c < MAX_CHANNELS; c++) if (a.pending & (1u << c)) te_gaan++;
+
   if (now) { a.last_fired = now; saveAnnounces(); }
-  ANN_DIAG("ingang %d %s: %d kanaal(en) verzonden, %d masker-bit(s) zonder kanaal",
-           i, now ? "op tijd" : "als proef", verzonden, gemist);
-  return verzonden;
+  ANN_DIAG("ingang %d %s: %d kanaal nu, %d volgt met %us ertussen, %d bit(s) zonder kanaal",
+           i, now ? "op tijd" : "als proef", gestuurd, te_gaan,
+           (unsigned)_ann_gap_s, gemist);
+  return gestuurd + te_gaan;
+}
+
+/* Het volgende openstaande kanaal van een aankondiging versturen. Retour: of er
+ * iets in de wachtrij is gezet. "In de wachtrij" en niet "verzonden": of het
+ * pakket de lucht in gaat beslist de dispatcher (luchtbudget, CAD), en dat weten
+ * we hier niet. Die twee door elkaar halen was precies de fout in de eerste
+ * versie van deze functie -- de log meldde vier verzonden kanalen terwijl er twee
+ * onderweg zijn weggegooid. */
+bool RoomMesh::sendNextAnnounceChannel(int i) {
+  if (i < 0 || i >= MAX_ANNOUNCES) return false;
+  Announce& a = _announces[i];
+  if (!a.pending) return false;
+
+  int c = -1;
+  for (int k = 0; k < MAX_CHANNELS; k++) {
+    if (a.pending & (1u << k)) { c = k; break; }
+  }
+  if (c < 0) { a.pending = 0; return false; }
+  a.pending &= (uint16_t)~(1u << c);
+  a.next_send = futureMillis((unsigned long)_ann_gap_s * 1000UL);
+
+  if (!_channels[c].used) return false;    // tussentijds gewist
+  char tekst[BOT_MAX_TEXT_LEN + 1];
+  announceText(i, tekst, sizeof(tekst));
+  if (tekst[0] == 0 || strlen(tekst) > announceRoom()) return false;
+
+  mesh::GroupChannel ch;
+  memset(&ch, 0, sizeof(ch));
+  ch.hash[0] = _channels[c].hash;
+  memcpy(ch.secret, _channels[c].secret, PUB_KEY_SIZE);
+  bool ok = sendChannelReply(ch, tekst, 0);
+  ANN_DIAG("ingang %d -> kanaal %d (%s): %s", i, c, _channels[c].name,
+           ok ? "in de wachtrij" : "MISLUKT (pakket niet gemaakt)");
+  return ok;
+}
+
+int RoomMesh::announceSetGap(int secs) {
+  if (secs < 5 || secs > 900) return -2;
+  _ann_gap_s = (uint16_t)secs;
+  saveAnnounces();
+  ANN_DIAG("pauze tussen kanalen: %ds", secs);
+  return 0;
 }
 
 /* De klokcontrole. Hoogstens elke vijf seconden, want vaker heeft geen zin voor
@@ -3247,6 +3317,18 @@ int RoomMesh::fireAnnounce(int i, uint32_t now) {
 void RoomMesh::loopAnnounces() {
   if (!millisHasNowPassed(_next_announce_tick)) return;
   _next_announce_tick = futureMillis(5000);
+
+  /* Eerst de kanalen die nog openstaan van een aankondiging die al begonnen is.
+   * Dit staat VOOR de klokcontrole: een lopende reeks afmaken gaat voor een
+   * nieuwe beginnen, en zo staat er nooit meer dan een bericht per ronde in de
+   * wachtrij. */
+  for (int i = 0; i < MAX_ANNOUNCES; i++) {
+    Announce& a = _announces[i];
+    if (!a.pending) continue;
+    if (!millisHasNowPassed(a.next_send)) continue;
+    sendNextAnnounceChannel(i);
+    return;                      // hoogstens een per ronde
+  }
 
   uint32_t now = getRTCClock()->getCurrentTime();
   if (now < TIME_FLOOR) return;      // klok niet gesynct: zwijgen, zie de kop
@@ -3270,6 +3352,7 @@ void RoomMesh::saveAnnounces() {
   File f = _fs->open(ANNOUNCE_CFG_PATH, "w", true);
   if (!f) return;
   f.printf("#MUANN1\n");
+  f.printf("g %u\n", (unsigned)_ann_gap_s);
   for (int i = 0; i < MAX_ANNOUNCES; i++) {
     const Announce& a = _announces[i];
     if (!a.used) continue;
@@ -3285,6 +3368,7 @@ void RoomMesh::saveAnnounces() {
 
 void RoomMesh::loadAnnounces() {
   memset(_announces, 0, sizeof(_announces));
+  _ann_gap_s = ANNOUNCE_GAP_DEFAULT_S;
   _next_announce_tick = futureMillis(20000);   // niet meteen bij het opstarten
   if (_fs == NULL || !_fs->exists(ANNOUNCE_CFG_PATH)) return;
   File f = _fs->open(ANNOUNCE_CFG_PATH, "r");
@@ -3301,6 +3385,11 @@ void RoomMesh::loadAnnounces() {
     }
     line[len] = 0;
     if (first) { first = false; continue; }
+    if (line[0] == 'g') {         // de pauze tussen twee kanalen
+      int g = atoi(line + 1);
+      if (g >= 5 && g <= 900) _ann_gap_s = (uint16_t)g;
+      continue;
+    }
     if (line[0] != 'a') continue;
     // a <idx> <en> <hh> <mm> <dow> <chanmask> <last_fired> <tekst...>
     char* p = line + 1;

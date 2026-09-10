@@ -167,6 +167,13 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.9.1 = EEN KANAAL PER KEER. v2.9.0 zette alle kanalen van een aankondiging in
+ *            een keer in de zendwachtrij met 4 s verschil. Dat is geen zendritme: het
+ *            luchtbudget (duty cycle 10 %) laat dat niet toe en de pakketbeheerder
+ *            gooit weg wat niet in de wachtrij past -- in het ene kanaal kwam het aan
+ *            en in het andere niet (gemeld door de eigenaar, meetbaar). Nu een kanaal
+ *            per keer met een instelbare pauze (standaard 30 s), en de log/GUI zegt
+ *            "in de wachtrij" waar hij eerst "verzonden" zei -- dat is niet hetzelfde.
  *   v2.9.0 = GEPLANDE KANAALBERICHTEN. De bot antwoordde alleen op wat hij HOORDE, dus
  *            het advies over pad-hashes en scope bereikte alleen wie hem aansprak.
  *            Nu ook de andere richting: tot vier tijdstippen (lokale tijd, dagmasker)
@@ -210,7 +217,7 @@
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.9.0"
+  #define MESHUPTIME_VERSION   "v2.9.1"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"
