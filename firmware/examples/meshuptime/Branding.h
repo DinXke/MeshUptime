@@ -167,6 +167,30 @@
  *            wordt er NIETS gemeld (geen halve of verzonnen meting). De poll-URL
  *            meldt nu ?caps=settings,refresh, waarop MeshManager de knop "Status nu
  *            opvragen" vanzelf aanzet.
+ *   v2.10.0 = DE TWEE LIJNEN SAMEN. De IRC-server (irc-server) en de geplande
+ *            kanaalberichten (companion-hub-node) zijn parallel ontwikkeld en
+ *            droegen ALLEBEI het nummer v2.9.0 -- op verschillende takken, met
+ *            verschillende inhoud. Dat nummer is daarmee dubbelzinnig; de
+ *            samenvoeging krijgt daarom 2.10.0 en de twee regels hieronder
+ *            blijven staan zoals ze waren, want allebei zijn ze echt geflasht
+ *            geweest. MAX_CHANNELS is 16 (het hoogste van de twee: 12 voor de
+ *            aankondigingen, 16 omdat een app-import er negen meebrengt).
+ *   v2.9.1 = EEN KANAAL PER KEER. v2.9.0 zette alle kanalen van een aankondiging in
+ *            een keer in de zendwachtrij met 4 s verschil. Dat is geen zendritme: het
+ *            luchtbudget (duty cycle 10 %) laat dat niet toe en de pakketbeheerder
+ *            gooit weg wat niet in de wachtrij past -- in het ene kanaal kwam het aan
+ *            en in het andere niet (gemeld door de eigenaar, meetbaar). Nu een kanaal
+ *            per keer met een instelbare pauze (standaard 30 s), en de log/GUI zegt
+ *            "in de wachtrij" waar hij eerst "verzonden" zei -- dat is niet hetzelfde.
+ *   v2.9.0 = GEPLANDE KANAALBERICHTEN. De bot antwoordde alleen op wat hij HOORDE, dus
+ *            het advies over pad-hashes en scope bereikte alleen wie hem aansprak.
+ *            Nu ook de andere richting: tot vier tijdstippen (lokale tijd, dagmasker)
+ *            die zelf een bericht in gekozen kanalen zetten. EIGEN kanaalkeuze, los van
+ *            de kanalen waar hij meeleest. Zwijgt zolang de klok niet gesynct is en
+ *            stuurt hetzelfde tijdstip nooit twee keer (ook niet na een herstart).
+ *            /announce.cfg, /announce.json + /announce[/del|/test], GUI op het
+ *            bot-tabblad. sendChannelReply() meldt nu of het pakket echt de lucht in
+ *            ging -- dat mislukte voorheen stil bij een te lange tekst.
  *   v2.9.0 = IRC-SERVER OP DE NODE. Poort 6667; een gewone IRC-client praat op het
  *            mesh. De BOT-SLOTS dragen de identiteit (eigen sleutelpaar, kunnen DM's
  *            initieren en kanalen meelezen) -- rooms zijn de server-rol en snodes
@@ -209,7 +233,7 @@
  * ==========================================================================*/
 
 #ifndef MESHUPTIME_VERSION
-  #define MESHUPTIME_VERSION   "v2.9.0"
+  #define MESHUPTIME_VERSION   "v2.10.0"
 #endif
 #ifndef MESHUPTIME_AUTHOR
   #define MESHUPTIME_AUTHOR    "DinX"

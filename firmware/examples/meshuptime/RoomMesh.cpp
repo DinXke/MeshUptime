@@ -11,6 +11,14 @@
  * mag pakketten missen -- dat is inherent, geen bug: dan verschijnt hier NIETS). */
 #define CHAN_DIAG(...) do { Serial.printf("[chan] " __VA_ARGS__); Serial.println(); } while (0)
 
+/* === GEPLANDE KANAALBERICHTEN ================================================
+ * Altijd-aan seriele logging, prefix "[ann]". Dit is de enige plek waar te zien
+ * is of een gepland bericht ECHT de lucht in ging: een groep-datagram dat niet
+ * gemaakt kan worden (te lange tekst) gaf voorheen NULL terug en dan verdween
+ * het bericht zonder spoor. Een aankondiging die stil wegvalt is erger dan geen
+ * aankondiging, want je denkt dat hij werkt. */
+#define ANN_DIAG(...) do { Serial.printf("[ann] " __VA_ARGS__); Serial.println(); } while (0)
+
 /* === CLI-SESSIE-DIAGNOSE ====================================================
  * Waarom dit bestaat. Een repeater kan een loginverzoek keurig ANTWOORDEN
  * (meetbaar in het pakketarchief van een node die het hoort) terwijl deze kant
@@ -91,6 +99,11 @@
 #define BOT_RECIPS_PATH  "/bot_recips"
 #define BOTS_CFG_PATH    "/bots.cfg"
 #define CHANNELS_CFG_PATH "/channels.cfg"
+/* Geplande kanaalberichten (v2.9.0). Eigen bestand en niet bij de bots of de
+ * kanalen: die twee bestanden staan op een node die al draait, en een nieuw veld
+ * erin zou bij het inlezen door een oudere regel heen lopen. Een eigen bestand
+ * dat er nog niet is, is gewoon een lege lijst. */
+#define ANNOUNCE_CFG_PATH "/announce.cfg"
 /* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
  * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
 #define COMPANIONS_PATH  "/companions.cfg"
@@ -326,6 +339,9 @@ void RoomMesh::begin(FILESYSTEM* fs) {
   /* Hashtag-/publieke kanalen die de bot meeleest (persistent, /channels.cfg). */
   loadChannels();
   loadNames();      /* v2.9.0: de gedeelde naamtabel */
+
+  /* Geplande kanaalberichten (persistent, /announce.cfg). */
+  loadAnnounces();
 
   /* Companions (v2.4.0): persistente lijst in /companions.cfg. Seed niets. */
   loadCompanions();
@@ -1590,6 +1606,7 @@ void RoomMesh::loopSlot(RoomSlot& slot) {
 
 void RoomMesh::loop() {
   mesh::Mesh::loop();
+  loopAnnounces();
 
   for (int i = 0; i < MAX_ROOMS; i++) {
     if (!rooms[i].active) continue;
@@ -3102,6 +3119,380 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
   return n;
 }
 
+/* ================================================================== */
+/*  Geplande kanaalberichten (v2.9.0)                                  */
+/* ================================================================== */
+/*
+ * WAT DIT IS. De bot antwoordt op wat hij HOORT: iemand zet `ping`, `test` of
+ * `path` in een kanaal en krijgt een antwoord met het zenddiagnose-achtervoegsel
+ * ("2-byte 👍 | geen scope 😞"). Daarmee bereikt het advies alleen wie de bot
+ * aanspreekt -- en dat is precies niet de groep die het nodig heeft. Dit is de
+ * andere richting: op vaste tijdstippen zelf een bericht in een kanaal zetten.
+ *
+ * TWEE LOSSE LIJSTEN, met opzet. Waar de bot MEELEEST staat in de kanaaltabel
+ * (`enabled`); waar hij AANKONDIGT staat per aankondiging in een masker over die
+ * tabel. Een kanaal kan dus aankondigingen krijgen zonder dat de bot er meeleest
+ * en omgekeerd. Het masker gaat over ALLE ingangen van de tabel, niet alleen de
+ * ingeschakelde -- anders zou uitzetten van het meelezen stil de aankondiging
+ * meenemen.
+ *
+ * DE KLOK IS DE HARDE VOORWAARDE. Onder TIME_FLOOR staat de RTC op zijn vaste
+ * terugval (15 mei 2024) en dan weten we de tijd NIET. Er gaat dan niets uit:
+ * een bericht op het verkeerde moment is erger dan geen bericht, en een node die
+ * na een stroomstoring om 2 uur 's nachts alle vier de aankondigingen tegelijk
+ * uitspuugt is een bot die niemand meer op zijn kanaal wil.
+ *
+ * NOOIT TWEE KEER. Het tijdstip matcht een hele minuut lang, en een herstart
+ * binnen die minuut zou het bericht opnieuw versturen. Daarom staat het moment
+ * van de laatste verzending in het BESTAND en niet alleen in RAM, en geldt er
+ * bovendien een ondergrens van vijf minuten tussen twee verzendingen van
+ * dezelfde ingang.
+ */
+
+/* De ingebouwde tekst, voor wie niets wil bedenken. Bewust kort: sendChannelReply
+ * zet er "<botnaam>: " voor en de mesh-tekstlimiet is 160 byte, dus een lange
+ * tekst zou de URL eruit duwen. De URL komt uit dezelfde instelling als die
+ * achter "geen scope" in de bot-antwoorden staat -- een tweede plek om hetzelfde
+ * te onderhouden is een plek die gaat afwijken. */
+#define ANNOUNCE_DEFAULT_TEXT \
+  "Tip: 2-byte pad-hashes + gescopete flood; 1-byte/ongescopet wordt steeds " \
+  "vaker geweigerd."
+
+/* De ZENDRUIMTE voor de tekst van een aankondiging: de mesh-tekstlimiet min de
+ * "<botnaam>: " die sendChannelReply ervoor zet, min wat marge voor de
+ * pakketkop. Hier gerekend en niet pas bij het versturen, zodat de GUI dezelfde
+ * tekst toont als er werkelijk uitgaat -- en zodat een URL er HEEL bij komt of
+ * helemaal niet, in plaats van halverwege afgekapt te worden. */
+size_t RoomMesh::announceRoom() const {
+  int ab = alertBotIndex(); if (ab < 0) ab = 0;
+  size_t naam = strlen(_bots[ab].name[0] ? _bots[ab].name : "bot") + 2;
+  size_t ruimte = (size_t)BOT_MAX_TEXT_LEN;
+  if (ruimte < naam + 16) return 16;         // absurd lange naam: houd iets over
+  return ruimte - naam - 8;                  // 8 = marge voor de pakketkop
+}
+
+void RoomMesh::announceText(int i, char* out, size_t out_len) const {
+  if (out == NULL || out_len == 0) return;
+  out[0] = 0;
+  if (i < 0 || i >= MAX_ANNOUNCES) return;
+  const Announce& a = _announces[i];
+
+  /* Een EIGEN tekst komt er onverkort in, ook als hij te lang is: hij wordt bij
+   * het opslaan geweigerd en bij het versturen niet verzonden, en dan hoort de
+   * GUI te tonen wat er staat -- niet een ingekorte versie die suggereert dat
+   * het zo wel gaat. Zie announceSet() en fireAnnounce(). */
+  if (a.text[0]) { StrHelper::strncpy(out, a.text, out_len); return; }
+
+  /* De ingebouwde tekst past binnen de zendruimte; de URL komt er heel bij of
+   * helemaal niet. Dat laat een ELEMENT weg en kapt geen zin af. */
+  size_t ruimte = announceRoom();
+  if (out_len > ruimte + 1) out_len = ruimte + 1;
+
+  /* De ingebouwde tekst plus de uitleg-URL van de alert-bot, als die past. Alles
+   * of niets voor die URL: een halve link is geen link. */
+  int ab = alertBotIndex(); if (ab < 0) ab = 0;
+  size_t n = snprintf(out, out_len, "%s", ANNOUNCE_DEFAULT_TEXT);
+  if (n >= out_len) return;                  // zelfs de kale tekst past net niet
+  const char* url = _bots[ab].diag_url;
+  if (url && url[0]) {
+    size_t nodig = strlen(" Uitleg: ") + strlen(url);
+    if (n + nodig < out_len) snprintf(out + n, out_len - n, " Uitleg: %s", url);
+  }
+}
+
+bool RoomMesh::announceGet(int i, Announce& out) const {
+  if (i < 0 || i >= MAX_ANNOUNCES || !_announces[i].used) return false;
+  out = _announces[i];
+  return true;
+}
+
+int RoomMesh::announceSet(int i, bool enabled, int hh, int mm, uint8_t dow_mask,
+                          uint16_t chan_mask, const char* text) {
+  if (i < 0 || i >= MAX_ANNOUNCES) return -2;
+  if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return -2;
+  if ((dow_mask & 0x7F) == 0) return -2;          // geen enkele dag = nooit
+  chan_mask &= (uint16_t)((1u << MAX_CHANNELS) - 1u);
+  if (chan_mask == 0) return -4;                  // geen kanaal = niets om naar te sturen
+  /* Wijst het masker naar een ingang die niet bestaat, dan is dat geen fout maar
+   * wel iets om te weten: die bit doet niets tot daar een kanaal komt. */
+  Announce& a = _announces[i];
+  const Announce vorige = a;      // om terug te zetten als de tekst niet past
+  memset(&a, 0, sizeof(a));
+  a.used = true;
+  a.enabled = enabled;
+  a.hh = (uint8_t)hh;
+  a.mm = (uint8_t)mm;
+  a.dow_mask = (uint8_t)(dow_mask & 0x7F);
+  a.chan_mask = chan_mask;
+  a.last_fired = 0;
+  if (text && text[0]) StrHelper::strncpy(a.text, text, sizeof(a.text));
+  /* Te lang? Dan NIET opslaan -- en de oude ingang blijft staan zoals hij was,
+   * want een half doorgevoerde wijziging is de derde manier om iemand voor de
+   * gek te houden. De aanroeper krijgt de maat mee via announceRoom(). */
+  if (a.text[0] && strlen(a.text) > announceRoom()) {
+    memcpy(&a, &vorige, sizeof(a));
+    return -5;
+  }
+  saveAnnounces();
+  ANN_DIAG("ingang %d gezet: %02u:%02u dagen=0x%02X kanalen=0x%04X %s",
+           i, (unsigned)a.hh, (unsigned)a.mm, (unsigned)a.dow_mask,
+           (unsigned)a.chan_mask, a.enabled ? "aan" : "uit");
+  return 0;
+}
+
+int RoomMesh::announceDel(int i) {
+  if (i < 0 || i >= MAX_ANNOUNCES) return -2;
+  memset(&_announces[i], 0, sizeof(_announces[i]));
+  saveAnnounces();
+  return 1;
+}
+
+/* Nu versturen, wat de klok ook zegt. Dit is de proefknop, en die mag WEL zonder
+ * een gesynchroniseerde klok: de eigenaar staat erbij en kijkt of het aankomt.
+ * Hij raakt `last_fired` niet aan, zodat een proef het echte tijdstip van vandaag
+ * niet overslaat. */
+int RoomMesh::announceFireNow(int i) {
+  if (i < 0 || i >= MAX_ANNOUNCES || !_announces[i].used) return -2;
+  return fireAnnounce(i, 0);
+}
+
+/* Versturen naar elk kanaal in het masker. `now` = de UTC-tijd die in last_fired
+ * gaat; 0 betekent "dit is een proef, laat last_fired staan".
+ *
+ * De kanalen krijgen elk hun eigen vertraging: vier floods tegelijk de lucht in
+ * duwen kost airtime die de radio dan niet heeft voor het gewone werk, en de
+ * mesh vindt het ook niet leuk. Retour: het aantal kanalen waar het bericht echt
+ * de lucht in ging. */
+int RoomMesh::fireAnnounce(int i, uint32_t now) {
+  if (i < 0 || i >= MAX_ANNOUNCES || !_announces[i].used) return -2;
+  Announce& a = _announces[i];
+
+  char tekst[BOT_MAX_TEXT_LEN + 1];
+  announceText(i, tekst, sizeof(tekst));
+  if (tekst[0] == 0) { ANN_DIAG("ingang %d: lege tekst -- niets verzonden", i); return -3; }
+
+  /* Te lang gaat NIET de lucht in. Afkappen zou een halve zin als hele zin
+   * afleveren en daar is op het mesh niets van te zien -- hetzelfde beleid als
+   * voor de kanaalberichten die iemand zelf typt. Dit hoort niet te kunnen
+   * gebeuren (announceSet weigert het al), dus als het gebeurt is er iets anders
+   * mis en hoort dat luid in de log te staan. */
+  size_t ruimte = announceRoom();
+  if (strlen(tekst) > ruimte) {
+    ANN_DIAG("ingang %d NIET verzonden: tekst is %d byte, er past %d "
+             "(botnaam kost de rest)", i, (int)strlen(tekst), (int)ruimte);
+    return -5;
+  }
+
+  /* Alleen de kanalen die ECHT bestaan; een masker-bit zonder kanaal is geen
+   * fout maar hoort wel gemeld te worden. */
+  uint16_t doelen = 0;
+  int gemist = 0;
+  for (int c = 0; c < MAX_CHANNELS; c++) {
+    if (!(a.chan_mask & (1u << c))) continue;
+    if (_channels[c].used) doelen |= (uint16_t)(1u << c);
+    else gemist++;
+  }
+  if (!doelen) {
+    ANN_DIAG("ingang %d: geen bestaand kanaal in het masker (%d bit(s) leeg)", i, gemist);
+    return 0;
+  }
+
+  /* EEN KANAAL NU, de rest laat loopAnnounces() volgen met announceGap()
+   * seconden ertussen. Alles tegelijk in de wachtrij zetten was de fout: het
+   * luchtbudget laat dat niet toe en de pakketbeheerder gooit weg wat niet past.
+   * Zie de toelichting bij ANNOUNCE_GAP_DEFAULT_S. */
+  a.pending = doelen;
+  a.next_send = 0;
+  int gestuurd = sendNextAnnounceChannel(i) ? 1 : 0;
+  int te_gaan = 0;
+  for (int c = 0; c < MAX_CHANNELS; c++) if (a.pending & (1u << c)) te_gaan++;
+
+  if (now) { a.last_fired = now; saveAnnounces(); }
+  ANN_DIAG("ingang %d %s: %d kanaal nu, %d volgt met %us ertussen, %d bit(s) zonder kanaal",
+           i, now ? "op tijd" : "als proef", gestuurd, te_gaan,
+           (unsigned)_ann_gap_s, gemist);
+  return gestuurd + te_gaan;
+}
+
+/* Het volgende openstaande kanaal van een aankondiging versturen. Retour: of er
+ * iets in de wachtrij is gezet. "In de wachtrij" en niet "verzonden": of het
+ * pakket de lucht in gaat beslist de dispatcher (luchtbudget, CAD), en dat weten
+ * we hier niet. Die twee door elkaar halen was precies de fout in de eerste
+ * versie van deze functie -- de log meldde vier verzonden kanalen terwijl er twee
+ * onderweg zijn weggegooid. */
+bool RoomMesh::sendNextAnnounceChannel(int i) {
+  if (i < 0 || i >= MAX_ANNOUNCES) return false;
+  Announce& a = _announces[i];
+  if (!a.pending) return false;
+
+  int c = -1;
+  for (int k = 0; k < MAX_CHANNELS; k++) {
+    if (a.pending & (1u << k)) { c = k; break; }
+  }
+  if (c < 0) { a.pending = 0; return false; }
+  a.pending &= (uint16_t)~(1u << c);
+  a.next_send = futureMillis((unsigned long)_ann_gap_s * 1000UL);
+
+  if (!_channels[c].used) return false;    // tussentijds gewist
+  char tekst[BOT_MAX_TEXT_LEN + 1];
+  announceText(i, tekst, sizeof(tekst));
+  if (tekst[0] == 0 || strlen(tekst) > announceRoom()) return false;
+
+  mesh::GroupChannel ch;
+  memset(&ch, 0, sizeof(ch));
+  ch.hash[0] = _channels[c].hash;
+  memcpy(ch.secret, _channels[c].secret, PUB_KEY_SIZE);
+  bool ok = sendChannelReply(ch, tekst, 0);
+  ANN_DIAG("ingang %d -> kanaal %d (%s): %s", i, c, _channels[c].name,
+           ok ? "in de wachtrij" : "MISLUKT (pakket niet gemaakt)");
+  return ok;
+}
+
+int RoomMesh::announceSetGap(int secs) {
+  if (secs < 5 || secs > 900) return -2;
+  _ann_gap_s = (uint16_t)secs;
+  saveAnnounces();
+  ANN_DIAG("pauze tussen kanalen: %ds", secs);
+  return 0;
+}
+
+/* De klokcontrole. Hoogstens elke vijf seconden, want vaker heeft geen zin voor
+ * een raster van hele minuten -- en localtime_r is niet gratis. */
+void RoomMesh::loopAnnounces() {
+  if (!millisHasNowPassed(_next_announce_tick)) return;
+  _next_announce_tick = futureMillis(5000);
+
+  /* Eerst de kanalen die nog openstaan van een aankondiging die al begonnen is.
+   * Dit staat VOOR de klokcontrole: een lopende reeks afmaken gaat voor een
+   * nieuwe beginnen, en zo staat er nooit meer dan een bericht per ronde in de
+   * wachtrij. */
+  for (int i = 0; i < MAX_ANNOUNCES; i++) {
+    Announce& a = _announces[i];
+    if (!a.pending) continue;
+    if (!millisHasNowPassed(a.next_send)) continue;
+    sendNextAnnounceChannel(i);
+    return;                      // hoogstens een per ronde
+  }
+
+  uint32_t now = getRTCClock()->getCurrentTime();
+  if (now < TIME_FLOOR) return;      // klok niet gesynct: zwijgen, zie de kop
+
+  time_t t = (time_t)now;
+  struct tm lt;
+  localtime_r(&t, &lt);
+
+  for (int i = 0; i < MAX_ANNOUNCES; i++) {
+    Announce& a = _announces[i];
+    if (!a.used || !a.enabled) continue;
+    if (!(a.dow_mask & (1u << lt.tm_wday))) continue;
+    if (lt.tm_hour != a.hh || lt.tm_min != a.mm) continue;
+    if (a.last_fired && now - a.last_fired < 300) continue;   // niet twee keer
+    fireAnnounce(i, now);
+  }
+}
+
+void RoomMesh::saveAnnounces() {
+  if (_fs == NULL) return;
+  File f = _fs->open(ANNOUNCE_CFG_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUANN1\n");
+  f.printf("g %u\n", (unsigned)_ann_gap_s);
+  for (int i = 0; i < MAX_ANNOUNCES; i++) {
+    const Announce& a = _announces[i];
+    if (!a.used) continue;
+    /* De tekst staat ACHTERAAN en mag spaties bevatten; alles ervoor is een
+     * getal. Regeleindes kunnen er niet in staan -- de web-route weigert ze. */
+    f.printf("a %d %d %u %u %u %u %lu %s\n", i, a.enabled ? 1 : 0,
+             (unsigned)a.hh, (unsigned)a.mm, (unsigned)a.dow_mask,
+             (unsigned)a.chan_mask, (unsigned long)a.last_fired, a.text);
+  }
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadAnnounces() {
+  memset(_announces, 0, sizeof(_announces));
+  _ann_gap_s = ANNOUNCE_GAP_DEFAULT_S;
+  _next_announce_tick = futureMillis(20000);   // niet meteen bij het opstarten
+  if (_fs == NULL || !_fs->exists(ANNOUNCE_CFG_PATH)) return;
+  File f = _fs->open(ANNOUNCE_CFG_PATH, "r");
+  if (!f) return;
+  char line[BOT_MAX_TEXT_LEN + 64];
+  bool first = true;
+  while (f.available()) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int ch = f.read();
+      if (ch < 0 || ch == '\n') break;
+      if (ch == '\r') continue;
+      line[len++] = (char)ch;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] == 'g') {         // de pauze tussen twee kanalen
+      int g = atoi(line + 1);
+      if (g >= 5 && g <= 900) _ann_gap_s = (uint16_t)g;
+      continue;
+    }
+    if (line[0] != 'a') continue;
+    // a <idx> <en> <hh> <mm> <dow> <chanmask> <last_fired> <tekst...>
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    long v[7];
+    bool goed = true;
+    for (int k = 0; k < 7; k++) {
+      if (*p == 0) { goed = false; break; }
+      v[k] = strtol(p, &p, 10);
+      while (*p == ' ') p++;
+    }
+    if (!goed) continue;
+    int i = (int)v[0];
+    if (i < 0 || i >= MAX_ANNOUNCES) continue;
+    Announce& a = _announces[i];
+    memset(&a, 0, sizeof(a));
+    a.used = true;
+    a.enabled = v[1] ? true : false;
+    a.hh = (uint8_t)(v[2] % 24);
+    a.mm = (uint8_t)(v[3] % 60);
+    a.dow_mask = (uint8_t)(v[4] & 0x7F);
+    if (a.dow_mask == 0) a.dow_mask = 0x7F;
+    a.chan_mask = (uint16_t)(v[5] & ((1u << MAX_CHANNELS) - 1u));
+    a.last_fired = (uint32_t)v[6];
+    StrHelper::strncpy(a.text, p, sizeof(a.text));
+  }
+  f.close();
+}
+
+/* De web-vorm van announceGet: losse velden in plaats van de struct (IWebNode
+ * kent RoomMesh niet), en de WERKELIJKE tekst erbij -- dat is wat er de lucht in
+ * gaat, en dat is iets anders dan wat er ingevuld staat zodra het veld leeg is. */
+bool RoomMesh::webAnnounceGet(int i, int* enabled, int* hh, int* mm, int* dow_mask,
+                              int* chan_mask, char* text, size_t text_len,
+                              unsigned long* last_fired, char* eff, size_t eff_len) {
+  Announce a;
+  if (!announceGet(i, a)) return false;
+  if (enabled)   *enabled = a.enabled ? 1 : 0;
+  if (hh)        *hh = a.hh;
+  if (mm)        *mm = a.mm;
+  if (dow_mask)  *dow_mask = a.dow_mask;
+  if (chan_mask) *chan_mask = a.chan_mask;
+  if (last_fired) *last_fired = (unsigned long)a.last_fired;
+  if (text && text_len) StrHelper::strncpy(text, a.text, text_len);
+  if (eff && eff_len) announceText(i, eff, eff_len);
+  return true;
+}
+
+/* Een ingang uit de kanaaltabel op INDEX, ook als hij uitgeschakeld is: het
+ * masker van een aankondiging wijst naar deze indexen, dus de GUI moet ze alle
+ * kunnen tonen -- inclusief de uitgeschakelde, want daar mag wel aangekondigd
+ * worden. */
+bool RoomMesh::channelSlot(int i, char* out_name, size_t out_len, bool* out_enabled) const {
+  if (i < 0 || i >= MAX_CHANNELS || !_channels[i].used) return false;
+  if (out_name && out_len) StrHelper::strncpy(out_name, _channels[i].name, out_len);
+  if (out_enabled) *out_enabled = _channels[i].enabled;
+  return true;
+}
+
 /* Een ontsleutelde group-tekst. Formaat: [ts:4][txt_type:1]["<afzender>: <bericht>"].
  * We knippen de "<afzender>: "-prefix eraf, herkennen ping/test/path en antwoorden
  * IN het kanaal (met de afzendernaam erbij). */
@@ -3262,7 +3653,7 @@ void RoomMesh::handleChannelText(mesh::Packet* packet, const mesh::GroupChannel&
 }
 
 /* "<botnaam>: <reply>" bouwen en IN het kanaal versturen (geflood). */
-void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
+bool RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
                                 uint32_t delay_millis) {
   static uint8_t temp[MAX_PACKET_PAYLOAD];
   uint32_t ts = getRTCClock()->getCurrentTimeUnique();
@@ -3276,7 +3667,16 @@ void RoomMesh::sendChannelReply(const mesh::GroupChannel& channel, const char* r
    * ondertekend, maar houd de dispatch-toestand netjes). */
   mesh::GroupChannel ch = channel;   // niet-const kopie voor de API
   mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
-  if (pkt) sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+  if (pkt) {
+    sendFloodScoped(default_scope, pkt, delay_millis, _prefs.path_hash_mode + 1);
+    return true;
+  }
+  /* NIET STIL. createGroupDatagram geeft NULL bij een te lange tekst of een lege
+   * pakketpool, en dat is van buiten niet te zien: het antwoord blijft simpelweg
+   * weg. Precies de soort stilte waar deze firmware tegen ontworpen is. */
+  ANN_DIAG("kanaal #%02X: pakket NIET gemaakt (%d byte tekst) -- niets verzonden",
+           (unsigned)ch.hash[0], (int)(off > 5 ? off - 5 : 0));
+  return false;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -3305,7 +3705,16 @@ int RoomMesh::botSay(int b, int chan_idx, const char* text) {
   if (off > MAX_PACKET_PAYLOAD - 1) off = MAX_PACKET_PAYLOAD - 1;
 
   mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, ch, temp, off);
-  if (!pkt) return -5;
+  if (!pkt) {
+    /* NIET STIL -- zelfde reden als in sendChannelReply(), waar deze functie een
+     * kopie van is. createGroupDatagram geeft NULL bij een te lange tekst of een
+     * lege pakketpool, en de IRC-kant meldde dat als "code -5" zonder spoor op de
+     * console. De aankondigingen kregen deze reparatie in v2.9.0; hier stond hij
+     * nog niet omdat de twee takken parallel liepen. */
+    ANN_DIAG("kanaal #%02X: pakket NIET gemaakt (%d byte tekst) -- niets verzonden",
+             (unsigned)ch.hash[0], (int)(off > 5 ? off - 5 : 0));
+    return -5;
+  }
   sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
   return 0;
 }

@@ -7,6 +7,131 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.10.0 — de twee lijnen samen
+
+De IRC-server en de geplande kanaalberichten zijn parallel ontwikkeld, op twee
+takken, en droegen **allebei het nummer v2.9.0**. Dat nummer zegt dus niets meer:
+welke v2.9.0 op een node staat hangt af van welke tak er geflasht is. De
+samenvoeging krijgt daarom 2.10.0. De twee secties hieronder blijven staan zoals
+ze geschreven zijn — allebei hebben ze echt op het toestel gedraaid.
+
+Wat de samenvoeging zelf raakt:
+
+- **`MAX_CHANNELS` is 16.** Beide takken liepen tegen dezelfde volle tabel aan en
+  verhoogden hem los van elkaar (12 voor de aankondigingen, 16 omdat een
+  app-import er negen meebrengt). Het hoogste wint; 16 dekt allebei.
+- **Twee zenders op één radio.** De aankondigingen en de IRC-brug posten allebei
+  in kanalen. De luchtbegroting van de IRC-server meet `getTotalAirTime()` van de
+  radio, dus de aankondigingen tellen daar vanzelf in mee: staat er een reeks
+  aankondigingen in de wachtrij, dan wijkt het chatverkeer daarvoor. Andersom niet
+  — een aankondiging gaat altijd door, en dat hoort ook: die is gepland en de chat
+  is dat niet.
+- **`botSay()` erfde een fout die `sendChannelReply()` net kwijt was.** De
+  IRC-kant is destijds van die functie gekopieerd, inclusief het stil weggooien
+  van een `NULL` uit `createGroupDatagram()`. v2.9.0 (aankondigingen) repareerde
+  dat aan die kant; hier is dezelfde reparatie in `botSay()` aangebracht.
+
+## v2.9.1 — een kanaal per keer (waarom sommige kanalen het bericht niet kregen)
+
+Gemeld door de eigenaar: "ik zie het in sommige kanalen wel en sommige niet". Dat
+was geen RF-pech maar een fout in v2.9.0.
+
+**Wat er mis was.** fireAnnounce() zette alle kanalen in EEN keer in de
+zendwachtrij, met 4000 ms verschil in hun scheduled_for. Dat is geen zendritme
+maar een wachtrij. De dispatcher rekent met een **luchtbudget**
+(airtime_factor, op deze node 9,0 → een duty cycle van 1/(1+9) = 10 %), dus na
+een flood van ~1,5 s mag de radio ~15 s niets. De pakketten kwamen dus bij een
+radio die ze niet mocht sturen, en StaticPoolPacketManager::queueOutbound()
+**gooit weg** wat niet meer in de wachtrij past ("send queue full, dropping
+packet"). Vandaar: in het ene kanaal wel, in het andere niet.
+
+En de log loog mee. "4 kanaal(en) verzonden" betekende "vier keer in de wachtrij
+gezet" — niet hetzelfde, en het verhulde precies wat er gebeurde.
+
+**Wat er nu gebeurt.** Eén kanaal per keer, aangestuurd vanuit
+loopAnnounces(), met een instelbare pauze (standaard **30 s**, 5–900) tussen
+twee kanalen. Elk bericht is dan het enige nieuwe pakket in de wachtrij en het
+budget heeft tijd om bij te komen. Een lopende reeks gaat vóór een nieuwe: er
+staat nooit meer dan één aankondiging per ronde in de wachtrij. Wat nog te doen is
+staat alleen in RAM — na een herstart halverwege is de helft al verstuurd, en de
+rest een uur later nasturen is vreemder dan hem overslaan.
+
+De woorden zijn rechtgezet: log, JSON en GUI zeggen nu **"in de wachtrij"** waar
+ze "verzonden" zeiden. Of een pakket de lucht in gaat beslist de dispatcher, en
+dat weet de aanroeper niet.
+
+**Geverifieerd op de lucht** (10 sep): twee privékanalen, nu sturen gaf
+{"ok":true,"queued":2,"gap":30} en de log toont 15:54:19 (kanaal 8) en
+15:54:52 (kanaal 9) — 33 s ertussen (30 s pauze plus de tick van 5 s).
+
+## v2.9.0 — geplande kanaalberichten (de bot zegt ook zelf iets, op tijd)
+
+Alleen de room-server-variant (`env:meshuptime_room`). Additief: de bewaking, de
+opvragingen, de klok-job en het bestaande bot-gedrag blijven ongewijzigd.
+
+**Waarom dit er is.** De bot antwoordt op wat hij *hoort*: iemand zet `ping`,
+`test` of `path` in een kanaal en krijgt een antwoord met het oordeel over
+pad-hash en scope erachter (`2-byte 👍 | geen scope 😞`). Daarmee bereikt dat
+advies alleen wie de bot aanspreekt — en dat is precies niet de groep die het
+nodig heeft. Dit is de andere richting: tot vier tijdstippen die zelf een bericht
+in gekozen kanalen zetten.
+
+**Twee losse lijsten, met opzet.** Waar de bot *meeleest* staat in de kanaaltabel
+(`enabled`); waar hij *aankondigt* staat per aankondiging als masker over die
+tabel. Een kanaal mag dus aankondigingen krijgen zonder dat de bot er meeleest en
+omgekeerd. Het masker gaat over **alle** ingangen van de tabel en niet alleen de
+ingeschakelde — anders zou het uitzetten van het meelezen stil de aankondiging
+meenemen. Geverifieerd op de lucht met een kanaal dat op `enabled=0` stond.
+
+**De klok is de harde voorwaarde.** Onder `TIME_FLOOR` staat de RTC op zijn vaste
+terugval (15 mei 2024) en dan weten we de tijd niet: er gaat dan **niets** uit.
+Een bericht op het verkeerde moment is erger dan geen bericht, en een node die na
+een stroomstoring om 2 uur 's nachts alle vier de aankondigingen tegelijk
+uitspuugt is een bot die niemand meer op zijn kanaal wil. De tijd is **lokale**
+tijd (de ingestelde zone, zie `/time.cfg`); opslag en protocol blijven UTC.
+
+**Nooit twee keer.** Het tijdstip matcht een hele minuut lang en de klokcontrole
+loopt elke vijf seconden — zonder rem zou dat twaalf berichten geven. Er geldt een
+ondergrens van vijf minuten tussen twee verzendingen van dezelfde ingang, en het
+moment van de laatste verzending staat in het **bestand** en niet alleen in RAM:
+een herstart binnen die minuut mag het bericht niet opnieuw versturen.
+
+**Wat er nog bij hoort:**
+
+- **`nu sturen`** per ingang (`POST /announce/test`): verstuurt meteen, wat de klok
+  ook zegt, en laat het geplande tijdstip van vandaag staan. De enige manier om te
+  zien of het aankomt zonder tot morgen te wachten. Met opzet geen GET — een link
+  die een browser of linkchecker kan volgen mag geen bericht de mesh in zetten.
+- **De tekst mag leeg**: dan gaat de ingebouwde adviestekst uit, met de uitleg-URL
+  van de bot erachter (dezelfde instelling als die achter "geen scope" in de
+  antwoorden staat — een tweede plek om hetzelfde te onderhouden is een plek die
+  gaat afwijken).
+- **De zendruimte wordt vooraf gerekend** (`announceRoom()`): de mesh-tekstlimiet
+  min de `<botnaam>: ` die ervoor komt. De GUI toont daardoor exact wat er uitgaat,
+  en een URL komt er **heel** bij of helemaal niet. Dat was geen theorie: de eerste
+  proef logde *"tekst afgekapt van 147 naar 135 byte (naam kost 17)"* en die twaalf
+  byte waren precies het staartje van de link.
+- **Meerdere kanalen** krijgen het bericht met vier seconden tussenruimte, zodat de
+  radio niet in één keer volgeblazen wordt.
+- **`sendChannelReply()` geeft nu `bool` terug.** `createGroupDatagram` levert NULL
+  bij een te lange tekst of een lege pakketpool, en dat werd genegeerd: het bericht
+  verdween dan zonder spoor. Nu staat het in de log (`[ann]`), en dat geldt ook voor
+  de bestaande bot-antwoorden die langs dezelfde functie gaan.
+- **`MAX_CHANNELS` van 8 naar 12.** De tabel van de node zat vol, en dan kun je een
+  kanaal om op aan te kondigen niet eens toevoegen. Vier ingangen kosten ~256 byte.
+
+**Web:** `/announce.json` (GET; de lijst, de kanaalingangen mét hun index en de
+lokale klok van de node), `/announce`, `/announce/del` en `/announce/test` (POST).
+GUI op het bot-tabblad, onder de kanalen. Config in `/announce.cfg` (`#MUANN1`),
+een eigen bestand — een nieuw veld in `bots.cfg` of `channels.cfg` zou op een node
+die al draait door een bestaande regel heen lopen.
+
+**Geverifieerd op de lucht** (10 sep 2026): een aankondiging gepland op 15:38 naar
+een privékanaal waar de bot niet meeleest ging op 15:38:00 CEST de lucht in
+(`[ann] ingang 0 op tijd: 1 kanaal(en) verzonden`), exact één keer; de instelling
+en het "laatst verzonden"-moment overleefden een herstart; `nu sturen` gaf
+`{"ok":true,"sent":1}` zonder dat tijdstip aan te raken; en de tekst kwam op 116
+byte uit met de link er compleet in.
 ## v2.9.0 — een IRC-server op de node
 
 Alleen de room-server-variant (`env:meshuptime_room`). Een gewone IRC-client

@@ -185,6 +185,32 @@ class IrcTask;
   #define MAX_CHANNELS  16
 #endif
 
+/* GEPLANDE KANAALBERICHTEN. De bot antwoordt op wat hij HOORT (ping/test/path,
+ * met het zenddiagnose-achtervoegsel); dit is de andere richting: op vaste
+ * tijdstippen zelf iets in een kanaal zetten, zonder dat iemand er iets voor
+ * hoeft te sturen. Waarvoor dat bestaat: het advies over 2-byte pad-hashes en
+ * gescopete flood bereikt nu alleen wie de bot aanspreekt, en dat is precies
+ * niet de groep die het nodig heeft.
+ *
+ * De kanalen hangen aan een MASKER over de kanaaltabel en niet aan de
+ * ``enabled``-vlag daarvan: waar de bot MEELEEST en waar hij AANKONDIGT zijn
+ * losse keuzes. Een kanaal kan dus aankondigingen krijgen zonder dat de bot er
+ * meeleest, en omgekeerd. */
+#ifndef MAX_ANNOUNCES
+  #define MAX_ANNOUNCES   4
+#endif
+
+/* Seconden tussen twee KANALEN van dezelfde aankondiging. Waarom dit niet klein
+ * mag zijn: de dispatcher rekent met een luchtbudget (``airtime_factor``, op deze
+ * node 9,0 -- een duty cycle van 10 %), dus na een flood van ~1,5 s mag de radio
+ * ~15 s niets. Zet je ze sneller achter elkaar, dan staan ze in de zendwachtrij
+ * te wachten en gooit de pakketbeheerder weg wat er niet meer in past -- dan komt
+ * de aankondiging in het ene kanaal aan en in het andere niet. 30 s is ruim voor
+ * een tekstbericht op SF8 en vier kanalen zijn dan in anderhalve minuut rond. */
+#ifndef ANNOUNCE_GAP_DEFAULT_S
+  #define ANNOUNCE_GAP_DEFAULT_S   30
+#endif
+
 /* GEDEELDE NAAMTABEL (v2.9.0). Naam -> pubkey, gevuld uit de app-config die een
  * IRC-gebruiker importeert. Waarom node-BREED en niet per gebruiker: hij bestaat
  * alleen om `/msg <naam>` te laten werken voor nodes die deze node zelf nooit
@@ -422,6 +448,33 @@ struct NameEntry {
   bool    used;
 };
 
+/* Een gepland kanaalbericht. Tijd in LOKALE tijd, zoals de eigenaar hem
+ * instelt en op de statuspagina terugleest; de opslag en het protocol blijven
+ * UTC (zie TimeFmt.h). ``dow_mask`` bit 0 = zondag .. bit 6 = zaterdag, zoals
+ * ``struct tm::tm_wday``; 0x7F is elke dag.
+ *
+ * ``last_fired`` staat in het bestand en niet alleen in RAM: zonder dat zou een
+ * herstart binnen dezelfde minuut het bericht een tweede keer versturen -- en
+ * een bot die zich herhaalt op een gedeeld kanaal is precies wat je niet wil
+ * zijn. */
+struct Announce {
+  bool     used;
+  bool     enabled;
+  uint8_t  hh;              // 0..23, lokale tijd
+  uint8_t  mm;              // 0..59
+  uint8_t  dow_mask;        // bit0=zo .. bit6=za; 0x7F = elke dag
+  uint16_t chan_mask;       // bit i = kanaalingang i uit _channels
+  uint32_t last_fired;      // UTC-epoch van de laatste verzending (0 = nooit)
+  char     text[BOT_MAX_TEXT_LEN + 1];   // leeg = de ingebouwde adviestekst
+  /* Wat er nog te doen is, alleen in RAM. Een aankondiging naar meerdere kanalen
+   * gaat EEN KANAAL PER KEER de lucht in (zie ANNOUNCE_GAP_DEFAULT_S); dit is het
+   * masker van wat er nog moet en wanneer het volgende mag. Niet in het bestand:
+   * na een herstart halverwege is de helft al verstuurd, en de rest een uur later
+   * nasturen is vreemder dan hem overslaan tot het volgende tijdstip. */
+  uint16_t pending;
+  unsigned long next_send;
+};
+
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode,
                  public RepeaterCliHost {
 public:
@@ -643,6 +696,25 @@ public:
   }
   int  webChannelDel(const char* name) override    { return channelDel(name); }
   int  webChannelToggle(const char* name, int enabled) override { return channelSetEnabled(name, enabled != 0); }
+  bool webChannelSlot(int i, char* name, size_t name_len, bool* enabled) override {
+    return channelSlot(i, name, name_len, enabled);
+  }
+
+  /* ---- IWebNode: geplande kanaalberichten (v2.9.0) ---- */
+  int  webAnnounceMax() override { return announceMax(); }
+  bool webAnnounceGet(int i, int* enabled, int* hh, int* mm, int* dow_mask,
+                      int* chan_mask, char* text, size_t text_len,
+                      unsigned long* last_fired, char* eff, size_t eff_len) override;
+  int  webAnnounceSet(int i, int enabled, int hh, int mm, int dow_mask,
+                      int chan_mask, const char* text) override {
+    return announceSet(i, enabled != 0, hh, mm, (uint8_t)dow_mask,
+                       (uint16_t)chan_mask, text);
+  }
+  int  webAnnounceDel(int i) override     { return announceDel(i); }
+  size_t webAnnounceRoom() override      { return announceRoom(); }
+  int  webAnnounceGap() override         { return announceGap(); }
+  int  webAnnounceSetGap(int s) override { return announceSetGap(s); }
+  int  webAnnounceFireNow(int i) override { return announceFireNow(i); }
 
   /* ---- IWebNode: companions (v2.4.0) ---- */
   int  webCompanionMax() override   { return MAX_COMPANIONS; }
@@ -765,6 +837,33 @@ public:
   int  channelAdd(const char* name, const char* secret_hex, bool enabled);
   int  channelDel(const char* name);                 // 1 ok, -2 niet gevonden
   int  channelSetEnabled(const char* name, bool en); // 1 ok, -2 niet gevonden
+  /* De kanaalingang op index (over ALLE ingangen, ook uitgeschakelde): nodig om
+   * een masker te kunnen tonen en zetten. false = vrije ingang. */
+  bool channelSlot(int i, char* out_name, size_t out_len, bool* out_enabled) const;
+
+  /* ---- Geplande kanaalberichten: publieke API (web + CLI) ---- */
+  int  announceMax() const { return MAX_ANNOUNCES; }
+  /* Op index (0..MAX_ANNOUNCES-1, ook vrije ingangen -> false). */
+  bool announceGet(int i, Announce& out) const;
+  /* Zetten op index. Een lege tekst betekent "de ingebouwde adviestekst", zodat
+   * de eigenaar niets hoeft te bedenken om te beginnen. Retour: 0 ok, -2
+   * ongeldig (index/tijd/masker), -4 geen kanaal in het masker. */
+  int  announceSet(int i, bool enabled, int hh, int mm, uint8_t dow_mask,
+                   uint16_t chan_mask, const char* text);
+  int  announceDel(int i);                       // 1 ok, -2 ongeldige index
+  /* De pauze tussen twee kanalen van dezelfde aankondiging (seconden). */
+  uint16_t announceGap() const { return _ann_gap_s; }
+  int  announceSetGap(int secs);                 // 0 ok, -2 buiten 5..900
+  /* Nu versturen, wat de klok ook zegt -- de "proef"-knop. Retour: het aantal
+   * kanalen waar het bericht de lucht in ging, of <0 bij een fout. */
+  int  announceFireNow(int i);
+  /* De tekst die er werkelijk uitgaat (met de ingebouwde tekst als de eigen leeg
+   * is, en nooit langer dan announceRoom()), zodat de GUI kan tonen wat er zal
+   * staan. */
+  void announceText(int i, char* out, size_t out_len) const;
+  /* Hoeveel tekst er in een aankondiging past: de mesh-tekstlimiet min de
+   * "<botnaam>: " die er bij het versturen voor komt. */
+  size_t announceRoom() const;
 
   /* ---- CommonCLICallbacks ---- */
   /* `ver` toont de MeshUptime-branding MET de MeshCore-versie erbij. Puur
@@ -899,6 +998,9 @@ private:
 
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
   BotChannel    _channels[MAX_CHANNELS];
+  Announce      _announces[MAX_ANNOUNCES];
+  unsigned long _next_announce_tick;   // millis van de volgende klokcontrole
+  uint16_t      _ann_gap_s;            // seconden tussen twee kanalen
 
   /* Companions (v2.4.0): de bot stuurt hen `!`-commando's, de node ontvangt hun
    * #LOC-locatierapporten. Persistent in /companions.cfg (zie Companion). */
@@ -1051,7 +1153,16 @@ private:
   void          handleChannelText(mesh::Packet* packet, const mesh::GroupChannel& channel,
                                   const char* text);
   /* Bouwen + IN het kanaal versturen: "<botnaam>: <reply>". */
-  void          sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
+  /* Geplande kanaalberichten. loopAnnounces() kijkt hoogstens elke paar seconden
+   * op de klok en verstuurt wat er op dit moment hoort te gaan. */
+  void          loadAnnounces();
+  void          saveAnnounces();
+  void          loopAnnounces();
+  int           fireAnnounce(int i, uint32_t now);
+  bool          sendNextAnnounceChannel(int i);
+  /* true = het pakket is de lucht in gegaan. false = het kon niet gemaakt worden
+   * (te lange tekst, lege pakketpool); dat werd voorheen stil genegeerd. */
+  bool          sendChannelReply(const mesh::GroupChannel& channel, const char* reply,
                                  uint32_t delay_millis = SERVER_RESPONSE_DELAY);
 
   /* ---- adverts + telemetrie voor sensor-nodes ---- */

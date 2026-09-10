@@ -196,6 +196,40 @@ public:
                                  { (void)name; (void)secret_hex; (void)enabled; return -1; }
   virtual int  webChannelDel(const char* name)          { (void)name; return -1; }
   virtual int  webChannelToggle(const char* name, int enabled) { (void)name; (void)enabled; return -1; }
+  /* Een kanaalingang op INDEX, ook een uitgeschakelde. Het masker van een
+   * geplande aankondiging wijst naar deze indexen, dus de GUI moet ze alle
+   * kunnen tonen -- ook de uitgeschakelde, want daar mag wel aangekondigd
+   * worden. */
+  virtual bool webChannelSlot(int i, char* name, size_t name_len, bool* enabled)
+                                 { (void)i; (void)name; (void)name_len; (void)enabled; return false; }
+
+  /* ---- GEPLANDE KANAALBERICHTEN (web-GUI) -----------------------------------
+   * Op vaste tijdstippen zelf een bericht in een of meer kanalen zetten, met een
+   * EIGEN kanaalkeuze -- los van de kanalen waar de bot meeleest en antwoordt.
+   * Tijd in lokale tijd (de ingestelde zone), dagen als masker bit0=zondag.
+   * Alleen de room-server implementeert dit. */
+  virtual int  webAnnounceMax()   { return 0; }
+  virtual bool webAnnounceGet(int i, int* enabled, int* hh, int* mm, int* dow_mask,
+                              int* chan_mask, char* text, size_t text_len,
+                              unsigned long* last_fired, char* eff, size_t eff_len)
+                                 { (void)i; (void)enabled; (void)hh; (void)mm; (void)dow_mask;
+                                   (void)chan_mask; (void)text; (void)text_len;
+                                   (void)last_fired; (void)eff; (void)eff_len; return false; }
+  virtual int  webAnnounceSet(int i, int enabled, int hh, int mm, int dow_mask,
+                              int chan_mask, const char* text)
+                                 { (void)i; (void)enabled; (void)hh; (void)mm; (void)dow_mask;
+                                   (void)chan_mask; (void)text; return -1; }
+  virtual int  webAnnounceDel(int i)      { (void)i; return -1; }
+  /* Hoeveel tekst er in een aankondiging past: de mesh-tekstlimiet min de
+   * "<botnaam>: " die er bij het versturen voor komt. De GUI toont die grens,
+   * dus hij hoort van de node te komen en niet uit een vast getal. */
+  virtual size_t webAnnounceRoom()        { return 0; }
+  /* De pauze tussen twee kanalen van dezelfde aankondiging (seconden). Eén
+   * instelling voor de hele node: hij gaat over de radio en niet over een
+   * bericht. */
+  virtual int  webAnnounceGap()           { return 0; }
+  virtual int  webAnnounceSetGap(int s)   { (void)s; return -1; }
+  virtual int  webAnnounceFireNow(int i)  { (void)i; return -1; }
 
   /* ---- COMPANIONS (web-GUI, v2.4.0) -----------------------------------------
    * Companion-apparaten (T1000-E e.d.) die de bot aanstuurt en waarvan de node

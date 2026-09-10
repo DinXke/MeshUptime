@@ -362,6 +362,13 @@ private:
   void handleChannelAdd();
   void handleChannelDel();
   void handleChannelToggle();
+  /* Geplande kanaalberichten (v2.9.0): /announce.json (GET), /announce (POST,
+   * zetten), /announce/del en /announce/test (POST). Zie handleAnnounce*(). */
+  void handleAnnouncesJson();
+  void handleAnnounceSet();
+  void handleAnnounceDel();
+  void handleAnnounceTest();
+  void handleAnnounceGap();
 
   /* Companions (v2.4.0):
    *  /companions.json (GET) : {companions:[{name,pubkey,lat,lon,seen}...]} -- ook
@@ -441,6 +448,11 @@ private:
   friend void web_route_channeladd();
   friend void web_route_channeldel();
   friend void web_route_channeltoggle();
+  friend void web_route_annjson();
+  friend void web_route_annset();
+  friend void web_route_anndel();
+  friend void web_route_anntest();
+  friend void web_route_anngap();
   friend void web_route_companionsjson();
   friend void web_route_companion();
   friend void web_route_messagesjson();
