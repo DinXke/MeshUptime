@@ -7,6 +7,36 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.14.1 - de app zei "firmware te oud": dat was een getal, geen versie
+
+De companion-app weigerde "discover neighbours" met de melding dat de firmware van
+de repeater te oud is -- terwijl 0x06 er sinds v2.14.0 in zit. Het lag niet aan
+dat verzoek maar aan een byte in het LOGINANTWOORD: reply_data[12] draagt
+FIRMWARE_VER_LEVEL, het protocolniveau los van elke versietekst. Upstream zet
+dat op **1** in de room-server en op **2** in de repeater, en de app leest er zijn
+mogelijkheden uit af -- in simple_repeater staat het er letterlijk bij:
+REQ_TYPE_GET_OWNER_INFO 0x07 // FIRMWARE_VER_LEVEL >= 2.
+
+Deze node erfde de 1 van de room-server. Zodra hij zich als repeater voorstelde
+zag de app dus een repeater van niveau 1 en zette het buurtscherm uit voordat er
+iets gevraagd werd.
+
+**Niveau 2 melden mag pas als we het ook zijn.** Wat een repeater op niveau 2 na
+de login extra kan is 0x06 (de buren, v2.14.0) en 0x07 (eigenaarsinfo). Die
+laatste is er nu bij: versie, nodenaam en eigenaarstekst, met onze eigen branding
+op de eerste regel omdat die de lezer meer zegt dan het kale MeshCore-nummer -- dat
+staat er toch in.
+
+**Alleen als repeater.** Stellen we ons als room voor, dan blijft het 1: dat is wat
+upstream's room-server meldt, en een roomclient hoort geen repeaterbeloftes te
+krijgen. Zelfde voorwaarde als bij het advert, de loginvorm en de statusvorm, zodat
+wat we zeggen te zijn en wat we spreken nooit uit elkaar lopen.
+
+**Niet meegenomen:** de drie ANON_REQ-types (regions/owner/clock). Die komen VOOR
+de login, dus de client heeft ons niveau dan nog niet gezien en ze hangen niet aan
+dit getal. Ze worden herkend en genegeerd in plaats van als loginpoging gelezen
+(v2.13.0).
+
 ## v2.14.0 — het buurtscherm van de app, en een herstart die eerst antwoordt
 
 **`REQ_TYPE_GET_NEIGHBOURS` (0x06).** Het buurtscherm van de companion-app werkt

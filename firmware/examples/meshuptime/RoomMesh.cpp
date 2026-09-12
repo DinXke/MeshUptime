@@ -51,11 +51,17 @@
 
 #define POST_SYNC_DELAY_SECS        6
 #define FIRMWARE_VER_LEVEL          1
+/* Het niveau dat we melden ZODRA WE ONS ALS REPEATER VOORSTELLEN. Upstream zet
+ * dit in simple_repeater op 2, en de companion-app leest er zijn mogelijkheden uit
+ * af: op 1 zet hij het buurtscherm uit met "firmware te oud". We claimen 2 omdat
+ * we ook doen wat 2 belooft -- REQ 0x06 (buren) en 0x07 (eigenaarsinfo). */
+#define FIRMWARE_VER_LEVEL_REPEATER 2
 
 #define REQ_TYPE_GET_STATUS         0x01
 #define REQ_TYPE_KEEP_ALIVE         0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA 0x03
 #define REQ_TYPE_GET_NEIGHBOURS     0x06   /* het buurtscherm van de companion-app */
+#define REQ_TYPE_GET_OWNER_INFO     0x07   /* hoort bij niveau 2 */
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 
 #define RESP_SERVER_LOGIN_OK        0
@@ -1087,7 +1093,10 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
   reply_data[6] = (client->isAdmin() ? 1 : (client->permissions == 0 ? 2 : 0));
   reply_data[7] = client->permissions;
   getRNG()->random(&reply_data[8], 4);
-  reply_data[12] = FIRMWARE_VER_LEVEL;
+  /* Als repeater melden we niveau 2, als room niveau 1 -- zie de toelichting bij
+   * FIRMWARE_VER_LEVEL_REPEATER. */
+  reply_data[12] = (_rep_adv_on || _travel_on) ? FIRMWARE_VER_LEVEL_REPEATER
+                                               : FIRMWARE_VER_LEVEL;
 
   slot.next_push = futureMillis(PUSH_NOTIFY_DELAY_MILLIS);
 
@@ -1755,6 +1764,22 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     memcpy(&reply_data[o], &res_n, 2);  o += 2;
     memcpy(&reply_data[o], resultaat, res_off); o += res_off;
     return o;
+  }
+
+  /* Eigenaarsinfo. Upstream stuurt hier "versie
+nodenaam
+eigenaarstekst"; wij
+   * zetten onze eigen branding op de eerste regel, want die zegt de lezer meer dan
+   * het kale MeshCore-nummer -- de MeshCore-versie staat er toch in. */
+  if (payload[0] == REQ_TYPE_GET_OWNER_INFO) {
+    /* Regeleindes via een losse constante: dit bestand wordt met scripts
+     * bewerkt en een \n in een opmaakreeks sneuvelde daar al twee keer. */
+    static const char OWNER_FMT[] = { '%','s',10,'%','s',10,'%','s',0 };
+    int n = snprintf((char*)&reply_data[4], sizeof(reply_data) - 8, OWNER_FMT,
+                     MESHUPTIME_BRAND_FULL(FIRMWARE_VERSION),
+                     _prefs.node_name, _prefs.owner_info);
+    if (n < 0) return 0;
+    return 4 + (int)strlen((char*)&reply_data[4]);
   }
 
   if (payload[0] == REQ_TYPE_GET_TELEMETRY_DATA) {
