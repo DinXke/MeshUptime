@@ -7,6 +7,56 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.11.0 — adverteren als repeater, met een eigen naam
+
+Alleen de room-server-variant. Standaard **uit**; er verandert niets tot je hem
+aanzet.
+
+**Het probleem.** Deze node stuurt pakketten door (`allowPacketForward` staat
+open), en de hop die hij daarbij in het pad stempelt is de sleutel van
+**room 0** — `Mesh::routeRecvPacket()` doet `self_id.copyHashTo(...)`. Maar die
+sleutel adverteert zichzelf als *room*. In een app of in MeshManager komt die hop
+dus wél voorbij terwijl er geen repeaternaam aan hangt: je ziet een room, of
+niets. Gemeten vóór de wijziging: MeshManager kende `48d7aade232b` als
+`{"name": "BE-HSS-DinX-Storingen", "node_type": "room"}`.
+
+**De instelling.** Staat hij aan, dan stelt diezelfde sleutel zich in zijn advert
+voor als `ADV_TYPE_REPEATER` met een naam die je zelf kiest. Alleen room 0 — de
+andere rooms stempelen niets in een pad en blijven gewoon rooms. Een lege naam
+valt terug op de nodenaam en anders op de roomnaam: er gaat nooit een naamloos
+advert uit, want dat toont in elke app als "(unnamed)".
+
+**Waarom dit een keuze is en geen verbetering-voor-iedereen.** Eén sleutel draagt
+in het MeshCore-advert precies **één** type, en een app onthoudt per sleutel één
+contact. "Allebei adverteren" bestaat dus niet: twee adverts voor dezelfde sleutel
+laten het contact heen en weer klappen. Zolang dit aanstaat ziet een app deze
+sleutel **niet meer als room** — de room blijft draaien en blijft joinbaar via zijn
+QR/join-link, alleen het ontdekken via het advert valt weg. Die prijs staat in de
+GUI, niet alleen hier.
+
+**Waarom geen aparte sleutel voor de repeater.** Dat zou het probleem verplaatsen
+in plaats van oplossen: de hops blijven dan de hash van room 0 dragen, dus de
+naam van die tweede sleutel zou nog steeds niet bij de hop horen. Het enige dat
+werkt is dat de sleutel die het doorsturen dóet zich ook zo voorstelt.
+
+**Web:** stand in `/rooms.json` (`repadv`), zetten via `POST /repeater/advert`
+(`on`, `name`) — POST-only, want dit verandert hoe de node zich aan de hele mesh
+voorstelt en stuurt meteen een advert. Config in `/repeater.cfg` (`#MUREP1`).
+Bediening in de Rooms-tab, onder de roomtabel.
+
+**Geverifieerd op de lucht** (12 sep 2026). Aanzetten met een proefnaam, en 35
+seconden later kende MeshManager dezelfde sleutel als
+`{"name": "BE-HSS-DinX-RPT", "node_type": "repeater"}`. De ruwe advertbytes uit
+het pakketarchief bevestigen het: zelfde pubkey `48d7aade232b54c8…`,
+`node_type: repeater`. Daarna teruggezet op uit en gecontroleerd dat het contact
+weer `room | BE-HSS-DinX-Storingen` werd.
+
+**Wat die test óók liet zien.** Van de drie adverts die ik er doorheen stuurde,
+haalde er één de overkant niet: LoRa kent geen ontvangstbevestiging en een los
+zero-hop-advert kan gewoon wegvallen. Dat staat nu bij de instelling — met de
+verwijzing naar de bestaande advert-knop bij room 0, die exact hetzelfde pakket
+stuurt.
+
 ## v2.10.0 — de twee lijnen samen
 
 De IRC-server en de geplande kanaalberichten zijn parallel ontwikkeld, op twee

@@ -713,6 +713,15 @@ public:
   int  webAnnounceDel(int i) override     { return announceDel(i); }
   size_t webAnnounceRoom() override      { return announceRoom(); }
   int  webAnnounceGap() override         { return announceGap(); }
+  /* ---- IWebNode: adverteren als repeater ---- */
+  bool webRepeaterAdvertGet(int* on, char* name, size_t name_len) override {
+    if (on) *on = _rep_adv_on ? 1 : 0;
+    if (name && name_len) StrHelper::strncpy(name, repeaterAdvertName(), name_len);
+    return true;
+  }
+  int  webRepeaterAdvertSet(int on, const char* name) override {
+    return setRepeaterAdvert(on != 0, name);
+  }
   int  webAnnounceSetGap(int s) override { return announceSetGap(s); }
   int  webAnnounceFireNow(int i) override { return announceFireNow(i); }
 
@@ -821,6 +830,24 @@ public:
   bool botRecipHas(int b, const uint8_t* pubkey) const;
   int  botSendTo(int b, const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
   int  botPost(int b, const char* text);                              // aantal aangeschreven, <0 fout
+
+  /* ---- Adverteren als REPEATER (v2.11.0) ----
+   * Deze node stuurt pakketten door onder de sleutel van room 0; die hash komt in
+   * het pad van elk doorgestuurd pakket. Staat dit AAN, dan stelt diezelfde
+   * sleutel zich in zijn advert voor als repeater (ADV_TYPE_REPEATER) met de naam
+   * hieronder, zodat die hop in apps en in MeshManager een naam krijgt.
+   *
+   * De prijs staat in de GUI: één sleutel draagt één advert-type, dus zolang dit
+   * aanstaat ziet een app deze sleutel NIET meer als room. De room blijft gewoon
+   * werken en blijft joinbaar via zijn QR/join-link; alleen het ontdekken via het
+   * advert valt weg. De andere rooms, sensor-nodes en bots hebben eigen sleutels
+   * en veranderen niet. */
+  bool        repeaterAdvertOn() const   { return _rep_adv_on; }
+  /* De naam die in het advert komt. Leeg veld -> de nodenaam uit de prefs, zodat
+   * er nooit een naamloos repeater-advert de lucht in gaat. */
+  const char* repeaterAdvertName() const;
+  /* 0 ok, -2 ongeldige naam (te lang of leeg terwijl er ook geen nodenaam is). */
+  int         setRepeaterAdvert(bool on, const char* name);
 
   /* ---- Hashtag-/publieke kanalen: publieke API (CLI + web) ---- */
   int  channelMax() const { return MAX_CHANNELS; }
@@ -998,6 +1025,8 @@ private:
 
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
   BotChannel    _channels[MAX_CHANNELS];
+  bool          _rep_adv_on;           // hoofdidentiteit adverteert als repeater
+  char          _rep_adv_name[24];     // naam daarvoor ("" = de nodenaam)
   Announce      _announces[MAX_ANNOUNCES];
   unsigned long _next_announce_tick;   // millis van de volgende klokcontrole
   uint16_t      _ann_gap_s;            // seconden tussen twee kanalen
@@ -1155,6 +1184,8 @@ private:
   /* Bouwen + IN het kanaal versturen: "<botnaam>: <reply>". */
   /* Geplande kanaalberichten. loopAnnounces() kijkt hoogstens elke paar seconden
    * op de klok en verstuurt wat er op dit moment hoort te gaan. */
+  void          loadRepeaterAdvert();
+  void          saveRepeaterAdvert();
   void          loadAnnounces();
   void          saveAnnounces();
   void          loopAnnounces();

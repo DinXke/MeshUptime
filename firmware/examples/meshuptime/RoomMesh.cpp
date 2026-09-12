@@ -104,6 +104,10 @@
  * erin zou bij het inlezen door een oudere regel heen lopen. Een eigen bestand
  * dat er nog niet is, is gewoon een lege lijst. */
 #define ANNOUNCE_CFG_PATH "/announce.cfg"
+/* Adverteren als repeater (v2.11.0). Eigen bestandje: het gaat over hoe de
+ * hoofdidentiteit zich voorstelt, niet over een room, en de room-config van een
+ * draaiende node hoort er niet voor te veranderen. */
+#define REPADV_CFG_PATH   "/repeater.cfg"
 /* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
  * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
 #define COMPANIONS_PATH  "/companions.cfg"
@@ -342,6 +346,9 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   /* Geplande kanaalberichten (persistent, /announce.cfg). */
   loadAnnounces();
+
+  /* Hoe de hoofdidentiteit zich voorstelt (persistent, /repeater.cfg). */
+  loadRepeaterAdvert();
 
   /* Companions (v2.4.0): persistente lijst in /companions.cfg. Seed niets. */
   loadCompanions();
@@ -1413,8 +1420,15 @@ mesh::Packet* RoomMesh::createRoomAdvert(RoomSlot& slot) {
    * slot.name (naam-only, net als simple_room_server). De inkomende parser
    * (onAdvertRecv -> AdvertDataParser) verwachtte dit standaardformaat al; alleen
    * onze UITGAANDE adverts waren fout. */
+  /* ROOM 0 MAG ZICH ALS REPEATER VOORSTELLEN (v2.11.0). Die sleutel is degene
+   * die het doorsturen doet en dus in elk doorgestuurd pad staat; zonder dit
+   * hangt er aan die hop geen repeaternaam. Alleen room 0: de andere rooms
+   * stempelen niets in een pad en zijn gewoon rooms. Zie setRepeaterAdvert(). */
+  bool als_repeater = _rep_adv_on && (&slot == &rooms[0]);
+
   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
-  AdvertDataBuilder builder(ADV_TYPE_ROOM, slot.name);
+  AdvertDataBuilder builder(als_repeater ? ADV_TYPE_REPEATER : ADV_TYPE_ROOM,
+                            als_repeater ? repeaterAdvertName() : slot.name);
   uint8_t app_data_len = builder.encodeTo(app_data);
 
   self_id = slot.id;
@@ -3117,6 +3131,83 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
     n++;
   }
   return n;
+}
+
+/* ================================================================== */
+/*  Adverteren als repeater (v2.11.0)                                  */
+/* ================================================================== */
+
+const char* RoomMesh::repeaterAdvertName() const {
+  /* Nooit een naamloos advert: valt terug op de nodenaam, en pas daarna op de
+   * roomnaam. Een advert zonder naam toont in elke app als "(unnamed)" en dat is
+   * precies de klacht die deze instelling komt oplossen. */
+  if (_rep_adv_name[0]) return _rep_adv_name;
+  if (_prefs.node_name[0]) return _prefs.node_name;
+  return rooms[0].name;
+}
+
+int RoomMesh::setRepeaterAdvert(bool on, const char* name) {
+  char nieuw[sizeof(_rep_adv_name)];
+  nieuw[0] = 0;
+  if (name) StrHelper::strncpy(nieuw, name, sizeof(nieuw));
+  /* Spaties aan de randen weg: een naam die met een spatie begint leest in een
+   * contactenlijst als een lege regel. */
+  char* p = nieuw; while (*p == ' ') p++;
+  if (p != nieuw) memmove(nieuw, p, strlen(p) + 1);
+  size_t n = strlen(nieuw);
+  while (n > 0 && nieuw[n - 1] == ' ') nieuw[--n] = 0;
+
+  /* Aanzetten zonder naam mag alleen als er iets is om op terug te vallen. */
+  if (on && nieuw[0] == 0 && _prefs.node_name[0] == 0 && rooms[0].name[0] == 0) return -2;
+
+  _rep_adv_on = on;
+  StrHelper::strncpy(_rep_adv_name, nieuw, sizeof(_rep_adv_name));
+  saveRepeaterAdvert();
+
+  /* METEEN een advert, anders duurt het tot de volgende ronde (uren) voordat er
+   * ook maar iets van te zien is. Zero-hop: de buren zien het direct en het kost
+   * geen mesh-brede flood. Het flood-advert volgt vanzelf op zijn eigen schema. */
+  sendRoomAdvertisement(rooms[0], 800, false);
+  return 0;
+}
+
+void RoomMesh::saveRepeaterAdvert() {
+  if (_fs == NULL) return;
+  File f = _fs->open(REPADV_CFG_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUREP1\n");
+  f.printf("r %d %s\n", _rep_adv_on ? 1 : 0, _rep_adv_name);
+  f.printf(".\n");
+  f.close();
+}
+
+void RoomMesh::loadRepeaterAdvert() {
+  _rep_adv_on = false;
+  _rep_adv_name[0] = 0;
+  if (_fs == NULL || !_fs->exists(REPADV_CFG_PATH)) return;
+  File f = _fs->open(REPADV_CFG_PATH, "r");
+  if (!f) return;
+  char line[96];
+  bool first = true;
+  while (f.available()) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int ch = f.read();
+      if (ch < 0 || ch == '\n') break;
+      if (ch == '\r') continue;
+      line[len++] = (char)ch;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'r') continue;
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    _rep_adv_on = (*p == '1');
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    StrHelper::strncpy(_rep_adv_name, p, sizeof(_rep_adv_name));
+  }
+  f.close();
 }
 
 /* ================================================================== */

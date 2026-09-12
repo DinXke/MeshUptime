@@ -229,6 +229,16 @@ public:
    * bericht. */
   virtual int  webAnnounceGap()           { return 0; }
   virtual int  webAnnounceSetGap(int s)   { (void)s; return -1; }
+
+  /* ---- ADVERTEREN ALS REPEATER (web-GUI, v2.11.0) ---------------------------
+   * De node stuurt pakketten door onder de sleutel van zijn hoofdidentiteit;
+   * staat dit aan, dan stelt die sleutel zich in zijn advert voor als repeater
+   * met de gegeven naam, zodat de hop in apps een naam krijgt. Alleen de
+   * room-server implementeert dit. */
+  virtual bool webRepeaterAdvertGet(int* on, char* name, size_t name_len)
+                                 { (void)on; (void)name; (void)name_len; return false; }
+  virtual int  webRepeaterAdvertSet(int on, const char* name)
+                                 { (void)on; (void)name; return -1; }
   virtual int  webAnnounceFireNow(int i)  { (void)i; return -1; }
 
   /* ---- COMPANIONS (web-GUI, v2.4.0) -----------------------------------------

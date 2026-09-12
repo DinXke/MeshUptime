@@ -504,6 +504,7 @@ void web_route_annset()       { if (g_self) g_self->handleAnnounceSet(); }
 void web_route_anndel()       { if (g_self) g_self->handleAnnounceDel(); }
 void web_route_anntest()      { if (g_self) g_self->handleAnnounceTest(); }
 void web_route_anngap()       { if (g_self) g_self->handleAnnounceGap(); }
+void web_route_repadv()       { if (g_self) g_self->handleRepeaterAdvert(); }
 void web_route_companionsjson(){ if (g_self) g_self->handleCompanionsJson(); }
 void web_route_companion()    { if (g_self) g_self->handleCompanion(); }
 void web_route_messagesjson() { if (g_self) g_self->handleMessagesJson(); }
@@ -1751,6 +1752,37 @@ draagt naam&nbsp;+&nbsp;publieke sleutel, <i>niet</i> het wachtwoord). Staat er 
 <b>stealth</b>-room adverteert niet en is alleen via QR/link te vinden.</p>
 <div class="card pad0"><table id="rl"></table></div>
 <div id="rmsg"></div>
+
+<h2>Adverteren als repeater</h2>
+<p class="why"><b>Waarom dit bestaat:</b> deze node <i>stuurt pakketten door</i> —
+en de hop die hij daarbij in het pad stempelt is de sleutel van <b>room&nbsp;0</b>.
+Zolang die sleutel zich als <i>room</i> voorstelt, komt die hop in apps en in
+MeshManager wel voorbij maar hangt er geen repeaternaam aan. Zet dit aan en
+diezelfde sleutel stelt zich voor als <b>repeater</b>, met de naam die je hier
+kiest.</p>
+<div class="card">
+<div class="frow">
+<label class="cb"><input type="checkbox" id="ra-on"> adverteer als repeater</label>
+<input id="ra-name" placeholder="repeaternaam (bv. BE-HSS-DinX-RPT)" maxlength="23" spellcheck="false" style="flex:1;min-width:12rem">
+<button type="button" id="ra-save">opslaan</button>
+</div>
+<div id="ramsg"></div>
+</div>
+<p class="note"><b>De prijs, want die is er.</b> Eén sleutel draagt in het
+MeshCore-advert precies <b>één</b> type, en een app onthoudt per sleutel één
+contact. Staat dit aan, dan ziet een app deze sleutel dus <b>niet meer als
+room</b>. De room zelf blijft gewoon draaien en blijft joinbaar via zijn
+<b>QR/join-link</b> — alleen het ontdekken via het advert valt weg. De andere
+rooms, de sensor-nodes en de bots hebben eigen sleutels en veranderen niet.
+<b>Een aparte sleutel voor de repeater zou niet helpen:</b> de hops blijven dan
+de hash van room&nbsp;0 dragen, dus die naam zou nog steeds niet bij de hop horen.
+Laat je de naam leeg, dan gebruikt de node zijn nodenaam.</p>
+<p class="note"><b>Opslaan stuurt meteen een advert naar de buren</b>, maar LoRa
+kent geen ontvangstbevestiging: bij een test hier ging de ene wel de lucht in en
+de andere niet. Zie je de nieuwe naam nergens verschijnen, druk dan op de
+<b>advert</b>-knop bij room&nbsp;0 &mdash; dat is precies hetzelfde pakket. Het
+mesh-brede flood-advert volgt daarna vanzelf op zijn eigen schema, en pas daarmee
+bereikt de naam ook de nodes die je niet rechtstreeks hoort.</p>
 
 <!-- Deel-paneel: QR + kopieerbare join-link -->
 <div id="rshare" class="card" hidden>
@@ -3748,6 +3780,24 @@ e.textContent=t||"";e.className=ok?"ok":"x";e.style.margin=t?".4rem 0":"0";
 if(t)setTimeout(function(){if(e.textContent==t)e.textContent=""},6000)}
 
 var RM=[];
+/* Adverteren als repeater: stand uit /rooms.json, opslaan via /repeater/advert. */
+function repAdvFill(d){
+  var c=document.getElementById("ra-on"), n=document.getElementById("ra-name");
+  if(!c||!n||!d||!d.repadv)return;
+  c.checked=!!d.repadv.on; n.value=d.repadv.name||"";
+}
+function repAdvSave(){
+  var c=document.getElementById("ra-on"), n=document.getElementById("ra-name");
+  fetch("repeater/advert",{method:"POST",credentials:"include",
+  headers:{"Content-Type":"application/x-www-form-urlencoded"},
+  body:"on="+(c.checked?1:0)+"&name="+encodeURIComponent(n.value.trim())})
+  .then(function(r){return r.json()}).then(function(j){
+    bmsg("ramsg",j.ok?(j.on?("adverteert nu als repeater \u2014 \""+j.name+"\""):
+      "adverteert weer als room"):"mislukt: "+(j.error||""),j.ok?1:0);
+    roomsLoad&&roomsLoad();})
+  .catch(function(){bmsg("ramsg","mislukt",0)});
+}
+(function(){var b=document.getElementById("ra-save");if(b)b.onclick=repAdvSave})();
 function roomsGet(){return fetch("rooms.json",{credentials:"include"})
 .then(function(r){if(r.status==401){location="/login";throw 0}
 if(r.status==501)return null;if(!r.ok)throw 0;return r.json()})}
@@ -3764,7 +3814,7 @@ ircProbe()})
 function roomsLoad(){roomsGet().then(function(d){
 var e=document.getElementById("rl");
 if(!d){e.innerHTML="<tr><td>Deze node kent geen rooms (sensor-variant).</td></tr>";return}
-RM=d.rooms||[];roomsRender(d)}).catch(function(){rmsg("rmsg","kon rooms niet laden",0)})}
+RM=d.rooms||[];roomsRender(d);repAdvFill(d)}).catch(function(){rmsg("rmsg","kon rooms niet laden",0)})}
 
 function roomsRender(d){var e=document.getElementById("rl");e.innerHTML="";
 var h=e.insertRow();["#","naam","stealth","gast","posts",""].forEach(function(t){
@@ -4972,6 +5022,10 @@ void WebTask::routes() {
   _server->on("/announce/del", HTTP_POST, web_route_anndel);
   _server->on("/announce/test", HTTP_POST, web_route_anntest);
   _server->on("/announce/gap", HTTP_POST, web_route_anngap);
+  /* POST-only: dit verandert hoe de node zich aan de hele mesh voorstelt en
+   * stuurt meteen een advert. Geen GET, dus geen link die een browser of een
+   * linkchecker per ongeluk kan volgen. */
+  _server->on("/repeater/advert", HTTP_POST, web_route_repadv);
   /* Companions (v2.4.0): leeskant /companions.json (GET, ook voor MeshManager),
    * mutaties via /companion (POST: key+name toevoegen/wijzigen, of del=prefix). */
   _server->on("/companions.json", HTTP_GET, web_route_companionsjson);
@@ -6303,7 +6357,19 @@ void WebTask::handleRoomsJson() {
     n = appendAclJson(_acl, g_json, sizeof(g_json), n, 1, i);   // 1 = sensor-node
     n += snprintf(g_json + n, sizeof(g_json) - n, "}");
   }
-  strlcat(g_json, "]}", sizeof(g_json));
+  /* Hoe de hoofdidentiteit zich voorstelt (v2.11.0). Hier en niet in een eigen
+   * endpoint: het gaat over room 0 en de Rooms-tab haalt dit bestand toch al op. */
+  {
+    int on = 0; char rn[24], resc[24 * 6 + 1];
+    if (_acl->webRepeaterAdvertGet(&on, rn, sizeof(rn))) {
+      jsonEscape(rn, resc, sizeof(resc));
+      size_t n2 = strlen(g_json);
+      snprintf(g_json + n2, sizeof(g_json) - n2,
+               "],\"repadv\":{\"on\":%d,\"name\":\"%s\"}}", on, resc);
+    } else {
+      strlcat(g_json, "]}", sizeof(g_json));
+    }
+  }
 
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
@@ -7100,6 +7166,40 @@ void WebTask::handleAnnounceDel() {
   int r = _acl->webAnnounceDel(atoi(buf));
   if (r < 0) { _server->send(400, "application/json", "{\"ok\":false,\"error\":\"ongeldige index\"}"); return; }
   _server->send(200, "application/json", "{\"ok\":true}");
+}
+
+/* POST /repeater/advert  (on=0|1, name)
+ *
+ * Verandert hoe de HOOFDIDENTITEIT zich voorstelt: als room (standaard) of als
+ * repeater met een eigen naam. Waarom dat een keuze is en geen verbetering: één
+ * sleutel draagt één advert-type, dus zolang dit aanstaat ziet een app deze
+ * sleutel niet meer als room. De room blijft werken en blijft joinbaar via zijn
+ * QR/join-link; alleen het ontdekken via het advert valt weg. */
+void WebTask::handleRepeaterAdvert() {
+  if (!requireAuth()) return;
+  if (_acl == nullptr) { _server->send(503, "application/json",
+      "{\"ok\":false,\"error\":\"meshlaag niet gekoppeld\"}"); return; }
+  int dummy = 0; char probe[24];
+  if (!_acl->webRepeaterAdvertGet(&dummy, probe, sizeof(probe))) {
+    _server->send(501, "application/json",
+        "{\"ok\":false,\"error\":\"niet beschikbaar op deze variant\"}");
+    return;
+  }
+  char buf[8], name[24];
+  int on = getArg(*_server, "on", buf, sizeof(buf)) ? atoi(buf) : 0;
+  name[0] = 0;
+  getArg(*_server, "name", name, sizeof(name));
+  if (_acl->webRepeaterAdvertSet(on, name) != 0) {
+    _server->send(400, "application/json",
+        "{\"ok\":false,\"error\":\"geef een naam (of zet eerst een nodenaam)\"}");
+    return;
+  }
+  char nu[24], esc[24 * 6 + 1];
+  _acl->webRepeaterAdvertGet(&dummy, nu, sizeof(nu));
+  jsonEscape(nu, esc, sizeof(esc));
+  char out[140];
+  snprintf(out, sizeof(out), "{\"ok\":true,\"on\":%d,\"name\":\"%s\"}", dummy, esc);
+  _server->send(200, "application/json", out);
 }
 
 /* POST /announce/gap  (secs) -- de pauze tussen twee kanalen van dezelfde
