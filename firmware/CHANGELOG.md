@@ -7,6 +7,55 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.16.0 — de buurtlijst overleeft een herstart (en `[req]`-logging)
+
+**Eerst meten, dan repareren.** Na twee gegokte oorzaken voor "de firmware van de
+repeater is te oud" (de niveaubyte, daarna de anonieme verzoeken) is er logging
+bijgekomen die opschrijft wát er binnenkomt en wát er teruggaat: prefix `[req]`,
+altijd aan, stil op een node die niets gevraagd wordt.
+
+De eigenaar drukte op *discover neighbours* en de node schreef op:
+
+```
+[req] verzoek 0x06 (len 12) van een beheerder
+[req] buren: 0 bekend, 0 meegestuurd, antwoord 8 byte (gevraagd 10 vanaf 0, volgorde 0, 4 byte sleutel)
+```
+
+Drie keer, netjes beantwoord. **De app weigerde dus niets** — hij vroeg gewoon, en
+kreeg een lijst met nul ingangen terug. Beide eerdere theorieën waren fout: het
+niveau was niet het probleem en de anonieme verzoeken ook niet (die kwamen niet
+eens langs).
+
+**De echte oorzaak.** De buurtlijst leefde alleen in RAM, en de node was drie
+seconden eerder herstart — deze is die avond vijftien keer geflasht. Een repeater
+die bij elke herstart vergeet wie hij hoort, heeft aan dat scherm niets.
+
+**De lijst gaat nu naar flash.** De 64 laatst gehoorde buren met hun volledige
+sleutel, zodat een verzoek om meer dan een paar byte sleutel ook na een herstart
+te beantwoorden is. Niet alle 200: dat is ruim twintig kilobyte voor ingangen die
+niemand opvraagt. Lui geschreven — een minuut na de laatste wijziging, niet bij
+elk advert, want op een druk mesh is dat een flashschrijfactie per advert. Bij het
+opstarten gaat elke ingang door dezelfde `noteAdvert()` als een echt advert: een
+tweede weg waarop een ingang ontstaat, is een tweede weg die kan afwijken.
+
+**Wat hiermee nog niet bewezen is.** Of het buurtscherm in de app nu vult. Dat de
+node antwoordt staat vast (het staat in de log, met de gevraagde parameters
+erbij); of de app een niet-lege lijst ook toont, moet uit de app blijken. Wat wel
+zeker is: met nul ingangen kon hij niets tonen, en dat lag aan ons.
+
+## v2.15.0 - anonieme verzoeken beantwoorden
+
+De companion-app bevraagt een repeater VOOR de login: ANON_REQ_TYPE_REGIONS (1),
+_OWNER (2) en _BASIC (3, klok + eigenschappen). Deze node herkende ze sinds
+v2.13.0 wel maar beantwoordde ze niet, en wie op zo'n vraag zwijgt kan voor oude
+firmware doorgaan. Nu beantwoord, met het formaat van upstream (antwoordpad uit
+het verzoek, 0xFF = flood) en een snelheidsrem van een antwoord per drie
+seconden -- het zijn vragen zonder login, en elk antwoord kost zendtijd.
+
+Achteraf bleek dit NIET de oorzaak van de klacht te zijn (zie v2.16.0): de app
+stuurt deze verzoeken hier niet eens. Het hoort er wel: een repeater die erop
+zwijgt is onvolledig.
+
 ## v2.14.1 - de app zei "firmware te oud": dat was een getal, geen versie
 
 De companion-app weigerde "discover neighbours" met de melding dat de firmware van

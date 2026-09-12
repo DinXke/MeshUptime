@@ -19,6 +19,13 @@
  * aankondiging, want je denkt dat hij werkt. */
 #define ANN_DIAG(...) do { Serial.printf("[ann] " __VA_ARGS__); Serial.println(); } while (0)
 
+/* === WAT VRAAGT DE CLIENT? =================================================
+ * Altijd-aan, prefix "[req]". Print alleen bij een binnenkomend verzoek, dus op
+ * een stille node blijft het stil. Bestaat omdat "de app zegt dat de firmware te
+ * oud is" van deze kant niet te zien was: zonder dit weet je niet eens of de
+ * vraag de node wel haalt. */
+#define REQ_DIAG(...) do { Serial.printf("[req] " __VA_ARGS__); Serial.println(); } while (0)
+
 /* === CLI-SESSIE-DIAGNOSE ====================================================
  * Waarom dit bestaat. Een repeater kan een loginverzoek keurig ANTWOORDEN
  * (meetbaar in het pakketarchief van een node die het hoort) terwijl deze kant
@@ -62,6 +69,13 @@
 #define REQ_TYPE_GET_TELEMETRY_DATA 0x03
 #define REQ_TYPE_GET_NEIGHBOURS     0x06   /* het buurtscherm van de companion-app */
 #define REQ_TYPE_GET_OWNER_INFO     0x07   /* hoort bij niveau 2 */
+/* Anonieme verzoeken: wat een client VOOR de login kan vragen. */
+#define ANON_REQ_TYPE_REGIONS       0x01
+#define ANON_REQ_TYPE_OWNER         0x02
+#define ANON_REQ_TYPE_BASIC         0x03   /* klok + eigenschappen */
+/* Hoogstens één anoniem antwoord per zoveel ms. Een app bevraagt één keer; een
+ * stortvloed hoort hier te stoppen en niet in onze zendtijd. */
+#define ANON_MIN_GAP_MS             3000
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 
 #define RESP_SERVER_LOGIN_OK        0
@@ -119,6 +133,10 @@
  * wat bij het opstarten gelezen wordt en het bepaalt of de halve node wel of
  * niet opstart. Eén regel, geen afhankelijkheden. */
 #define TRAVEL_CFG_PATH   "/travel.cfg"
+/* De buurtlijst (v2.16.0). Zie saveNeighbours(). */
+#define NEIGHBOURS_CFG_PATH "/neighbours.cfg"
+#define NEIGHBOURS_SAVE_MAX 64
+#define NEIGHBOURS_SAVE_DELAY_MS 60000
 /* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
  * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
 #define COMPANIONS_PATH  "/companions.cfg"
@@ -184,6 +202,8 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
 {
   _board = &board;
   _travel_clock_set = false;
+  _anon_next_ms = 0;
+  _nb_dirty_expiry = 0;
   _reboot_at = 0;
   _fs = NULL;
   _num_active_rooms = 0;
@@ -385,6 +405,10 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   /* Hoe de hoofdidentiteit zich voorstelt (persistent, /repeater.cfg). */
   loadRepeaterAdvert();
+
+  /* De buurtlijst van vóór de herstart. Zonder dit staat het buurtscherm van de
+   * app na elke herstart op nul -- en daar liep het op vast. */
+  loadNeighbours();
 
   /* Reismodus (persistent, /travel.cfg). Moet GELEZEN zijn voor main_room.cpp
    * beslist of WiFi en de taken eromheen opgestart worden. */
@@ -875,6 +899,9 @@ bool RoomMesh::allowPacketForward(const mesh::Packet* packet) {
 void RoomMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
                             const uint8_t* app_data, size_t app_data_len) {
   travelAdoptClock(timestamp);
+  /* De lijst is veranderd; over een minuut wegschrijven. Niet nu: op een druk
+   * mesh zou dat een flashschrijfactie per advert betekenen. */
+  if (_nb_dirty_expiry == 0) _nb_dirty_expiry = futureMillis(NEIGHBOURS_SAVE_DELAY_MS);
   AdvertDataParser parser(app_data, app_data_len);
   neighbours.noteAdvert(id.pub_key,
                         (parser.isValid() && parser.hasName()) ? parser.getName() : NULL,
@@ -958,12 +985,108 @@ void RoomMesh::getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) {
   }
 }
 
+/* ------------------------------------------------------------------ *
+ *  Anonieme verzoeken: regio's, eigenaar, klok (v2.15.0)               *
+ * ------------------------------------------------------------------ *
+ *
+ * Waarom deze er alsnog zijn. De companion-app BEVRAAGT een repeater voordat er
+ * ingelogd wordt: ANON_REQ_TYPE_REGIONS (1), _OWNER (2) en _BASIC (3) -- dat
+ * laatste is "geef je klok en je eigenschappen". Deze node beantwoordde ze niet,
+ * en een app die op zo'n vraag stilte krijgt kan alleen maar besluiten dat hij met
+ * iets ouds praat. De niveaubyte in het loginantwoord hielp daar niets aan: die
+ * ziet de app pas NA een login.
+ *
+ * Vorm (upstream simple_repeater):
+ *   verzoek:  [ts:4][type:1][antwoordpad-lengte:1][antwoordpad...]
+ *   antwoord: [ts:4][onze klok:4][rest afhankelijk van het type]
+ *
+ * Het ANTWOORDPAD komt uit het verzoek zelf: de client zegt erbij langs welke weg
+ * hij het antwoord wil. 0xFF betekent "ik weet het niet, flood maar".
+ *
+ * SNELHEIDSREM. Dit zijn onversleutelde vragen van wie dan ook: zonder rem is het
+ * een gratis manier om onze zendtijd op te maken. Upstream heeft er een limiter
+ * voor; hier één antwoord per ANON_MIN_GAP_MS, wat voor een app die één keer
+ * bevraagt ruim genoeg is en voor een stortvloed niet.
+ */
+bool RoomMesh::handleAnonTypedReq(mesh::Packet* packet, const mesh::Identity& sender,
+                                  const uint8_t* secret, uint8_t* data, size_t len) {
+  const uint8_t type = data[4];
+  if (type != ANON_REQ_TYPE_REGIONS && type != ANON_REQ_TYPE_OWNER &&
+      type != ANON_REQ_TYPE_BASIC) return false;
+  /* Upstream beantwoordt deze alleen op een DIRECT pakket; een geflood verzoek
+   * zou het hele mesh een antwoord laten uitlokken. */
+  if (!packet->isRouteDirect()) return true;      // herkend, maar niet beantwoord
+  if (len < 6) return true;                       // geen antwoordpad meegestuurd
+
+  unsigned long nu_ms = millis();
+  if (_anon_next_ms && (long)(nu_ms - _anon_next_ms) < 0) {
+    ANN_DIAG("anon-verzoek type %u geweigerd door de snelheidsrem", (unsigned)type);
+    return true;
+  }
+  _anon_next_ms = nu_ms + ANON_MIN_GAP_MS;
+
+  uint8_t pad_len = data[5];
+  if (pad_len != 0xFF && !mesh::Packet::isValidPathLen(pad_len)) return true;
+
+  uint32_t sender_timestamp;
+  memcpy(&sender_timestamp, data, 4);
+  memcpy(reply_data, &sender_timestamp, 4);
+  uint32_t klok = getRTCClock()->getCurrentTime();
+  memcpy(&reply_data[4], &klok, 4);
+
+  int reply_len = 0;
+  if (type == ANON_REQ_TYPE_REGIONS) {
+    reply_len = 8 + region_map.exportNamesTo((char*)&reply_data[8],
+                                             sizeof(reply_data) - 12, REGION_DENY_FLOOD);
+  } else if (type == ANON_REQ_TYPE_OWNER) {
+    /* "nodenaam\neigenaarstekst", met het regeleinde als losse byte omdat dit
+     * bestand met scripts bewerkt wordt en een \n in een opmaakreeks hier al
+     * twee keer gesneuveld is. */
+    static const char OWNER2_FMT[] = { '%', 's', 10, '%', 's', 0 };
+    snprintf((char*)&reply_data[8], sizeof(reply_data) - 12, OWNER2_FMT,
+             _prefs.node_name, _prefs.owner_info);
+    reply_len = 8 + (int)strlen((char*)&reply_data[8]);
+  } else {   /* ANON_REQ_TYPE_BASIC: klok + eigenschappenbyte */
+    reply_data[8] = 0;
+    if (_prefs.disable_fwd) reply_data[8] |= 0x80;   // deze repeater stuurt niet door
+    reply_len = 9;
+  }
+  if (reply_len <= 0) return true;
+
+  /* Terugsturen langs het pad dat de client meegaf. Zelfde drietrapsregel als bij
+   * het loginantwoord: geflood binnen -> pad terugleren, anders direct of (als de
+   * client geen pad wist) geflood. */
+  uint8_t gedeeld[PUB_KEY_SIZE];
+  memcpy(gedeeld, secret, PUB_KEY_SIZE);
+  if (packet->isRouteFlood()) {
+    mesh::Packet* p = createPathReturn(sender, gedeeld, packet->path, packet->path_len,
+                                       PAYLOAD_TYPE_RESPONSE, reply_data, reply_len);
+    if (p) sendFloodReply(p, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+  } else {
+    mesh::Packet* p = createDatagram(PAYLOAD_TYPE_RESPONSE, sender, gedeeld, reply_data, reply_len);
+    if (p) {
+      if (pad_len == 0xFF) {
+        sendFloodReply(p, SERVER_RESPONSE_DELAY, packet->getPathHashSize());
+      } else {
+        uint8_t pad[MAX_PATH_SIZE];
+        mesh::Packet::writePath(pad, &data[6], pad_len);
+        sendDirect(p, pad, pad_len, SERVER_RESPONSE_DELAY);
+      }
+    }
+  }
+  ANN_DIAG("anon-verzoek type %u beantwoord (%d byte)", (unsigned)type, reply_len);
+  return true;
+}
+
 /* ------------------------------------------------------------------ */
 /*  onAnonDataRecv -- room-login                                        */
 /* ------------------------------------------------------------------ */
 void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
                               const mesh::Identity& sender, uint8_t* data, size_t len) {
   if (packet->getPayloadType() != PAYLOAD_TYPE_ANON_REQ) return;
+  REQ_DIAG("anon binnen: eerste byte na ts = 0x%02X, len %u, route %s",
+           (unsigned)(len > 4 ? data[4] : 0), (unsigned)len,
+           packet->isRouteDirect() ? "direct" : "flood");
   /* De bot kent geen room-login/ACL: een (afwijkende) ANON_REQ aan de bot mag NIET
    * in room 0 belanden. De bot praat alleen het TXT-diagnosepad (onPeerDataRecv). */
   if (_active_is_bot) return;
@@ -986,7 +1109,10 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
    * ze negeren: met `allow.read.only` aan levert dat een gast-ingang in de ACL
    * op van iemand die alleen maar iets vroeg. */
   if (data[4] != 0 && data[4] < ' ') {
-    MESH_DEBUG_PRINTLN("anon-verzoek type %u -- geen login, genegeerd", (unsigned)data[4]);
+    /* Een GETYPEERD verzoek, geen login. De app stelt ze voordat hij inlogt; wie
+     * hier zwijgt wordt voor oude firmware aangezien. */
+    if (handleAnonTypedReq(packet, sender, secret, data, len)) return;
+    MESH_DEBUG_PRINTLN("anon-verzoek type %u onbekend -- genegeerd", (unsigned)data[4]);
     return;
   }
 
@@ -1629,6 +1755,9 @@ void RoomMesh::updateFloodAdvertTimer() {
 /* ------------------------------------------------------------------ */
 int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_timestamp,
                             uint8_t* payload, size_t payload_len) {
+  REQ_DIAG("verzoek 0x%02X (len %u) van een %s",
+           (unsigned)payload[0], (unsigned)payload_len,
+           sender && sender->isAdmin() ? "beheerder" : "gast");
   memcpy(reply_data, &sender_timestamp, 4);
 
   if (payload[0] == REQ_TYPE_GET_STATUS) {
@@ -1763,6 +1892,10 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     memcpy(&reply_data[o], &totaal, 2); o += 2;
     memcpy(&reply_data[o], &res_n, 2);  o += 2;
     memcpy(&reply_data[o], resultaat, res_off); o += res_off;
+    REQ_DIAG("buren: %d bekend, %u meegestuurd, antwoord %d byte "
+             "(gevraagd %u vanaf %u, volgorde %u, %u byte sleutel)",
+             aantal, (unsigned)res_n, o, (unsigned)gevraagd, (unsigned)vanaf,
+             (unsigned)volgorde, (unsigned)pfx_len);
     return o;
   }
 
@@ -1850,6 +1983,11 @@ void RoomMesh::loopSlot(RoomSlot& slot) {
 }
 
 void RoomMesh::loop() {
+  if (_nb_dirty_expiry && millisHasNowPassed(_nb_dirty_expiry)) {
+    _nb_dirty_expiry = 0;
+    saveNeighbours();
+  }
+
   /* Uitgestelde herstart na `travel on|off`: het antwoord is inmiddels de deur
    * uit (serieel én over het mesh), dus nu mag de node om. */
   if (_reboot_at && millisHasNowPassed(_reboot_at)) {
@@ -3369,6 +3507,91 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
     n++;
   }
   return n;
+}
+
+/* De buurtlijst naar flash en terug.
+ *
+ * Regelvorm: "n <sleutel 64 hex> <gehoord> <aantal> <snr4> <hops> <type> <naam>".
+ * De naam staat achteraan want die mag spaties bevatten; al het andere is een
+ * getal. Bij het inlezen gaat elke ingang door dezelfde noteAdvert() als een echt
+ * advert.
+ *
+ * ALLEEN DE LAATST GEHOORDE 64. Tweehonderd ingangen met een volledige sleutel is
+ * ruim twintig kilobyte, en de oudste worden toch nooit opgevraagd. */
+void RoomMesh::saveNeighbours() {
+  if (_fs == NULL) return;
+  int totaal = neighbours.getNumEntries();
+  if (totaal <= 0) return;
+
+  File f = _fs->open(NEIGHBOURS_CFG_PATH, "w", true);
+  if (!f) return;
+  f.println("#MUNB1");
+  /* Telkens de nieuwste die ouder is dan de vorige ronde. Simpele selectie: dit
+   * loopt hooguit eens per minuut, een sorteertabel zou hier verspilling zijn. */
+  uint32_t grens = 0xFFFFFFFF;
+  int geschreven = 0;
+  char hex[PUB_KEY_SIZE * 2 + 1];
+  while (geschreven < NEIGHBOURS_SAVE_MAX) {
+    const NeighbourEntry* beste = NULL;
+    for (int i = 0; i < totaal; i++) {
+      const NeighbourEntry* e = neighbours.getEntryByIdx(i);
+      if (e == NULL || e->heard_at == 0 || e->heard_at >= grens) continue;
+      if (beste == NULL || e->heard_at > beste->heard_at) beste = e;
+    }
+    if (beste == NULL) break;
+    grens = beste->heard_at;
+    mesh::Utils::toHex(hex, beste->pub_key, PUB_KEY_SIZE);
+    hex[PUB_KEY_SIZE * 2] = 0;
+    f.printf("n %s %lu %lu %d %u %u %s", hex,
+             (unsigned long)beste->heard_at, (unsigned long)beste->count,
+             (int)beste->snr4, (unsigned)beste->hops, (unsigned)beste->adv_type,
+             beste->name);
+    f.println();
+    geschreven++;
+  }
+  f.println(".");
+  f.close();
+  ANN_DIAG("buurtlijst bewaard: %d van %d", geschreven, totaal);
+}
+
+void RoomMesh::loadNeighbours() {
+  if (_fs == NULL || !_fs->exists(NEIGHBOURS_CFG_PATH)) return;
+  File f = _fs->open(NEIGHBOURS_CFG_PATH, "r");
+  if (!f) return;
+  char line[PUB_KEY_SIZE * 2 + 96];
+  bool first = true;
+  int gelezen = 0;
+  while (f.available()) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int ch = f.read();
+      if (ch < 0 || ch == 10) break;
+      if (ch == 13) continue;
+      line[len++] = (char)ch;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 'n') continue;
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    char* hex2 = p; while (*p && *p != ' ') p++; if (*p) *p++ = 0;
+    if (strlen(hex2) != PUB_KEY_SIZE * 2) continue;
+    uint8_t pub[PUB_KEY_SIZE];
+    if (!mesh::Utils::fromHex(pub, PUB_KEY_SIZE, hex2)) continue;
+    long v[5];
+    bool goed = true;
+    for (int k = 0; k < 5; k++) {
+      while (*p == ' ') p++;
+      if (*p == 0) { goed = false; break; }
+      v[k] = strtol(p, &p, 10);
+    }
+    if (!goed) continue;
+    while (*p == ' ') p++;
+    neighbours.noteAdvert(pub, p, (uint8_t)v[4], (int8_t)v[2], (uint8_t)v[3], (uint32_t)v[0]);
+    gelezen++;
+  }
+  f.close();
+  if (gelezen) ANN_DIAG("buurtlijst gelezen: %d ingangen", gelezen);
 }
 
 /* De buurtlijst als CLI-antwoord.

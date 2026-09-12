@@ -1205,14 +1205,25 @@ private:
   /* Geplande kanaalberichten. loopAnnounces() kijkt hoogstens elke paar seconden
    * op de klok en verstuurt wat er op dit moment hoort te gaan. */
   void          handleTravelCommand(const char* args, char* reply);
+  /* De drie anonieme verzoeken die een companion-app stelt voordat hij inlogt.
+   * true = het was er een (beantwoord of bewust niet), dus geen loginpoging. */
+  bool          handleAnonTypedReq(mesh::Packet* packet, const mesh::Identity& sender,
+                                   const uint8_t* secret, uint8_t* data, size_t len);
   /* Reismodus: de klok uit een gehoord advert overnemen zolang de onze nog op de
    * terugval staat. Eén keer per herstart; zie de toelichting bij de definitie. */
   void          travelAdoptClock(uint32_t advert_ts);
   bool          _travel_clock_set;
+  /* Snelheidsrem op anonieme verzoeken (regio/eigenaar/klok): dat zijn vragen van
+   * wie dan ook, zonder login, en elk antwoord kost zendtijd. */
+  unsigned long _anon_next_ms;
+  /* Buurtlijst naar flash, lui geschreven. 0 = niets te schrijven. */
+  unsigned long _nb_dirty_expiry;
   /* Uitgestelde herstart (travel on|off). Nul = geen. Zie handleTravelCommand:
    * rechtstreeks herstarten verslikt het antwoord dat over het mesh nog verstuurd
    * moet worden. */
   unsigned long _reboot_at;
+  void          saveNeighbours();
+  void          loadNeighbours();
   void          loadTravelMode();
   void          saveTravelMode();
   void          loadRepeaterAdvert();
