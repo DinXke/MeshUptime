@@ -929,7 +929,7 @@ public:
   bool formatFileSystem() override;
   void setTxPower(int8_t power_dbm) override;
   bool setRxBoostedGain(bool enable) override { return radio_driver.setRxBoostedGainMode(enable); }
-  void formatNeighborsReply(char* reply) override { strcpy(reply, "not supported"); }
+  void formatNeighborsReply(char* reply) override;
   void formatStatsReply(char* reply) override;
   void formatRadioStatsReply(char* reply) override;
   void formatPacketStatsReply(char* reply) override;

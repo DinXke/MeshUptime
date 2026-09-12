@@ -142,6 +142,28 @@ struct ServerStats {
   uint16_t n_posted, n_post_push;
 };
 
+/* Wat een REPEATER terugstuurt op REQ_TYPE_GET_STATUS (upstream simple_repeater,
+ * MyMesh.h). Gelijk aan ServerStats tot en met n_flood_dups; alleen de staart
+ * verschilt. Hier letterlijk overgenomen zodat een app die ons als repeater ziet
+ * krijgt wat hij verwacht -- zie handleRequest(). */
+struct RepeaterStatsWire {
+  uint16_t batt_milli_volts;
+  uint16_t curr_tx_queue_len;
+  int16_t  noise_floor;
+  int16_t  last_rssi;
+  uint32_t n_packets_recv;
+  uint32_t n_packets_sent;
+  uint32_t total_air_time_secs;
+  uint32_t total_up_time_secs;
+  uint32_t n_sent_flood, n_sent_direct;
+  uint32_t n_recv_flood, n_recv_direct;
+  uint16_t err_events;
+  int16_t  last_snr;                    // x 4
+  uint16_t n_direct_dups, n_flood_dups;
+  uint32_t total_rx_air_time_secs;
+  uint32_t n_recv_errors;
+};
+
 /* ------------------------------------------------------------------ */
 /*  Constructor / begin                                                 */
 /* ------------------------------------------------------------------ */
@@ -937,14 +959,51 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
   /* De bot kent geen room-login/ACL: een (afwijkende) ANON_REQ aan de bot mag NIET
    * in room 0 belanden. De bot praat alleen het TXT-diagnosepad (onPeerDataRecv). */
   if (_active_is_bot) return;
-  if (len < 9) return;   // 4 ts + 4 sync_since + minstens de nul van het wachtwoord
+  /* 4 ts + minstens de afsluitende nul. De ROOM-vorm heeft er nog 4 bij
+   * (sync_since); zie de twee vormen hieronder. */
+  if (len < 5) return;
 
   RoomSlot& slot = activeSlot();   // room OF virtuele sensor-node
 
   uint32_t sender_timestamp, sender_sync_since;
   memcpy(&sender_timestamp, data, 4);
-  memcpy(&sender_sync_since, &data[4], 4);
   data[len] = 0;
+
+  /* GETYPEERD ANON-VERZOEK, GEEN LOGIN. Upstream kent ANON_REQ_TYPE_REGIONS (1),
+   * _OWNER (2) en _BASIC (3): dan staat er op data[4] een TYPE en geen
+   * wachtwoord. Diezelfde zeef als upstream gebruikt (`data[4] == 0 ||
+   * data[4] >= ' '` betekent "wachtwoord") zegt hier dus: dit is er geen.
+   *
+   * We beantwoorden die verzoeken niet -- maar ze als login lezen is erger dan
+   * ze negeren: met `allow.read.only` aan levert dat een gast-ingang in de ACL
+   * op van iemand die alleen maar iets vroeg. */
+  if (data[4] != 0 && data[4] < ' ') {
+    MESH_DEBUG_PRINTLN("anon-verzoek type %u -- geen login, genegeerd", (unsigned)data[4]);
+    return;
+  }
+
+  /* TWEE WIRE-VORMEN, want de client kiest op ons ADVERT-TYPE
+   * (BaseChatMesh::sendLogin):
+   *
+   *    room:       [ts:4][sync_since:4][wachtwoord]
+   *    repeater:   [ts:4][wachtwoord]
+   *
+   * Sinds deze node zich als repeater kan voorstellen (v2.11.0) komen ze allebei
+   * binnen -- en een client kan ons bovendien nog als het andere type in zijn
+   * lijst hebben van voor de omschakeling. Daarom niet raden maar allebei de
+   * posities aanbieden; verderop wint de vorm waarvan het wachtwoord ECHT klopt.
+   * Dat verzwakt niets: kloppen moet het in beide gevallen. */
+  const char* pw_room = (len >= 9) ? (const char*)&data[8] : NULL;   // room-vorm
+  /* Dezelfde zeef als upstream gebruikt om "is dit een wachtwoord?" te beslissen
+   * (simple_repeater: data[4] == 0 || data[4] >= ' '): bij de ROOM-vorm staat daar
+   * de eerste byte van sync_since, en die is zelden drukbaar. Zo blijft een
+   * room-login zonder wachtwoord (len 8) precies zo geweigerd als voorheen. */
+  const char* pw_rep  = (data[4] == 0 || data[4] >= ' ')
+                      ? (const char*)&data[4] : NULL;            // repeater-vorm
+  memcpy(&sender_sync_since, &data[4], 4);
+  /* Bij de korte vorm staat er geen sync_since: dan begint de client zonder
+   * achterstand. Welke vorm het is weten we pas na de wachtwoordcontrole, dus
+   * dit wordt daar zo nodig op 0 gezet. */
 
   const int a_kind = activeIsSnode() ? ACL_KIND_SNODE : ACL_KIND_ROOM;
   const int a_slot = activeIsSnode() ? _active_snode : _active_slot;
@@ -970,16 +1029,27 @@ void RoomMesh::onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret,
     client->last_activity = getRTCClock()->getCurrentTime();
     client->permissions = (uint8_t)((client->permissions & ~PERM_ACL_ROLE_MASK) | grant);
     memcpy(client->shared_secret, secret, PUB_KEY_SIZE);
-  } else if (data[8] == 0) {   // leeg wachtwoord: alleen als de afzender al bekend is
+  } else if ((pw_room && pw_room[0] == 0) || (!pw_room && pw_rep && pw_rep[0] == 0)) {
+    /* Leeg wachtwoord: alleen als de afzender al bekend is. In de korte vorm is
+     * "leeg" een pakket van precies 4 byte + nul. */
     client = slot.acl.getClient(sender.pub_key, PUB_KEY_SIZE);
   }
 
   if (client == NULL) {
     uint8_t perm;
-    if (strcmp((char*)&data[8], slot.password) == 0) {
+    /* Eerst de room-vorm (die draagt sync_since en is de gewone weg), dan de
+     * repeater-vorm. Wat matcht bepaalt meteen of er een sync_since IS. */
+    if (pw_room && strcmp(pw_room, slot.password) == 0) {
       perm = PERM_ACL_ADMIN;
-    } else if (slot.guest_password[0] && strcmp((char*)&data[8], slot.guest_password) == 0) {
+    } else if (pw_rep && strcmp(pw_rep, slot.password) == 0) {
+      perm = PERM_ACL_ADMIN;
+      sender_sync_since = 0;                 // korte vorm: geen achterstand
+    } else if (slot.guest_password[0] && pw_room &&
+               strcmp(pw_room, slot.guest_password) == 0) {
       perm = PERM_ACL_READ_WRITE;
+    } else if (slot.guest_password[0] && pw_rep && strcmp(pw_rep, slot.guest_password) == 0) {
+      perm = PERM_ACL_READ_WRITE;
+      sender_sync_since = 0;
     } else if (_prefs.allow_read_only) {
       perm = PERM_ACL_GUEST;
     } else {
@@ -1570,6 +1640,20 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     stats.n_flood_dups = ((SimpleMeshTables*)getTables())->getNumFloodDups();
     stats.n_posted = slot.num_posted;
     stats.n_post_push = slot.num_post_pushes;
+
+    /* Stellen we ons als REPEATER voor, dan hoort het antwoord ook de
+     * repeatervorm te hebben -- anders leest de app de staart verkeerd of
+     * verwerpt hij het hele antwoord. De eerste velden zijn gelijk, dus die
+     * nemen we over; de staart vullen we met wat een repeater daar zet. */
+    if (_rep_adv_on || _travel_on) {
+      RepeaterStatsWire r;
+      memcpy(&r, &stats, offsetof(ServerStats, n_posted));   // het gedeelde deel
+      r.total_rx_air_time_secs = getReceiveAirTime() / 1000;
+      r.n_recv_errors = radio_driver.getPacketsRecvErrors();
+      memcpy(&reply_data[4], &r, sizeof(r));
+      return 4 + sizeof(r);
+    }
+
     memcpy(&reply_data[4], &stats, sizeof(stats));
     return 4 + sizeof(stats);
   }
@@ -3154,6 +3238,45 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
     n++;
   }
   return n;
+}
+
+/* De buurtlijst als CLI-antwoord.
+ *
+ * Waarom dit er is: de companion-app beheert een repeater met een CLI-console, en
+ * `neighbors` antwoordde hier "not supported" terwijl de node de lijst gewoon
+ * heeft (de webinterface toont hem). Upstream beantwoordt daarnaast nog een
+ * binair REQ_TYPE_GET_NEIGHBOURS met sortering en paginering; dat is een flink
+ * stuk protocol voor dezelfde informatie bij dezelfde gebruiker.
+ *
+ * Het antwoord moet in de CLI-buffer passen (256 byte), dus het is een KEUZE en
+ * geen volledige lijst -- en dan hoort erbij te staan hoeveel er niet getoond is.
+ * Een lijst die stilzwijgend afkapt laat je denken dat je alles ziet. */
+void RoomMesh::formatNeighborsReply(char* reply) {
+  int totaal = neighbours.getNumEntries();
+  if (totaal == 0) { strcpy(reply, "geen buren gehoord"); return; }
+
+  uint32_t nu = getRTCClock()->getCurrentTime();
+  int o = 0, getoond = 0;
+  for (int i = 0; i < totaal && o < 200; i++) {
+    const NeighbourEntry* e = neighbours.getEntryByIdx(i);
+    if (e == NULL) continue;
+    char hex[5];
+    snprintf(hex, sizeof(hex), "%02X%02X", e->pub_key[0], e->pub_key[1]);
+    /* Ouderdom in minuten: een absolute tijd is hier niet te lezen en de klok van
+     * de node hoeft niet eens te kloppen (reismodus zonder NTP). */
+    long min_geleden = (nu > e->heard_at && e->heard_at) ? (long)((nu - e->heard_at) / 60) : -1;
+    /* "2hop 0min" en niet "2h 0m": dat laatste leest als twee uur nul minuten.
+     * Een onbekende ouderdom wordt "?" en niet "-1". */
+    char oud_str[12];
+    if (min_geleden < 0) snprintf(oud_str, sizeof(oud_str), "?");
+    else snprintf(oud_str, sizeof(oud_str), "%ldmin", min_geleden);
+    int n = snprintf(reply + o, 240 - o, "%s%s %.1fdB %dhop %s",
+                     o ? "; " : "", hex, e->snr4 / 4.0f, (int)e->hops, oud_str);
+    if (n <= 0 || o + n >= 240) break;
+    o += n;
+    getoond++;
+  }
+  if (getoond < totaal) snprintf(reply + o, 256 - o, " (+%d meer)", totaal - getoond);
 }
 
 /* ================================================================== */

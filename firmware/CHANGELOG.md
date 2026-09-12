@@ -7,6 +7,75 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.13.0 — beheerbaar als een gewone repeater, ook in de reismodus
+
+**Wat er stuk was, en waardoor.** Sinds deze node zich als repeater kan
+voorstellen (v2.11.0, en de reismodus zet dat af fabriek aan) lukte inloggen over
+het mesh niet meer. De oorzaak staat in de client, niet bij ons:
+`BaseChatMesh::sendLogin()` kiest de vorm van het loginpakket op het
+**advert-type** van het contact.
+
+```
+room:        [ts:4][sync_since:4][wachtwoord]     tlen = 8 + len
+al de rest:  [ts:4][wachtwoord]                   tlen = 4 + len
+```
+
+Deze node las het wachtwoord altijd op offset 8 — de room-vorm. Kreeg hij de korte
+vorm, dan vergeleek hij de **staart** van het wachtwoord met het echte: van
+`Jramfa82-` bleef `a82-` over. Wie `allow.read.only` aan heeft staan kwam er nog
+als gast in; wie dat uit heeft kreeg niets, en stil, want een foute login hoort
+geen antwoord te krijgen.
+
+**Nu worden beide vormen aanvaard.** Niet geraden op basis van hoe wij onszelf
+adverteren — een client kan ons nog als het andere type in zijn lijst hebben van
+vóór de omschakeling. We bieden allebei de posities aan en wat wint is de vorm
+waarvan het wachtwoord **echt** klopt. Dat verzwakt niets: kloppen moet het in
+beide gevallen. Bij de korte vorm is er geen `sync_since`, dus dan begint de
+client zonder achterstand aan de roomposts — wat een repeater-client toch niet
+opvraagt. Voor de korte vorm geldt dezelfde zeef als upstream gebruikt
+(`data[4] == 0 || data[4] >= ' '` betekent "hier staat een wachtwoord"), zodat een
+room-login zonder wachtwoord precies zo geweigerd blijft als voorheen.
+
+**Het statusantwoord in de repeatervorm.** Dezelfde valkuil, een laag dieper. Op
+`REQ_TYPE_GET_STATUS` antwoordt een room-server met `ServerStats` (52 byte) en een
+repeater met `RepeaterStats` (56 byte). De eerste 48 byte zijn identiek; alleen de
+staart verschilt — `n_posted`/`n_post_push` tegenover
+`total_rx_air_time_secs`/`n_recv_errors`. Een app die een repeater verwacht leest
+die staart verkeerd of verwerpt het hele antwoord; onze eigen `RepeaterCli` doet
+dat laatste expliciet. Stellen we ons als repeater voor, dan antwoorden we nu ook
+als repeater. Zelfde voorwaarde als bij het advert en bij de login, zodat wat we
+zeggen te zijn en wat we spreken nooit uit elkaar lopen.
+
+**Getypeerde anon-verzoeken worden niet meer als login gelezen.** De app stuurt
+vóór een login soms een ANON_REQ met een *type* in plaats van een wachtwoord
+(`ANON_REQ_TYPE_REGIONS` 1, `_OWNER` 2, `_BASIC` 3). Die las deze node als een
+loginpoging; met `allow.read.only` aan leverde dat een gast-ingang in de ACL op
+van iemand die alleen maar iets vroeg. We beantwoorden ze niet — maar we doen ook
+niet meer alsof het een login was.
+
+**`neighbors` doet eindelijk iets.** Dat antwoordde `not supported` terwijl de
+node de buurtlijst gewoon heeft (de webinterface toont hem). De app beheert een
+repeater met een CLI-console, dus daar komt dezelfde informatie nu langs:
+
+```
+0906 12.2dB 2hop 0min; 50C7 8.5dB 1hop 12min (+6 meer)
+```
+
+Eenheden voluit: `2h 0m` leest als twee uur nul minuten en dat is precies het
+verkeerde. Het antwoord past in de CLI-buffer van 256 byte, dus het is een keuze
+en geen volledige lijst — en dan hoort erbij te staan hoeveel er níet getoond is.
+
+**Wat er NIET in zit.** Upstream beantwoordt daarnaast een binair
+`REQ_TYPE_GET_NEIGHBOURS` (0x06) met sortering, paginering en instelbare
+sleutellengte, plus `REQ_TYPE_GET_ACCESS_LIST` (0x05). Die zijn niet
+geïmplementeerd: dat is een flink stuk protocol voor informatie die via de
+CLI-console bij dezelfde gebruiker terechtkomt. Het neighbours-scherm in de app
+blijft dus leeg; de console niet.
+
+**Geverifieerd** (13 sep 2026): `neighbors` over `/cli` gaf eerst
+`geen buren gehoord` (de lijst leeft in RAM en is na een herstart leeg) en na het
+eerste gehoorde advert `0906 12.2dB 2hop 0min`.
+
 ## v2.12.0 — reismodus: alles uit behalve repeteren
 
 Alleen de room-server-variant. Standaard **uit**; er verandert niets tot je hem
