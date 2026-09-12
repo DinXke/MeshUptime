@@ -831,6 +831,21 @@ public:
   int  botSendTo(int b, const uint8_t* pubkey, const char* text);     // 0 ok, <0 fout
   int  botPost(int b, const char* text);                              // aantal aangeschreven, <0 fout
 
+  /* ---- REISMODUS (v2.12.0): alles uit behalve repeteren ----
+   * Aan = geen WiFi (en daarmee geen web, push, poller, IRC en monitors), geen
+   * rooms/sensor-nodes/bots in de lucht, geen geplande berichten, scherm uit.
+   * Wat blijft: de radio, het DOORSTUREN, en één advert -- dat van room 0, als
+   * repeater, met de naam uit de repeater-instelling hieronder. Zo is hij
+   * onderweg een repeater met een naam in plaats van een naamloze hop.
+   *
+   * De keuze wordt bij het OPSTARTEN gelezen (main_room.cpp) en niet halverwege
+   * toegepast: WiFi en de taken eromheen worden bij het opstarten opgezet, en die
+   * later afbreken laat brokken achter. Zetten = bewaren en herstarten. */
+  bool        travelMode() const { return _travel_on; }
+  /* Bewaart de keuze. De AANROEPER herstart (de CLI doet dat meteen); zo staat de
+   * herstart op één plek en niet verstopt in een setter. */
+  int         setTravelMode(bool on);
+
   /* ---- Adverteren als REPEATER (v2.11.0) ----
    * Deze node stuurt pakketten door onder de sleutel van room 0; die hash komt in
    * het pad van elk doorgestuurd pakket. Staat dit AAN, dan stelt diezelfde
@@ -1024,7 +1039,12 @@ private:
   int           _bot_cmd_wait_bot = 0;   // welke bot de uitgestelde uitslag terugstuurt
 
   /* Hashtag-/publieke kanalen die de bot meeleest (zie BotChannel). */
+  /* Alleen om te kunnen HERSTARTEN na `travel on|off`. CommonCLI heeft dezelfde
+   * verwijzing maar houdt hem prive; een tweede pointer naar hetzelfde bord is
+   * goedkoper dan die klasse openbreken. */
+  mesh::MainBoard* _board;
   BotChannel    _channels[MAX_CHANNELS];
+  bool          _travel_on;            // reismodus: alles uit behalve repeteren
   bool          _rep_adv_on;           // hoofdidentiteit adverteert als repeater
   char          _rep_adv_name[24];     // naam daarvoor ("" = de nodenaam)
   Announce      _announces[MAX_ANNOUNCES];
@@ -1184,6 +1204,13 @@ private:
   /* Bouwen + IN het kanaal versturen: "<botnaam>: <reply>". */
   /* Geplande kanaalberichten. loopAnnounces() kijkt hoogstens elke paar seconden
    * op de klok en verstuurt wat er op dit moment hoort te gaan. */
+  void          handleTravelCommand(const char* args, char* reply);
+  /* Reismodus: de klok uit een gehoord advert overnemen zolang de onze nog op de
+   * terugval staat. Eén keer per herstart; zie de toelichting bij de definitie. */
+  void          travelAdoptClock(uint32_t advert_ts);
+  bool          _travel_clock_set;
+  void          loadTravelMode();
+  void          saveTravelMode();
   void          loadRepeaterAdvert();
   void          saveRepeaterAdvert();
   void          loadAnnounces();

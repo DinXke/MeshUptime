@@ -33,6 +33,10 @@
 /* Uitgestelde herstart (room/DM-commando 'reboot'): niet meteen, zodat het
  * antwoord nog verstuurd kan worden. loop() voert hem uit. */
 static unsigned long g_reboot_at = 0;
+/* REISMODUS (v2.12.0), één keer gezet in setup() uit /travel.cfg. Een vlag en
+ * geen functieaanroep: de klassen hierboven staan in dit bestand VOOR the_mesh,
+ * en het is toch een opstartbeslissing -- halverwege wisselen kan niet. */
+static bool g_travel = false;
 
 /* === TIJDELIJKE DIAGNOSE (v2.3.5) ===========================================
  * ALTIJD-AAN seriële logging (MESH_DEBUG staat uit) zodat de coordinator bij het
@@ -241,6 +245,11 @@ protected:
   }
 
   void onSensorDataRead() override {
+    /* REISMODUS: geen alarmmotor. Niet alleen de console blijft dan stil -- er
+     * gaat ook niets de lucht in vanaf een node waarvan de bots uit staan. Dat
+     * betekent wél dat het batterijalarm onderweg niet werkt; dat staat zo in de
+     * changelog, want het is een gevolg dat je moet weten. */
+    if (g_travel) return;
     const float v = (float)board.getBattMilliVolts() / 1000.0f;
     const bool  snoozed = sensors.isSnoozed();
 
@@ -622,6 +631,7 @@ void setup() {
 
   sensors.begin();
   the_mesh.begin(fs);
+  g_travel = the_mesh.travelMode();   // gelezen uit /travel.cfg; zie hierboven
   the_mesh.beginApp();
 
   the_mesh.dm.begin(&the_mesh, &dm_source);
@@ -635,10 +645,35 @@ void setup() {
       &the_mesh);
 
 #ifdef DISPLAY_CLASS
-  ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
+  if (g_travel) {
+    /* Scherm uit. Een OLED die de hele rit hetzelfde beeld toont kost stroom voor
+     * niemand -- er kijkt onderweg niemand naar. Eerst nog één regel, zodat wie
+     * hem aanzet ziet WAAROM het scherm zwart wordt en niet denkt dat hij stuk is. */
+    display.startFrame();
+    display.setCursor(0, 0);
+    display.print("REISMODUS");
+    display.setCursor(0, 12);
+    display.print("alleen repeteren");
+    display.endFrame();
+    delay(2500);
+    display.turnOff();
+  } else {
+    ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
+  }
 #endif
 
 #ifdef WIFI_SSID
+  /* REISMODUS (v2.12.0): sla dit hele blok over. Alles wat hier opgestart wordt
+   * hangt aan WiFi -- de webinterface, de push naar MeshManager, de poller, de
+   * IRC-server en de netwerkmonitors -- en WiFi is op een ESP32-S3 verreweg de
+   * grootste verbruiker. NIET starten is beter dan achteraf afzetten: dan blijven
+   * er geen sockets, taken of time-outs achter die om beurten wakker worden.
+   *
+   * De keuze komt uit /travel.cfg en is al gelezen door the_mesh.begin() hierboven. */
+  if (g_travel) {
+    Serial.println("REISMODUS: geen wifi, geen web, geen bots, geen IRC, geen monitors.");
+    Serial.println("Alleen repeteren. Terug naar alles: 'travel off' (dan herstart hij).");
+  } else
   {
     /* Tijd-config (NTP-server + tijdzone) VÓÓR wifi begint: setNtpServer moet staan
      * voordat de eerste sync (bij connect) draait, en de TZ moet gezet zijn voordat
@@ -751,17 +786,23 @@ void loop() {
   }
 
   the_mesh.loop();
-  sensors.loop();
+  /* REISMODUS: de bewaking draait niet. Niet alleen om de stroom -- zonder
+   * netwerk zou elke monitor in een time-out lopen en dat als STORING melden, en
+   * die melding gaat over de radio. Een repeater die onderweg alarmen staat te
+   * roepen over een netwerk dat er niet is, is erger dan geen bewaking. */
+  if (!g_travel) sensors.loop();
   the_mesh.dm.loop();   // v2.3.12: room-variant miste dit -> uitgestelde net-cmd-uitslag (ping/dns/...) werd nooit teruggepost in de room
 #ifdef WIFI_SSID
-  wifi_task.loop();
-  web_task.loop();
-  push_task.loop();
-  poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
-  irc_task.loop(); // v2.9.0: IRC-sessies; accept + leesronde, keert altijd terug
+  if (!g_travel) {
+    wifi_task.loop();
+    web_task.loop();
+    push_task.loop();
+    poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
+    irc_task.loop(); // v2.9.0: IRC-sessies; accept + leesronde, keert altijd terug
+  }
 #endif
 #ifdef DISPLAY_CLASS
-  ui_task.loop();
+  if (!g_travel) ui_task.loop();
 #endif
   rtc_clock.tick();
 #ifdef HAS_EXTERNAL_WATCHDOG

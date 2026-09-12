@@ -108,6 +108,10 @@
  * hoofdidentiteit zich voorstelt, niet over een room, en de room-config van een
  * draaiende node hoort er niet voor te veranderen. */
 #define REPADV_CFG_PATH   "/repeater.cfg"
+/* Reismodus (v2.12.0). Apart bestandje en bewust piepklein: dit is het eerste
+ * wat bij het opstarten gelezen wordt en het bepaalt of de halve node wel of
+ * niet opstart. Eén regel, geen afhankelijkheden. */
+#define TRAVEL_CFG_PATH   "/travel.cfg"
 /* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
  * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
 #define COMPANIONS_PATH  "/companions.cfg"
@@ -149,6 +153,8 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
       _cli(board, rtc, sensors, region_map, cli_acl, &_prefs, this),
       telemetry(MAX_PACKET_PAYLOAD - 4)
 {
+  _board = &board;
+  _travel_clock_set = false;
   _fs = NULL;
   _num_active_rooms = 0;
   _active_slot = 0;
@@ -349,6 +355,10 @@ void RoomMesh::begin(FILESYSTEM* fs) {
 
   /* Hoe de hoofdidentiteit zich voorstelt (persistent, /repeater.cfg). */
   loadRepeaterAdvert();
+
+  /* Reismodus (persistent, /travel.cfg). Moet GELEZEN zijn voor main_room.cpp
+   * beslist of WiFi en de taken eromheen opgestart worden. */
+  loadTravelMode();
 
   /* Companions (v2.4.0): persistente lijst in /companions.cfg. Seed niets. */
   loadCompanions();
@@ -834,6 +844,7 @@ bool RoomMesh::allowPacketForward(const mesh::Packet* packet) {
 
 void RoomMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp,
                             const uint8_t* app_data, size_t app_data_len) {
+  travelAdoptClock(timestamp);
   AdvertDataParser parser(app_data, app_data_len);
   neighbours.noteAdvert(id.pub_key,
                         (parser.isValid() && parser.hasName()) ? parser.getName() : NULL,
@@ -1424,7 +1435,11 @@ mesh::Packet* RoomMesh::createRoomAdvert(RoomSlot& slot) {
    * die het doorsturen doet en dus in elk doorgestuurd pad staat; zonder dit
    * hangt er aan die hop geen repeaternaam. Alleen room 0: de andere rooms
    * stempelen niets in een pad en zijn gewoon rooms. Zie setRepeaterAdvert(). */
-  bool als_repeater = _rep_adv_on && (&slot == &rooms[0]);
+  /* In de reismodus is repeteren het ENIGE wat deze node doet, dus dan stelt
+   * room 0 zich altijd als repeater voor -- ook als de losse instelling uit
+   * staat. Anders zou de node onderweg als "room" in de lijsten komen terwijl
+   * er geen room draait die iemand kan gebruiken. */
+  bool als_repeater = (_rep_adv_on || _travel_on) && (&slot == &rooms[0]);
 
   uint8_t app_data[MAX_ADVERT_DATA_SIZE];
   AdvertDataBuilder builder(als_repeater ? ADV_TYPE_REPEATER : ADV_TYPE_ROOM,
@@ -1462,6 +1477,13 @@ void RoomMesh::sendSensorNodeAdvertisement(RoomSlot& slot, int delay_millis, boo
 }
 
 void RoomMesh::sendSelfAdvertisement(int delay_millis, bool flood) {
+  /* REISMODUS: alleen room 0, en die stelt zich als repeater voor. De andere
+   * rooms, de sensor-nodes en de bots draaien niet, dus adverteren zou beloven
+   * wat er niet is -- plus elk advert is zendtijd en dus stroom. */
+  if (_travel_on) {
+    if (rooms[0].active) sendRoomAdvertisement(rooms[0], delay_millis, flood);
+    return;
+  }
   for (int i = 0; i < MAX_ROOMS; i++) {
     if (!rooms[i].active || rooms[i].stealth) continue;
     sendRoomAdvertisement(rooms[i], delay_millis + (uint32_t)i * 1000, flood);
@@ -1624,6 +1646,7 @@ void RoomMesh::loop() {
 
   for (int i = 0; i < MAX_ROOMS; i++) {
     if (!rooms[i].active) continue;
+    if (_travel_on && i > 0) continue;      // reismodus: alleen room 0 leeft
     RoomSlot& slot = rooms[i];
     loopSlot(slot);
 
@@ -3134,6 +3157,123 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
 }
 
 /* ================================================================== */
+/*  Reismodus (v2.12.0)                                                */
+/* ================================================================== */
+
+/* travel            -- toon de stand
+ * travel on|off     -- zet hem en herstart meteen
+ *
+ * Herstarten hoort BIJ dit commando en is geen bijwerking: de keuze wordt bij het
+ * opstarten toegepast, dus zonder herstart zou de node zeggen dat hij in de
+ * reismodus staat terwijl WiFi gewoon doorloopt. Dat is precies het soort halve
+ * waarheid dat deze firmware nergens toelaat.
+ *
+ * Het antwoord noemt de weg terug. In de reismodus is er geen webinterface -- dat
+ * is de bedoeling -- en dan is de USB-kabel met `travel off` de enige manier. Wie
+ * dat onderweg pas ontdekt, staat met een node die hij niet meer kan bijsturen. */
+void RoomMesh::handleTravelCommand(const char* args, char* reply) {
+  while (*args == ' ') args++;
+
+  if (*args == 0) {
+    snprintf(reply, 160, "reismodus: %s%s", _travel_on ? "AAN" : "uit",
+             _travel_on ? " (alleen repeteren; `travel off` + herstart voor de rest)"
+                        : " (alles draait)");
+    return;
+  }
+
+  bool aan;
+  if (!strcasecmp(args, "on") || !strcasecmp(args, "aan") || !strcmp(args, "1")) aan = true;
+  else if (!strcasecmp(args, "off") || !strcasecmp(args, "uit") || !strcmp(args, "0")) aan = false;
+  else { strcpy(reply, "gebruik: travel [on|off]"); return; }
+
+  if (aan == _travel_on) {
+    snprintf(reply, 160, "stond al %s", aan ? "aan" : "uit");
+    return;
+  }
+  setTravelMode(aan);
+
+  if (aan) {
+    snprintf(reply, 200, "reismodus AAN -- geen wifi/web/bots/IRC/monitors, alleen "
+                         "repeteren. Terug: USB + `travel off`. Herstart nu...");
+  } else {
+    snprintf(reply, 200, "reismodus uit -- alles komt terug na de herstart. "
+                         "Herstart nu...");
+  }
+  /* Even wachten zodat het antwoord de seriële lijn nog uit kan. */
+  Serial.println(reply);
+  Serial.flush();
+  delay(400);
+  if (_board) _board->reboot();
+}
+
+/* De klok uit het mesh halen als er geen NTP is.
+ *
+ * Voorwaarden, alle vier nodig:
+ *  - reismodus (in de gewone stand doet NTP dit, en beter);
+ *  - nog niet gedaan sinds de herstart (één bron, geen heen-en-weer);
+ *  - onze eigen klok staat nog onder de ondergrens (dus: we weten het echt niet);
+ *  - de gehoorde tijd is zelf plausibel -- boven de ondergrens en niet absurd ver
+ *    weg. Zonder die bovengrens trekt één buur met een kapotte klok iedereen mee.
+ *
+ * TIME_FLOOR is 1 jan 2025; de bovengrens ligt twintig jaar daarboven. Grof, maar
+ * het enige dat hier te controleren valt -- we hebben per definitie geen betere
+ * referentie, anders hadden we deze functie niet nodig. */
+void RoomMesh::travelAdoptClock(uint32_t advert_ts) {
+  if (!_travel_on || _travel_clock_set) return;
+  uint32_t nu = getRTCClock()->getCurrentTime();
+  if (nu >= TIME_FLOOR) { _travel_clock_set = true; return; }   // klok is al goed
+  if (advert_ts < TIME_FLOOR) return;                            // bron weet het ook niet
+  if (advert_ts > TIME_FLOOR + 20UL * 365UL * 24UL * 3600UL) return;   // absurd ver weg
+  if (advert_ts <= nu) return;                                   // alleen vooruit
+
+  getRTCClock()->setCurrentTime(advert_ts);
+  _travel_clock_set = true;
+  /* Geen regeleinde in de opmaakreeks: dit bestand wordt met scripts bewerkt en
+   * een escape sneuvelde daar al eens. Twee aanroepen is even duidelijk. */
+  Serial.printf("[travel] klok overgenomen uit een advert: %lu", (unsigned long)advert_ts);
+  Serial.println();
+}
+
+int RoomMesh::setTravelMode(bool on) {
+  _travel_on = on;
+  saveTravelMode();
+  return 0;
+}
+
+void RoomMesh::saveTravelMode() {
+  if (_fs == NULL) return;
+  File f = _fs->open(TRAVEL_CFG_PATH, "w", true);
+  if (!f) return;
+  f.printf("#MUTRV1\nt %d\n.\n", _travel_on ? 1 : 0);
+  f.close();
+}
+
+void RoomMesh::loadTravelMode() {
+  _travel_on = false;
+  if (_fs == NULL || !_fs->exists(TRAVEL_CFG_PATH)) return;
+  File f = _fs->open(TRAVEL_CFG_PATH, "r");
+  if (!f) return;
+  char line[32];
+  bool first = true;
+  while (f.available()) {
+    size_t len = 0;
+    while (f.available() && len < sizeof(line) - 1) {
+      int ch = f.read();
+      if (ch < 0 || ch == '\n') break;
+      if (ch == '\r') continue;
+      line[len++] = (char)ch;
+    }
+    line[len] = 0;
+    if (first) { first = false; continue; }
+    if (line[0] != 't') continue;
+    char* p = line + 1;
+    while (*p == ' ') p++;
+    _travel_on = (*p == '1');
+  }
+  f.close();
+}
+
+/* ================================================================== */
 /*  Adverteren als repeater (v2.11.0)                                  */
 /* ================================================================== */
 
@@ -3450,6 +3590,7 @@ int RoomMesh::announceSetGap(int secs) {
 /* De klokcontrole. Hoogstens elke vijf seconden, want vaker heeft geen zin voor
  * een raster van hele minuten -- en localtime_r is niet gratis. */
 void RoomMesh::loopAnnounces() {
+  if (_travel_on) return;       // reismodus: geen aankondigingen, geen zendtijd
   if (!millisHasNowPassed(_next_announce_tick)) return;
   _next_announce_tick = futureMillis(5000);
 
@@ -4244,6 +4385,9 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     handleChannelCommand(command + 8, reply);
   } else if (memcmp(command, "irc ", 4) == 0) {
     handleIrcCommand(command + 4, reply);
+  } else if (memcmp(command, "travel", 6) == 0 &&
+             (command[6] == 0 || command[6] == ' ')) {
+    handleTravelCommand(command + 6, reply);
   } else if (memcmp(command, "room ", 5) == 0) {
     handleRoomCommand(command + 5, reply);
   } else if (sender_timestamp == 0 && strcmp(command, "get acl") == 0) {

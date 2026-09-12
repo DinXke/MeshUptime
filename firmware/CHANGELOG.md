@@ -7,6 +7,74 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.12.0 — reismodus: alles uit behalve repeteren
+
+Alleen de room-server-variant. Standaard **uit**; er verandert niets tot je hem
+aanzet.
+
+**Waarvoor.** Deze node is een room-server, een bot, een IRC-server, een monitor
+en een poller — en dat kost stroom, want WiFi staat dan continu aan. Wie hem als
+losse repeater wil meenemen heeft van dat alles niets nodig. Eén schakelaar op de
+seriële CLI zet alles uit behalve wat een repeater nodig heeft.
+
+```
+travel            de stand
+travel on|off     zetten; de node herstart meteen
+```
+
+**Wat er uit gaat:** WiFi (en daarmee de webinterface, de push naar MeshManager,
+de poller, de IRC-server en de netwerkmonitors), de adverts van de andere rooms,
+de sensor-nodes en de bots, de geplande kanaalberichten, de alarmmotor, en het
+scherm. **Wat er blijft:** de radio, het **doorsturen**, en één advert — dat van
+room 0, als repeater, met de naam uit de repeater-instelling (v2.11.0). Onderweg
+is hij dus een repeater met een naam in plaats van een naamloze hop.
+
+**Waarom een herstart.** WiFi en alles wat eraan hangt wordt bij het opstarten
+opgezet. Halverwege afbreken laat brokken achter: open sockets, een webserver
+zonder netwerk, een poller die in een time-out loopt. De schakelaar bewaart dus
+alleen de keuze (`/travel.cfg`) en herstart; bij het opstarten wordt die keuze één
+keer gelezen en dan klopt alles met elkaar.
+
+**De weg terug is de USB-kabel.** In de reismodus is er geen webinterface — dat is
+het punt. `travel off` over serieel en hij herstart als de gewone node. Dat staat
+ook in het antwoord van het commando zelf, zodat je het niet pas onderweg ontdekt.
+
+**De alarmmotor moest er apart uit.** Na de eerste versie bleef
+`[fixedge] mon BEVROREN` doorlopen op de console: die regels komen uit
+`onSensorDataRead()`, en dat is een callback van de **mesh** (de periodieke
+sensoruitlezing), niet van `sensors.loop()`. Dat hij niets verstuurde kwam alleen
+doordat een monitor zonder netwerk "niet meetbaar" is en de grendel uit v2.3.7 dan
+zwijgt — de batterijalarmen zijn wél meetbaar en zouden dus wél de lucht in zijn
+gegaan, vanaf een node waarvan de bots bewust uit staan. **Gevolg dat je moet
+weten: in de reismodus is er geen batterijwaarschuwing.**
+
+**De klok komt uit het mesh.** Zonder WiFi is er geen NTP, en de RTC begint na
+elke herstart op de vaste terugval. Gemeten op de lucht: de adverts droegen alle
+drie `advert_ts 1715770357` — 15 mei 2024. Clients die adverts op volgorde bewaken
+(tegen replay) negeren zo'n advert van een node die ze al kennen, en dan is de
+node weer een naamloze hop — precies wat de repeaternaam moest oplossen. Daarom
+neemt de node in de reismodus de tijd over uit het eerste advert dat hij hoort,
+onder vier voorwaarden: alleen in de reismodus, één keer per herstart, alleen als
+zijn eigen klok nog onder de ondergrens staat, en alleen uit een tijd die zelf
+plausibel is (boven de ondergrens, niet meer dan twintig jaar daarboven). Alleen
+vooruit, zoals overal in dit project. Met een logregel, want een klok die stil
+verspringt is erger dan een klok die verkeerd staat.
+
+**Geverifieerd op de lucht** (12 sep 2026). Na `travel on` herstartte de node en
+meldde de console `REISMODUS: geen wifi, geen web, geen bots, geen IRC, geen
+monitors`; daarna bleef de console **stil**. De webinterface was onbereikbaar
+(`http=000`). En hij repeteerde gewoon door: in het pakketarchief staat om
+22:33:49 een REQ met `pad= 48d7` — de hash van deze node, dus die heeft hem
+doorgestuurd. MeshManager zag hem intussen als
+`{"name": "BE-HSS-DinX-Mobile", "node_type": "repeater"}`.
+
+**Wat dit NIET is: diepe slaap.** MeshCore houdt de radio continu in ontvangst en
+de CPU draait door. WiFi is verreweg de grootste verbruiker op een ESP32-S3 en die
+is nu weg, plus het scherm — maar wat overblijft (CPU + LoRa in RX) is nog altijd
+tientallen milliampère. Reken op een flinke verbetering, niet op een factor tien.
+Een lagere CPU-klok zou daar nog een stuk af halen; dat is bewust niet in deze
+versie meegenomen, want dat hoort gemeten te worden voordat het aan staat.
+
 ## v2.11.0 — adverteren als repeater, met een eigen naam
 
 Alleen de room-server-variant. Standaard **uit**; er verandert niets tot je hem
