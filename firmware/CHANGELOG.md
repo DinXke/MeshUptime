@@ -7,6 +7,57 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.14.0 — het buurtscherm van de app, en een herstart die eerst antwoordt
+
+**`REQ_TYPE_GET_NEIGHBOURS` (0x06).** Het buurtscherm van de companion-app werkt
+nu ook op deze node. Het wire-formaat is letterlijk dat van upstream
+(`simple_repeater`), want daar rekent de app op:
+
+```
+verzoek:  [0]=0x06 [1]=versie(0) [2]=aantal [3..4]=vanaf(uint16)
+          [5]=volgorde [6]=lengte sleutelprefix [7..10]=blob
+antwoord: [uint16 totaal][uint16 in dit antwoord]
+          per buur: [sleutelprefix][uint32 seconden geleden][int8 snr x4]
+```
+
+Volgorde 0 nieuw→oud, 1 oud→nieuw, 2 sterk→zwak, 3 zwak→sterk; paginering via
+`vanaf`/`aantal`; de resultaten passen in 130 byte en wat niet past volgt op de
+volgende vraag. SNR gaat als SNR×4 over de draad, precies wat onze
+`NeighbourEntry` al bewaart.
+
+**Eén afwijking van upstream, met opzet.** Die zet een array van `MAX_NEIGHBOURS`
+pointers op de **stack** en gooit er `std::sort` overheen. Bij ons is
+`MAX_NEIGHBOURS` 200 — 800 byte stapel in een pakkethandler — en deze firmware
+heeft al eens een stapeloverloop gehad van een grote buffer op een handlerstapel
+(zie de les bij v2.2.0). Hier dus een **statische** indextabel van 200 byte en een
+insertion sort: geen allocatie, geen stapel, en bij tweehonderd ingangen ruim snel
+genoeg. De "seconden geleden" wordt op nul geklemd: in de reismodus kan de klok
+verzet zijn sinds we die buur hoorden, en dan zou dat verschil als een enorm getal
+doorkomen.
+
+**De herstart na `travel on|off` antwoordt nu eerst.** `handleTravelCommand` riep
+`_board->reboot()` rechtstreeks aan. Over serieel ging dat goed — daar print ik
+het antwoord zelf vóór de herstart — maar over het **mesh** en over `POST /cli`
+bouwt de aanroeper het antwoord pas ná `handleCommand()`. Dat antwoord vertrok dus
+nooit: in de app zou `travel off` de node laten herstarten zonder een woord terug.
+Juist bij dit commando is dat erg, want het antwoord vertelt hoe je terugkomt. Nu
+zet het commando een tijdstip en herstart `RoomMesh::loop()` drie seconden later.
+
+Gemeten vóór en ná: op de oude build gaf `POST /cli` met `travel on` een leeg
+antwoord, op deze build komt
+`reismodus AAN -- ... Herstart nu...` netjes terug en gaat de node daarna om.
+
+**En die tekst klopt nu ook.** Hij zei "Terug: USB + `travel off`", maar sinds
+v2.13.0 kan de CLI-console van de app over het mesh commando's sturen — en dat is
+onderweg de bruikbare weg, want daar heb je geen kabel bij je. Beide staan er nu.
+
+**Niet getest van deze kant.** Voor het buurtscherm is een MeshCore-client nodig
+en die heb ik hier niet; het formaat is regel voor regel tegen upstream gelegd,
+maar of het scherm in de app vult, moet uit de app zelf blijken. Wat wél getest
+is: de node boot in de reismodus, blijft stil op de console, repeteert door
+(`pad= 48d7` in het pakketarchief) en adverteert als
+`repeater | BE-HSS-DinX-Mobile`.
+
 ## v2.13.0 — beheerbaar als een gewone repeater, ook in de reismodus
 
 **Wat er stuk was, en waardoor.** Sinds deze node zich als repeater kan

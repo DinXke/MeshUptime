@@ -55,6 +55,7 @@
 #define REQ_TYPE_GET_STATUS         0x01
 #define REQ_TYPE_KEEP_ALIVE         0x02
 #define REQ_TYPE_GET_TELEMETRY_DATA 0x03
+#define REQ_TYPE_GET_NEIGHBOURS     0x06   /* het buurtscherm van de companion-app */
 #define REQ_TYPE_GET_ACCESS_LIST    0x05
 
 #define RESP_SERVER_LOGIN_OK        0
@@ -177,6 +178,7 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
 {
   _board = &board;
   _travel_clock_set = false;
+  _reboot_at = 0;
   _fs = NULL;
   _num_active_rooms = 0;
   _active_slot = 0;
@@ -1657,6 +1659,104 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     memcpy(&reply_data[4], &stats, sizeof(stats));
     return 4 + sizeof(stats);
   }
+  /* ---------------------------------------------------------------- *
+   *  REQ_TYPE_GET_NEIGHBOURS (0x06) -- het buurtscherm van de app      *
+   * ---------------------------------------------------------------- *
+   *
+   * Wat een repeater hier hoort te sturen staat in upstream
+   * (simple_repeater/MyMesh.cpp). Het verzoek:
+   *
+   *   [0] 0x06
+   *   [1] versie (alleen 0 bestaat)
+   *   [2] hoeveel buren      (0-255)
+   *   [3..4] vanaf welke     (uint16)
+   *   [5] volgorde           0 nieuw>oud, 1 oud>nieuw, 2 sterk>zwak, 3 zwak>sterk
+   *   [6] hoeveel byte sleutel per buur
+   *   [7..10] willekeurige blob (maakt het pakket uniek)
+   *
+   * Het antwoord (na de weerkaatste tijdstempel van 4 byte):
+   *
+   *   [uint16 totaal bekend][uint16 in dit antwoord]
+   *   dan per buur: [sleutelprefix][uint32 seconden geleden gehoord][int8 snr*4]
+   *
+   * SNR gaat als SNR x 4 over de draad -- precies wat onze NeighbourEntry al
+   * bewaart (snr4), dus daar hoeft niets omgerekend te worden.
+   *
+   * SORTEREN ZONDER GROTE STAPEL. Upstream zet een array van MAX_NEIGHBOURS
+   * pointers op de STACK en gooit er std::sort overheen. Met 200 buren is dat 800
+   * byte stapel in een pakkethandler, en deze firmware heeft al eens een
+   * stapeloverloop gehad van een grote buffer op een handlerstapel (zie de les bij
+   * v2.2.0). Vandaar een STATISCHE indextabel van 200 byte en een insertion sort:
+   * geen allocatie, geen stapel, en bij tweehonderd ingangen ruim snel genoeg.
+   */
+  if (payload[0] == REQ_TYPE_GET_NEIGHBOURS) {
+    if (payload_len < 7) return 0;          // te kort om te lezen; niets verzinnen
+    if (payload[1] != 0) return 0;          // onbekende versie van het verzoek
+
+    uint8_t  gevraagd = payload[2];
+    uint16_t vanaf;   memcpy(&vanaf, &payload[3], 2);
+    uint8_t  volgorde = payload[5];
+    uint8_t  pfx_len  = payload[6];
+    if (pfx_len > PUB_KEY_SIZE) pfx_len = PUB_KEY_SIZE;
+
+    /* De gebruikte ingangen op volgorde zetten. Statisch, zie de kop. */
+    static uint8_t orde[MAX_NEIGHBOURS];
+    int aantal = 0;
+    int totaal_lijst = neighbours.getNumEntries();
+    for (int i = 0; i < totaal_lijst && aantal < MAX_NEIGHBOURS; i++) {
+      const NeighbourEntry* e = neighbours.getEntryByIdx(i);
+      if (e == NULL || e->heard_at == 0) continue;     // lege ingang
+      orde[aantal++] = (uint8_t)i;
+    }
+
+    /* Insertion sort op de gevraagde volgorde. De vergelijking zit in een lambda-
+     * loze vorm (gewone if) omdat er maar vier varianten zijn. */
+    for (int i = 1; i < aantal; i++) {
+      uint8_t huidig = orde[i];
+      const NeighbourEntry* a = neighbours.getEntryByIdx(huidig);
+      int j = i - 1;
+      while (j >= 0) {
+        const NeighbourEntry* b = neighbours.getEntryByIdx(orde[j]);
+        bool a_voor_b;
+        if (volgorde == 1)      a_voor_b = (a->heard_at <  b->heard_at);   // oud -> nieuw
+        else if (volgorde == 2) a_voor_b = (a->snr4     >  b->snr4);       // sterk -> zwak
+        else if (volgorde == 3) a_voor_b = (a->snr4     <  b->snr4);       // zwak -> sterk
+        else                    a_voor_b = (a->heard_at >  b->heard_at);   // nieuw -> oud
+        if (!a_voor_b) break;
+        orde[j + 1] = orde[j];
+        j--;
+      }
+      orde[j + 1] = huidig;
+    }
+
+    uint8_t  resultaat[130];
+    int      res_off = 0;
+    uint16_t res_n = 0;
+    uint32_t nu = getRTCClock()->getCurrentTime();
+    int entry_size = (int)pfx_len + 4 + 1;
+
+    for (int k = 0; k < (int)gevraagd && (k + (int)vanaf) < aantal; k++) {
+      if (res_off + entry_size > (int)sizeof(resultaat)) break;   // vol; de rest volgt op de volgende vraag
+      const NeighbourEntry* e = neighbours.getEntryByIdx(orde[k + vanaf]);
+      if (e == NULL) continue;
+      /* Seconden geleden, en nooit negatief: de klok kan verzet zijn sinds we deze
+       * buur hoorden (in de reismodus neemt de node de tijd uit het mesh over) en
+       * dan zou dit als een enorm getal doorkomen. */
+      uint32_t geleden = (nu > e->heard_at) ? (nu - e->heard_at) : 0;
+      if (pfx_len) { memcpy(&resultaat[res_off], e->pub_key, pfx_len); res_off += pfx_len; }
+      memcpy(&resultaat[res_off], &geleden, 4); res_off += 4;
+      resultaat[res_off] = (uint8_t)e->snr4; res_off += 1;
+      res_n++;
+    }
+
+    uint16_t totaal = (uint16_t)aantal;
+    int o = 4;
+    memcpy(&reply_data[o], &totaal, 2); o += 2;
+    memcpy(&reply_data[o], &res_n, 2);  o += 2;
+    memcpy(&reply_data[o], resultaat, res_off); o += res_off;
+    return o;
+  }
+
   if (payload[0] == REQ_TYPE_GET_TELEMETRY_DATA) {
     uint8_t perm_mask = ~(payload[1]);
     telemetry.reset();
@@ -1725,6 +1825,12 @@ void RoomMesh::loopSlot(RoomSlot& slot) {
 }
 
 void RoomMesh::loop() {
+  /* Uitgestelde herstart na `travel on|off`: het antwoord is inmiddels de deur
+   * uit (serieel én over het mesh), dus nu mag de node om. */
+  if (_reboot_at && millisHasNowPassed(_reboot_at)) {
+    _reboot_at = 0;
+    if (_board) _board->reboot();   // keert niet terug
+  }
   mesh::Mesh::loop();
   loopAnnounces();
 
@@ -3316,17 +3422,24 @@ void RoomMesh::handleTravelCommand(const char* args, char* reply) {
   setTravelMode(aan);
 
   if (aan) {
+    /* De weg terug noemt nu ALLEBEI de wegen. Sinds v2.13.0 kan de
+     * CLI-console van de companion-app over het mesh commando's sturen, en dat
+     * is onderweg de bruikbare weg -- daar heb je geen kabel bij je. */
     snprintf(reply, 200, "reismodus AAN -- geen wifi/web/bots/IRC/monitors, alleen "
-                         "repeteren. Terug: USB + `travel off`. Herstart nu...");
+                         "repeteren. Terug: `travel off` via USB of via de "
+                         "CLI-console van de app. Herstart nu...");
   } else {
     snprintf(reply, 200, "reismodus uit -- alles komt terug na de herstart. "
                          "Herstart nu...");
   }
-  /* Even wachten zodat het antwoord de seriële lijn nog uit kan. */
+  /* NIET hier herstarten. Over serieel zou dat kunnen -- daar is het antwoord al
+   * geprint -- maar over het MESH bouwt de aanroeper het antwoordpakket pas na
+   * deze functie, en dan zou de node stil herstarten zonder ooit te zeggen hoe je
+   * terugkomt. Drie seconden is ruim voor een CLI-antwoord over LoRa (het wacht
+   * zelf al SERVER_RESPONSE_DELAY) en kort genoeg om niet op een herstart te
+   * staan wachten. */
   Serial.println(reply);
-  Serial.flush();
-  delay(400);
-  if (_board) _board->reboot();
+  _reboot_at = futureMillis(3000);
 }
 
 /* De klok uit het mesh halen als er geen NTP is.

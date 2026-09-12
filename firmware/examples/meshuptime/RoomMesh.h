@@ -1209,6 +1209,10 @@ private:
    * terugval staat. Eén keer per herstart; zie de toelichting bij de definitie. */
   void          travelAdoptClock(uint32_t advert_ts);
   bool          _travel_clock_set;
+  /* Uitgestelde herstart (travel on|off). Nul = geen. Zie handleTravelCommand:
+   * rechtstreeks herstarten verslikt het antwoord dat over het mesh nog verstuurd
+   * moet worden. */
+  unsigned long _reboot_at;
   void          loadTravelMode();
   void          saveTravelMode();
   void          loadRepeaterAdvert();
