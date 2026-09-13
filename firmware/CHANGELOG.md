@@ -7,6 +7,43 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.17.0 — `discover.neighbors`: de opdracht die ontbrak
+
+**Het was geen leesactie maar een opdracht.** *Discover neighbours* in de companion-
+app haalt geen lijst op: de app voert eerst het CLI-commando `discover.neighbors`
+uit op de repeater, en die gaat dan zélf zoeken. Pas daarna vraagt hij de lijst op
+met REQ 0x06. Dat commando kende deze node niet, het viel door naar de gewone CLI,
+en de app kreeg een onbekend commando terug — wat hij toont als "de firmware van de
+repeater is te oud". Drie theorieën verder was dat de hele oorzaak; de eigenaar
+wees het aan.
+
+**Hoe de zoekronde werkt** (control-pakketten, zoals upstream `simple_repeater`):
+
+```
+wij → iedereen   0x80 [filter=1<<REPEATER][tag:4][sinds:4]   zero-hop
+ieder → ons      0x90|type [snr×4][tag:4][pubkey:32]         zero-hop
+```
+
+**Zero-hop, en dat is de kern.** Een buur is iemand die je rechtstreeks hoort. Het
+antwoord draagt de SNR die de ander van óns mat, dus je weet niet alleen dát hij er
+is maar ook hoe goed de verbinding is. Een willekeurige vertraging op het antwoord,
+want op één zoekronde antwoordt de hele buurt tegelijk.
+
+**Wij antwoorden ook.** Een repeater die andermans zoekronde negeert is een gat in
+de kaart van iedereen. Met dezelfde voorwaarden als upstream: niet als het
+doorsturen uit staat (dan zijn we geen repeater), en met een rem van een halve
+minuut — dit is een onversleuteld verzoek van wie dan ook en het antwoord kost
+zendtijd.
+
+**De 0x06-lijst is bijgesneden.** Onze buurtlijst bewaart alles wat we horen — ook
+telefoons, rooms en nodes op vijf hops — omdat de webinterface daar iets aan heeft.
+Maar *neighbours* betekent hier wat upstream ermee doet: een REPEATER die we
+rechtstreeks horen. Een telefoon op drie hops als buurrepeater tonen zou de kaart
+van de eigenaar bederven, dus die vallen er nu uit.
+
+**Wat hiermee nog niet bewezen is.** Of het buurtscherm vult. Dat hangt er nu
+vooral van af of er in zendbereik een repeater staat die zelf antwoordt.
+
 ## v2.16.0 — de buurtlijst overleeft een herstart (en `[req]`-logging)
 
 **Eerst meten, dan repareren.** Na twee gegokte oorzaken voor "de firmware van de

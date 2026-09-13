@@ -137,6 +137,12 @@
 #define NEIGHBOURS_CFG_PATH "/neighbours.cfg"
 #define NEIGHBOURS_SAVE_MAX 64
 #define NEIGHBOURS_SAVE_DELAY_MS 60000
+/* De zoekronde naar buurrepeaters (v2.17.0), zie onControlDataRecv(). */
+#define CTL_TYPE_NODE_DISCOVER_REQ   0x80
+#define CTL_TYPE_NODE_DISCOVER_RESP  0x90
+/* Hoogstens eens per halve minuut andermans zoekronde beantwoorden: het is een
+ * onversleuteld verzoek van wie dan ook en het antwoord kost zendtijd. */
+#define DISCOVER_MIN_GAP_MS          30000
 /* Companions (v2.4.0): een persistente lijst van companion-apparaten (T1000-E
  * e.d.) die de bot aanstuurt en waarvan de node #LOC-locatierapporten ontvangt. */
 #define COMPANIONS_PATH  "/companions.cfg"
@@ -204,6 +210,9 @@ RoomMesh::RoomMesh(mesh::MainBoard& board, mesh::Radio& radio, mesh::Millisecond
   _travel_clock_set = false;
   _anon_next_ms = 0;
   _nb_dirty_expiry = 0;
+  _discover_tag = 0;
+  _discover_until = 0;
+  _discover_next_ms = 0;
   _reboot_at = 0;
   _fs = NULL;
   _num_active_rooms = 0;
@@ -1844,6 +1853,13 @@ int RoomMesh::handleRequest(RoomSlot& slot, ClientInfo* sender, uint32_t sender_
     for (int i = 0; i < totaal_lijst && aantal < MAX_NEIGHBOURS; i++) {
       const NeighbourEntry* e = neighbours.getEntryByIdx(i);
       if (e == NULL || e->heard_at == 0) continue;     // lege ingang
+      /* ALLEEN BUURREPEATERS. Onze buurtlijst bewaart alles wat we horen -- ook
+       * telefoons, rooms en nodes op vijf hops -- omdat de webinterface daar
+       * iets aan heeft. Maar "neighbours" betekent hier wat upstream ermee doet:
+       * een REPEATER die we RECHTSTREEKS horen. Een telefoon op drie hops als
+       * buurrepeater tonen zou de kaart van de eigenaar bederven. */
+      if (e->adv_type != ADV_TYPE_REPEATER) continue;
+      if (e->hops != 0) continue;
       orde[aantal++] = (uint8_t)i;
     }
 
@@ -3509,6 +3525,112 @@ int RoomMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel chann
   return n;
 }
 
+/* ================================================================== */
+/*  discover.neighbors -- buurREPEATERS zoeken (v2.17.0)               */
+/* ================================================================== */
+/*
+ * WAT DIT IS, EN WAT HET NIET IS. "Discover neighbours" in de app is geen
+ * leesactie maar een OPDRACHT: de app voert het CLI-commando
+ * `discover.neighbors` uit op de repeater, en die gaat dan zelf zoeken. Pas
+ * daarna haalt de app de lijst op met REQ 0x06. Onze node kende dat commando
+ * niet, viel door naar de gewone CLI en antwoordde met een onbekend commando --
+ * en dat is wat de app als "de firmware is te oud" toonde.
+ *
+ * HOE HET ZOEKEN WERKT (upstream simple_repeater, control-pakketten):
+ *
+ *   wij -> iedereen   CTL_TYPE_NODE_DISCOVER_REQ, zero-hop
+ *                     [0x80][filter=1<<ADV_TYPE_REPEATER][tag:4][since:4]
+ *   ieder -> ons      CTL_TYPE_NODE_DISCOVER_RESP, zero-hop
+ *                     [0x90|type][snr*4][tag:4][pubkey:32]
+ *
+ * ZERO-HOP, en dat is de kern: een buur is iemand die je RECHTSTREEKS hoort.
+ * Daarom draagt het antwoord ook de SNR die de ander van ONS mat -- zo weet je
+ * niet alleen dat hij er is, maar ook hoe goed de verbinding is.
+ *
+ * ALLEEN REPEATERS. Het filter in het verzoek zegt het al en het antwoord draagt
+ * het nodetype in zijn lage vier bits. Een telefoon of een room is geen buur in
+ * deze zin -- die repeat niets.
+ *
+ * WIJ ANTWOORDEN OOK. Een repeater die zelf niet antwoordt op andermans
+ * zoekronde is een gat in de kaart van iedereen. Met dezelfde voorwaarden als
+ * upstream: niet als het doorsturen uit staat (dan zijn we geen repeater) en met
+ * een snelheidsrem, want dit is een onversleuteld verzoek van wie dan ook.
+ */
+
+void RoomMesh::sendNodeDiscoverReq() {
+  uint8_t data[10];
+  data[0] = CTL_TYPE_NODE_DISCOVER_REQ;            /* prefix_only = 0 */
+  data[1] = (uint8_t)(1 << ADV_TYPE_REPEATER);     /* alleen repeaters */
+  getRNG()->random(&data[2], 4);                   /* tag, om antwoorden te matchen */
+  memcpy(&_discover_tag, &data[2], 4);
+  _discover_until = futureMillis(60000);
+  uint32_t since = 0;
+  memcpy(&data[6], &since, 4);
+
+  mesh::Packet* pkt = createControlData(data, sizeof(data));
+  if (pkt) {
+    sendZeroHop(pkt);
+    REQ_DIAG("discover.neighbors verstuurd (tag %08lX), 60 s luisteren",
+             (unsigned long)_discover_tag);
+  } else {
+    REQ_DIAG("discover.neighbors: pakket NIET gemaakt");
+  }
+}
+
+void RoomMesh::onControlDataRecv(mesh::Packet* packet) {
+  if (packet->payload_len < 6) return;
+  uint8_t type = packet->payload[0] & 0xF0;
+
+  if (type == CTL_TYPE_NODE_DISCOVER_REQ) {
+    /* Iemand zoekt buren. Wij zijn er een zolang we doorsturen. */
+    if (_prefs.disable_fwd) return;
+    unsigned long nu = millis();
+    if (_discover_next_ms && (long)(nu - _discover_next_ms) < 0) return;   /* rem */
+    _discover_next_ms = nu + DISCOVER_MIN_GAP_MS;
+
+    int i = 1;
+    uint8_t filter = packet->payload[i++];
+    uint32_t tag; memcpy(&tag, &packet->payload[i], 4); i += 4;
+    uint32_t since = 0;
+    if ((int)packet->payload_len >= i + 4) memcpy(&since, &packet->payload[i], 4);
+    if ((filter & (1 << ADV_TYPE_REPEATER)) == 0) return;   /* niet naar ons gevraagd */
+    if (_prefs.discovery_mod_timestamp < since) return;     /* niets nieuws te melden */
+
+    bool prefix_only = (packet->payload[0] & 1) != 0;
+    uint8_t data[6 + PUB_KEY_SIZE];
+    data[0] = CTL_TYPE_NODE_DISCOVER_RESP | ADV_TYPE_REPEATER;
+    data[1] = (uint8_t)packet->_snr;        /* wat WIJ van hem maten (x4) */
+    memcpy(&data[2], &tag, 4);
+    memcpy(&data[6], rooms[0].id.pub_key, PUB_KEY_SIZE);
+    mesh::Packet* resp = createControlData(data, prefix_only ? 6 + 8 : 6 + PUB_KEY_SIZE);
+    if (resp) {
+      /* Ruime willekeurige vertraging: op één zoekronde antwoorden alle buren
+       * tegelijk, en dan praten ze door elkaar heen. */
+      sendZeroHop(resp, getRetransmitDelay(resp) * 4);
+      REQ_DIAG("discover-verzoek beantwoord (tag %08lX)", (unsigned long)tag);
+    }
+    return;
+  }
+
+  if (type == CTL_TYPE_NODE_DISCOVER_RESP) {
+    uint8_t node_type = packet->payload[0] & 0x0F;
+    if (node_type != ADV_TYPE_REPEATER) return;
+    if (packet->payload_len < 6 + PUB_KEY_SIZE) return;   /* alleen de volle sleutel */
+    if (_discover_tag == 0 || millisHasNowPassed(_discover_until)) { _discover_tag = 0; return; }
+    uint32_t tag; memcpy(&tag, &packet->payload[2], 4);
+    if (tag != _discover_tag) return;                     /* van een andermans ronde */
+    if (memcmp(&packet->payload[6], rooms[0].id.pub_key, PUB_KEY_SIZE) == 0) return;  /* onszelf */
+
+    /* In de buurtlijst, langs dezelfde weg als een advert: type repeater, nul
+     * hops (anders was het geen buur) en de SNR die WIJ van hem maten. De naam
+     * kennen we hier niet -- die komt uit een advert als dat ooit langskomt. */
+    neighbours.noteAdvert(&packet->payload[6], "", ADV_TYPE_REPEATER,
+                          (int8_t)packet->_snr, 0, getRTCClock()->getCurrentTime());
+    if (_nb_dirty_expiry == 0) _nb_dirty_expiry = futureMillis(NEIGHBOURS_SAVE_DELAY_MS);
+    REQ_DIAG("buur gevonden via discover (snr %d/4)", (int)(int8_t)packet->_snr);
+  }
+}
+
 /* De buurtlijst naar flash en terug.
  *
  * Regelvorm: "n <sleutel 64 hex> <gehoord> <aantal> <snr4> <hops> <type> <naam>".
@@ -4869,6 +4991,19 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     handleChannelCommand(command + 8, reply);
   } else if (memcmp(command, "irc ", 4) == 0) {
     handleIrcCommand(command + 4, reply);
+  } else if (memcmp(command, "discover.neighbors", 18) == 0) {
+    /* Zo heet het commando dat de companion-app op een repeater uitvoert als
+     * je op "discover neighbours" drukt; de naam komt letterlijk uit upstream.
+     * Zonder dit viel het door naar de gewone CLI en kreeg de app een
+     * onbekend commando terug -- wat hij toonde als "firmware te oud". */
+    const char* sub = command + 18;
+    while (*sub == ' ') sub++;
+    if (*sub != 0) {
+      strcpy(reply, "Err - discover.neighbors has no options");
+    } else {
+      sendNodeDiscoverReq();
+      strcpy(reply, "OK - Discover sent");
+    }
   } else if (memcmp(command, "travel", 6) == 0 &&
              (command[6] == 0 || command[6] == ' ')) {
     handleTravelCommand(command + 6, reply);

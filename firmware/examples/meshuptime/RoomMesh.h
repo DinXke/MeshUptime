@@ -951,6 +951,8 @@ protected:
 
   mesh::DispatcherAction onRecvPacket(mesh::Packet* pkt) override;
   bool allowPacketForward(const mesh::Packet* packet) override;
+  /* Control-pakketten: de zoekronde naar buurrepeaters, beide richtingen. */
+  void onControlDataRecv(mesh::Packet* packet) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len) override;
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
   int  searchPeersByHash(const uint8_t* hash) override;
@@ -1218,10 +1220,16 @@ private:
   unsigned long _anon_next_ms;
   /* Buurtlijst naar flash, lui geschreven. 0 = niets te schrijven. */
   unsigned long _nb_dirty_expiry;
+  /* Zoekronde naar buurrepeaters (discover.neighbors). De tag koppelt de
+   * antwoorden aan ONZE ronde; buiten het venster tellen ze niet mee. */
+  uint32_t      _discover_tag;
+  unsigned long _discover_until;
+  unsigned long _discover_next_ms;   // rem op het beantwoorden van andermans ronde
   /* Uitgestelde herstart (travel on|off). Nul = geen. Zie handleTravelCommand:
    * rechtstreeks herstarten verslikt het antwoord dat over het mesh nog verstuurd
    * moet worden. */
   unsigned long _reboot_at;
+  void          sendNodeDiscoverReq();
   void          saveNeighbours();
   void          loadNeighbours();
   void          loadTravelMode();
