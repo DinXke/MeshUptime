@@ -183,6 +183,15 @@ public:
    * een nul een meting, en een verzonnen nul wordt een punt in een grafiek. */
   void queueRepeaterStats(const char* pubkey_hex12, const RepeaterStatus& st);
 
+  /* De burenlijst van een andere repeater (v2.20.0). De rijen zijn de RUWE
+   * draadingangen uit RepeaterCli (RCLI_NB_ENTRY byte per stuk); ze worden hier
+   * pas naar JSON vertaald, zodat de mesh-ontvangstlus alleen hoeft te
+   * kopieren. ``total`` is wat de NODE zelf zegt te kennen en is het getal dat
+   * als neighbor_count gemeld wordt -- niet ``count``, want dat is alleen wat
+   * wij ophaalden. */
+  void queueRepeaterNeighbours(const char* pubkey_hex12, const uint8_t* rows,
+                               uint8_t count, uint16_t total);
+
   typedef void (*PollFn)(void* ctx, const char* body);
   bool requestPoll(PollFn cb, void* ctx);
   bool pollInFlight() const { return _poll_requested || _kind == KIND_POLL; }
@@ -212,7 +221,7 @@ private:
    * finishOk()/failXxx() ruimen de bijhorende ring op. Companion-pushes gaan
    * VOOR (een val mag niet achter een heartbeat aansluiten). */
   enum PushKind : uint8_t { KIND_SENSOR = 0, KIND_COMPANION, KIND_REPCLI, KIND_POLL,
-                           KIND_INGEST };
+                           KIND_INGEST, KIND_NEIGHBOURS };
   PushKind _kind = KIND_SENSOR;
 
   /* De poll (GET /api/v1/commands). _poll_requested = de Poller wil pollen zodra
@@ -249,6 +258,21 @@ private:
     char           node[13];   /* pubkey-prefix van de DOELrepeater, 12 hex */
     RepeaterStatus st;
   };
+  /* De burenring. EEN plaats: een burenronde volgt altijd op een statusronde
+   * van dezelfde sessie, er loopt er hoogstens een tegelijk, en de push
+   * vertrekt binnen seconden. Een tweede plaats zou 160 byte kosten voor een
+   * samenloop die niet bestaat. */
+  static const uint8_t NB_RING_SIZE = 1;
+  struct NbPush {
+    char     node[13];
+    uint8_t  rows[RCLI_NB_MAX * RCLI_NB_ENTRY];
+    uint8_t  count;
+    uint16_t total;
+  };
+  NbPush  _nbring[NB_RING_SIZE];
+  uint8_t _nbring_count = 0;
+  uint8_t _nb_inflight  = 0;
+
   IngestPush _iring[ING_RING_SIZE];
   uint8_t _iring_tail   = 0;
   uint8_t _iring_count  = 0;
@@ -323,6 +347,7 @@ private:
   bool buildRepCliBody(char* body, size_t cap, size_t& blen);
   bool buildIngestBody(char* body, size_t cap, size_t& blen);
   bool buildPollRequest();   /* KIND_POLL: een GET zonder body */
+  bool buildNeighboursBody(char* body, size_t cap, size_t& blen);
   void stepConnect();
   void stepSend();
   void stepRecv();

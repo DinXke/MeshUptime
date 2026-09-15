@@ -161,6 +161,7 @@ public:
   uint8_t     pendingCount() const   { return _pending_count; }
   int         lastRefreshSeen() const { return _last_refresh_seen; }
   uint32_t    autoStartedCount() const { return _auto_started; }
+  uint32_t    neighboursOkCount() const { return _nb_ok; }
   uint32_t    statusOkCount() const   { return _status_ok; }
   uint32_t    statusFailCount() const { return _status_fail; }
   uint32_t    clockfixOkCount() const   { return _clockfix_ok; }
@@ -230,6 +231,7 @@ private:
   uint32_t _processed;             // verwerkte settings-verzoeken (gestart of geweigerd)
   uint32_t _dropped;               // verzoeken die _pending niet meer in konden
   int      _last_refresh_seen;     // statusverzoeken in de laatste poll (nu uitgevoerd)
+  uint32_t _nb_ok;                 // geslaagde burenrondes
   uint32_t _status_ok;             // geslaagde statusrondes (metingen gemeld)
   uint32_t _status_fail;           // statusrondes zonder meting (login/stil/onplausibel)
   uint32_t _clockfix_ok;           // klok-jobs die met "OK - " eindigden
@@ -272,6 +274,13 @@ private:
 
   /* De uitslag van een statusronde, doorgegeven door RepeaterCli. Statische thunk
    * -> deze instance; zet de meting in de PushTask-ring en telt mee. */
+  /* De burenronde (v2.20.0): dezelfde weg als de statusuitslag, een eigen
+   * push. Het AANTAL komt uit de teller van de node zelf, niet uit de lijst. */
+  static void nbThunk(void* ctx, const char* pubkey_hex12, const uint8_t* rows,
+                      uint8_t count, uint16_t total);
+  void onNeighbours(const char* pubkey_hex12, const uint8_t* rows,
+                    uint8_t count, uint16_t total);
+
   static void statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st);
   void onStats(const char* pubkey_hex12, const RepeaterStatus& st);
 

@@ -65,6 +65,27 @@
 #define RCLI_STATS_WIRE_LEN   56
 #define RCLI_STATUS_RESP_MIN  (4 + RCLI_STATS_WIRE_LEN)   /* 60 */
 
+/* DE BURENRONDE (v2.20.0). Zie sendNeighboursReq() voor de draadvorm.
+ *
+ * RCLI_NB_PREFIX_LEN is drie omdat zes hextekens de breedte is waarop elke
+ * tabel aan de serverkant keyt; meer vragen kost zendtijd voor iets dat daar
+ * toch afgekapt wordt. RCLI_NB_PER_REQ past ruim in de 130-byte antwoord-
+ * buffer van upstream (9 x 8 = 72 byte). RCLI_NB_MAX is wat er in EEN push
+ * naar de server past; het gemelde AANTAL komt niet uit deze lijst maar uit de
+ * teller die de node zelf meestuurt, dus dit plafond maakt het getal niet
+ * onwaar -- het bepaalt alleen hoeveel van de verste buren wegvallen. */
+#define REQ_TYPE_GET_NEIGHBOURS  0x06
+#define RCLI_NB_PREFIX_LEN    3
+#define RCLI_NB_PER_REQ       9
+#define RCLI_NB_MAX           18
+#define RCLI_NB_ENTRY         (RCLI_NB_PREFIX_LEN + 4 + 1)
+
+/* De uitslag van een burenronde: de ruwe draadingangen (RCLI_NB_ENTRY byte
+ * per stuk), hoeveel we er ophaalden, en hoeveel de node er ZELF zegt te
+ * kennen. Die laatste is het getal dat gemeld hoort te worden. */
+typedef void (*RcliNeighboursFn)(void* ctx, const char* pubkey_hex12,
+                                 const uint8_t* rows, uint8_t count, uint16_t total);
+
 /* Het ontlede statusantwoord. Alleen ruwe velden -- het omrekenen naar de
  * MeshManager-eenheden (volt, dagen, minuten, dB) gebeurt bij het opbouwen van de
  * ingest-body, zodat de omrekening op EEN plek staat. */
@@ -332,6 +353,7 @@ public:
     RCLI_LOGIN,      // login onderweg, wachten op RESP_SERVER_LOGIN_OK
     RCLI_CMD,        // een commando van de job onderweg, wachten op CLI_DATA
     RCLI_STATUS,     // REQ_TYPE_GET_STATUS onderweg, wachten op de stats-RESPONSE
+    RCLI_NEIGHBOURS, // REQ_TYPE_GET_NEIGHBOURS onderweg (mogelijk meerdere bladen)
     RCLI_DONE,       // job klaar (alle commando's afgehandeld of overgeslagen)
     RCLI_FAILED      // job afgebroken (login mislukt / bovengrens); error() zegt waarom
   };
@@ -427,7 +449,13 @@ public:
   /* POLLER: een STATUSVERZOEK (v2.7.0). Eenmaal inloggen, dan EEN
    * REQ_TYPE_GET_STATUS, en het antwoord via de stats-callback. Een leesactie, dus
    * de gewone drie pogingen (isMutating is hier niet van toepassing). */
-  Enq queueStatus(const char* pubkey_hex, const char* password);
+  /* met_buren (v2.19.0): na het statusantwoord in DEZELFDE sessie nog een
+   * `neighbors` over de CLI, afgeleverd onder de sleutel "cmd:neighbors".
+   * Een tweede sessie zou een tweede login kosten voor drie regels tekst. */
+  Enq queueStatus(const char* pubkey_hex, const char* password, bool met_buren = false);
+
+  /* Waar een burenronde zijn uitslag aflevert (Poller -> PushTask -> ingest). */
+  void setNeighboursCallback(RcliNeighboursFn fn, void* ctx) { _nb_fn = fn; _nb_ctx = ctx; }
 
   /* POLLER: DE KLOK RECHTZETTEN (v2.8.0). Eén job, meerdere stappen; zie CfStep.
    * Het antwoord is EEN mensleesbare zin, afgeleverd onder de parameternaam
@@ -440,7 +468,8 @@ public:
 
   /* ---- inkomend, aangeroepen door de meshklasse ---- */
   bool matchesSrcHash(const uint8_t* hash) const {
-    return (_state == RCLI_LOGIN || _state == RCLI_CMD || _state == RCLI_STATUS)
+    return (_state == RCLI_LOGIN || _state == RCLI_CMD || _state == RCLI_STATUS
+            || _state == RCLI_NEIGHBOURS)
            && _target_pub[0] == hash[0];
   }
   /* Is DIT de node waar nu een sessie mee loopt? Op de VOLLE sleutel, niet op de
@@ -462,7 +491,8 @@ public:
   /* ---- uitlezen (webinterface, statuspagina) ---- */
   State       state() const   { return _state; }
   bool        busy() const    { return _state == RCLI_LOGIN || _state == RCLI_CMD
-                                    || _state == RCLI_STATUS; }
+                                    || _state == RCLI_STATUS
+                                    || _state == RCLI_NEIGHBOURS; }
   const char* error() const   { return _error; }
   const char* command() const { return _cmd; }         // het LOPENDE commando
   const char* answer() const  { return _answer; }       // antwoord op het lopende cmd
@@ -526,6 +556,21 @@ private:
   uint16_t _chunk_off[RCLI_CHUNK_MAX];
   uint16_t _chunk_len[RCLI_CHUNK_MAX];
   uint16_t _answer_used;
+  /* Staat er na de status nog een burenvraag open? Eenmalig: de vlag valt om
+   * zodra we hem gebruiken, zodat een herhaald statusantwoord (een late
+   * dubbel) geen tweede commando start. */
+  bool     _nb_after_status;
+  /* De lopende burenronde. _nb_total is wat de NODE zegt te kennen (het te
+   * melden getal); _nb_have is wat we ophaalden. _nb_total_seen scheidt
+   * 'nul buren' van 'nooit antwoord gekregen'. */
+  uint32_t _nb_tag;
+  uint16_t _nb_from;
+  uint16_t _nb_total;
+  uint8_t  _nb_have;
+  bool     _nb_total_seen;
+  uint8_t  _nb_buf[RCLI_NB_MAX * RCLI_NB_ENTRY];
+  RcliNeighboursFn _nb_fn;
+  void*            _nb_ctx;
   unsigned long _collect_until;   // na dit moment zonder nieuw stuk: afleveren
 
   /* Het pad NAAR het doel, geleerd uit de PATH die de repeater op onze flood
@@ -551,6 +596,8 @@ private:
   void sendLogin();
   void sendCommand();
   void sendStatusReq();
+  void sendNeighboursReq();
+  void finishNeighbours();
   /* Ontleedt + toetst een stats-antwoord. false = niet plausibel of te kort; dan
    * wordt er NIETS gemeld. */
   static bool parseStatus(const uint8_t* data, size_t len, RepeaterStatus& out);

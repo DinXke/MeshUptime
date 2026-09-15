@@ -76,6 +76,10 @@ static uint16_t s_port = 80;
  * koppen; 512 is daar een veelvoud van, en wat er niet in past wordt geteld
  * maar niet bewaard -- de statusregel en de ack-lijst staan vooraan. */
 #define PUSH_BODY_MAX 1024
+/* Een dubbele quote als losse macro. Dit bestand wordt met scripts bewerkt en
+ * een ontsnapte quote in een opmaakreeks is hier al vaker gesneuveld dan me
+ * lief is; zo staat er in de bron geen enkele. */
+#define DQ "\""
 static char   s_req[PUSH_BODY_MAX + 416];
 static size_t s_req_len = 0;
 static size_t s_req_off = 0;      /* hoeveel er al de socket in is */
@@ -261,6 +265,31 @@ void PushTask::queueRepeaterStats(const char* pubkey_hex12, const RepeaterStatus
   _iring_count++;
 }
 
+
+/* De burenlijst van een andere repeater klaarzetten. Kopieren, geen I/O: dit
+ * draait in de ontvangstlus van de mesh. Loopt de ene plaats vol, dan valt de
+ * OUDSTE eruit -- net als bij de andere ringen, en met dezelfde reden: de verse
+ * lijst is de nuttige. */
+void PushTask::queueRepeaterNeighbours(const char* pubkey_hex12, const uint8_t* rows,
+                                       uint8_t count, uint16_t total) {
+  if (!enabled() || pubkey_hex12 == NULL || pubkey_hex12[0] == 0) return;
+  if (count > RCLI_NB_MAX) count = RCLI_NB_MAX;
+
+  if (_nbring_count >= NB_RING_SIZE) {
+    _nbring_count = 0;
+    if (_nb_inflight > 0) _nb_inflight = 0;
+    _lost++;
+    MESH_DEBUG_PRINTLN("PushTask: burenring vol, oudste vervallen (verloren: %lu)",
+                       (unsigned long)_lost);
+  }
+  NbPush& e = _nbring[0];
+  StrHelper::strncpy(e.node, pubkey_hex12, sizeof(e.node));
+  if (count) memcpy(e.rows, rows, (size_t)count * RCLI_NB_ENTRY);
+  e.count = count;
+  e.total = total;
+  _nbring_count = 1;
+}
+
 /* Wanneer moet er een POST uit? Zodra er iets te melden is (gebeurtenissen of
  * node-bevestigingen), en anders op de heartbeat-klok. De retry-rem gaat voor:
  * na een fout wordt er even niet geprobeerd, wat er ook klaarstaat. */
@@ -274,6 +303,9 @@ bool PushTask::dueNow(unsigned long now) const {
   /* Een status-momentopname: net als een cli-antwoord de uitkomst van een
    * LoRa-ronde waar iemand op wacht, dus ook meteen. */
   if (_iring_count > 0) return true;
+  /* De burenlijst hoort bij dezelfde ronde als die status; hem laten wachten
+   * zou het aantal en de lijst uit elkaar laten lopen op de pagina. */
+  if (_nbring_count > 0) return true;
   /* Een gevraagde poll: zodra het uitkomt. Staat achter de pushes in prioriteit
    * (startAttempt), maar mag de heartbeat niet hoeven af te wachten. */
   if (_poll_requested) return true;
@@ -349,6 +381,7 @@ void PushTask::startAttempt() {
   _kind = (_cring_count > 0)  ? KIND_COMPANION
         : (_rring_count > 0)  ? KIND_REPCLI
         : (_iring_count > 0)  ? KIND_INGEST
+        : (_nbring_count > 0) ? KIND_NEIGHBOURS
         : (_poll_requested)   ? KIND_POLL
                               : KIND_SENSOR;
 
@@ -376,7 +409,7 @@ void PushTask::startAttempt() {
   snprintf(s_path, sizeof(s_path), "%s%s", *p ? p : "",
            _kind == KIND_COMPANION ? "/api/companion" :
            _kind == KIND_REPCLI    ? "/api/v1/repeater_settings" :
-           _kind == KIND_INGEST    ? "/api/v1/ingest" :
+           _kind == KIND_INGEST || _kind == KIND_NEIGHBOURS ? "/api/v1/ingest" :
            /* ?caps= zegt de server WAT deze poller waarmaakt. Sinds v2.7.0 zijn
             * dat er TWEE: instellingenopvragingen (CLI over LoRa) EN
             * statusverzoeken (REQ_TYPE_GET_STATUS -> /api/v1/ingest). Op die
@@ -453,6 +486,8 @@ bool PushTask::buildRequest(const char* host, const char* path) {
     if (!buildRepCliBody(body, sizeof(body), blen)) return false;
   } else if (_kind == KIND_INGEST) {
     if (!buildIngestBody(body, sizeof(body), blen)) return false;
+  } else if (_kind == KIND_NEIGHBOURS) {
+    if (!buildNeighboursBody(body, sizeof(body), blen)) return false;
   } else {
     if (!buildSensorBody(body, sizeof(body), blen)) return false;
   }
@@ -645,6 +680,51 @@ bool PushTask::buildIngestBody(char* body, size_t cap, size_t& blen) {
 
   if (!appendf(body, cap, blen, "}}")) return false;
   _ing_inflight = 1;
+  return true;
+}
+
+
+/* De burenbody: het aantal als METING, de lijst als ``neighbors``-array.
+ *
+ * TWEE VERSCHILLENDE GETALLEN, en dat is de kern van deze bouwer.
+ * ``neighbor_count`` komt uit de teller die de NODE meestuurde -- exact, ook als
+ * we maar de helft ophaalden. De array draagt wat we ophaalden, nieuwste eerst.
+ * De vorige weg (het `neighbors`-CLI-antwoord) had die twee noodgedwongen aan
+ * elkaar gelijk, en dat maakte van een node met tweeentwintig buren er negen.
+ *
+ * De tijd staat er niet in: de server zet er zijn eigen ontvangsttijd op, en
+ * ``seen_min`` is een LEEFTIJD (minuten geleden) die daar vanaf gerekend wordt.
+ * Dat is dezelfde afspraak als de dakrepeater gebruikte. */
+bool PushTask::buildNeighboursBody(char* body, size_t cap, size_t& blen) {
+  blen = 0;
+  _nb_inflight = 0;
+  if (_nbring_count == 0) return false;
+
+  const NbPush& e = _nbring[0];
+  if (!appendf(body, cap, blen,
+               "{" DQ "repeater" DQ ":{" DQ "pubkey_prefix" DQ ":" DQ "%s" DQ "},"
+               DQ "metrics" DQ ":{" DQ "neighbor_count" DQ ":%u}," DQ "neighbors" DQ ":[",
+               e.node, (unsigned)e.total)) return false;
+
+  char hex[RCLI_NB_PREFIX_LEN * 2 + 1];
+  for (uint8_t i = 0; i < e.count; i++) {
+    const uint8_t* r = &e.rows[(size_t)i * RCLI_NB_ENTRY];
+    mesh::Utils::toHex(hex, r, RCLI_NB_PREFIX_LEN);
+    hex[RCLI_NB_PREFIX_LEN * 2] = 0;
+    uint32_t secs;  memcpy(&secs, &r[RCLI_NB_PREFIX_LEN], 4);
+    int8_t   snr4 = (int8_t)r[RCLI_NB_PREFIX_LEN + 4];
+    /* Past deze er niet meer bij, dan stoppen we -- met een geldige body. Een
+     * half geschreven ingang zou de hele push onleesbaar maken, en dan was ook
+     * het aantal weg. */
+    size_t voor = blen;
+    if (!appendf(body, cap, blen,
+                 "%s{" DQ "prefix" DQ ":" DQ "%s" DQ "," DQ "snr" DQ ":%.2f,"
+                 DQ "seen_min" DQ ":%lu}",
+                 i ? "," : "", hex, (double)snr4 / 4.0,
+                 (unsigned long)(secs / 60))) { blen = voor; break; }
+  }
+  if (!appendf(body, cap, blen, "]}")) return false;
+  _nb_inflight = 1;
   return true;
 }
 
@@ -886,6 +966,10 @@ void PushTask::finishOk() {
     _iring_tail   = (uint8_t)((_iring_tail + _ing_inflight) % ING_RING_SIZE);
     _iring_count  = (uint8_t)(_iring_count - _ing_inflight);
     _ing_inflight = 0;
+  } else if (_kind == KIND_NEIGHBOURS) {
+    /* Zelfde regel als bij de statusring: de buren van een ANDERE node zijn
+     * geen meting van onszelf en mogen de heartbeat-belofte niet verschuiven. */
+    if (_nb_inflight) { _nbring_count = 0; _nb_inflight = 0; }
   } else if (_kind == KIND_REPCLI) {
     /* Alleen de eigen ring opruimen. De heartbeat-klok blijft met rust: een
      * CLI-antwoord is buiten de cadans om en mag de belofte "je hoort me elke

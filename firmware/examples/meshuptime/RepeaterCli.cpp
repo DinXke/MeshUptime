@@ -73,6 +73,12 @@ void RepeaterCli::reset() {
   _cf_tries         = 0;
   _cf_window_end    = 0;
   _cf_skew          = 0;
+  _nb_after_status  = false;
+  _nb_tag           = 0;
+  _nb_from          = 0;
+  _nb_total         = 0;
+  _nb_have          = 0;
+  _nb_total_seen    = false;
   _cf_was[0]        = 0;
   _cf_now[0]        = 0;
   _answer[0]        = 0;
@@ -223,13 +229,17 @@ RepeaterCli::Enq RepeaterCli::queueJob(const char* pubkey_hex, const char* passw
  * bestaande job-boekhouding (pogingen, tussenpauzes, bovengrens) ongewijzigd
  * geldt. De parameternaam wordt niet gebruikt -- het antwoord gaat via de
  * stats-callback en niet via de per-param-weg. */
-RepeaterCli::Enq RepeaterCli::queueStatus(const char* pubkey_hex, const char* password) {
+RepeaterCli::Enq RepeaterCli::queueStatus(const char* pubkey_hex, const char* password,
+                                          bool met_buren) {
   if (busy()) return RCLI_BUSY;
   reset();
+  _nb_after_status = met_buren;
 
   StrHelper::strncpy(_job, "status", sizeof(_job));
   _job_n    = 1;
   _job_kind = RCLI_JOB_STATUS;
+  /* De burenvraag hierna telt als het ENE commando van deze job, zodat
+   * beginNextCommand() na het antwoord netjes op DONE uitkomt. */
 
   return startJob(pubkey_hex, password);
 }
@@ -414,6 +424,76 @@ void RepeaterCli::sendStatusReq() {
 }
 
 /* ------------------------------------------------------------------------
+ * DE BURENRONDE (v2.20.0) -- REQ_TYPE_GET_NEIGHBOURS, met bladeren
+ *
+ * WAAROM NIET DE CLI. v2.19.0 vroeg de buren met het gewone `neighbors`-commando
+ * en dat werkte, maar upstream kapt dat antwoord af op ~134 tekens: acht a negen
+ * buren, terwijl een drukke repeater er dertig heeft. Het GETAL dat daaruit
+ * volgde -- "negen buren" bij een node met er tweeentwintig -- was daarmee niet
+ * fout gelezen maar wel onwaar, en dat is erger dan geen getal.
+ *
+ * Het binaire verzoek kent twee dingen die de CLI niet heeft: het zegt hoeveel
+ * buren de node in TOTAAL kent, en je kunt erdoorheen bladeren.
+ *
+ *   verzoek (na de 4 byte tijdstempel):
+ *     [0] 0x06  [1] versie 0  [2] hoeveel  [3..4] vanaf  [5] volgorde
+ *     [6] byte sleutel per buur  [7..10] willekeurige blob
+ *   antwoord (na de teruggekaatste tijdstempel):
+ *     [uint16 totaal bekend][uint16 in dit antwoord]
+ *     per buur: [sleutel][uint32 seconden geleden][int8 snr x 4]
+ *
+ * WAT WE OPHALEN EN WAT WE MELDEN, en dat zijn twee verschillende dingen. Het
+ * AANTAL komt uit "totaal bekend" en is dus exact, ook als we niet alles
+ * ophalen. De LIJST is wat er in een push past: RCLI_NB_MAX ingangen, op
+ * volgorde nieuw->oud, dus de verste buren vallen weg en niet de verse. Zo staat
+ * er nooit een lijst van achttien naast een teller die achttien zegt terwijl het
+ * er vierendertig zijn -- dat was precies de fout van de CLI-weg.
+ *
+ * DRIE BYTE SLEUTEL. Zes hextekens is de breedte waarop elke tabel aan de
+ * serverkant keyt (contacts.prefix6, packets.sender, neighbors.prefix). Meer
+ * vragen zou per buur een byte zendtijd kosten voor iets dat daar toch wordt
+ * afgekapt.
+ * ------------------------------------------------------------------------ */
+void RepeaterCli::sendNeighboursReq() {
+  uint8_t temp[15];
+  _nb_tag = _mesh->getRTCClock()->getCurrentTimeUnique();
+  memcpy(temp, &_nb_tag, 4);
+  temp[4] = REQ_TYPE_GET_NEIGHBOURS;
+  temp[5] = 0;                          /* versie; alleen 0 bestaat */
+  temp[6] = RCLI_NB_PER_REQ;
+  memcpy(&temp[7], &_nb_from, 2);
+  temp[9]  = 0;                         /* volgorde: nieuw -> oud */
+  temp[10] = RCLI_NB_PREFIX_LEN;
+  _mesh->getRNG()->random(&temp[11], 4);
+
+  _host->rcliUseClientIdentity();
+  mesh::Identity dest(_target_pub);
+  mesh::Packet* pkt = _mesh->createDatagram(PAYLOAD_TYPE_REQ, dest, _secret, temp, sizeof(temp));
+  if (pkt == nullptr) { _next_send = millis() + 1000; return; }
+
+  _host->rcliSend(pkt, _path, _path_len);
+  _attempt++;
+  _next_send = millis() + RCLI_MIN_GAP_MS;
+  _deadline  = millis() + RCLI_STEP_TIMEOUT_MS;
+}
+
+/* De ronde afsluiten: afleveren wat we hebben en door naar DONE.
+ *
+ * Ook met NUL opgehaalde ingangen afleveren, zolang de node ons wel zijn totaal
+ * gaf: "deze repeater heeft geen buren" is een uitkomst en hoort de teller op
+ * nul te zetten. Alleen als er nooit een antwoord kwam (_nb_total_seen is dan
+ * false) melden we niets -- zie de terugval op de CLI in loop(). */
+void RepeaterCli::finishNeighbours() {
+  if (_nb_fn != nullptr && _nb_total_seen) {
+    _nb_fn(_nb_ctx, _target_hex, _nb_buf, _nb_have, _nb_total);
+  }
+  snprintf(_answer, sizeof(_answer), "buren: %u van %u opgehaald",
+           (unsigned)_nb_have, (unsigned)_nb_total);
+  memset(_pass, 0, sizeof(_pass));
+  _state = RCLI_DONE;
+}
+
+/* ------------------------------------------------------------------------
  * loop -- hoogstens EEN zending per ronde
  * ------------------------------------------------------------------------ */
 void RepeaterCli::loop() {
@@ -478,6 +558,24 @@ void RepeaterCli::loop() {
       failJob("ingelogd, maar geen statusantwoord na 3 pogingen");
       return;
     }
+  } else if (_state == RCLI_NEIGHBOURS) {
+    if (_attempt >= RCLI_MAX_ATTEMPTS) {
+      /* TERUGVAL OP DE CLI. Kregen we al een blad, dan leveren we wat we hebben
+       * -- het getal klopt dan al. Kwam er nooit iets, dan kent deze firmware het
+       * verzoek blijkbaar niet, en dan is `neighbors` over de gewone CLI nog
+       * altijd beter dan niets: acht a negen buren en geen totaal, maar wel de
+       * verse. Zo kan een node met oudere firmware er niet op achteruitgaan. */
+      if (_nb_total_seen) { finishNeighbours(); return; }
+      StrHelper::strncpy(_cur_param, "cmd:neighbors", sizeof(_cur_param));
+      StrHelper::strncpy(_cmd, "neighbors", sizeof(_cmd));
+      _state       = RCLI_CMD;
+      _attempt     = 0;
+      _answer[0]   = 0;
+      _nchunks     = 0;
+      _answer_used = 0;
+      _next_send   = now + RCLI_MIN_GAP_MS;
+      return;
+    }
   } else if (_state == RCLI_CMD && _job_kind == RCLI_JOB_CLOCKFIX) {
     /* De klok-job beslist zelf wat "geen antwoord" betekent -- bij `clkreboot` is
      * dat namelijk het VERWACHTE gedrag (de node herstart voordat hij antwoordt). */
@@ -506,6 +604,7 @@ void RepeaterCli::loop() {
 
   if (_state == RCLI_LOGIN)       sendLogin();
   else if (_state == RCLI_STATUS) sendStatusReq();
+  else if (_state == RCLI_NEIGHBOURS) sendNeighboursReq();
   else {
     sendCommand();
     /* `clkreboot` antwoordt nooit (de node herstart eerst). Niet de volle
@@ -623,6 +722,48 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
     return true;
   }
 
+  /* HET BURENANTWOORD (v2.20.0). Zelfde PAYLOAD_TYPE_RESPONSE als de login en de
+   * status; de staat en de teruggekaatste tag scheiden ze. */
+  if (_state == RCLI_NEIGHBOURS && type == PAYLOAD_TYPE_RESPONSE) {
+    if (_attempt == 0) return false;
+    if (len < 8) return false;                 /* te kort voor tag + twee tellers */
+
+    uint32_t tag;
+    memcpy(&tag, data, 4);
+    if (tag != _nb_tag) return false;          /* antwoord op een ouder verzoek */
+
+    uint16_t totaal = 0, in_dit = 0;
+    memcpy(&totaal, &data[4], 2);
+    memcpy(&in_dit, &data[6], 2);
+    _nb_total = totaal;
+    _nb_total_seen = true;
+
+    /* Wat er werkelijk in het pakket zit telt, niet wat de teller belooft: een
+     * afgekapt of beschadigd antwoord mag geen ingangen uit het geheugen naast
+     * de buffer lezen. */
+    const size_t per = RCLI_NB_ENTRY;
+    size_t beschikbaar = (len - 8) / per;
+    if (in_dit > beschikbaar) in_dit = (uint16_t)beschikbaar;
+
+    for (uint16_t i = 0; i < in_dit && _nb_have < RCLI_NB_MAX; i++) {
+      memcpy(&_nb_buf[(size_t)_nb_have * per], &data[8 + (size_t)i * per], per);
+      _nb_have++;
+    }
+
+    /* Nog een blad? Alleen als de node zegt dat er meer is, we nog ruimte hebben
+     * EN dit antwoord iets opleverde -- anders draaien we rond op een node die
+     * zijn eigen teller niet waarmaakt. */
+    _nb_from = (uint16_t)(_nb_from + in_dit);
+    if (in_dit > 0 && _nb_have < RCLI_NB_MAX && _nb_from < _nb_total) {
+      _attempt  = 0;
+      _next_send = millis() + RCLI_MIN_GAP_MS;
+      _deadline  = millis() + RCLI_STEP_TIMEOUT_MS;
+      return true;
+    }
+    finishNeighbours();
+    return true;
+  }
+
   /* HET STATUSANTWOORD. Zelfde PAYLOAD_TYPE_RESPONSE als de login, dus alleen de
    * staat (en de tag) scheiden ze. Zie de draadvorm bovenaan RepeaterCli.h. */
   if (_state == RCLI_STATUS && type == PAYLOAD_TYPE_RESPONSE) {
@@ -663,6 +804,32 @@ bool RepeaterCli::onPeerData(uint8_t type, const uint8_t* data, size_t len) {
              "status ok: %u mV, uptime %lus, airtime %lus",
              (unsigned)st.batt_milli_volts, (unsigned long)st.total_up_time_secs,
              (unsigned long)st.total_air_time_secs);
+
+    /* DE BUREN, IN DEZELFDE SESSIE (v2.19.0). Stock firmware heeft `neighbors` in
+     * de gewone CLI ("<4 byte sleutel>:<seconden geleden>:<snr x 4>" per buur,
+     * "-none-" als er geen zijn), en daar is geen tweede protocol voor nodig. Het
+     * hoort hier en niet in een eigen sessie: de login is al gedaan, het pad is al
+     * gevonden, en dit kost nog twee pakketten. Een eigen sessie zou vier keer zo
+     * duur zijn voor drie regels tekst.
+     *
+     * Het antwoord gaat langs de GEWONE cmd-weg terug (deliverCurrent ->
+     * MeshManager, sleutel "cmd:neighbors"), dus als de repeater het commando niet
+     * kent of stil blijft, is dat gewoon een parameter zonder antwoord -- de
+     * metingen van de status zijn dan al lang gemeld. Mislukken mag hier niets
+     * kosten. */
+    if (_nb_after_status) {
+      _nb_after_status = false;
+      _state         = RCLI_NEIGHBOURS;
+      _attempt       = 0;
+      _nb_from       = 0;
+      _nb_have       = 0;
+      _nb_total      = 0;
+      _nb_total_seen = false;
+      _next_send     = millis() + RCLI_MIN_GAP_MS;
+      _deadline      = millis() + RCLI_STEP_TIMEOUT_MS;
+      return true;
+    }
+
     memset(_pass, 0, sizeof(_pass));
     _state = RCLI_DONE;
     return true;

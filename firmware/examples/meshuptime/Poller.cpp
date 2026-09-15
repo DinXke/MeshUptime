@@ -91,6 +91,7 @@ void Poller::reset() {
   _last_refresh_seen = 0;
   _status_ok = 0;
   _status_fail = 0;
+  _nb_ok = 0;
   _status_wait = false;
   _status_got = false;
   _clockfix_ok = 0;
@@ -104,6 +105,7 @@ void Poller::begin(fs::FS* fs, PushTask* push, RepeaterCli* rcli) {
   /* De statusuitslag komt via RepeaterCli terug; de CLI-antwoorden lopen via de
    * result-callback die main_room al zet. Twee wegen, twee endpoints. */
   if (_rcli) _rcli->setStatsCallback(Poller::statsThunk, this);
+  if (_rcli) _rcli->setNeighboursCallback(Poller::nbThunk, this);
   loadConfig();
   loadTargets();
   /* De eerste poll na een korte genadetijd (wifi/tijd/advert eerst). */
@@ -592,7 +594,10 @@ void Poller::startStatus(const Pending& e) {
    * gebruiken we die. Anders moet RepeaterCli de prefix uit de buurtlijst oplossen,
    * en dat lukt alleen als deze node ooit een advert van dat doel hoorde. Zelfde
    * keuze als bij een settings-job (zie startNextPending). */
-  RepeaterCli::Enq r = _rcli->queueStatus(keyFor(e.prefix), pass);
+  /* met_buren=true: dezelfde sessie haalt na de status ook de burenlijst op
+   * (v2.19.0). Dat was het tweede gat dat de dakrepeater achterliet -- hij
+   * publiceerde de buren van elke node die hij bewaakte mee. */
+  RepeaterCli::Enq r = _rcli->queueStatus(keyFor(e.prefix), pass, true);
   if (r == RepeaterCli::RCLI_OK) {
     _status_wait = true;
     _status_got  = false;
@@ -621,6 +626,25 @@ void Poller::onStats(const char* pubkey_hex12, const RepeaterStatus& st) {
            pubkey_hex12, (unsigned)st.batt_milli_volts,
            (unsigned long)(st.total_up_time_secs / 86400UL));
   MESH_DEBUG_PRINTLN("Poller: %s", _note);
+}
+
+/* De uitslag van een burenronde. Alleen doorzetten naar de push-ring; het
+ * vertalen naar JSON gebeurt daar, want dit draait in de ontvangstlus van de
+ * mesh. Ook een lege lijst gaat door: "deze repeater hoort niemand" is een
+ * uitkomst, en de teller hoort dan op nul te staan in plaats van op het getal
+ * van gisteren. */
+void Poller::onNeighbours(const char* pubkey_hex12, const uint8_t* rows,
+                          uint8_t count, uint16_t total) {
+  _nb_ok++;
+  if (_push) _push->queueRepeaterNeighbours(pubkey_hex12, rows, count, total);
+  snprintf(_note, sizeof(_note), "%s: %u van %u buren gemeld",
+           pubkey_hex12, (unsigned)count, (unsigned)total);
+  MESH_DEBUG_PRINTLN("Poller: %s", _note);
+}
+
+void Poller::nbThunk(void* ctx, const char* pubkey_hex12, const uint8_t* rows,
+                     uint8_t count, uint16_t total) {
+  static_cast<Poller*>(ctx)->onNeighbours(pubkey_hex12, rows, count, total);
 }
 
 void Poller::statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st) {

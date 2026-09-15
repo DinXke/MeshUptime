@@ -7,6 +7,54 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.20.0 — de burenronde, nu binair en met het juiste getal
+
+**Wat er mis was aan v2.19.0.** Die vroeg de buren met het gewone
+`neighbors`-commando, en dat werkte — maar upstream kapt dat antwoord af op ~134
+tekens. Acht à negen buren, terwijl JessaZH er veertig heeft. Het getal dat
+daaruit volgde was niet verkeerd gelezen, het was **onwaar**, en dat is erger dan
+geen getal: "negen buren" bij een node met veertig stuurt de lezer de verkeerde
+kant op.
+
+**Het binaire verzoek kent twee dingen die de CLI niet heeft**: het zegt hoeveel
+buren de node in totaal kent, en je kunt erdoorheen bladeren.
+
+```
+verzoek:   [0x06][versie 0][hoeveel][vanaf:2][volgorde][byte sleutel][blob:4]
+antwoord:  [totaal bekend:2][in dit antwoord:2] dan per buur:
+           [sleutel][seconden geleden:4][snr x 4:1]
+```
+
+**Twee verschillende getallen, en dat is de kern.** `neighbor_count` komt uit de
+teller die de node meestuurt — exact, ook als we niet alles ophalen. De lijst is
+wat er in één push past: 18 ingangen, nieuw→oud, dus de verste buren vallen weg en
+niet de verse. Gemeten op JessaZH: *node zegt 40 buren, 18 verse rijen*; op URS:
+*14 en 14* — die past volledig.
+
+**Drie byte sleutel** (zes hextekens), want dat is de breedte waarop elke tabel aan
+de serverkant keyt. Meer vragen kost zendtijd voor iets dat daar toch wordt
+afgekapt.
+
+**De CLI blijft als terugval.** Komt er op het binaire verzoek nooit een antwoord
+— een firmware die het niet kent — dan gaat alsnog `neighbors` over de CLI de lucht
+in. Acht buren en geen totaal, maar beter dan niets, en zo kan een oudere node er
+niet op achteruitgaan.
+
+
+## v2.19.0 — de statusronde vraagt ook de buren
+
+De dakrepeater publiceerde de buren van elke node die hij bewaakte mee. Sinds hij
+wegviel stond `neighbor_count` op de kaarten zoals hij dagen eerder was — niet
+omdat de buren weg waren, maar omdat de koerier weg was.
+
+**In dezelfde sessie**, en dat is de hele winst: de login is al gedaan en het pad
+is al gevonden, dus dit kost twee pakketten extra in plaats van een tweede volle
+ronde. Mislukken kost hier niets — de metingen van de status zijn dan al gemeld, en
+een buurvraag die stil blijft is gewoon een parameter zonder antwoord.
+
+Deze versie gebruikte er het `neighbors`-CLI-commando voor; v2.20.0 verving dat
+door het binaire verzoek. Zie daar waarom.
+
 ## v2.18.0 — de poller vraagt zijn doelen zelf uit
 
 **Wat er stukging.** De zonnerepeater op het dak trok zijn accu leeg (3,55 V op
