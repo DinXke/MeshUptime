@@ -1478,7 +1478,19 @@ serververzoeken. Er komt <b>nooit</b> een tweede <code>clkreboot</code>.</p>
 <label style="align-self:center"><input type="checkbox" id="pl-on"> poller aan</label>
 <span style="align-self:center;color:var(--muted);font-size:.8rem">interval (s):</span>
 <input id="pl-secs" type="number" min="10" max="3600" style="width:6rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">eigen ronde (min, 0=uit):</span>
+<input id="pl-auto" type="number" min="0" max="1440" style="width:6rem">
 <button type="button" id="pl-save">opslaan</button></div>
+<p class="note" style="margin-top:.6rem"><b>Eigen statusrondes.</b> MeshManager
+vraagt uit zichzelf <b>nooit</b> een status op: een <code>refresh</code> komt
+alleen in de wachtrij als iemand op de knop drukt. Staat hier een getal, dan
+vraagt deze node <b>elk doel</b> hoogstens eens per zoveel minuten zelf uit
+(login + <code>REQ_TYPE_GET_STATUS</code>, meting naar <code>/api/v1/ingest</code>)
+&mdash; niet de hele lijst per interval, maar om beurten, met een halve minuut
+ertussen. Een opdracht van de server gaat altijd voor, er loopt nooit meer dan
+&eacute;&eacute;n sessie, en zonder push-url gebeurt er niets: dan zou de meting
+nergens heen kunnen en is het zendtijd voor niets. Doelen zonder wachtwoord
+worden overgeslagen.</p>
 <p class="note" style="margin-top:.6rem"><b>Doel-wachtwoorden.</b> Om als beheerder
 op een repeater in te loggen moet deze node diens admin-wachtwoord kennen. Zet een
 wachtwoord per doel (pubkey-prefix, 12&ndash;64 hex) of één standaardwachtwoord als
@@ -3251,11 +3263,13 @@ fetch("poller.json").then(function(r){return r.ok?r.json():null}).then(function(
 if(!j){document.getElementById("pl-status").textContent="poller niet beschikbaar";return}
 document.getElementById("pl-on").checked=!!j.on;
 var si=document.getElementById("pl-secs");if(document.activeElement!==si){si.value=j.poll_secs}
+var ai=document.getElementById("pl-auto");if(document.activeElement!==ai){ai.value=j.auto_mins}
 var age=j.ever?(j.last_poll_age+"s geleden"):"nog nooit";
 document.getElementById("pl-status").innerHTML=
 "<b>"+(j.on?"AAN":"uit")+"</b> &middot; laatste poll: "+age+
 " &middot; verwerkt: "+j.processed+" &middot; verloren: "+j.dropped+
 " &middot; wachtrij: "+j.pending+" &middot; sessie: "+esc(j.session)+
+(j.auto_mins?(" &middot; eigen ronde: elk doel/"+j.auto_mins+" min ("+j.auto_started+" ingepland)"):"")+
 (j.status_ok||j.status_fail?(" &middot; status "+j.status_ok+" ok/"+j.status_fail+" mislukt"):"")+
 (j.clockfix_ok||j.clockfix_fail?(" &middot; klok "+j.clockfix_ok+" ok/"+j.clockfix_fail+" mislukt"):"")+
 "<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"+
@@ -3283,7 +3297,8 @@ document.getElementById("pl-save").onclick=function(){
 var on=document.getElementById("pl-on").checked?"1":"0";
 var s=document.getElementById("pl-secs").value;
 fetch("poller",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"on="+on+"&poll_secs="+encodeURIComponent(s)})
+var a=document.getElementById("pl-auto").value;
+body:"on="+on+"&poll_secs="+encodeURIComponent(s)+"&auto_mins="+encodeURIComponent(a)})
 .then(function(r){return r.text()}).then(function(t){logline("poller",t,1);plLoad()})}
 
 document.getElementById("pl-tset").onclick=function(){
@@ -8459,12 +8474,13 @@ void WebTask::handlePollerJson() {
   static char cfesc[RCLI_ANSWER_MAX * 2 + 1];
   jsonEscape(_poller->clockfixLast(), cfesc, sizeof(cfesc));
   int n = snprintf(g_json, sizeof(g_json),
-      "{\"on\":%d,\"poll_secs\":%u,\"ever\":%d,\"last_poll_age\":%lu,"
+      "{\"on\":%d,\"poll_secs\":%u,\"auto_mins\":%u,\"auto_started\":%lu,\"ever\":%d,\"last_poll_age\":%lu,"
       "\"processed\":%lu,\"dropped\":%lu,\"pending\":%u,\"refresh_seen\":%d,"
       "\"status_ok\":%lu,\"status_fail\":%lu,"
       "\"clockfix_ok\":%lu,\"clockfix_fail\":%lu,\"clockfix_last\":\"%s\","
       "\"targets\":%d,\"default_pass\":%d,\"session\":\"%s\",\"note\":\"%s\"}",
       _poller->enabled() ? 1 : 0, (unsigned)_poller->pollSecs(),
+      (unsigned)_poller->autoMins(), (unsigned long)_poller->autoStartedCount(),
       _poller->everPolled() ? 1 : 0, (unsigned long)_poller->lastPollAgeSecs(),
       (unsigned long)_poller->processedCount(), (unsigned long)_poller->droppedCount(),
       (unsigned)_poller->pendingCount(), _poller->lastRefreshSeen(),
@@ -8493,11 +8509,22 @@ void WebTask::handlePoller() {
     }
     _poller->setPollSecs((uint16_t)s);
   }
+  /* 0 = uit; daarbuiten klemt setAutoMins zelf op het toegestane bereik. Een
+   * getal dat er net naast ligt is hier geen fout maar een vergissing van een
+   * mens, en die hoort bijgestuurd te worden, niet afgewezen. */
+  if (getArg(*_server, "auto_mins", v, sizeof(v)) && v[0]) {
+    long m = strtol(v, nullptr, 10);
+    if (m < 0) m = 0;
+    if (m > POLLER_AUTO_MAX_MINS) m = POLLER_AUTO_MAX_MINS;
+    _poller->setAutoMins((uint16_t)m);
+  }
   if (getArg(*_server, "on", v, sizeof(v))) {
     _poller->setEnabled(v[0] == '1');
   }
-  snprintf(g_rcli_reply, sizeof(g_rcli_reply), "ok poller %s, interval %us\n",
-           _poller->enabled() ? "aan" : "uit", (unsigned)_poller->pollSecs());
+  snprintf(g_rcli_reply, sizeof(g_rcli_reply),
+           "ok poller %s, interval %us, eigen ronde %s\n",
+           _poller->enabled() ? "aan" : "uit", (unsigned)_poller->pollSecs(),
+           _poller->autoMins() ? "aan" : "uit");
   _server->send(200, "text/plain", g_rcli_reply);
 }
 

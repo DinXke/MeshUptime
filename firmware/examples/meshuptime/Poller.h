@@ -101,6 +101,19 @@ class PushTask;
  * onmerkbaar voor de gebruiker. */
 #define POLLER_FIRST_DELAY_MS 15000UL
 
+/* EIGEN STATUSRONDES (v2.18.0). 0 = uit. De ondergrens is geen smaak maar
+ * zendtijd: een statusronde is een login plus een verzoek plus een antwoord,
+ * en dat vijf minuten uit elkaar is voor een grafiek al fijner dan de mesh
+ * verdient. Zie autoStatusTick() voor wat het interval precies betekent. */
+#define POLLER_AUTO_MIN_MINS   5
+#define POLLER_AUTO_MAX_MINS   1440
+/* Minstens zoveel tussen twee rondes, ongeacht hoeveel doelen aan de beurt
+ * zijn: uitgesmeerd in plaats van een stoot. */
+#define POLLER_AUTO_GAP_MS     30000UL
+/* Na een herstart is elk doel 'nooit gedaan' en dus meteen aan de beurt. Even
+ * wachten tot wifi, klok en de eerste advertronde hun werk deden. */
+#define POLLER_AUTO_FIRST_DELAY_MS 60000UL
+
 /* De pubkey-prefix zoals hij in de wachtrij en in de doeltabel staat: 12 hex
  * (6 byte) is de minimale, MeshManager stuurt precies dat. We laten tot 64 toe
  * zodat iemand de volle sleutel kan opslaan als de node de repeater nooit als
@@ -124,6 +137,9 @@ public:
   uint16_t pollSecs() const  { return _poll_secs; }
   void     setEnabled(bool on);
   void     setPollSecs(uint16_t s);
+  /* Eigen statusrondes: elk doel hoogstens eens per m minuten (0 = uit). */
+  uint16_t autoMins() const  { return _auto_mins; }
+  void     setAutoMins(uint16_t m);
 
   /* ---- doel-wachtwoorden (web-GUI) ----
    * setTarget: prefix (12..64 hex) -> wachtwoord (<=15). Leeg wachtwoord verwijdert
@@ -144,6 +160,7 @@ public:
   uint32_t    droppedCount() const   { return _dropped; }
   uint8_t     pendingCount() const   { return _pending_count; }
   int         lastRefreshSeen() const { return _last_refresh_seen; }
+  uint32_t    autoStartedCount() const { return _auto_started; }
   uint32_t    statusOkCount() const   { return _status_ok; }
   uint32_t    statusFailCount() const { return _status_fail; }
   uint32_t    clockfixOkCount() const   { return _clockfix_ok; }
@@ -165,6 +182,9 @@ private:
   bool     _on;
   uint16_t _poll_secs;
   unsigned long _next_poll;
+  uint16_t      _auto_mins;      // 0 = geen eigen rondes
+  unsigned long _auto_next_ms;   // vroegste moment voor de volgende eigen ronde
+  uint32_t      _auto_started;   // eigen rondes die we inplanden
   unsigned long _last_poll;   // millis van de laatste GELUKTE poll (0 = nooit)
 
   /* Doel-wachtwoorden. Prefix als hex-tekst (zo staat hij in de wachtrij), niet
@@ -174,6 +194,10 @@ private:
   struct Target {
     char prefix[POLLER_PREFIX_MAX];
     char pass[RCLI_PASS_MAX];
+    /* Wanneer dit doel voor het laatst uit EIGEN beweging werd uitgevraagd
+     * (millis; 0 = nog nooit). Bewust niet persistent: na een herstart is de
+     * reeks toch onderbroken, en dan is een ronde meteen juist wat je wilt. */
+    unsigned long auto_last;
   };
   Target  _targets[POLLER_MAX_TARGETS];
   int     _ntargets;
@@ -250,6 +274,10 @@ private:
    * -> deze instance; zet de meting in de PushTask-ring en telt mee. */
   static void statsThunk(void* ctx, const char* pubkey_hex12, const RepeaterStatus& st);
   void onStats(const char* pubkey_hex12, const RepeaterStatus& st);
+
+  /* Is er een doel aan de beurt voor een eigen statusronde? Zet er hoogstens
+   * EEN in de wachtrij en laat startNextPending de rest doen. */
+  void autoStatusTick(unsigned long now);
 
   /* Een statusverzoek starten (of weigeren met een logregel). */
   void startStatus(const Pending& e);

@@ -77,6 +77,9 @@ void Poller::reset() {
   _poll_secs = POLL_SECS_DEFAULT;
   _next_poll = 0;
   _last_poll = 0;
+  _auto_mins = 0;
+  _auto_next_ms = 0;
+  _auto_started = 0;
   _ntargets = 0;
   _default_pass[0] = 0;
   memset(_targets, 0, sizeof(_targets));
@@ -105,6 +108,9 @@ void Poller::begin(fs::FS* fs, PushTask* push, RepeaterCli* rcli) {
   loadTargets();
   /* De eerste poll na een korte genadetijd (wifi/tijd/advert eerst). */
   _next_poll = millis() + POLLER_FIRST_DELAY_MS;
+  /* En de eerste EIGEN statusronde nog wat later: die kost zendtijd, de poll
+   * hierboven alleen een GET over wifi. */
+  _auto_next_ms = millis() + POLLER_AUTO_FIRST_DELAY_MS;
 }
 
 /* ------------------------------------------------------------------------
@@ -122,6 +128,16 @@ void Poller::loadConfig() {
     if (v > POLL_SECS_MAX) v = POLL_SECS_MAX;
     _poll_secs = (uint16_t)v;
   }
+  /* Regel 3 (v2.18.0) mag ONTBREKEN: een bestand van voor deze versie laat de
+   * eigen rondes gewoon uit staan, en dat is de juiste terugval -- zendtijd hoort
+   * niet vanzelf te gaan lopen na een firmware-upgrade. */
+  if (readLine(f, line, sizeof(line)) >= 0) {
+    long v = strtol(line, nullptr, 10);
+    if (v < 0) v = 0;
+    if (v != 0 && v < POLLER_AUTO_MIN_MINS) v = POLLER_AUTO_MIN_MINS;
+    if (v > POLLER_AUTO_MAX_MINS) v = POLLER_AUTO_MAX_MINS;
+    _auto_mins = (uint16_t)v;
+  }
   f.close();
 }
 
@@ -129,7 +145,8 @@ void Poller::saveConfig() {
   if (_fs == nullptr) return;
   fs::File f = _fs->open(POLLER_CFG_PATH, "w");
   if (!f) return;
-  f.printf("%d\n%u\n", _on ? 1 : 0, (unsigned)_poll_secs);
+  f.printf("%d\n%u\n%u\n", _on ? 1 : 0,
+           (unsigned)_poll_secs, (unsigned)_auto_mins);
   f.close();
 }
 
@@ -153,6 +170,7 @@ void Poller::loadTargets() {
     if (line[0] == 0 || pass[0] == 0) continue;
     StrHelper::strncpy(_targets[_ntargets].prefix, line, sizeof(_targets[_ntargets].prefix));
     StrHelper::strncpy(_targets[_ntargets].pass, pass, sizeof(_targets[_ntargets].pass));
+    _targets[_ntargets].auto_last = 0;
     _ntargets++;
   }
   f.close();
@@ -240,6 +258,9 @@ bool Poller::setTarget(const char* prefix_hex, const char* password) {
   if (_ntargets >= POLLER_MAX_TARGETS) return false;   // vol
   StrHelper::strncpy(_targets[_ntargets].prefix, prefix, sizeof(_targets[_ntargets].prefix));
   StrHelper::strncpy(_targets[_ntargets].pass, password, sizeof(_targets[_ntargets].pass));
+  /* Uitdrukkelijk, want delTarget schuift de lijst op en laat de oude staart
+   * staan: zonder dit erft een nieuw doel het beurt-moment van een gewist doel. */
+  _targets[_ntargets].auto_last = 0;
   _ntargets++;
   saveTargets();
   return true;
@@ -660,6 +681,84 @@ void Poller::noteClockFix(const char* answer) {
 }
 
 /* ------------------------------------------------------------------------
+ * EIGEN STATUSRONDES (v2.18.0)
+ *
+ * WAAROM DIT ER IS. MeshManager vraagt uit zichzelf nooit een status op:
+ * `refresh` komt alleen in de wachtrij als iemand op de knop drukt. De
+ * regelmaat kwam tot nu toe volledig van de dakrepeater, die de andere nodes
+ * over LoRa uitvroeg en via MQTT publiceerde. Toen die zijn accu leegtrok
+ * stonden er drie nodes tegelijk stil -- niet omdat ze weg waren, maar omdat de
+ * koerier weg was. Deze node kan die rondes zelf doen: de hele machinerie
+ * (login, REQ_TYPE_GET_STATUS, de meting naar /api/v1/ingest) stond er al, er
+ * ontbrak alleen een klok.
+ *
+ * WAT HET INTERVAL BETEKENT: elk DOEL wordt hoogstens eens per _auto_mins
+ * uitgevraagd -- niet de hele lijst per interval. Met vier doelen en een uur
+ * gaat er dus gemiddeld elk kwartier een ronde de lucht in, niet vier tegelijk.
+ *
+ * WAT HET NOOIT DOET:
+ *  - voorkruipen. Een opdracht van de server (settings, refresh, klok) gaat
+ *    altijd voor: staat er iets in de wachtrij, dan slaan we deze beurt over.
+ *  - twee sessies tegelijk. RepeaterCli doet er een, en een eigen ronde die op
+ *    een serveropdracht zou botsen is een ronde die niets oplevert.
+ *  - zenden zonder bestemming. Zonder push-url gaat de meting nergens heen; dan
+ *    is het zendtijd voor niets, en zendtijd is het enige wat op een mesh echt
+ *    op kan.
+ *  - een doel zonder wachtwoord uitvragen. Dat wordt een login die stil blijft
+ *    en een mislukking in de tellers, elke ronde opnieuw.
+ *
+ * DE REM ERTUSSEN (POLLER_AUTO_GAP_MS). Acht doelen die tegelijk aan de beurt
+ * komen zouden acht sessies achter elkaar starten. Per beurt één, met een halve
+ * minuut ertussen: dan zijn de rondes uitgesmeerd in plaats van een stoot.
+ * ------------------------------------------------------------------------ */
+void Poller::setAutoMins(uint16_t m) {
+  if (m != 0) {
+    if (m < POLLER_AUTO_MIN_MINS) m = POLLER_AUTO_MIN_MINS;
+    if (m > POLLER_AUTO_MAX_MINS) m = POLLER_AUTO_MAX_MINS;
+  }
+  _auto_mins = m;
+  /* Net aangezet: niet meteen, maar met dezelfde rem als tussen twee doelen --
+   * anders vertrekt er een ronde terwijl de beheerder nog aan het instellen is. */
+  if (m != 0) _auto_next_ms = millis() + POLLER_AUTO_GAP_MS;
+  saveConfig();
+}
+
+void Poller::autoStatusTick(unsigned long now) {
+  if (_auto_mins == 0) return;                          /* uit */
+  if (_push == nullptr || !_push->enabled()) return;    /* geen url: nergens heen */
+  if (_pending_count > 0) return;                       /* serveropdrachten eerst */
+  if (_status_wait) return;                             /* onze vorige ronde loopt nog */
+  if (_rcli == nullptr || _rcli->busy()) return;        /* een sessie tegelijk */
+  if ((long)(now - _auto_next_ms) < 0) return;          /* de rem tussen twee doelen */
+
+  /* Het doel dat het LANGST geleden aan de beurt was en de tijd voorbij is.
+   * "Nooit gedaan" telt als oudste: na een herstart is elk doel een keer aan de
+   * beurt, en dat is precies wat je wilt -- de reeks is dan toch onderbroken. */
+  const unsigned long interval_ms = (unsigned long)_auto_mins * 60000UL;
+  int keuze = -1;
+  unsigned long oudste = 0;
+  for (int i = 0; i < _ntargets; i++) {
+    if (passwordFor(_targets[i].prefix) == nullptr) continue;
+    unsigned long leeftijd = (_targets[i].auto_last == 0)
+                           ? 0xFFFFFFFFUL : (now - _targets[i].auto_last);
+    if (leeftijd < interval_ms) continue;
+    if (keuze < 0 || leeftijd > oudste) { keuze = i; oudste = leeftijd; }
+  }
+  if (keuze < 0) return;
+
+  /* De beurt is verbruikt zodra we hem geven, ook als de wachtrij hem weigert:
+   * anders blijft hetzelfde doel elke lus opnieuw proberen en komt de rest nooit
+   * aan bod. */
+  _targets[keuze].auto_last = now;
+  _auto_next_ms = now + POLLER_AUTO_GAP_MS;
+  if (pushPending(_targets[keuze].prefix, "", PEND_STATUS)) {
+    _auto_started++;
+    snprintf(_note, sizeof(_note), "%.16s: eigen statusronde ingepland",
+             _targets[keuze].prefix);
+  }
+}
+
+/* ------------------------------------------------------------------------
  * loop
  * ------------------------------------------------------------------------ */
 void Poller::loop() {
@@ -684,6 +783,11 @@ void Poller::loop() {
   startNextPending();
 
   const unsigned long now = millis();
+
+  /* Eigen statusrondes (v2.18.0). NA startNextPending: die leegt de wachtrij,
+   * en deze zet er hoogstens een bij als ze leeg is. */
+  autoStatusTick(now);
+
   if ((long)(now - _next_poll) < 0) return;
 
   /* Alleen pollen als er PLAATS is om te bewaren wat we ophalen: clear-on-read.

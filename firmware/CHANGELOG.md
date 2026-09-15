@@ -7,6 +7,52 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.18.0 — de poller vraagt zijn doelen zelf uit
+
+**Wat er stukging.** De zonnerepeater op het dak trok zijn accu leeg (3,55 V op
+13/09 → 2,81 V op 15/09 00:00) en viel uit. Dat is geen ramp; wat wél een ramp was:
+in MeshManager stonden er **drie** nodes tegelijk stil. Die repeater vroeg de andere
+over LoRa uit en publiceerde hun cijfers via MQTT — hij was de koerier, en er was er
+maar één.
+
+**Waarom niets het overnam.** MeshManager vraagt uit zichzelf nooit een status op:
+`refresh` komt alleen in de wachtrij als iemand op de knop drukt (`commanding.py`
+noemt het letterlijk *manual status requests*). De regelmaat kwam volledig van die
+ene node. Op deze node stond ondertussen de hele machinerie klaar — inloggen,
+`REQ_TYPE_GET_STATUS`, de meting naar `/api/v1/ingest` — alleen keek er nooit iemand
+op de klok.
+
+**Nu wel.** Staat `auto_mins` op een getal, dan vraagt de node **elk doel** hoogstens
+eens per zoveel minuten zelf uit. Elk doel, niet de hele lijst per interval: met vier
+doelen en een uur gaat er gemiddeld elk kwartier één ronde de lucht in, niet vier
+tegelijk. Daar bovenop een halve minuut tussen twee rondes, want acht doelen die
+toevallig samen aan de beurt komen zijn anders acht sessies achter elkaar.
+
+**Wat het nooit doet**, en dat is waar de meeste regels aan opgaan:
+
+- **voorkruipen** — een opdracht van de server gaat voor; staat er iets in de
+  wachtrij, dan slaat de eigen ronde die beurt over;
+- **twee sessies tegelijk** — `RepeaterCli` doet er één, en een eigen ronde die op
+  een serveropdracht botst levert niets op;
+- **zenden zonder bestemming** — zonder push-url kan de meting nergens heen, en dan
+  is het zendtijd voor niets. Zendtijd is het enige op een mesh dat echt op kan;
+- **een doel zonder wachtwoord uitvragen** — dat wordt een login die stil blijft en
+  een mislukking in de tellers, elke ronde opnieuw.
+
+**Uit na een upgrade.** De derde regel in `/poller.cfg` mag ontbreken; een bestand van
+vóór deze versie laat de eigen rondes uit staan. Zendtijd hoort niet vanzelf te gaan
+lopen omdat er nieuwe firmware op staat.
+
+**Eén detail dat een bug was geworden.** `delTarget()` schuift de lijst op en laat de
+oude staart staan. Zonder `auto_last = 0` bij het toevoegen erft een nieuw doel het
+beurt-moment van een gewist doel — en dan blijft het uren stil om een reden die
+nergens te zien is.
+
+**Wat hiermee niet opgelost is.** De dakrepeater blijft de plek waar de ruwe
+pakketstroom (`/rx`) en het pakketfilter thuishoren: die horen bij een antenne op een
+dak, niet bij een node binnenshuis. Wat hier verhuist is het koerierswerk, niet het
+oor. En de accu die leegliep heeft nog altijd geen alarm gegeven.
+
 ## v2.17.0 — `discover.neighbors`: de opdracht die ontbrak
 
 **Het was geen leesactie maar een opdracht.** *Discover neighbours* in de companion-
