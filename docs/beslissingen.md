@@ -331,3 +331,33 @@ Over de DM (LoRa, versleuteld) blijft het `ping`, want daar kijkt geen middlebox
 mee. Een beveiligingsdoos die je eigen beheerverkeer sloopt is een omgevingsfeit;
 er stil omheen werken met een alias is goedkoper dan documentatie die zegt "zet je
 IPS uit".
+
+## Waarom de openHop-brug niet op `availableForWrite()` mag leunen (19 sep 2026)
+
+De brug moet de node nooit stilzetten: `WiFiClient::write()` wacht tot de bytes
+weg kunnen, en leest de gast even niet, dan staat de hele hoofdlus stil -- geen
+webserver, geen mesh. Gemeten in die toestand: Send-Q 2552 byte vast, backoff 11,
+rto 120 s, negen minuten geen teken van leven terwijl ping gewoon beantwoord werd
+(die zit in de lwIP-taak, niet in de lus).
+
+De eerste oplossing was "alleen schrijven als er nu plaats is". Die deugt niet:
+**`availableForWrite()` bestaat niet in deze Arduino-ESP32-kern**. `WiFiClient`
+erft hem van `Client`, en dat is een vaste `0`. De drempel las dus altijd "geen
+plaats" en gooide elk RX-frame weg -- de daemon hoorde niets meer, en dan kan
+niemand nog over de mesh inloggen op de node die erachter hangt. `rx: 0,
+rx_dropped: 29` aan de ene kant, "buffer vol 18" aan de andere.
+
+Tweede voetangel in dezelfde hoek: `setTimeout()` rekent hier in **milliseconden**
+(`_timeout` gaat via `tv.tv_sec = _timeout / 1000` naar de socket). `setTimeout(2)`
+is dus 2 ms, niet 2 s.
+
+Wat het wel is: schrijven met een echte tijdsgrens (2000 ms) plus de
+stilstand-teller die er al was -- na vijf seconden zonder doorkomen de ring weg en
+eerlijk één verlies per frame tellen, na dertig seconden de verbinding loslaten
+zodat de gast schoon kan terugkomen. Dat laatste is meteen het signaal waar de
+failover op wacht. Na deze wijziging: `rx: 28, rx_dropped: 0`, en in het
+daemonlogboek weer `RX bureau -> TX dak -> Retransmitted packet`.
+
+De les erachter is algemener dan deze brug: een API die compileert is nog geen API
+die bestaat. `availableForWrite()` is een `virtual` met een nette standaardwaarde,
+en een standaardwaarde van nul ziet er in code uit als een meting.

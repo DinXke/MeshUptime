@@ -69,6 +69,10 @@
 #define OPENHOP_FO_HOLD_DEFAULT  60
 #define OPENHOP_FO_HOLD_MIN      10
 #define OPENHOP_FO_HOLD_MAX      3600
+/* Een VERBONDEN host die niets zegt is normaal: hun driver praat alleen als
+ * er iets te zenden valt. Pas na dit veelvoud van de wachttijd zonder enig
+ * frame noemen we hem vastgelopen -- dan is het geen rustige minuut meer. */
+#define OPENHOP_FO_STALL_MULT    10
 
 /* Het protocol. Namen letterlijk uit protocol_constants.py, zodat ze naast
  * elkaar te leggen zijn zonder te hoeven vertalen. */
@@ -116,6 +120,10 @@
  * socket wachten, dus wordt er gekopieerd en pas in loop() geschreven. Zes
  * plaatsen is ruim een seconde aan druk verkeer en kost ~1,6 kB. */
 #define OH_RX_RING              6
+/* Zolang de host niets aanneemt: na dit stilstaan de ring weggooien (en dat
+ * eerlijk tellen), en na zes keer zo lang de verbinding loslaten zodat hij
+ * opnieuw kan verbinden. */
+#define OH_STALL_DROP_MS        5000UL
 
 class RoomMesh;
 class WifiTask;
@@ -158,6 +166,9 @@ public:
   uint32_t    rxDropped() const    { return _rx_dropped; }
   uint32_t    txAccepted() const   { return _tx_ok; }
   uint32_t    txRefused() const    { return _tx_refused; }
+  /* Frames die we lieten vallen omdat de zendbuffer vol zat. Zie sendFrame:
+   * wachten zou de hele node stilzetten. */
+  uint32_t    sockFull() const     { return _sock_full; }
   const char* lastNote() const     { return _note; }
 
 private:
@@ -186,7 +197,8 @@ private:
   uint16_t  _rx_len[OH_RX_RING];
   uint8_t   _rx_head, _rx_count;
 
-  uint32_t  _rx_pushed, _rx_dropped, _tx_ok, _tx_refused;
+  uint32_t  _rx_pushed, _rx_dropped, _tx_ok, _tx_refused, _sock_full;
+  unsigned long _stall_since;   /* sinds wanneer neemt hij niets meer aan? */
 
   /* De failover. _guest_seen is het laatste LEVENSTEKEN van de host: elk
    * geldig frame telt, en hun driver stuurt uit zichzelf PING's. Zo valt een
@@ -198,6 +210,7 @@ private:
   uint16_t  _fo_hold_s;
   unsigned long _guest_seen;
   unsigned long _guest_back_since;
+  unsigned long _guest_gone_since;   /* sinds wanneer missen we hem? */
   bool      _fo_taken;
   uint32_t  _fo_count;
   char      _note[80];
@@ -211,7 +224,11 @@ private:
   void dropClient(const char* waarom);
 
   /* Een frame de deur uit. false = er kon niet geschreven worden. */
-  bool sendFrame(uint8_t cmd, const uint8_t* payload, size_t len);
+  /* alleen_als_plaats: voor de RX-stroom. Antwoorden (PONG, AUTH_OK,
+   * CONFIG_RESP, TX_DONE) moeten er gewoon uit -- zonder die hoort hun
+   * driver niets terug en komt de verbinding nooit tot stand. */
+  bool sendFrame(uint8_t cmd, const uint8_t* payload, size_t len,
+                 bool alleen_als_plaats = false);
   void sendError(uint8_t code);
 
   void readSocket();

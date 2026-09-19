@@ -595,7 +595,13 @@ companion → antwoord terug). De poller (`Poller.*`) doet dat nu op de node zel
    inloggen, dan de N parameters achter elkaar. `cmd:X` → stuur `X` letterlijk; elke
    andere param `P` → `get P` (exact de vertaling van de oude HA-pusher);
 3. **terugmelden** — elk antwoord naar `POST /api/v1/repeater_settings`; **geen
-   antwoord → `null`** ("gevraagd, geen antwoord"), nooit stilte.
+   antwoord → `null`** ("gevraagd, geen antwoord"), nooit stilte;
+4. **statusverzoeken** (v2.7.0) — voor elk `refresh`-verzoek dezelfde
+   sessie-aanpak, maar na de login één `REQ_TYPE_GET_STATUS` in plaats van
+   CLI-tekst; het antwoord gaat als **metingen** naar `POST /api/v1/ingest`;
+5. **de klok rechtzetten** (v2.8.0) — de parameter `cmd:clockfix` wordt een eigen
+   job met meerdere stappen (`clock` lezen, en afhankelijk van de afwijking niets,
+   `time`, of `clkreboot` + `time`). Zie de eigen sectie hieronder.
 
 **Clear-on-read.** De wachtrij wist zich bij het uitreiken, dus wat je ophaalt
 bestaat daarna nergens meer. De poller polt daarom alleen als zijn eigen wachtrij
@@ -617,9 +623,115 @@ wachtrij de lucht in** (`clkreboot`/`reboot`/`erase`/`set radio`/`poweroff`/
 stuurt MeshManager alleen leescommando's plus `cmd:filter count`/`cmd:region`; deze
 zeef is de gordel voor het geval de `cli_params`-lijst wordt uitgebreid.
 
-**Bekende beperking.** `refresh`-verzoeken (een statusverzoek, `REQ_TYPE_GET_STATUS`
-— een ander protocol dan de CLI-sessie) worden in deze versie **niet** uitgevoerd:
-ze worden gelogd als "niet ondersteund" en vallen weg.
+### Statusverzoeken: de knop "Status nu opvragen" (v2.7.0)
+
+Tot v2.6.0 liet de poller `refresh`-verzoeken vallen, en MeshManager zette de knop
+*Status nu opvragen* daarom uit met de reden erbij. Nu voert hij ze uit, dus die
+reden is weg en de knop werkt op **elke** repeater waarvan deze node het wachtwoord
+kent — ook als daar niet onze eigen firmware op draait.
+
+Een statusronde is een eigen LoRa-sessie: **inloggen** (dat is ook hier verplicht —
+`MyMesh::handleRequest` wordt alleen bereikt via `onPeerDataRecv`, en dat vereist dat
+de afzender in de toegangslijst staat; de anonieme weg kent alleen
+LOGIN/REGIONS/OWNER/CLOCK) en dan **één `REQ_TYPE_GET_STATUS`**
+(`PAYLOAD_TYPE_REQ`). Het antwoord is een `PAYLOAD_TYPE_RESPONSE` van 4 + 56 byte:
+de teruggekaatste tag plus `struct RepeaterStats`.
+
+Een statusverzoek is een **leesactie**, dus hier mag wél herhaald worden — de gewone
+drie pogingen. Dat is het verschil met een muterend CLI-commando, waar een
+herhaling het commando op de tegenkant opnieuw zou uitvoeren.
+
+De metingen gaan onder de namen die `server/app/metrics.py` kent: `bat` (V),
+`uptime` (dagen), `airtime` en `rx_airtime` (minuten), `last_snr` (dB),
+`tx_queue_len`, `noise_floor`, `last_rssi`, `nb_recv`, `nb_sent`, `recv_flood`,
+`recv_direct`, `sent_flood`, `sent_direct`, `flood_dups`, `direct_dups`,
+`recv_errors` en `full_evts`. Wat de firmware niet meldt, wordt **weggelaten** — een
+nul is op de server een meting, en een verzonnen nul wordt een punt in een grafiek.
+`airtime_utilization` en `rx_airtime_utilization` sturen we **niet**: die zijn op de
+server afgeleid uit de airtime-tellers (`db._UTIL_BASIS`, `computed_utilization` —
+"Computed here instead of read from the node"), dus daar hoeven wij alleen de
+tellers voor te leveren.
+
+**Als het niet lukt, wordt er niets gemeld.** Mislukte login, drie keer stilte, of
+een antwoord dat de plausibiliteitstoets niet haalt: dan komt er een logregel en een
+teller (`status_fail` in `/poller.json`), en géén meting. `/api/v1/ingest` neemt
+metingen aan, en een halve of verzonnen meting zou daar als echte waarde in de
+reeksen en de grafieken belanden. Liever een lege pagina.
+
+**De plausibiliteitstoets** bestaat omdat de doelrepeater niet onze build hoeft te
+draaien (JessaZH draait `v1.17.1-PS+filter+rollback` van dutchmeshcore). Een fork die
+een veld *toevoegt* aan het eind is onschadelijk — we lezen de eerste 56 byte en
+negeren de rest. Een fork die een veld *invoegt* of *herordent* is dat niet: dan
+lezen we geldige getallen op de verkeerde plaats, en dat is aan de bytes niet te
+zien. Daarom toetst de node de velden waarvan het bereik vaststaat: accuspanning
+(0 of 1,5–6,0 V), uptime (< 20 jaar), **airtime ≤ uptime** (een radio kan niet langer
+gezonden hebben dan hij aan stond — de scherpste toets, die precies een verschuiving
+pakt), TX-wachtrij ≤ 4096, ruisvloer/RSSI −200…50 dBm, SNR −50…50 dB. Faalt er één,
+dan wordt het **hele** antwoord verworpen.
+
+### De klok van een repeater rechtzetten (v2.8.0)
+
+MeshManager kan de opdracht in de wachtrij zetten als settings-parameter
+`cmd:clockfix`. De poller haalt die **uit** de parameterlijst en maakt er een eigen
+job van — het woord "clockfix" gaat nooit naar de repeater, die kent het niet.
+
+**Waarom dit één job op de node is.** De firmware van de tegenkant weigert een klok
+**achteruit**: `CommonCLI::handleCommand` antwoordt bij `time <epoch>` met
+`(ERR: clock cannot go backwards)` zodra `secs <= curr`. Loopt een node dus *voor*,
+dan is `clkreboot` de enige uitweg — die zet de klok op 15 mei 2024 en herstart
+meteen, zonder te antwoorden — gevolgd door `time <epoch>`. Tussen die twee is de
+node **onzichtbaar** voor iedereen die zijn oude, in de toekomst liggende
+advert-tijdstempel onthield: adverts met een lagere tijdstempel worden overal
+weggegooid. Dat venster mag geen HTTP-ronde, geen clear-on-read-wachtrij en geen
+serverstoring bevatten. Alleen de node zelf staat dicht genoeg bij de radio om er
+twintig seconden lang op te hameren, en zolang de job loopt houdt hij de enige
+sessie bezet zodat er niets tussen komt.
+
+**Het verloop:**
+
+1. `clock` lezen en de afwijking bepalen.
+2. **Minder dan 60 s afwijking → niets doen**, geen herstart. Een node herstarten
+   voor niets is de duurste vorm van ijver. Die 60 s is ook de eerlijke ondergrens
+   van de meting: `clock` antwoordt `HH:MM - D/M/YYYY UTC`, dus **zonder seconden**.
+   De tegenkant wordt op het midden van die minuut geschat (+30 s), waarmee er
+   ±30 s onzekerheid overblijft — een drempel korter dan een minuut zou op ruis
+   staan.
+3. **Loopt achter → alleen `time <epoch>`**, geen herstart. Vooruit mag altijd.
+4. **Loopt voor → `clkreboot`.** Daar komt **geen antwoord** op; stilte betekent
+   hier "verstuurd". Daarom wacht de job daar maar 4 s op in plaats van de gewone
+   25 s: elke seconde in dit venster is een seconde waarin de node onzichtbaar is.
+5. Na 12 s wachten wordt er elke 10 s opnieuw **ingelogd en `time <epoch>` met een
+   verse epoch** gestuurd, tot `clock set` terugkomt of tot het venster van 3
+   minuten om is. De login is tegelijk de "is hij al terug?"-proef, en zorgt dat we
+   weer in zijn toegangslijst staan als die de herstart niet overleefde. Eerste
+   poging dus op ~16 s na de herstart — waar de handmatige run raakte.
+6. `clock` teruglezen, zodat het antwoord de **echte** nieuwe stand draagt.
+
+Het antwoord is één zin voor een mens, bijvoorbeeld
+`OK - klok gezet: 11:22 UTC (was 11:39, liep 1040 s voor; clkreboot + 2 pogingen)`
+of `MISLUKT - clkreboot verstuurd maar 'time' niet bevestigd na 15 pogingen; klok
+staat op mei 2024`.
+
+**Geen tweede `clkreboot`, ooit.** Eén per job, en een `backwards`-antwoord ná een
+clkreboot leidt tot MISLUKT en niet tot een tweede herstart. Twee clkreboots achter
+elkaar is precies hoe je een node op een dak in 2024 achterlaat. `clkreboot` als
+**los** commando uit de wachtrij blijft geweigerd (de BRICK-zeef); alleen deze job
+mag hem sturen, en alleen als stap 4.
+
+**Geen marge op de epoch.** We sturen de tijd van het verzendmoment zonder
+correctie voor de vluchttijd. Overschatten zou de node opnieuw *vóór* laten lopen,
+en dat is de dure richting; een paar seconden achterlopen is onschadelijk en wordt
+door de gewone `clock sync` van elke app rechtgetrokken.
+
+**Zichtbaarheid.** Elke stap gaat serieel het logboek in, en `/poller.json` draagt
+`clockfix_ok`, `clockfix_fail` en `clockfix_last` (de laatste uitkomst voluit). De
+GUI-kaart toont dat ook. Dit is de handeling waarvan je achteraf wilt kunnen zien
+wat er gebeurde.
+
+**De capability-opgave.** De poll-URL meldt `?caps=settings,refresh,clockfix`. Daarop zet
+MeshManager de knop aan of uit (`db.note_poller_seen`); aan de site hoeft niets te
+veranderen. Zet daar nooit iets in wat de poller niet echt uitvoert — dan belooft de
+beheerpagina een knop die een verzoek in een wachtrij legt dat hier stil sneuvelt.
 
 **Aanzetten.** De poller staat standaard **uit**. Zet het standaardwachtwoord (of een
 wachtwoord per doel-prefix), vink *poller aan* aan, kies eventueel het interval, en

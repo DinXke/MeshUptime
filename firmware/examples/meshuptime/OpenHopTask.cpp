@@ -37,11 +37,13 @@ void OpenHopTask::reset() {
   _client_ip[0] = 0;
   _in_len = 0;
   _rx_head = _rx_count = 0;
-  _rx_pushed = _rx_dropped = _tx_ok = _tx_refused = 0;
+  _rx_pushed = _rx_dropped = _tx_ok = _tx_refused = _sock_full = 0;
+  _stall_since = 0;
   _fo_on = false;
   _fo_hold_s = OPENHOP_FO_HOLD_DEFAULT;
   _guest_seen = 0;
   _guest_back_since = 0;
+  _guest_gone_since = 0;
   _fo_taken = false;
   _fo_count = 0;
   StrHelper::strncpy(_note, "uit", sizeof(_note));
@@ -171,9 +173,26 @@ bool OpenHopTask::clientConnected() const {
 /* ------------------------------------------------------------------------
  * Frames schrijven
  * ------------------------------------------------------------------------ */
-bool OpenHopTask::sendFrame(uint8_t cmd, const uint8_t* payload, size_t len) {
+bool OpenHopTask::sendFrame(uint8_t cmd, const uint8_t* payload, size_t len,
+                            bool alleen_als_plaats) {
 #ifdef ESP32
   if (!clientConnected()) return false;
+
+  /* EEN GAST MAG ZENDTIJD KOSTEN, GEEN HOOFDLUS. WiFiClient::write() wacht tot
+   * de bytes weg kunnen; leest de host even niet, dan staat deze node stil --
+   * geen webserver, geen mesh, en hij stopt zelfs met ACK'en (gemeten: Send-Q
+   * 2552 byte vast, rto 120 s, negen minuten niets). Dus schrijven we alleen
+   * als er NU plaats is, en laten we het frame anders vallen. Een RX_PACKET dat
+   * de host mist is vervelend; een node die stilstaat is erger. */
+  /* GEEN availableForWrite(): die bestaat in deze kern niet (WiFiClient erft
+   * hem van Client en dat is een vaste 0). Daarop drempelen betekende: elk
+   * RX-frame weggooien, en dus een host die niets meer hoort.
+   *
+   * De grens zit in de TIJD. setTimeout staat op twee seconden (in ms, zie
+   * loop()); langer mag een write nooit duren, want zo lang staat de hoofdlus
+   * stil. Neemt de host structureel niets meer aan, dan vangt de
+   * stilstand-teller in flushRxRing() dat op. */
+  (void)alleen_als_plaats;
   uint8_t hdr[5];
   hdr[0] = OH_SYNC;
   hdr[1] = cmd;
@@ -234,11 +253,31 @@ void OpenHopTask::onRawRx(float snr, float rssi, const uint8_t* raw, int len) {
 
 void OpenHopTask::flushRxRing() {
   while (_rx_count > 0) {
-    if (!sendFrame(OH_CMD_RX_PACKET, _rx[_rx_head], _rx_len[_rx_head])) return;
+    if (!sendFrame(OH_CMD_RX_PACKET, _rx[_rx_head], _rx_len[_rx_head], true)) {
+      /* Past niet. Deze ronde niet blijven duwen -- anders staat de hele ring
+       * achter een frame te wachten dat er nu eenmaal niet in gaat. */
+      const unsigned long nu = millis();
+      if (_stall_since == 0) { _stall_since = nu; return; }
+      if (nu - _stall_since < OH_STALL_DROP_MS) return;
+
+      /* Lang genoeg dicht: de ring weg, en EEN verlies per frame tellen. Zo
+       * blijft het getal betekenen wat het zegt en loopt de doorstroom weer. */
+      _rx_dropped += _rx_count;
+      _rx_head = _rx_count = 0;
+      if (nu - _stall_since >= OH_STALL_DROP_MS * 6) {
+        /* Hij leest al een halve minuut niets. Dan is de verbinding er wel maar
+         * de host niet, en laten we hem los zodat hij schoon kan terugkomen --
+         * meteen ook het signaal waar de failover op wacht. */
+        dropClient("host neemt niets meer aan");
+      }
+      return;
+    }
+    _stall_since = 0;
     _rx_head = (uint8_t)((_rx_head + 1) % OH_RX_RING);
     _rx_count--;
     _rx_pushed++;
   }
+  _stall_since = 0;
 }
 
 /* ------------------------------------------------------------------------
@@ -502,11 +541,24 @@ void OpenHopTask::failoverTick() {
   const unsigned long nu = millis();
   const unsigned long hold = (unsigned long)_fo_hold_s * 1000UL;
 
-  bool levend = clientConnected() && _guest_seen != 0 && (nu - _guest_seen) < hold;
-  if (!levend) _guest_back_since = 0;
-  else if (_guest_back_since == 0) _guest_back_since = nu;
+  /* De VERBINDING is het levensteken. Een host die alleen luistert is stil, en
+   * dat is geen storing; pas een verbonden host die een veelvoud van de
+   * wachttijd geen byte meer stuurde, is vastgelopen. */
+  const bool verbonden = clientConnected();
+  const bool vastgelopen = verbonden && _guest_seen != 0 &&
+      (nu - _guest_seen) > hold * OPENHOP_FO_STALL_MULT;
+  const bool levend = verbonden && !vastgelopen;
 
-  if (!levend && !_fo_taken) {
+  if (levend) {
+    _guest_gone_since = 0;
+    if (_guest_back_since == 0) _guest_back_since = nu;
+  } else {
+    _guest_back_since = 0;
+    if (_guest_gone_since == 0) _guest_gone_since = nu;
+  }
+
+  /* Pas overnemen als hij ONAFGEBROKEN lang genoeg weg is. */
+  if (!levend && !_fo_taken && (nu - _guest_gone_since) >= hold) {
     if (_mesh->ohForwarding()) return;      /* stond al aan; niets over te nemen */
     _mesh->ohSetForwarding(true);
     _fo_taken = true;
@@ -553,6 +605,9 @@ void OpenHopTask::loop() {
     if (clientConnected()) dropClient("nieuwe host meldt zich");
     _cl = nieuw;
     _cl.setNoDelay(true);
+    /* Tweede vangnet: mocht een write toch blijven hangen, dan is de schade
+     * seconden in plaats van minuten. */
+    _cl.setTimeout(2000);   /* milliseconden in deze kern */
     _in_len = 0;
     _authed = (_token[0] == 0);          /* geen token = meteen binnen */
     snprintf(_client_ip, sizeof(_client_ip), "%s", _cl.remoteIP().toString().c_str());
