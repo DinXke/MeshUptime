@@ -12,9 +12,9 @@ De bot is intussen een **tweerichtings** mesh-diagnose-responder — hij antwoor
 `ping`/`test`/`path` zowel per DM als in **hashtag-/publieke kanalen** — de node
 synct zijn klok over **NTP** en toont menselijke tijden in de lokale tijdzone, en
 een **grote contactenlijst** lost overal node-namen op.
-De huidige versie is **MeshUptime v2.6.0** (eigen versionering, los van de
+De huidige versie is **MeshUptime v2.8.0** (eigen versionering, los van de
 MeshCore-bibliotheek v1.17.0); de branding toont beide:
-`MeshUptime v2.6.0 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
+`MeshUptime v2.8.0 (by DinX) - MeshCore v1.17.0`. De feature-geschiedenis staat in
 **[firmware/CHANGELOG.md](firmware/CHANGELOG.md)**.
 
 Er zijn **twee PlatformIO-envs**:
@@ -76,7 +76,27 @@ wachtwoorden staan in een klein persistent tabelletje (nooit teruggelezen), te
 beheren op de kaart *MeshManager-poller* van het nodebeheer-tabblad. Eén sessie
 tegelijk, niet-blokkerend, geen herhaling van muterende commando's, en gevaarlijke
 commando's (`clkreboot` c.s.) komen niet uit de wachtrij de lucht in. Er is ook een
-handmatige weg: `@<pubkey>[:<wachtwoord>] <opdracht>` in de CLI-console. Zie
+handmatige weg: `@<pubkey>[:<wachtwoord>] <opdracht>` in de CLI-console.
+
+Sinds **v2.7.0** voert de poller ook **statusverzoeken** uit: de knop *Status nu
+opvragen* op de MeshManager-beheerpagina werkt daarmee op elke repeater waarvan deze
+node het wachtwoord kent, ook zonder onze eigen firmware aan de andere kant. Zo'n
+ronde logt in en stuurt een `REQ_TYPE_GET_STATUS`; het antwoord (accu, uptime,
+airtime, RSSI/SNR, tellers) gaat als metingen naar `/api/v1/ingest`. Statusverzoeken
+zijn leesacties, dus die mogen wel herhaald worden. Lukt het niet, of ziet het
+antwoord er niet uit zoals verwacht (een andere firmware kan de structuur anders
+indelen), dan wordt er **niets** gemeld -- een halve meting is erger dan een lege
+pagina.
+
+En sinds **v2.8.0** kan de node de **klok van een repeater rechtzetten** als één job
+(`cmd:clockfix`). Dat moet één job zijn omdat de tegenkant een klok niet achteruit
+laat zetten (`ERR: clock cannot go backwards`): bij een node die vóórloopt is
+`clkreboot` (klok naar mei 2024 + herstart) de enige weg, en tussen die herstart en
+een gelukte `time <epoch>` is de node onzichtbaar voor iedereen die zijn oude
+tijdstempel onthield. Dat venster mag geen HTTP-ronde of wachtrij bevatten, dus
+hamert de node er zelf op: elke tien seconden opnieuw inloggen en `time` sturen, tot
+drie minuten lang. Wijkt de klok minder dan een minuut af, dan gebeurt er niets --
+en er komt **nooit** een tweede `clkreboot`. Zie
 [docs/werking.md](docs/werking.md).
 
 **Room-server-variant (v2.0.0 → v2.3.2), het huidige hoofdproduct:**
@@ -202,6 +222,22 @@ aangebracht; met de hand hoeft dat alleen nog in de losse bouwkopie.
 
 `upload` schrijft alleen de programmapartitie en niet SPIFFS: de identiteit in
 `/identity/_main.id` en het instellingenbestand blijven staan.
+
+## Verwante projecten
+
+Vier stukken die samen gegroeid zijn, met opzet in aparte repo's: elk draait op
+andere hardware en is bruikbaar zonder de rest.
+
+| Project | Wat het is |
+|---|---|
+| **MeshUptime** (hier) | De bewakingsnode: room-server, bots, IRC, sensoren, en de poller die de andere repeaters over LoRa om status, instellingen en buren vraagt. Plus de T1000-E-companionfirmware |
+| [**MeshManager**](https://github.com/DinXke/MeshStats) | De site: statistieken, live kaart, pakketarchief, alarmen en het beheer van de vloot |
+| [**MeshManagerNet**](https://github.com/DinXke/MeshManagerNet) | De dakrepeater: een MeshCore-repeater met een IP-leven ernaast (wifi, beheerpagina, OTA met terugrol, MQTT, pakketfilter). Overlay op MeshCore |
+| [openHop](https://github.com/openhop-dev) (van derden) | Python-herimplementatie van MeshCore; draait naast deze vloot met de nodes als antenne |
+
+Deze node draagt sinds v2.21.0 een **openHop-brug**: een openHop-daemon mag zijn
+radio over TCP gebruiken zonder dat de node ophoudt te doen wat hij deed, met een
+failover die het repeteren terugneemt zodra die daemon wegvalt.
 
 ## Documentatie
 
