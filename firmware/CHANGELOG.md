@@ -7,6 +7,30 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.21.1 — de halve web-GUI lag plat sinds v2.18.0
+
+**Het symptoom.** Alle tabbladen die door script zichtbaar gemaakt worden — rooms,
+sensor-nodes, bot, companions, irc — bleven verborgen. De bot leek stuk; dat was hij
+niet, je kon alleen niet meer bij zijn scherm.
+
+**De oorzaak, en het is een domme.** Het veld voor de eigen pollerrondes (v2.18.0)
+kreeg zijn waarde uitgelezen met een regel die MIDDEN IN een object-literal belandde:
+
+```js
+fetch("poller",{method:"POST",headers:{...},
+var a=document.getElementById("pl-auto").value;      // <- hier
+body:"on="+on+...})
+```
+
+Dat is een syntaxfout, en een syntaxfout nekt het hele scriptblok — dus ook de
+probes die achteraan staan en de tabbladen zichtbaar maken. Vier dagen lang, want
+de pollerpagina zelf werkte gewoon en niemand klikt elke dag op alles.
+
+**De les die ik hier opschrijf.** Deze GUI is één groot scriptblok in een C-string;
+een fout erin is niet lokaal maar fataal. Een gegenereerde pagina hoort daarom
+gecontroleerd te worden voordat hij geflasht wordt — `node --check` op de scripts uit
+de geserveerde pagina kost seconden en had dit meteen gezien.
+
 ## v2.21.0 — openHop mag meerijden op onze radio
 
 **Wat openHop is.** Een Python-herimplementatie van MeshCore: zelfde protocol,

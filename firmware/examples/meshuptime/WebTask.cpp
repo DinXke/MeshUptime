@@ -3356,8 +3356,8 @@ body:"del="+encodeURIComponent(p)}).then(function(){plLoad()})}}}).catch(functio
 document.getElementById("pl-save").onclick=function(){
 var on=document.getElementById("pl-on").checked?"1":"0";
 var s=document.getElementById("pl-secs").value;
-fetch("poller",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
 var a=document.getElementById("pl-auto").value;
+fetch("poller",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"on="+on+"&poll_secs="+encodeURIComponent(s)+"&auto_mins="+encodeURIComponent(a)})
 .then(function(r){return r.text()}).then(function(t){logline("poller",t,1);plLoad()})}
 
