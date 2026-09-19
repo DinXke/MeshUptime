@@ -1,4 +1,5 @@
 #include "RoomMesh.h"
+#include "OpenHopTask.h"
 #include "TimeFmt.h"
 #include "PushTask.h"   /* v2.5.1: instant companion-push via _push->queueCompanion() */
 #include "IrcTask.h"    /* v2.9.0: kanaaltekst en DM's doorgeven aan de IRC-sessies */
@@ -6061,6 +6062,55 @@ void RoomMesh::saveIdentity(const mesh::LocalIdentity& new_id) {
   IdentityStore store(*_fs, "/identity");
 #endif
   store.save("_main", new_id);
+}
+
+
+/* ------------------------------------------------------------------------
+ * De openHop-brug: wat een gast van onze radio mag zien en doen (v2.21.0).
+ * Zie OpenHopTask.h voor het waarom van elke grens.
+ * ------------------------------------------------------------------------ */
+void RoomMesh::ohRadioParams(uint32_t& freq_hz, uint32_t& bw_hz, uint8_t& sf,
+                             uint8_t& cr, int8_t& pwr) const {
+  /* Wij bewaren MHz en kHz als kommagetal, de host rekent in hele hertz. */
+  freq_hz = (uint32_t)(_prefs.freq * 1000000.0f + 0.5f);
+  bw_hz   = (uint32_t)(_prefs.bw * 1000.0f + 0.5f);
+  sf = _prefs.sf;
+  cr = _prefs.cr;
+  pwr = (int8_t)_prefs.tx_power_dbm;
+}
+
+int   RoomMesh::ohNoiseFloor() const { return _radio->getNoiseFloor(); }
+int   RoomMesh::ohLastRssi() const   { return (int)radio_driver.getLastRSSI(); }
+float RoomMesh::ohLastSnr() const    { return radio_driver.getLastSNR(); }
+
+/* "Bezet" is hier geen echte CAD -- die zou de ontvangst onderbreken van een
+ * node die voor het hele mesh luistert. Dit is wat we eerlijk weten: staat er
+ * een pakket binnen te komen, dan is het kanaal in gebruik. */
+bool  RoomMesh::ohRadioBusy() const  { return _radio->isReceiving(); }
+
+bool RoomMesh::ohInjectRaw(const uint8_t* raw, int len, uint32_t* airtime_ms_out) {
+  mesh::Packet* pkt = obtainNewPacket();
+  if (pkt == NULL) return false;                 // wachtrij vol; NIET doen alsof
+  if (!tryParsePacket(pkt, raw, len)) {
+    releasePacket(pkt);
+    return false;                                // geen leesbaar MeshCore-pakket
+  }
+  /* Als gezien merken, net zoals Mesh::sendFlood doet voor onze eigen
+   * uitgaande pakketten: komt dit pakket straks van een buur bij ons terug,
+   * dan mogen wij het niet nog eens gaan rondsturen. Zonder dit zou elk
+   * pakket dat de gast stuurt door onszelf verdubbeld worden. */
+  getTables()->markSeen(pkt);
+  if (airtime_ms_out) *airtime_ms_out = _radio->getEstAirtimeFor(len);
+  /* Prioriteit 3 = de laagste, dezelfde baan als adverts: een gast op onze
+   * antenne dringt niet voor op ons eigen verkeer. */
+  sendPacket(pkt, 3, 0);
+  return true;
+}
+
+/* Elk ruw ontvangen pakket ook aan de brug aanbieden. Deze haak zat al in
+ * Dispatcher (logRxRaw) en werd hier nog niet gebruikt. */
+void RoomMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  if (_openhop) _openhop->onRawRx(snr, rssi, raw, len);
 }
 
 void RoomMesh::clearStats() {

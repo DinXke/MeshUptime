@@ -64,7 +64,8 @@ class WifiTask;
 class MonitorSensors;
 class IWebNode;    // de node-interface (SensorMesh of RoomMesh); zie IWebNode.h
 class RepeaterCli; // admin-CLI naar een ANDERE repeater; zie RepeaterCli.h
-class Poller;      // MeshManager-opdrachtwachtrij-poller; zie Poller.h
+class Poller;
+class OpenHopTask;      // MeshManager-opdrachtwachtrij-poller; zie Poller.h
 class WebServer;   // vooruit verklaard: WebServer.h hoort niet in deze header
 
 class WebTask {
@@ -111,6 +112,10 @@ public:
    * routes 503 met de reden. Zo hoeft de sensor-variant niets. */
   void setPoller(Poller* poller) { _poller = poller; }
 
+  /* De openHop-brug (v2.21.0). Zelfde vorm als setPoller: zonder brug
+   * antwoorden de endpoints 503 in plaats van te doen alsof. */
+  void setOpenHop(OpenHopTask* oh) { _openhop = oh; }
+
   /* Kort en niet blokkerend; hoort in loop() naast the_mesh.loop(). */
   void loop();
 
@@ -122,6 +127,7 @@ private:
   IWebNode*       _acl = nullptr;
   RepeaterCli*    _rcli = nullptr;
   Poller*         _poller = nullptr;
+  OpenHopTask*    _openhop = nullptr;
   WebServer*      _server = nullptr;
   const char*     _fw = "";
   bool            _serving = false;
@@ -243,6 +249,8 @@ private:
    *  handleTargetsJson()  GET  /repeater_targets.json -- doelen (ZONDER wachtwoord)
    *  handleTarget()       POST /repeater/target      -- doel zetten/wissen + default
    * Wachtwoorden komen NOOIT in een GET terug; de JSON zegt alleen "gezet: ja/nee". */
+  void handleOpenHopJson();
+  void handleOpenHop();
   void handlePollerJson();
   void handlePoller();
   void handleTargetsJson();
@@ -406,6 +414,8 @@ private:
   friend void web_route_aclstrict();
   friend void web_route_cli();
   friend void web_route_cliremote();
+  friend void web_route_openhopjson();
+  friend void web_route_openhop();
   friend void web_route_pollerjson();
   friend void web_route_poller();
   friend void web_route_targetsjson();

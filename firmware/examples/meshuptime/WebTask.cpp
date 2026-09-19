@@ -1,4 +1,5 @@
 #include "WebTask.h"
+#include "OpenHopTask.h"
 #include "WifiTask.h"
 #include "MonitorSensors.h"
 #include "MonitorStore.h"
@@ -456,6 +457,8 @@ void web_route_cli()       { if (g_self) g_self->handleCli(); }
 void web_route_cliremote() { if (g_self) g_self->handleCliRemote(); }
 void web_route_pollerjson()   { if (g_self) g_self->handlePollerJson(); }
 void web_route_poller()       { if (g_self) g_self->handlePoller(); }
+void web_route_openhopjson()  { if (g_self) g_self->handleOpenHopJson(); }
+void web_route_openhop()      { if (g_self) g_self->handleOpenHop(); }
 void web_route_targetsjson()  { if (g_self) g_self->handleTargetsJson(); }
 void web_route_target()       { if (g_self) g_self->handleTarget(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
@@ -1003,6 +1006,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button id="tabbot" data-p="6" hidden>bot</button>
 <button id="tabcomp" data-p="7" hidden>companions</button>
 <button id="tabirc" data-p="8" hidden>irc</button>
+<button id="taboh" data-p="9">openhop</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -2278,6 +2282,38 @@ browser internet heeft; zonder internet valt dit terug op <code>lat,lon</code> a
 tekst met een OpenStreetMap-link per companion.</p>
 </section>
 
+<section id="p9" hidden>
+<h2>openHop-brug</h2>
+<p class="note"><b>Deze node als radio voor een openHop-repeater, zonder iets in te leveren.</b>
+openHop is een Python-herimplementatie van MeshCore: zelfde protocol, zelfde mesh. Hun eigen
+modemfirmware maakt van dit bord een <i>domme</i> radio &mdash; dan is alles wat hier verder
+draait weg. Deze brug doet het omgekeerd: wij blijven de repeater en de openHop-host wordt een
+passagier op onze radio. Hij hoort alles wat wij horen en mag zenden via onze wachtrij.</p>
+<p class="note"><b>Drie grenzen</b>, en die staan vast. Een gast <b>verzet onze radio niet</b>:
+een <code>SET_CONFIG</code> met een andere frequentie, bandbreedte, spreiding of codering wordt
+geweigerd &mdash; die zou deze node uit zijn eigen mesh tillen. Een gast <b>dringt niet voor</b>:
+zijn pakketten gaan in dezelfde wachtrij met de laagste prioriteit en binnen hetzelfde
+zendtijdbudget, en past er niets meer bij dan zegt hij dat (TX_FAIL) in plaats van te doen alsof.
+En een gast <b>herconfigureert ons niet</b>: de wifi-commando's uit hun protocol worden
+geweigerd.</p>
+<p class="note"><b>Zet aan de overkant <code>mode: monitor</code>.</b> De openHop-daemon is een
+eigen node met een eigen sleutel op ONZE antenne. Laat je hem ook doorsturen, dan gaat elk
+floodpakket twee keer de lucht in &mdash; een keer van ons en een keer van hem.</p>
+<div id="oh-status" class="note">&hellip;</div>
+<div class="quick" style="margin-top:.4rem">
+<label style="align-self:center"><input type="checkbox" id="oh-on"> brug aan</label>
+<span style="align-self:center;color:var(--muted);font-size:.8rem">poort:</span>
+<input id="oh-port" type="number" min="1" max="65535" style="width:6rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">token:</span>
+<input id="oh-token" type="password" autocomplete="new-password" maxlength="32"
+ placeholder="leeg = geen" style="width:9rem">
+<button type="button" id="oh-save">opslaan</button></div>
+<p class="note" style="margin-top:.6rem">In <code>/etc/openhop_repeater/config.yaml</code> aan de
+overkant: <code>radio_type: modem_tcp</code> met <code>host</code> = het adres van deze node en
+<code>port</code> = de poort hierboven. Het token hoort in <code>modem_tcp.token</code> te staan;
+leeg laten mag op een net waar je iedereen vertrouwt.</p>
+</section>
+
 <section id="p8" hidden>
 <h2>IRC-server &mdash; klassieke chatclients op het mesh</h2>
 <p class="why"><b>Wat dit is:</b> een gewone IRC-client (HexChat, irssi, WeeChat,
@@ -3073,13 +3109,37 @@ var TB=document.querySelectorAll(".tabs button");
 for(var i=0;i<TB.length;i++){TB[i].onclick=function(){
 var p=this.getAttribute("data-p");
 for(var j=0;j<TB.length;j++){TB[j].className=TB[j]==this?"on":""}
-for(var k=1;k<=8;k++){var pk=document.getElementById("p"+k);if(pk)pk.hidden=(""+k)!=p}
+for(var k=1;k<=9;k++){var pk=document.getElementById("p"+k);if(pk)pk.hidden=(""+k)!=p}
 if(p=="3"){cfg()}
 if(p=="4"){roomsLoad();refreshPickers()}
 if(p=="5"){snodesLoad();refreshPickers()}
 if(p=="6"){botLoad()}
 if(p=="7"){companionsLoad()}
-if(p=="8"){ircLoad()}}}
+if(p=="8"){ircLoad()}
+if(p=="9"){ohLoad()}}}
+
+/* ---- de openHop-brug ---- */
+function ohLoad(){
+fetch("openhop.json").then(function(r){return r.ok?r.json():null}).then(function(j){
+if(!j){document.getElementById("oh-status").textContent="brug niet beschikbaar";return}
+document.getElementById("oh-on").checked=!!j.on;
+var pi=document.getElementById("oh-port");if(document.activeElement!==pi){pi.value=j.port}
+document.getElementById("oh-status").innerHTML=
+"<b>"+(j.on?"AAN":"uit")+"</b> &middot; host: "+(j.client?("verbonden ("+esc(j.client_ip)+")"):"geen")+
+" &middot; token "+(j.token_set?"gezet":"leeg")+
+" &middot; ontvangen doorgegeven: "+j.rx+(j.rx_dropped?(" (verloren "+j.rx_dropped+")"):"")+
+" &middot; verzonden namens host: "+j.tx+(j.tx_refused?(" (geweigerd "+j.tx_refused+")"):"")+
+"<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})}
+
+document.getElementById("oh-save").onclick=function(){
+var on=document.getElementById("oh-on").checked?"1":"0";
+var po=document.getElementById("oh-port").value;
+var tk=document.getElementById("oh-token").value;
+var body="on="+on+"&port="+encodeURIComponent(po);
+if(tk!==""){body+="&token="+encodeURIComponent(tk)}
+fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:body}).then(function(r){return r.text()}).then(function(t){
+logline("openhop",t,1);document.getElementById("oh-token").value="";ohLoad()})}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -4961,6 +5021,8 @@ void WebTask::routes() {
    * en /repeater/target (POST). Zie de handlers. */
   _server->on("/poller.json", HTTP_GET, web_route_pollerjson);
   _server->on("/poller", HTTP_POST, web_route_poller);
+  _server->on("/openhop.json", HTTP_GET, web_route_openhopjson);
+  _server->on("/openhop", HTTP_POST, web_route_openhop);
   _server->on("/repeater_targets.json", HTTP_GET, web_route_targetsjson);
   _server->on("/repeater/target", HTTP_POST, web_route_target);
   /* De eigen web-login. POST-only, en achter dezelfde Basic-auth als de rest: dit
@@ -8453,6 +8515,57 @@ void WebTask::handleCliRemote() {
  * prefix en "gezet: ja/nee". Dit is Basic-auth over onversleuteld HTTP; roteer op
  * een net waar niemand meeleest en zet deze node niet open naar buiten.
  * ===========================================================================*/
+
+/* GET /openhop.json -- de stand van de brug. Het token komt NOOIT terug, net
+ * als bij de poller en de wifi: alleen "gezet: ja/nee". */
+void WebTask::handleOpenHopJson() {
+  if (!requireAuth()) return;
+  if (_openhop == nullptr) {
+    _server->send(503, "text/plain", "geen openHop-brug op deze variant\n");
+    return;
+  }
+  char note[160]; jsonEscape(_openhop->lastNote(), note, sizeof(note));
+  snprintf(g_json, sizeof(g_json),
+      "{\"on\":%d,\"port\":%u,\"token_set\":%d,"
+      "\"client\":%d,\"client_ip\":\"%s\","
+      "\"rx\":%lu,\"rx_dropped\":%lu,\"tx\":%lu,\"tx_refused\":%lu,"
+      "\"note\":\"%s\"}",
+      _openhop->enabled() ? 1 : 0, (unsigned)_openhop->port(),
+      _openhop->tokenSet() ? 1 : 0,
+      _openhop->clientConnected() ? 1 : 0, _openhop->clientIp(),
+      (unsigned long)_openhop->rxPushed(), (unsigned long)_openhop->rxDropped(),
+      (unsigned long)_openhop->txAccepted(), (unsigned long)_openhop->txRefused(),
+      note);
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /openhop   on=0|1 & port=<n> & token=<tekst>   (alle drie optioneel) */
+void WebTask::handleOpenHop() {
+  if (!requireAuth()) return;
+  if (_openhop == nullptr) {
+    _server->send(503, "text/plain", "geen openHop-brug op deze variant\n"); return;
+  }
+  char v[64];
+  if (getArg(*_server, "port", v, sizeof(v)) && v[0]) {
+    long p = strtol(v, nullptr, 10);
+    if (p < 1 || p > 65535) {
+      _server->send(400, "text/plain", "poort buiten bereik (1-65535)\n"); return;
+    }
+    _openhop->setPort((uint16_t)p);
+  }
+  if (getArg(*_server, "token", v, sizeof(v))) {
+    _openhop->setToken(v);
+  }
+  if (getArg(*_server, "on", v, sizeof(v))) {
+    _openhop->setEnabled(v[0] == (char)49);
+  }
+  snprintf(g_rcli_reply, sizeof(g_rcli_reply), "ok openhop %s, poort %u, token %s\n",
+           _openhop->enabled() ? "aan" : "uit", (unsigned)_openhop->port(),
+           _openhop->tokenSet() ? "gezet" : "leeg");
+  _server->send(200, "text/plain", g_rcli_reply);
+}
+
 void WebTask::handlePollerJson() {
   if (!requireAuth()) return;
   if (_poller == nullptr) {

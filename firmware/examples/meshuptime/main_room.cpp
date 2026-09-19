@@ -49,6 +49,7 @@ static bool g_travel = false;
   #include "WebTask.h"
   #include "PushTask.h"
   #include "Poller.h"
+#include "OpenHopTask.h"
   #include "IrcTask.h"
   static WifiTask wifi_task;
   static WebTask  web_task;
@@ -57,6 +58,9 @@ static bool g_travel = false;
    * in de room-variant met wifi -- hij leunt op PushTask (HTTP) en the_mesh.rcli
    * (RepeaterCli). Zie Poller.h. */
   static Poller   poller;
+  /* De openHop-brug (v2.21.0): zelfde plek en zelfde levensduur als de
+   * andere netwerktaken, en net als zij alleen op de room-variant. */
+  static OpenHopTask openhop_task;
   /* v2.9.0: de IRC-server. Alleen in de room-variant met wifi -- hij heeft zowel
    * een IP-leven (poort 6667) als de bot-slots van RoomMesh nodig, en die twee
    * bestaan alleen hier samen. Zie IrcTask.h. */
@@ -736,6 +740,12 @@ void setup() {
      * wachtwoordloze parameters. De web-GUI beheert aan/uit, interval en de
      * doel-wachtwoorden. */
     poller.begin(&SPIFFS, &push_task, &the_mesh.rcli);
+  /* De openHop-brug (v2.21.0): een TCP-server die het modemprotocol van
+   * openHop spreekt met ONZE radio eronder. Standaard uit; de node blijft
+   * alles doen wat hij deed. */
+  openhop_task.begin(&SPIFFS, &wifi_task, &the_mesh);
+  the_mesh.setOpenHop(&openhop_task);
+  web_task.setOpenHop(&openhop_task);
     web_task.setPoller(&poller);
 
     /* DE IRC-SERVER (v2.9.0). Twee koppelingen, allebei een pointer:
@@ -798,6 +808,7 @@ void loop() {
     web_task.loop();
     push_task.loop();
     poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
+    openhop_task.loop();  // v2.21.0: de openHop-brug; begrensde hap per ronde
     irc_task.loop(); // v2.9.0: IRC-sessies; accept + leesronde, keert altijd terug
   }
 #endif

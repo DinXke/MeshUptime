@@ -7,6 +7,50 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.21.0 — openHop mag meerijden op onze radio
+
+**Wat openHop is.** Een Python-herimplementatie van MeshCore: zelfde protocol,
+zelfde mesh. De repeater-daemon draait op Linux en praat met zijn radio over een
+klein binair protocol, over USB of TCP-poort 5055. Hun eigen firmware
+(`openhop_modem`) maakt van een Heltec V3 een **domme** modem — en dan is alles wat
+deze node verder is (room-server, bots, IRC, poller, web-GUI, bewakingen,
+companion-hub) weg.
+
+**Dit is de andere kant van die ruil.** Wij spreken hun modemprotocol, maar blijven
+zelf de repeater. De openHop-host wordt een passagier: hij hoort alles wat wij horen
+(`logRxRaw` → `RX_PACKET`) en mag zenden via onze wachtrij (`TX_REQUEST` →
+`tryParsePacket` → `sendPacket`). Dat kan alleen omdat het dezelfde pakketten op
+dezelfde frequentie zijn; er valt niets te vertalen.
+
+**Drie grenzen, en die zijn de hele feature:**
+
+- **Een gast verzet onze radio niet.** `SET_CONFIG` met een andere frequentie,
+  bandbreedte, spreiding of codering wordt geweigerd (`ERR_INVALID_CONFIG`), met
+  onze werkelijke stand in `CONFIG_RESP` ernaast. Anders tilt een daemon die
+  opstart deze node uit zijn eigen mesh.
+- **Een gast dringt niet voor.** Zijn pakketten gaan in dezelfde wachtrij met
+  prioriteit 3 (de baan van adverts) en binnen hetzelfde zendtijdbudget. Past er
+  niets meer bij, dan `TX_FAIL` — nooit een `TX_DONE` voor iets dat niet de lucht
+  in ging.
+- **Een gast herconfigureert ons niet.** De wifi-commando's uit hun protocol
+  krijgen `ERR_INVALID_CMD`; daar heeft deze node zijn eigen weg voor, achter een
+  login.
+
+**`markSeen` op wat de gast stuurt**, net als bij onze eigen uitgaande pakketten:
+komt het via een buur terug, dan sturen wij het niet nog eens rond. Zonder dat zou
+elk pakket van de gast door onszelf verdubbeld worden.
+
+**Standaard uit**, met een eigen tab in de web-GUI (aan/uit, poort, token, en wat
+er doorheen gaat). `/openhop.json` en `POST /openhop` ernaast.
+
+**Wat de eigenaar moet weten.** Zet aan de overkant `mode: monitor`. De daemon is
+een eigen node met een eigen sleutel op ONZE antenne; laat je hem ook doorsturen,
+dan gaat elk floodpakket twee keer de lucht in.
+
+Gemeten op 19/09: host verbonden, `Async config push result: ok=True`, 13 pakketten
+doorgegeven en 1 pakket namens de host verzonden, terwijl de poller in dezelfde
+minuut gewoon zijn statusronde deed.
+
 ## v2.20.0 — de burenronde, nu binair en met het juiste getal
 
 **Wat er mis was aan v2.19.0.** Die vroeg de buren met het gewone

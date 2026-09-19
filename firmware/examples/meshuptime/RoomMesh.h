@@ -475,6 +475,8 @@ struct Announce {
   unsigned long next_send;
 };
 
+class OpenHopTask;
+
 class RoomMesh : public mesh::Mesh, public CommonCLICallbacks, public IWebNode,
                  public RepeaterCliHost {
 public:
@@ -576,6 +578,22 @@ public:
   /* ---- IWebNode (webbeheer) ---- */
   void        handleCommandWeb(uint32_t ts, char* command, char* reply) override { handleCommand(ts, command, reply); }
   NodePrefs*  getNodePrefs() override { return &_prefs; }
+
+  /* ---- de openHop-brug (v2.21.0) --------------------------------------
+   * Alles wat OpenHopTask van de radio moet weten loopt via deze zes.
+   * Zo blijft die taak vrij van MeshCore-interna en staat op EEN plek wat
+   * een gast van onze radio mag zien en doen. */
+  void setOpenHop(OpenHopTask* t) { _openhop = t; }
+  void logRxRaw(float snr, float rssi, const uint8_t raw[], int len) override;
+  void ohRadioParams(uint32_t& freq_hz, uint32_t& bw_hz, uint8_t& sf,
+                     uint8_t& cr, int8_t& pwr) const;
+  int   ohNoiseFloor() const;
+  int   ohLastRssi() const;
+  float ohLastSnr() const;
+  bool  ohRadioBusy() const;
+  /* Ruwe bytes van de host in ONZE zendwachtrij. false = niet gelukt, en
+   * dan hoort de host een TX_FAIL te krijgen en geen TX_DONE. */
+  bool  ohInjectRaw(const uint8_t* raw, int len, uint32_t* airtime_ms_out);
   const char* getRoleName() override { return FIRMWARE_ROLE; }
   const uint8_t* getSelfPubKey() override { return rooms[0].id.pub_key; }
   uint32_t    nowSecs() override { return getRTCClock()->getCurrentTime(); }
@@ -1090,6 +1108,7 @@ private:
   bool          region_load_active;
 
   NodePrefs         _prefs;
+  OpenHopTask*      _openhop = nullptr;
   TransportKeyStore key_store;
   RegionMap         region_map, temp_map;
   ClientACL&        cli_acl;   // = rooms[0].acl, geleend aan CommonCLI
