@@ -594,6 +594,12 @@ public:
   /* Ruwe bytes van de host in ONZE zendwachtrij. false = niet gelukt, en
    * dan hoort de host een TX_FAIL te krijgen en geen TX_DONE. */
   bool  ohInjectRaw(const uint8_t* raw, int len, uint32_t* airtime_ms_out);
+  /* Doorsturen aan/uit voor de failover. LEEST en ZET alleen de werkstand in
+   * RAM -- bewust niet opslaan: na een herstart hoort de node op de stand te
+   * staan die JIJ koos, en beslist de failover opnieuw. Anders zou een
+   * overname stilletjes blijvend worden. */
+  bool  ohForwarding() const { return _prefs.disable_fwd == 0; }
+  void  ohSetForwarding(bool aan) { _prefs.disable_fwd = aan ? 0 : 1; }
   const char* getRoleName() override { return FIRMWARE_ROLE; }
   const uint8_t* getSelfPubKey() override { return rooms[0].id.pub_key; }
   uint32_t    nowSecs() override { return getRTCClock()->getCurrentTime(); }

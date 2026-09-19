@@ -2308,6 +2308,20 @@ floodpakket twee keer de lucht in &mdash; een keer van ons en een keer van hem.<
 <input id="oh-token" type="password" autocomplete="new-password" maxlength="32"
  placeholder="leeg = geen" style="width:9rem">
 <button type="button" id="oh-save">opslaan</button></div>
+<p class="note" style="margin-top:.6rem"><b>Failover.</b> Staat dit aan, dan gaat deze node
+<b>zelf weer repeteren</b> zodra de openHop-host wegvalt &mdash; en geeft hij dat weer uit handen
+zodra de host terug is. Dat hoort hier te draaien en niet op de server: als openHop wegvalt is er
+vaak m&eacute;&eacute;r weg (container, LAN, wifi), en een failover die zelf over het netwerk moet
+praten faalt dan mee. Elk geldig frame van de host telt als levensteken &mdash; hun driver pingt
+uit zichzelf &mdash; dus ook een daemon die nog verbonden is maar vastgelopen valt op.</p>
+<p class="note">Twee regels die het rustig houden: hij zet <b>alleen terug wat hij zelf omzette</b>
+(stond doorsturen al aan, dan gebeurt er niets), en de omzetting gaat <b>alleen in RAM</b> &mdash;
+na een herstart staat de node weer op jouw keuze en beslist de failover opnieuw.</p>
+<div class="quick" style="margin-top:.4rem">
+<label style="align-self:center"><input type="checkbox" id="oh-fo"> failover aan</label>
+<span style="align-self:center;color:var(--muted);font-size:.8rem">wachttijd (s):</span>
+<input id="oh-fohold" type="number" min="10" max="3600" style="width:6rem">
+<button type="button" id="oh-fosave">opslaan</button></div>
 <p class="note" style="margin-top:.6rem">In <code>/etc/openhop_repeater/config.yaml</code> aan de
 overkant: <code>radio_type: modem_tcp</code> met <code>host</code> = het adres van deze node en
 <code>port</code> = de poort hierboven. Het token hoort in <code>modem_tcp.token</code> te staan;
@@ -3123,12 +3137,18 @@ function ohLoad(){
 fetch("openhop.json").then(function(r){return r.ok?r.json():null}).then(function(j){
 if(!j){document.getElementById("oh-status").textContent="brug niet beschikbaar";return}
 document.getElementById("oh-on").checked=!!j.on;
+document.getElementById("oh-fo").checked=!!j.failover;
+var fi=document.getElementById("oh-fohold");if(document.activeElement!==fi){fi.value=j.fo_hold}
 var pi=document.getElementById("oh-port");if(document.activeElement!==pi){pi.value=j.port}
 document.getElementById("oh-status").innerHTML=
 "<b>"+(j.on?"AAN":"uit")+"</b> &middot; host: "+(j.client?("verbonden ("+esc(j.client_ip)+")"):"geen")+
 " &middot; token "+(j.token_set?"gezet":"leeg")+
 " &middot; ontvangen doorgegeven: "+j.rx+(j.rx_dropped?(" (verloren "+j.rx_dropped+")"):"")+
 " &middot; verzonden namens host: "+j.tx+(j.tx_refused?(" (geweigerd "+j.tx_refused+")"):"")+
+"<br>doorsturen door deze node: <b>"+(j.repeat?"AAN":"uit")+"</b>"+
+(j.failover?(" &middot; failover aan ("+j.fo_hold+"s)"+
+(j.fo_actief?" &middot; <b>OVERGENOMEN</b>":"")+
+(j.fo_aantal?(" &middot; "+j.fo_aantal+"x overgenomen"):"")):" &middot; failover uit")+
 "<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})}
 
 document.getElementById("oh-save").onclick=function(){
@@ -3140,6 +3160,13 @@ if(tk!==""){body+="&token="+encodeURIComponent(tk)}
 fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:body}).then(function(r){return r.text()}).then(function(t){
 logline("openhop",t,1);document.getElementById("oh-token").value="";ohLoad()})}
+
+document.getElementById("oh-fosave").onclick=function(){
+var fo=document.getElementById("oh-fo").checked?"1":"0";
+var h=document.getElementById("oh-fohold").value;
+fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
+body:"failover="+fo+"&fo_hold="+encodeURIComponent(h)})
+.then(function(r){return r.text()}).then(function(t){logline("openhop",t,1);ohLoad()})}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -8529,12 +8556,16 @@ void WebTask::handleOpenHopJson() {
       "{\"on\":%d,\"port\":%u,\"token_set\":%d,"
       "\"client\":%d,\"client_ip\":\"%s\","
       "\"rx\":%lu,\"rx_dropped\":%lu,\"tx\":%lu,\"tx_refused\":%lu,"
-      "\"note\":\"%s\"}",
+      "\"failover\":%d,\"fo_hold\":%u,\"fo_actief\":%d,\"fo_aantal\":%lu,"
+      "\"repeat\":%d,\"note\":\"%s\"}",
       _openhop->enabled() ? 1 : 0, (unsigned)_openhop->port(),
       _openhop->tokenSet() ? 1 : 0,
       _openhop->clientConnected() ? 1 : 0, _openhop->clientIp(),
       (unsigned long)_openhop->rxPushed(), (unsigned long)_openhop->rxDropped(),
       (unsigned long)_openhop->txAccepted(), (unsigned long)_openhop->txRefused(),
+      _openhop->failover() ? 1 : 0, (unsigned)_openhop->failoverHold(),
+      _openhop->failoverActive() ? 1 : 0, (unsigned long)_openhop->failoverCount(),
+      _openhop->nodeForwarding() ? 1 : 0,
       note);
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
@@ -8556,6 +8587,13 @@ void WebTask::handleOpenHop() {
   }
   if (getArg(*_server, "token", v, sizeof(v))) {
     _openhop->setToken(v);
+  }
+  if (getArg(*_server, "fo_hold", v, sizeof(v)) && v[0]) {
+    long h = strtol(v, nullptr, 10);
+    _openhop->setFailoverHold((uint16_t)(h < 0 ? 0 : h));
+  }
+  if (getArg(*_server, "failover", v, sizeof(v))) {
+    _openhop->setFailover(v[0] == (char)49);
   }
   if (getArg(*_server, "on", v, sizeof(v))) {
     _openhop->setEnabled(v[0] == (char)49);

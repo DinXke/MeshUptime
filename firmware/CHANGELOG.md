@@ -7,6 +7,37 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.22.0 — failover: valt openHop weg, dan repeteert de node zelf weer
+
+Laat je openHop het repeteren doen, dan hangt je dekking aan een container, een
+LAN en een wifi-verbinding. Deze schakelaar maakt dat terugvalbaar: is de gast
+langer dan `fo_hold` seconden weg, dan zet de node zijn eigen doorsturen aan; is
+hij terug en blijft hij, dan geeft de node het weer uit handen.
+
+**Waarom op de node en niet op de server.** Juist als openHop wegvalt is er vaak
+meer weg. Een failover die zelf over het netwerk moet praten faalt dan mee. Deze
+kijkt alleen naar wat hij van hier kan zien.
+
+**Wat "weg" betekent.** Niet alleen een dichte socket: elk geldig frame van de
+host telt als levensteken, en hun driver pingt uit zichzelf. Een daemon die nog
+verbonden is maar vastgelopen valt dus ook op.
+
+**Twee regels die het rustig houden.** Hij zet alleen terug wat hij zelf omzette —
+stond doorsturen al aan, dan gebeurt er niets, en hij vecht nooit met een keuze van
+de eigenaar. En de omzetting gaat **alleen in RAM**: na een herstart staat de node
+weer op de ingestelde stand en beslist de failover opnieuw. Een overname die
+stilletjes blijvend wordt, is een instelling die niemand meer kan navertellen.
+
+**De faalrichting is de veilige.** Raakt de node zijn eigen netwerk kwijt, dan ziet
+hij "gast weg" en gaat hij repeteren — precies wat je wil als de slimme helft
+onbereikbaar is.
+
+Een overname en een teruggave melden zich via de alert-bot (hoog bij overname,
+laag/groen bij herstel — dezelfde regel als bij de bewakingen).
+
+Live getoetst: daemon gestopt → na 60 s `fo_actief:1, repeat:1`; daemon gestart →
+na 60 s `fo_actief:0, repeat:0`.
+
 ## v2.21.1 — de halve web-GUI lag plat sinds v2.18.0
 
 **Het symptoom.** Alle tabbladen die door script zichtbaar gemaakt worden — rooms,

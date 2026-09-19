@@ -1,6 +1,7 @@
 #include "OpenHopTask.h"
 #include "RoomMesh.h"
 #include "WifiTask.h"
+#include "MonitorStore.h"   /* MON_ALERT_*, MON_SEV_* */
 #include <string.h>
 
 /* Zie OpenHopTask.h voor het waarom en de draadvorm. Dit bestand is de
@@ -37,6 +38,12 @@ void OpenHopTask::reset() {
   _in_len = 0;
   _rx_head = _rx_count = 0;
   _rx_pushed = _rx_dropped = _tx_ok = _tx_refused = 0;
+  _fo_on = false;
+  _fo_hold_s = OPENHOP_FO_HOLD_DEFAULT;
+  _guest_seen = 0;
+  _guest_back_since = 0;
+  _fo_taken = false;
+  _fo_count = 0;
   StrHelper::strncpy(_note, "uit", sizeof(_note));
 }
 
@@ -55,7 +62,7 @@ void OpenHopTask::loadConfig() {
    * leesbaar en gaat er nooit een instelling verloren die er niet in staat. */
   char line[OPENHOP_TOKEN_MAX + 8];
   int n = 0;
-  while (f.available() && n < 3) {
+  while (f.available() && n < 5) {
     size_t len = 0;
     while (f.available() && len < sizeof(line) - 1) {
       int ch = f.read();
@@ -68,8 +75,13 @@ void OpenHopTask::loadConfig() {
     else if (n == 1) {
       long v = strtol(line, nullptr, 10);
       if (v >= 1 && v <= 65535) _port = (uint16_t)v;
-    } else {
+    } else if (n == 2) {
       StrHelper::strncpy(_token, line, sizeof(_token));
+    } else if (n == 3) {
+      _fo_on = (line[0] == '1');
+    } else {
+      long v = strtol(line, nullptr, 10);
+      if (v >= OPENHOP_FO_HOLD_MIN && v <= OPENHOP_FO_HOLD_MAX) _fo_hold_s = (uint16_t)v;
     }
     n++;
   }
@@ -83,6 +95,8 @@ void OpenHopTask::saveConfig() {
   f.println(_on ? "1" : "0");
   f.println((int)_port);
   f.println(_token);
+  f.println(_fo_on ? "1" : "0");
+  f.println((int)_fo_hold_s);
   f.close();
 }
 
@@ -424,6 +438,7 @@ void OpenHopTask::readSocket() {
     uint16_t gekregen = (uint16_t)_in[4 + plen] | ((uint16_t)_in[5 + plen] << 8);
     uint16_t verwacht = crc16(&_in[1], 3 + plen);
     if (gekregen == verwacht) {
+      _guest_seen = millis();   /* levensteken voor de failover */
       handleFrame(_in[1], &_in[4], plen);
     } else {
       OH_DIAG("frame met foute CRC (cmd 0x%02X, %u byte)", _in[1], (unsigned)plen);
@@ -434,9 +449,95 @@ void OpenHopTask::readSocket() {
 #endif
 }
 
+
+/* ------------------------------------------------------------------------
+ * DE FAILOVER (v2.22.0)
+ *
+ * WAAROM DIT OP DE NODE ZIT EN NIET OP DE SERVER. Juist als openHop wegvalt is
+ * er vaak meer weg: de container, het LAN, de wifi. Een failover die zelf over
+ * het netwerk moet praten faalt dan mee. Deze kijkt alleen naar wat hij van hier
+ * kan zien, en dat is genoeg.
+ *
+ * WAT "WEG" BETEKENT. Niet "de socket is dicht" alleen -- ook een daemon die nog
+ * verbonden is maar vastgelopen. Elk geldig frame van de host is een levensteken,
+ * en hun driver stuurt uit zichzelf PING's; blijft het OPENHOP_FO_HOLD_DEFAULT
+ * seconden helemaal stil, dan is hij weg.
+ *
+ * DE FAALRICHTING IS DE VEILIGE. Raakt deze node zijn eigen netwerk kwijt, dan
+ * ziet hij "gast weg" en gaat hij repeteren. Dat is precies wat je wil als de
+ * slimme helft onbereikbaar is.
+ *
+ * WAT HIJ NOOIT DOET: iets terugzetten dat hij niet zelf omzette. Stond het
+ * doorsturen al aan, dan valt er niets over te nemen en gebeurt er niets. En de
+ * omzetting gaat ALLEEN in RAM: na een herstart staat de node op de stand die de
+ * eigenaar koos en beslist de failover opnieuw. Een overname die stilletjes
+ * blijvend wordt, is een instelling die niemand meer kan navertellen.
+ * ------------------------------------------------------------------------ */
+bool OpenHopTask::nodeForwarding() const {
+  return _mesh != nullptr && _mesh->ohForwarding();
+}
+
+void OpenHopTask::setFailover(bool on) {
+  if (on == _fo_on) return;
+  _fo_on = on;
+  /* Uitzetten terwijl we het overgenomen hadden: netjes teruggeven, anders
+   * blijft de node repeteren om een reden die niet meer bestaat. */
+  if (!_fo_on && _fo_taken && _mesh) {
+    _mesh->ohSetForwarding(false);
+    _fo_taken = false;
+    OH_DIAG("failover uit; doorsturen weer aan de gast gelaten");
+  }
+  saveConfig();
+}
+
+void OpenHopTask::setFailoverHold(uint16_t s) {
+  if (s < OPENHOP_FO_HOLD_MIN) s = OPENHOP_FO_HOLD_MIN;
+  if (s > OPENHOP_FO_HOLD_MAX) s = OPENHOP_FO_HOLD_MAX;
+  _fo_hold_s = s;
+  saveConfig();
+}
+
+void OpenHopTask::failoverTick() {
+  if (!_fo_on || _mesh == nullptr) return;
+  const unsigned long nu = millis();
+  const unsigned long hold = (unsigned long)_fo_hold_s * 1000UL;
+
+  bool levend = clientConnected() && _guest_seen != 0 && (nu - _guest_seen) < hold;
+  if (!levend) _guest_back_since = 0;
+  else if (_guest_back_since == 0) _guest_back_since = nu;
+
+  if (!levend && !_fo_taken) {
+    if (_mesh->ohForwarding()) return;      /* stond al aan; niets over te nemen */
+    _mesh->ohSetForwarding(true);
+    _fo_taken = true;
+    _fo_count++;
+    snprintf(_note, sizeof(_note), "FAILOVER: gast weg, node repeteert nu zelf");
+    OH_DIAG("%s (na %u s stilte)", _note, (unsigned)_fo_hold_s);
+    _mesh->dispatchAlert(MON_ALERT_BOTH, 0xFFFF, true,
+                         "openHop weg -- deze node neemt het repeteren over",
+                         MON_SEV_HIGH);
+    return;
+  }
+
+  if (levend && _fo_taken && (nu - _guest_back_since) >= hold) {
+    _mesh->ohSetForwarding(false);
+    _fo_taken = false;
+    snprintf(_note, sizeof(_note), "gast terug; repeteren weer aan openHop");
+    OH_DIAG("%s", _note);
+    /* Herstel is altijd laag/groen -- zelfde regel als bij de bewakingen. */
+    _mesh->dispatchAlert(MON_ALERT_BOTH, 0xFFFF, false,
+                         "openHop is terug -- deze node stopt weer met repeteren",
+                         MON_SEV_LOW);
+  }
+}
+
 void OpenHopTask::loop() {
 #ifdef ESP32
+  /* De failover kijkt ook als de brug uit staat NIET: zonder brug is er geen
+   * gast en valt er niets over te nemen. Wel voor de wifi-controle hieronder,
+   * want een node zonder netwerk heeft ook geen host. */
   if (!_on) return;
+  failoverTick();
   if (_wifi == nullptr || !_wifi->isOnline()) {
     /* Zonder netwerk valt er niets te bedienen. De luisteraar blijft staan;
      * WiFiServer komt vanzelf terug als de verbinding er weer is. */
@@ -455,6 +556,7 @@ void OpenHopTask::loop() {
     _in_len = 0;
     _authed = (_token[0] == 0);          /* geen token = meteen binnen */
     snprintf(_client_ip, sizeof(_client_ip), "%s", _cl.remoteIP().toString().c_str());
+    _guest_seen = millis();
     snprintf(_note, sizeof(_note), "host %s verbonden", _client_ip);
     OH_DIAG("%s", _note);
   }

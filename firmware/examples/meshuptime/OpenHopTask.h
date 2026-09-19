@@ -61,6 +61,15 @@
 #define OPENHOP_PORT_DEFAULT  5055
 #define OPENHOP_TOKEN_MAX     33      /* 32 tekens + afsluiter */
 
+/* FAILOVER (v2.22.0). Hoe lang de gast weg moet zijn voordat de node zelf
+ * weer gaat repeteren, en hoe lang hij terug moet zijn voordat de node het
+ * weer uit handen geeft. Een wifi-hik van een paar tellen hoort geen
+ * omschakeling te worden; een minuut is lang genoeg om dat te filteren en
+ * kort genoeg om een echte uitval niet te laten liggen. */
+#define OPENHOP_FO_HOLD_DEFAULT  60
+#define OPENHOP_FO_HOLD_MIN      10
+#define OPENHOP_FO_HOLD_MAX      3600
+
 /* Het protocol. Namen letterlijk uit protocol_constants.py, zodat ze naast
  * elkaar te leggen zijn zonder te hoeven vertalen. */
 #define OH_SYNC                 0xAA
@@ -129,6 +138,17 @@ public:
   uint16_t port() const         { return _port; }
   void     setPort(uint16_t p);
   bool     tokenSet() const     { return _token[0] != 0; }
+  /* ---- failover ---- */
+  bool     failover() const     { return _fo_on; }
+  void     setFailover(bool on);
+  uint16_t failoverHold() const { return _fo_hold_s; }
+  void     setFailoverHold(uint16_t s);
+  /* Heeft de node het repeteren NU van de gast overgenomen? */
+  bool     failoverActive() const { return _fo_taken; }
+  uint32_t failoverCount() const  { return _fo_count; }
+  /* De huidige doorstuurstand van de node, zodat de GUI kan tonen wie er nu
+   * repeteert zonder zelf de mesh te hoeven kennen. */
+  bool     nodeForwarding() const;
   void     setToken(const char* t);
 
   /* ---- stand (/openhop.json) ---- */
@@ -167,6 +187,19 @@ private:
   uint8_t   _rx_head, _rx_count;
 
   uint32_t  _rx_pushed, _rx_dropped, _tx_ok, _tx_refused;
+
+  /* De failover. _guest_seen is het laatste LEVENSTEKEN van de host: elk
+   * geldig frame telt, en hun driver stuurt uit zichzelf PING's. Zo valt een
+   * daemon die nog verbonden is maar vastgelopen, ook op.
+   * _fo_taken onthoudt dat WIJ het aanzetten: de failover geeft alleen terug
+   * wat hij zelf omzette, zodat hij nooit vecht met een keuze van de
+   * eigenaar. */
+  bool      _fo_on;
+  uint16_t  _fo_hold_s;
+  unsigned long _guest_seen;
+  unsigned long _guest_back_since;
+  bool      _fo_taken;
+  uint32_t  _fo_count;
   char      _note[80];
 
   void reset();
@@ -184,6 +217,8 @@ private:
   void readSocket();
   void handleFrame(uint8_t cmd, const uint8_t* payload, size_t len);
   void flushRxRing();
+  /* Elke ronde: is de gast er nog, en moeten we iets doen? */
+  void failoverTick();
 
   void cmdSetConfig(const uint8_t* payload, size_t len);
   void cmdGetConfig();
