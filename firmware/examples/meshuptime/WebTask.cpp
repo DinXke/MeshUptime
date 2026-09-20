@@ -2321,7 +2321,13 @@ na een herstart staat de node weer op jouw keuze en beslist de failover opnieuw.
 <label style="align-self:center"><input type="checkbox" id="oh-fo"> failover aan</label>
 <span style="align-self:center;color:var(--muted);font-size:.8rem">wachttijd (s):</span>
 <input id="oh-fohold" type="number" min="10" max="3600" style="width:6rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">droogte (s, 0=uit):</span>
+<input id="oh-droogte" type="number" min="0" max="7200" style="width:6rem">
 <button type="button" id="oh-fosave">opslaan</button></div>
+<p class="note">De <b>droogte</b> is de tweede toets: staat de host wel verbonden maar komt er
+al die tijd geen enkel zendverzoek terwijl wij hem wel pakketten aanreiken, dan repeteert hij
+niet en nemen we het over. Nul zet het uit, en dat is nodig bij <code>tx_mode: default</code>
+of <code>sticky</code>: daar kan een tweede kop terecht nooit iets te zenden krijgen.</p>
 <p class="note" style="margin-top:.6rem">In <code>/etc/openhop_repeater/config.yaml</code> aan de
 overkant: <code>radio_type: modem_tcp</code> met <code>host</code> = het adres van deze node en
 <code>port</code> = de poort hierboven. Het token hoort in <code>modem_tcp.token</code> te staan;
@@ -3139,6 +3145,7 @@ if(!j){document.getElementById("oh-status").textContent="brug niet beschikbaar";
 document.getElementById("oh-on").checked=!!j.on;
 document.getElementById("oh-fo").checked=!!j.failover;
 var fi=document.getElementById("oh-fohold");if(document.activeElement!==fi){fi.value=j.fo_hold}
+var di=document.getElementById("oh-droogte");if(document.activeElement!==di){di.value=j.droogte}
 var pi=document.getElementById("oh-port");if(document.activeElement!==pi){pi.value=j.port}
 document.getElementById("oh-status").innerHTML=
 "<b>"+(j.on?"AAN":"uit")+"</b> &middot; host: "+(j.client?("verbonden ("+esc(j.client_ip)+")"):"geen")+
@@ -3146,7 +3153,7 @@ document.getElementById("oh-status").innerHTML=
 " &middot; ontvangen doorgegeven: "+j.rx+(j.rx_dropped?(" (verloren "+j.rx_dropped+")"):"")+
 " &middot; verzonden namens host: "+j.tx+(j.tx_refused?(" (geweigerd "+j.tx_refused+")"):"")+
 "<br>doorsturen door deze node: <b>"+(j.repeat?"AAN":"uit")+"</b>"+
-(j.failover?(" &middot; failover aan ("+j.fo_hold+"s)"+
+(j.failover?(" &middot; failover aan ("+j.fo_hold+"s"+(j.droogte?(", droogte "+j.droogte+"s"):", droogte uit")+")"+
 (j.fo_actief?" &middot; <b>OVERGENOMEN</b>":"")+
 (j.fo_aantal?(" &middot; "+j.fo_aantal+"x overgenomen"):"")):" &middot; failover uit")+
 "<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"}).catch(function(){})}
@@ -3164,8 +3171,9 @@ logline("openhop",t,1);document.getElementById("oh-token").value="";ohLoad()})}
 document.getElementById("oh-fosave").onclick=function(){
 var fo=document.getElementById("oh-fo").checked?"1":"0";
 var h=document.getElementById("oh-fohold").value;
+var d=document.getElementById("oh-droogte").value;
 fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
-body:"failover="+fo+"&fo_hold="+encodeURIComponent(h)})
+body:"failover="+fo+"&fo_hold="+encodeURIComponent(h)+"&droogte="+encodeURIComponent(d)})
 .then(function(r){return r.text()}).then(function(t){logline("openhop",t,1);ohLoad()})}
 
 /* ---- de console ---- */
