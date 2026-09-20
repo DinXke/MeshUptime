@@ -67,6 +67,13 @@ public:
   uint32_t reconnectCount() const { return _reconnects; }
   uint32_t hardResetCount()  const { return _hard_resets; }
 
+  /* De bereikbaarheidstest. Hoe vaak greep hij in, en hoeveel rondes staan
+   * er NU achter elkaar mislukt -- dat laatste hoort in de webinterface,
+   * want het is het enige teken dat je krijgt vlak voordat een node
+   * wegvalt. */
+  uint32_t probeDropCount()  const { return _probe_drops; }
+  uint8_t  probeFailStreak() const { return _probe_fails; }
+
 private:
   State _state = OFF;
   unsigned long _state_since = 0;
@@ -76,6 +83,14 @@ private:
   uint32_t _reconnects = 0;
   uint32_t _hard_resets = 0;
   bool     _time_synced = false;
+  /* Bereikbaarheidstest in de ONLINE-toestand. */
+  unsigned long _probe_at = 0;        /* wanneer de volgende ronde mag   */
+  unsigned long _probe_deadline = 0;  /* 0 = er loopt er geen            */
+  uint8_t  _probe_fails = 0;          /* mislukt achter elkaar           */
+  uint32_t _probe_drops = 0;          /* hoe vaak greep hij in           */
+  void*    _probe_handle = nullptr;   /* esp_ping_handle_t, los gehouden */
+  void startProbe();
+  void checkProbe();
   unsigned long _sntp_deadline = 0;
   char     _ntp[48] = {0};
   char     _sync_msg[64] = {0};

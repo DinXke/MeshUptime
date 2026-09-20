@@ -125,6 +125,14 @@
  * opnieuw kan verbinden. */
 #define OH_STALL_DROP_MS        5000UL
 
+/* DROOGTE: verbonden maar niets meer zenden. Zie de failover in het .cpp.
+ * Standaard tien minuten, en pas nadat we hem minstens dit aantal pakketten
+ * hebben aangereikt -- anders zou een stil mesh als storing tellen. */
+#define OH_DROOGTE_DEFAULT_S      600
+#define OH_DROOGTE_MIN_S           60
+#define OH_DROOGTE_MAX_S         7200
+#define OH_DROOGTE_MIN_RX          20
+
 class RoomMesh;
 class WifiTask;
 
@@ -151,6 +159,10 @@ public:
   void     setFailover(bool on);
   uint16_t failoverHold() const { return _fo_hold_s; }
   void     setFailoverHold(uint16_t s);
+  /* 0 = uit. Zet dit uit bij tx_mode default/sticky: daar kan een tweede
+   * kop terecht nooit een zendverzoek krijgen. */
+  void      setDroogte(uint16_t s);
+  uint16_t  droogte() const { return _droogte_s; }
   /* Heeft de node het repeteren NU van de gast overgenomen? */
   bool     failoverActive() const { return _fo_taken; }
   uint32_t failoverCount() const  { return _fo_count; }
@@ -199,6 +211,9 @@ private:
 
   uint32_t  _rx_pushed, _rx_dropped, _tx_ok, _tx_refused, _sock_full;
   unsigned long _stall_since;   /* sinds wanneer neemt hij niets meer aan? */
+  uint16_t      _droogte_s;     /* 0 = uit                                 */
+  unsigned long _laatste_tx;    /* laatste TX-verzoek van de host          */
+  uint32_t      _rx_sinds_tx;   /* aangereikt sinds dat verzoek            */
 
   /* De failover. _guest_seen is het laatste LEVENSTEKEN van de host: elk
    * geldig frame telt, en hun driver stuurt uit zichzelf PING's. Zo valt een

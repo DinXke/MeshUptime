@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <time.h>
 #include "esp_sntp.h"
+#include "ping/ping_sock.h"
 #include "target.h"
 
 /* Logging. Een waakhond die bestaat om een moeilijk te betrappen storing te
@@ -13,6 +14,14 @@
 #ifndef WIFI_LOG
   #define WIFI_LOG(...) Serial.printf("[wifi] " __VA_ARGS__)
 #endif
+
+/* Uitslag van de lopende ronde: 0 = bezig, 1 = antwoord, 2 = niets. Een
+ * bestandsstatische variabele omdat de esp_ping-callbacks losse C-functies zijn
+ * en er hooguit één ronde tegelijk loopt. */
+static volatile uint8_t s_probe_state = 0;
+
+static void probe_ok(esp_ping_handle_t hdl, void* args)   { s_probe_state = 1; }
+static void probe_fail(esp_ping_handle_t hdl, void* args) { s_probe_state = 2; }
 
 static const char* stateName(int s) {
   switch (s) {
@@ -32,6 +41,19 @@ static const char* stateName(int s) {
 #define WATCHDOG_MS           180000   // 3 min zonder verbinding -> radio omlaag
 #define FAILS_BEFORE_RESET         3
 #define FAILS_BEFORE_AP            6
+
+/* DE BEREIKBAARHEIDSTEST. Elke minuut één ping naar de gateway; drie keer
+ * niets achter elkaar betekent dat er geen verkeer meer door gaat, wat er
+ * ook op WiFi.status() staat. Drie minuten is ruim genoeg om een AP die
+ * even herstart niet aan te zien voor een storing, en kort genoeg om een
+ * node niet een halve dag onbereikbaar te laten staan (gemeten: dertien
+ * uur, 20 september 2026).
+ *
+ * De timeout is kort: een gateway op het eigen LAN antwoordt in
+ * milliseconden of hij antwoordt niet. */
+#define PROBE_EVERY_MS         60000
+#define PROBE_TIMEOUT_MS        2000
+#define PROBE_FAILS_BEFORE_DROP    3
 
 /* Het toegangspunt waarop je terugvalt. Geen wachtwoord: wie fysiek bij het
  * toestel kan, kan het ook met een kabel instellen, en een half onthouden
@@ -181,6 +203,98 @@ void WifiTask::checkTimeSync() {
   }
 }
 
+/* Eén ping naar de gateway. Niet-blokkerend: esp_ping zet er een eigen taak op
+ * die in select() slaapt tot er een antwoord of een timeout is, en meldt zich
+ * via de callbacks hierboven. */
+void WifiTask::startProbe() {
+  IPAddress gw = WiFi.gatewayIP();
+  if ((uint32_t)gw == 0) {           /* geen gateway bekend: niets te meten */
+    _probe_at = millis() + PROBE_EVERY_MS;
+    return;
+  }
+
+  esp_ping_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.count           = 1;
+  cfg.interval_ms     = 1000;
+  cfg.timeout_ms      = PROBE_TIMEOUT_MS;
+  cfg.data_size       = 16;
+  cfg.tos             = 0;
+  cfg.ttl             = 64;
+  cfg.task_stack_size = 3072;
+  cfg.task_prio       = 2;           /* zoals MonitorSensors: boven de lus, onder lwIP */
+  cfg.interface       = 0;
+  ip_addr_set_ip4_u32(&cfg.target_addr, (uint32_t)gw);
+
+  esp_ping_callbacks_t cbs;
+  memset(&cbs, 0, sizeof(cbs));
+  cbs.cb_args         = NULL;
+  cbs.on_ping_success = probe_ok;
+  cbs.on_ping_timeout = probe_fail;
+  cbs.on_ping_end     = NULL;
+
+  s_probe_state = 0;
+  esp_ping_handle_t h = NULL;
+  if (esp_ping_new_session(&cfg, &cbs, &h) != ESP_OK || h == NULL) {
+    /* Geen geheugen of geen socket. Dat is ONZE kant: niet meetellen als
+     * mislukte ronde, anders haalt een krappe heap de wifi neer. */
+    _probe_at = millis() + PROBE_EVERY_MS;
+    return;
+  }
+  if (esp_ping_start(h) != ESP_OK) {
+    esp_ping_delete_session(h);
+    _probe_at = millis() + PROBE_EVERY_MS;
+    return;
+  }
+  _probe_handle = h;
+  _probe_deadline = millis() + PROBE_TIMEOUT_MS + 1500;   /* marge boven de eigen timeout */
+}
+
+/* Kijkt of de lopende ronde af is, en trekt de conclusie. */
+void WifiTask::checkProbe() {
+  unsigned long now = millis();
+
+  if (_probe_deadline == 0) {                    /* er loopt er geen */
+    if (_probe_at == 0) _probe_at = now + PROBE_EVERY_MS;
+    if ((long)(now - _probe_at) >= 0) startProbe();
+    return;
+  }
+
+  uint8_t st = s_probe_state;
+  if (st == 0 && (long)(now - _probe_deadline) < 0) return;   /* nog bezig */
+
+  /* Klaar (of over tijd, wat hetzelfde betekent: geen antwoord). */
+  if (_probe_handle != NULL) {
+    esp_ping_stop(_probe_handle);
+    esp_ping_delete_session(_probe_handle);
+    _probe_handle = NULL;
+  }
+  _probe_deadline = 0;
+  _probe_at = now + PROBE_EVERY_MS;
+
+  if (st == 1) {
+    if (_probe_fails > 0) {
+      WIFI_LOG("gateway weer bereikbaar na %u mislukte rondes\n", _probe_fails);
+    }
+    _probe_fails = 0;
+    return;
+  }
+
+  _probe_fails++;
+  WIFI_LOG("gateway antwoordt niet (%u/%u)\n", _probe_fails, PROBE_FAILS_BEFORE_DROP);
+  if (_probe_fails < PROBE_FAILS_BEFORE_DROP) return;
+
+  /* Genoeg. WiFi.status() beweert nog CONNECTED, maar er gaat niets doorheen --
+   * precies de toestand waarin deze node dertien uur bleef staan. Behandelen
+   * als wegvallen; de bestaande escalatie doet de rest. */
+  _probe_drops++;
+  _probe_fails = 0;
+  WIFI_LOG("geen doorstroming terwijl status online zegt -> opnieuw verbinden\n");
+  setState(RETRYING);
+  _fails = 0;
+  _next_action = now + RETRY_DELAY_MS;
+}
+
 void WifiTask::loop() {
   unsigned long now = millis();
   checkTimeSync();
@@ -204,6 +318,9 @@ void WifiTask::loop() {
     case CONNECTING:
       if (g_got_ip || WiFi.status() == WL_CONNECTED) {
         _fails = 0; _reconnects++;
+        _probe_fails = 0;
+        _probe_deadline = 0;
+        _probe_at = millis() + PROBE_EVERY_MS;
         setState(ONLINE);
         startTimeSync();
         WIFI_LOG("verbonden, rssi %d, ip %s\n",
@@ -221,12 +338,22 @@ void WifiTask::loop() {
       break;
 
     case ONLINE:
-      /* Waakhond ook hier: WiFi.status() kan CONNECTED beweren terwijl er geen
-       * verkeer meer door gaat. Zodra de status niet meer klopt, opnieuw. */
+      /* TWEE WAAKHONDEN, want er zijn twee manieren om weg te zijn.
+       *
+       * De vlag: soms meldt de ESP32 het wegvallen netjes. Dan is dit genoeg.
+       *
+       * De doorstroming: soms niet. WiFi.status() blijft dan CONNECTED beweren
+       * terwijl er geen pakket meer doorheen gaat, en op die vlag nog eens
+       * kijken levert niets op -- dat stond hier tot 20 september 2026, en die
+       * dag bleef deze node dertien uur 'online' zonder netwerk. Daarom pingt
+       * checkProbe() elke minuut de gateway; drie keer niets is wegvallen. */
       if (WiFi.status() != WL_CONNECTED) {
         setState(RETRYING);
         _next_action = now + RETRY_DELAY_MS;
-      } else if (_time_synced && _sntp_deadline == 0 &&
+      } else {
+        checkProbe();
+      }
+      if (_state == ONLINE && _time_synced && _sntp_deadline == 0 &&
                  (long)(now - _synced_at) >= (long)NTP_RESYNC_MS) {
         /* PERIODIEK HER-SYNCEN. De ESP32 heeft geen batterijklok en zijn oscillator
          * drijft; zonder herhaling loopt de tijd over dagen weg. Alleen als er niet

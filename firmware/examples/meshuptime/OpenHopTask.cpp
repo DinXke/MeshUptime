@@ -39,6 +39,9 @@ void OpenHopTask::reset() {
   _rx_head = _rx_count = 0;
   _rx_pushed = _rx_dropped = _tx_ok = _tx_refused = _sock_full = 0;
   _stall_since = 0;
+  _droogte_s = OH_DROOGTE_DEFAULT_S;
+  _laatste_tx = 0;
+  _rx_sinds_tx = 0;
   _fo_on = false;
   _fo_hold_s = OPENHOP_FO_HOLD_DEFAULT;
   _guest_seen = 0;
@@ -64,7 +67,7 @@ void OpenHopTask::loadConfig() {
    * leesbaar en gaat er nooit een instelling verloren die er niet in staat. */
   char line[OPENHOP_TOKEN_MAX + 8];
   int n = 0;
-  while (f.available() && n < 5) {
+  while (f.available() && n < 6) {
     size_t len = 0;
     while (f.available() && len < sizeof(line) - 1) {
       int ch = f.read();
@@ -81,9 +84,14 @@ void OpenHopTask::loadConfig() {
       StrHelper::strncpy(_token, line, sizeof(_token));
     } else if (n == 3) {
       _fo_on = (line[0] == '1');
-    } else {
+    } else if (n == 4) {
       long v = strtol(line, nullptr, 10);
       if (v >= OPENHOP_FO_HOLD_MIN && v <= OPENHOP_FO_HOLD_MAX) _fo_hold_s = (uint16_t)v;
+    } else {
+      /* Regel 6: de droogtetijd. Ontbreekt hij (bestand van voor v2.23.0),
+       * dan blijft de standaard staan, en dat is de bedoeling. */
+      long v = strtol(line, nullptr, 10);
+      if (v == 0 || (v >= OH_DROOGTE_MIN_S && v <= OH_DROOGTE_MAX_S)) _droogte_s = (uint16_t)v;
     }
     n++;
   }
@@ -99,6 +107,7 @@ void OpenHopTask::saveConfig() {
   f.println(_token);
   f.println(_fo_on ? "1" : "0");
   f.println((int)_fo_hold_s);
+  f.println((int)_droogte_s);
   f.close();
 }
 
@@ -276,6 +285,7 @@ void OpenHopTask::flushRxRing() {
     _rx_head = (uint8_t)((_rx_head + 1) % OH_RX_RING);
     _rx_count--;
     _rx_pushed++;
+    _rx_sinds_tx++;
   }
   _stall_since = 0;
 }
@@ -359,6 +369,11 @@ void OpenHopTask::cmdNoise() {
 }
 
 void OpenHopTask::cmdTx(const uint8_t* payload, size_t len) {
+  /* Het VERZOEK is het levensteken voor de droogtemeting, niet pas de
+   * geslaagde zending: een weigering omdat de lucht bezet is betekent nog
+   * altijd dat openHop aan het repeteren is. */
+  _laatste_tx = millis();
+  _rx_sinds_tx = 0;
   if (len == 0 || len > 255) { _tx_refused++; sendError(OH_ERR_PAYLOAD_TOO_BIG); return; }
   uint32_t airtime = 0;
   if (!_mesh->ohInjectRaw(payload, (int)len, &airtime)) {
@@ -478,6 +493,8 @@ void OpenHopTask::readSocket() {
     uint16_t verwacht = crc16(&_in[1], 3 + plen);
     if (gekregen == verwacht) {
       _guest_seen = millis();   /* levensteken voor de failover */
+      _laatste_tx = _guest_seen;   /* krediet: hij mag eerst nog beginnen */
+      _rx_sinds_tx = 0;
       handleFrame(_in[1], &_in[4], plen);
     } else {
       OH_DIAG("frame met foute CRC (cmd 0x%02X, %u byte)", _in[1], (unsigned)plen);
@@ -529,6 +546,17 @@ void OpenHopTask::setFailover(bool on) {
   saveConfig();
 }
 
+void OpenHopTask::setDroogte(uint16_t s) {
+  if (s != 0) {
+    if (s < OH_DROOGTE_MIN_S) s = OH_DROOGTE_MIN_S;
+    if (s > OH_DROOGTE_MAX_S) s = OH_DROOGTE_MAX_S;
+  }
+  _droogte_s = s;
+  _laatste_tx = millis();   /* opnieuw krediet geven */
+  _rx_sinds_tx = 0;
+  saveConfig();
+}
+
 void OpenHopTask::setFailoverHold(uint16_t s) {
   if (s < OPENHOP_FO_HOLD_MIN) s = OPENHOP_FO_HOLD_MIN;
   if (s > OPENHOP_FO_HOLD_MAX) s = OPENHOP_FO_HOLD_MAX;
@@ -547,7 +575,14 @@ void OpenHopTask::failoverTick() {
   const bool verbonden = clientConnected();
   const bool vastgelopen = verbonden && _guest_seen != 0 &&
       (nu - _guest_seen) > hold * OPENHOP_FO_STALL_MULT;
-  const bool levend = verbonden && !vastgelopen;
+  /* DROOG: verbonden, wij reiken hem pakketten aan, en er komt al die tijd
+   * geen enkel zendverzoek terug. Dan repeteert hij niet -- bijvoorbeeld omdat
+   * zijn andere kop weg is en hij in bridge-stand alles daarheen stuurt. */
+  const bool droog = verbonden && _droogte_s > 0 &&
+      _rx_sinds_tx >= OH_DROOGTE_MIN_RX && _laatste_tx != 0 &&
+      (nu - _laatste_tx) >= (unsigned long)_droogte_s * 1000UL;
+
+  const bool levend = verbonden && !vastgelopen && !droog;
 
   if (levend) {
     _guest_gone_since = 0;
@@ -563,7 +598,8 @@ void OpenHopTask::failoverTick() {
     _mesh->ohSetForwarding(true);
     _fo_taken = true;
     _fo_count++;
-    snprintf(_note, sizeof(_note), "FAILOVER: gast weg, node repeteert nu zelf");
+    snprintf(_note, sizeof(_note), "FAILOVER: %s, node repeteert nu zelf",
+             droog ? "gast zendt niet meer" : "gast weg");
     OH_DIAG("%s (na %u s stilte)", _note, (unsigned)_fo_hold_s);
     _mesh->dispatchAlert(MON_ALERT_BOTH, 0xFFFF, true,
                          "openHop weg -- deze node neemt het repeteren over",

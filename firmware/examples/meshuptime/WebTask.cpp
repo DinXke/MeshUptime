@@ -8556,7 +8556,8 @@ void WebTask::handleOpenHopJson() {
       "{\"on\":%d,\"port\":%u,\"token_set\":%d,"
       "\"client\":%d,\"client_ip\":\"%s\","
       "\"rx\":%lu,\"rx_dropped\":%lu,\"tx\":%lu,\"tx_refused\":%lu,"
-      "\"failover\":%d,\"fo_hold\":%u,\"fo_actief\":%d,\"fo_aantal\":%lu,"
+      "\"failover\":%d,\"fo_hold\":%u,\"droogte\":%u,"
+      "\"fo_actief\":%d,\"fo_aantal\":%lu,"
       "\"repeat\":%d,\"note\":\"%s\"}",
       _openhop->enabled() ? 1 : 0, (unsigned)_openhop->port(),
       _openhop->tokenSet() ? 1 : 0,
@@ -8564,6 +8565,7 @@ void WebTask::handleOpenHopJson() {
       (unsigned long)_openhop->rxPushed(), (unsigned long)_openhop->rxDropped(),
       (unsigned long)_openhop->txAccepted(), (unsigned long)_openhop->txRefused(),
       _openhop->failover() ? 1 : 0, (unsigned)_openhop->failoverHold(),
+      (unsigned)_openhop->droogte(),
       _openhop->failoverActive() ? 1 : 0, (unsigned long)_openhop->failoverCount(),
       _openhop->nodeForwarding() ? 1 : 0,
       note);
@@ -8591,6 +8593,10 @@ void WebTask::handleOpenHop() {
   if (getArg(*_server, "fo_hold", v, sizeof(v)) && v[0]) {
     long h = strtol(v, nullptr, 10);
     _openhop->setFailoverHold((uint16_t)(h < 0 ? 0 : h));
+  }
+  if (getArg(*_server, "droogte", v, sizeof(v)) && v[0]) {
+    long d = strtol(v, nullptr, 10);
+    _openhop->setDroogte((uint16_t)(d < 0 ? 0 : d));
   }
   if (getArg(*_server, "failover", v, sizeof(v))) {
     _openhop->setFailover(v[0] == (char)49);

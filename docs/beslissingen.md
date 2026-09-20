@@ -361,3 +361,45 @@ daemonlogboek weer `RX bureau -> TX dak -> Retransmitted packet`.
 De les erachter is algemener dan deze brug: een API die compileert is nog geen API
 die bestaat. `availableForWrite()` is een `virtual` met een nette standaardwaarde,
 en een standaardwaarde van nul ziet er in code uit als een meting.
+
+## Twee waakhonden die naar de verpakking keken in plaats van naar de inhoud (20 sep 2026)
+
+Op één dag dezelfde denkfout op twee plaatsen betrapt, en allebei kostten ze
+uren voordat iemand doorhad dat er iets stuk was.
+
+**De wifi-waakhond.** In de ONLINE-toestand stond letterlijk dit:
+
+```
+/* Waakhond ook hier: WiFi.status() kan CONNECTED beweren terwijl er geen
+ * verkeer meer door gaat. Zodra de status niet meer klopt, opnieuw. */
+if (WiFi.status() != WL_CONNECTED) {
+```
+
+Het commentaar benoemt de storing exact en de regel eronder controleert precies
+de vlag die het net wantrouwt. Gemeten gevolg: om 11:55 verloor de node zijn
+netwerk, en dertien uur later draaide hij nog steeds, ping beantwoordend maar
+verder onbereikbaar, met `reconnects: 1, resets: 0` en een pingmotor die elke
+paar seconden `ping_sock: send error=0` uitspuwde. De hersteldienst is geen
+enkele keer aangesproken, want er was volgens de vlag niets aan de hand.
+
+Nu pingt hij elke minuut de gateway; drie mislukte rondes achter elkaar tellen
+als wegvallen. De gateway en niet een adres op internet: een node die zijn wifi
+neerhaalt omdat de internetverbinding hapert, is een tweede storing in plaats
+van een reparatie.
+
+**De openHop-failover.** Die vroeg: staat de gast nog verbonden? Diezelfde dag
+was het antwoord de hele tijd ja terwijl er niets de lucht in ging — de tweede
+kop was weg, en in `tx_mode: bridge` gaat alles wat de ene kop hoort via de
+andere naar buiten. 85 pakketten binnen per tien minuten, 182 mislukte
+zendpogingen per uur, nul geslaagde, en een failover die niets deed omdat de
+TCP-verbinding er prima bij lag.
+
+Nu telt ook of hij nog zendt: geen enkel TX-verzoek gedurende de droogtetijd
+terwijl wij hem wel pakketten bleven aanreiken, betekent dat hij zijn werk niet
+doet. Die maatstaf heeft een grens en die hoort erbij: hij neemt aan dat elke
+kop af en toe een zendverzoek krijgt. Dat klopt bij `bridge` en bij de
+default_radio, niet bij een tweede kop onder `default` of `sticky` — vandaar
+`openhop droogte uit`.
+
+De les is niet "meer waakhonden", maar: meet het ding zelf. Een verbinding is
+geen doorstroming, en een statusvlag is geen verkeer.
