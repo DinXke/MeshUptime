@@ -403,3 +403,32 @@ default_radio, niet bij een tweede kop onder `default` of `sticky` — vandaar
 
 De les is niet "meer waakhonden", maar: meet het ding zelf. Een verbinding is
 geen doorstroming, en een statusvlag is geen verkeer.
+
+## Een kortere blokkade is nog steeds een blokkade (21 sep 2026)
+
+Nadat de `availableForWrite()`-drempel eruit was, bleef de schrijfweg naar de
+openHop-host blokkerend, met een socket-timeout van twee seconden als enige
+grens. Dat voelde als een oplossing en was er geen: elke hapering bij de host
+kostte twee seconden hoofdlus, en dat is genoeg om alles eromheen te slopen.
+
+Gemeten: `/status.json` deed er **150 seconden** over. De node meldde zichzelf
+elke paar minuten als *"node stil (push): langer dan 90 s geen push"*, openHop
+kreeg zijn bevestiging niet meer terug (*"[TX] Failed - no TX_DONE response"*,
+elke dertien seconden, urenlang), en de monitors flapperden mee — waardoor de
+companion bij elke flip een alarmtoon kreeg. Eén blokkerende write, vier
+zichtbare storingen.
+
+Nu wacht de lus nergens meer op. Frames gaan in een uitgaande buffer van 2 KB,
+en `pumpTx()` leegt die elke ronde met `send(fd, ..., MSG_DONTWAIT)`: wat weg
+kan gaat weg, de rest blijft staan. `WiFiClient::fd()` geeft de onderliggende
+socket, en die bestaat in deze kern wél — in tegenstelling tot
+`availableForWrite()`.
+
+Wat er valt als de buffer vol zit, is een keuze per soort: een RX_PACKET mag
+vallen, want de host mist dan één pakket. Een antwoord niet — zonder TX_DONE
+blijft openHop eindeloos opnieuw vragen, en dat was precies de storing. Voor een
+antwoord maken we dus plaats door de buffer te laten gaan. Blijft hij dertig
+seconden vol, dan leest de overkant niet meer en laten we de verbinding los.
+
+Na de wijziging: `status.json` in **278 ms**, 18 doorstuuracties in vijf minuten
+over beide koppen, en geen enkele TX-fout meer buiten het herstartvenster.

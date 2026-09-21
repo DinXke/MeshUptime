@@ -1,4 +1,8 @@
 #include "OpenHopTask.h"
+#ifdef ESP32
+  #include <lwip/sockets.h>   /* send() met MSG_DONTWAIT: nooit wachten */
+  #include <errno.h>
+#endif
 #include "RoomMesh.h"
 #include "WifiTask.h"
 #include "MonitorStore.h"   /* MON_ALERT_*, MON_SEV_* */
@@ -39,6 +43,7 @@ void OpenHopTask::reset() {
   _rx_head = _rx_count = 0;
   _rx_pushed = _rx_dropped = _tx_ok = _tx_refused = _sock_full = 0;
   _stall_since = 0;
+  _out_head = _out_len = 0;
   _droogte_s = OH_DROOGTE_DEFAULT_S;
   _laatste_tx = 0;
   _rx_sinds_tx = 0;
@@ -187,28 +192,42 @@ bool OpenHopTask::sendFrame(uint8_t cmd, const uint8_t* payload, size_t len,
 #ifdef ESP32
   if (!clientConnected()) return false;
 
-  /* EEN GAST MAG ZENDTIJD KOSTEN, GEEN HOOFDLUS. WiFiClient::write() wacht tot
-   * de bytes weg kunnen; leest de host even niet, dan staat deze node stil --
-   * geen webserver, geen mesh, en hij stopt zelfs met ACK'en (gemeten: Send-Q
-   * 2552 byte vast, rto 120 s, negen minuten niets). Dus schrijven we alleen
-   * als er NU plaats is, en laten we het frame anders vallen. Een RX_PACKET dat
-   * de host mist is vervelend; een node die stilstaat is erger. */
-  /* GEEN availableForWrite(): die bestaat in deze kern niet (WiFiClient erft
-   * hem van Client en dat is een vaste 0). Daarop drempelen betekende: elk
-   * RX-frame weggooien, en dus een host die niets meer hoort.
+  /* DE HOOFDLUS WACHT NIET. WiFiClient::write() blokkeert tot de bytes weg
+   * kunnen; leest de host even niet, dan staat deze node stil -- geen
+   * webserver, geen mesh. Een socket-timeout maakt dat korter, niet goed: twee
+   * seconden per frame was genoeg om de node zichzelf als "stil" te laten
+   * melden en openHop zijn TX_DONE te laten missen.
    *
-   * De grens zit in de TIJD. setTimeout staat op twee seconden (in ms, zie
-   * loop()); langer mag een write nooit duren, want zo lang staat de hoofdlus
-   * stil. Neemt de host structureel niets meer aan, dan vangt de
-   * stilstand-teller in flushRxRing() dat op. */
-  (void)alleen_als_plaats;
-  uint8_t hdr[5];
+   * Dus schrijven we hier niets. We zetten het frame in de uitgaande buffer;
+   * pumpTx() leegt die elke ronde met MSG_DONTWAIT. */
+  const size_t nodig = 4 + len + 2;
+  if (nodig > OH_OUT_BUF) return false;          /* kan nooit passen */
+
+  if (!outRoom(nodig)) {
+    if (alleen_als_plaats) {
+      /* Een RX_PACKET mag vallen: de host mist een pakket, en dat is beter dan
+       * een node die wacht. */
+      _sock_full++;
+      return false;
+    }
+    /* Een antwoord (PONG, AUTH_OK, CONFIG_RESP, TX_DONE) is klein en
+     * noodzakelijk -- zonder TX_DONE blijft openHop eindeloos opnieuw vragen.
+     * Daarvoor maken we plaats door de buffer te laten vallen: die bevat dan
+     * toch vooral RX-frames die de host niet aankan. */
+    _rx_dropped += (uint32_t)(_out_len / 64);    /* ruwe schatting, eerlijk laag */
+    _out_head = 0;
+    _out_len = 0;
+    _sock_full++;
+    if (!outRoom(nodig)) return false;
+  }
+
+  uint8_t hdr[4];
   hdr[0] = OH_SYNC;
   hdr[1] = cmd;
   hdr[2] = (uint8_t)(len & 0xFF);
   hdr[3] = (uint8_t)((len >> 8) & 0xFF);
   uint16_t crc = crc16(&hdr[1], 3);
-  /* De CRC loopt over CMD+LEN+PAYLOAD; het tweede stuk komt hieronder. */
+  /* De CRC loopt over CMD+LEN+PAYLOAD; het tweede stuk hier. */
   if (payload && len) {
     uint16_t c = crc;
     for (size_t i = 0; i < len; i++) {
@@ -217,15 +236,63 @@ bool OpenHopTask::sendFrame(uint8_t cmd, const uint8_t* payload, size_t len,
     }
     crc = c;
   }
-  hdr[4] = 0;  /* niet gebruikt; houdt de buffer op 5 voor de duidelijkheid */
-  if (_cl.write(hdr, 4) != 4) return false;
-  if (payload && len && _cl.write(payload, len) != len) return false;
   uint8_t tail[2] = { (uint8_t)(crc & 0xFF), (uint8_t)(crc >> 8) };
-  return _cl.write(tail, 2) == 2;
+
+  outPush(hdr, 4);
+  if (payload && len) outPush(payload, len);
+  outPush(tail, 2);
+  pumpTx();                 /* meteen proberen; wat niet kan, blijft staan */
+  return true;
 #else
   return false;
 #endif
 }
+
+/* Bytes achteraan de ringloze buffer. De aanroeper heeft de plaats al
+ * gecontroleerd met outRoom(). */
+void OpenHopTask::outPush(const uint8_t* p, size_t n) {
+#ifdef ESP32
+  if (_out_head > 0 && (size_t)(_out_head + _out_len + n) > OH_OUT_BUF) {
+    memmove(_out, _out + _out_head, _out_len);   /* schuif naar voren */
+    _out_head = 0;
+  }
+  memcpy(_out + _out_head + _out_len, p, n);
+  _out_len = (uint16_t)(_out_len + n);
+#endif
+}
+
+/* Wat weg kan, gaat weg. Meer niet. */
+void OpenHopTask::pumpTx() {
+#ifdef ESP32
+  if (_out_len == 0) { _stall_since = 0; return; }
+  if (!clientConnected()) { _out_head = _out_len = 0; return; }
+
+  int fd = _cl.fd();
+  if (fd < 0) return;
+
+  while (_out_len > 0) {
+    int n = ::send(fd, _out + _out_head, _out_len, MSG_DONTWAIT);
+    if (n > 0) {
+      _out_head = (uint16_t)(_out_head + n);
+      _out_len  = (uint16_t)(_out_len - n);
+      if (_out_len == 0) { _out_head = 0; _stall_since = 0; }
+      continue;
+    }
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      /* Zendvenster vol. Niet wachten -- volgende ronde opnieuw. */
+      if (_stall_since == 0) _stall_since = millis();
+      else if (millis() - _stall_since >= OH_STALL_DROP_MS * 6) {
+        dropClient("host neemt niets meer aan");
+      }
+      return;
+    }
+    /* Echte fout op de socket. */
+    dropClient("schrijffout op de socket");
+    return;
+  }
+#endif
+}
+
 
 void OpenHopTask::sendError(uint8_t code) {
   sendFrame(OH_CMD_ERROR, &code, 1);
@@ -625,6 +692,10 @@ void OpenHopTask::loop() {
    * gast en valt er niets over te nemen. Wel voor de wifi-controle hieronder,
    * want een node zonder netwerk heeft ook geen host. */
   if (!_on) return;
+  /* Eerst de uitgaande buffer: die moet ook leeglopen als er even geen
+   * nieuw verkeer is, anders blijft een TX_DONE hangen tot het volgende
+   * pakket toevallig langskomt. */
+  pumpTx();
   failoverTick();
   if (_wifi == nullptr || !_wifi->isOnline()) {
     /* Zonder netwerk valt er niets te bedienen. De luisteraar blijft staan;
@@ -643,7 +714,9 @@ void OpenHopTask::loop() {
     _cl.setNoDelay(true);
     /* Tweede vangnet: mocht een write toch blijven hangen, dan is de schade
      * seconden in plaats van minuten. */
-    _cl.setTimeout(2000);   /* milliseconden in deze kern */
+    /* Geen setTimeout meer nodig: er wordt hier nooit blokkerend
+     * geschreven. pumpTx() gebruikt MSG_DONTWAIT. */
+    _out_head = _out_len = 0;
     _in_len = 0;
     _authed = (_token[0] == 0);          /* geen token = meteen binnen */
     snprintf(_client_ip, sizeof(_client_ip), "%s", _cl.remoteIP().toString().c_str());

@@ -125,6 +125,11 @@
  * opnieuw kan verbinden. */
 #define OH_STALL_DROP_MS        5000UL
 
+/* Uitgaande buffer. Ruim genoeg voor een handvol frames (een frame is
+ * hoogstens 4 + 264 + 2 bytes), zodat een korte hapering bij de host niets
+ * kost. Loopt hij vol, dan vallen de oudste RX-frames -- zie sendFrame. */
+#define OH_OUT_BUF              2048
+
 /* DROOGTE: verbonden maar niets meer zenden. Zie de failover in het .cpp.
  * Standaard tien minuten, en pas nadat we hem minstens dit aantal pakketten
  * hebben aangereikt -- anders zou een stil mesh als storing tellen. */
@@ -211,6 +216,12 @@ private:
 
   uint32_t  _rx_pushed, _rx_dropped, _tx_ok, _tx_refused, _sock_full;
   unsigned long _stall_since;   /* sinds wanneer neemt hij niets meer aan? */
+  uint8_t   _out[OH_OUT_BUF];   /* wacht op de socket, blokkeert de lus niet */
+  uint16_t  _out_head;          /* eerste byte die nog weg moet             */
+  uint16_t  _out_len;           /* hoeveel er nog staat                     */
+  void      pumpTx();           /* elke ronde: wat weg kan, gaat weg        */
+  bool      outRoom(size_t n) const { return (size_t)(OH_OUT_BUF - _out_len) >= n; }
+  void      outPush(const uint8_t* p, size_t n);
   uint16_t      _droogte_s;     /* 0 = uit                                 */
   unsigned long _laatste_tx;    /* laatste TX-verzoek van de host          */
   uint32_t      _rx_sinds_tx;   /* aangereikt sinds dat verzoek            */
