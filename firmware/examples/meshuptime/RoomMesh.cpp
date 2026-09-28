@@ -1,4 +1,5 @@
 #include "RoomMesh.h"
+#include "WolTask.h"
 #include "OpenHopTask.h"
 #include "TimeFmt.h"
 #include "PushTask.h"   /* v2.5.1: instant companion-push via _push->queueCompanion() */
@@ -3214,6 +3215,17 @@ void RoomMesh::handleBotDm(int b, mesh::Packet* packet, const uint8_t* sender_pu
                "ack @[%s] via %s (%d hops) | SNR: %.1f dB | RSSI: %d dBm | Received at: %s",
                name, route, nhops, snr_db, rssi, rxt);
     }
+  } else if (!strcasecmp(verb, "wol")) {
+    /* Wake-on-LAN via de bot, zodat een DM naar bijvoorbeeld MGMT hetzelfde doet
+     * als het commando op de console. Alleen voor wie in de ontvangerslijst van
+     * deze bot staat -- net als de andere beheercommando's: wie een pc mag
+     * wekken, hoort op die lijst te staan. */
+    if (botRecipHas(b, sender_pub)) {
+      if (!wol_handle_command(text, reply, sizeof(reply)))
+        snprintf(reply, sizeof(reply), "wol | wol <mac> | wol ip <adres> | wol set <mac> | wol uit");
+    } else {
+      snprintf(reply, sizeof(reply), "wol: niet toegestaan vanaf deze sleutel");
+    }
   } else if (!strcasecmp(verb, "help") || verb[0] == '?') {
     snprintf(reply, sizeof(reply),
              "mesh-diagnose-bot: `ping` -> Pong; `path` -> afzender + tussenliggende "
@@ -4986,6 +4998,10 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     else { addServerPost(0, msg); strcpy(reply, "OK"); }
   } else if (memcmp(command, "sensornode ", 11) == 0) {
     handleSensorNodeCommand(command + 11, reply);
+  } else if (wol_handle_command(command, reply, 160)) {
+    /* Wake-on-LAN. Hier en niet in WebTask, zodat serieel, de
+     * webconsole en een DM over de mesh allemaal hetzelfde commando
+     * krijgen in plaats van drie halve varianten. */
   } else if (memcmp(command, "bot ", 4) == 0) {
     handleBotCommand(command + 4, reply);
   } else if (memcmp(command, "channel ", 8) == 0) {

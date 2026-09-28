@@ -14,6 +14,7 @@
  * ==========================================================================*/
 
 #include "RoomMesh.h"
+#include "WolTask.h"
 #include "DmCommands.h"
 #include "TimeFmt.h"
 #if defined(ESP32)
@@ -743,6 +744,7 @@ void setup() {
   /* De openHop-brug (v2.21.0): een TCP-server die het modemprotocol van
    * openHop spreekt met ONZE radio eronder. Standaard uit; de node blijft
    * alles doen wat hij deed. */
+  wol_begin(SPIFFS);   /* Wake-on-LAN: bewaard MAC inlezen */
   openhop_task.begin(&SPIFFS, &wifi_task, &the_mesh);
   the_mesh.setOpenHop(&openhop_task);
   web_task.setOpenHop(&openhop_task);

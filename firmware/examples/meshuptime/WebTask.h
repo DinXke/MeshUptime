@@ -251,6 +251,8 @@ private:
    * Wachtwoorden komen NOOIT in een GET terug; de JSON zegt alleen "gezet: ja/nee". */
   void handleOpenHopJson();
   void handleOpenHop();
+  void handleWolJson();
+  void handleWol();
   void handlePollerJson();
   void handlePoller();
   void handleTargetsJson();
@@ -416,6 +418,8 @@ private:
   friend void web_route_cliremote();
   friend void web_route_openhopjson();
   friend void web_route_openhop();
+  friend void web_route_woljson();
+  friend void web_route_wol();
   friend void web_route_pollerjson();
   friend void web_route_poller();
   friend void web_route_targetsjson();

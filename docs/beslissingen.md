@@ -432,3 +432,32 @@ seconden vol, dan leest de overkant niet meer en laten we de verbinding los.
 
 Na de wijziging: `status.json` in **278 ms**, 18 doorstuuracties in vijf minuten
 over beide koppen, en geen enkele TX-fout meer buiten het herstartvenster.
+
+## Wake-on-LAN kan niet op IP, en waarom er toch een IP-veld is (29 sep 2026)
+
+Een slapende netwerkkaart heeft geen IP-stack draaien. Wat er nog werkt is één
+patroonherkenning in de kaart zelf: zes bytes 0xFF gevolgd door zestien keer
+haar eigen MAC. Daarom staat er een MAC in een magic packet en geen IP — dat is
+geen keuze van deze firmware maar van het mechanisme.
+
+Toch neemt het veld een IP aan, want dat is wat je bij de hand hebt. De node
+zoekt het dan eenmalig op via ARP (`etharp_request` + `etharp_find_addr` op
+`netif_default`) en bewaart het gevonden MAC. Dat lukt alleen zolang die machine
+nog WAKKER is; daarna wekt het bewaarde MAC hem ook uit slaap. Die volgorde moet
+je kennen, anders sla je het op het verkeerde moment op.
+
+Twee dingen die gemeten zijn en niet aangenomen:
+
+**Over USB kan het niet.** De node hangt aan een CP210x seriële brug. Die staat
+niet in `powercfg /devicequery wake_from_any` — een UART-brug kent geen
+remote-wakeup. Alleen HID-apparaten en netwerkkaarten staan daar.
+
+**Windows heeft twee schakelaars.** "Wake on Magic Packet: Enabled" op het
+tabblad Geavanceerd zet het aan in de driver; of het apparaat de pc werkelijk
+mag wekken staat in een aparte vlag (`MSPower_DeviceWakeEnable`). Op de Intel
+AX200 stond de eerste aan en de tweede uit, en dan ontbreekt de kaart in
+`wake_armed` terwijl alles goed lijkt te staan.
+
+Het pakket gaat naar het SUBNET-broadcastadres (192.168.110.255), niet naar
+255.255.255.255: dat laatste wordt door menig stack en switch stil geweigerd, en
+dan verdwijnt het zonder foutmelding.

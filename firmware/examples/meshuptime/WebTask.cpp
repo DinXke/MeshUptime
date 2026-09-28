@@ -1,4 +1,5 @@
 #include "WebTask.h"
+#include "WolTask.h"
 #include "OpenHopTask.h"
 #include "WifiTask.h"
 #include "MonitorSensors.h"
@@ -459,6 +460,8 @@ void web_route_pollerjson()   { if (g_self) g_self->handlePollerJson(); }
 void web_route_poller()       { if (g_self) g_self->handlePoller(); }
 void web_route_openhopjson()  { if (g_self) g_self->handleOpenHopJson(); }
 void web_route_openhop()      { if (g_self) g_self->handleOpenHop(); }
+void web_route_woljson()      { if (g_self) g_self->handleWolJson(); }
+void web_route_wol()          { if (g_self) g_self->handleWol(); }
 void web_route_targetsjson()  { if (g_self) g_self->handleTargetsJson(); }
 void web_route_target()       { if (g_self) g_self->handleTarget(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
@@ -1513,6 +1516,25 @@ placeholder="wachtwoord" style="width:9rem">
 <input id="pl-def" type="password" autocomplete="new-password" maxlength="15"
 placeholder="terugval-wachtwoord" style="width:11rem">
 <button type="button" id="pl-defset">standaard zetten</button></div>
+</div>
+
+<h2>Wake-on-LAN</h2>
+<div class="card">
+<p class="note">Wekt een pc op dit netwerk met een magic packet. Wekken kan <b>alleen op
+MAC</b> &mdash; een slapende netwerkkaart heeft geen IP-stack en herkent enkel zijn eigen
+MAC in het pakket. Vul je hier een <b>IP</b> in, dan zoekt de node het MAC eenmalig op via
+ARP en bewaart dat; dat lukt alleen zolang die pc nog wakker is.</p>
+<div class="quick" style="margin-top:.4rem">
+<input id="wol-mac" spellcheck="false" autocomplete="off" maxlength="40"
+ placeholder="8c:c6:81:eb:99:57  of  192.168.110.60" style="min-width:18rem">
+<button type="button" id="wol-save">bewaren</button>
+<button type="button" id="wol-send">nu wekken</button></div>
+<div id="wol-status" style="margin-top:.4rem;color:var(--muted)"></div>
+<p class="note" style="margin-top:.6rem">Zelfde commando over de mesh of serieel:
+<code>wol</code> (stuurt), <code>wol ip 192.168.110.60</code> (zoekt op),
+<code>wol set &lt;mac&gt;</code>, <code>wol uit</code>. Op de pc moet de netwerkkaart het
+mogen: <i>Energiebeheer &rarr; dit apparaat mag de computer wekken</i>, en bij voorkeur ook
+<i>alleen een magic packet</i>.</p>
 </div>
 
 <h2>Instellingen</h2>
@@ -3175,6 +3197,26 @@ var d=document.getElementById("oh-droogte").value;
 fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"failover="+fo+"&fo_hold="+encodeURIComponent(h)+"&droogte="+encodeURIComponent(d)})
 .then(function(r){return r.text()}).then(function(t){logline("openhop",t,1);ohLoad()})}
+
+/* ---- Wake-on-LAN ---- */
+function wolLoad(){
+fetch("wol.json").then(function(r){return r.ok?r.json():null}).then(function(j){
+if(!j){return}
+var i=document.getElementById("wol-mac");
+if(document.activeElement!==i&&j.mac){i.value=j.mac}
+document.getElementById("wol-status").textContent=j.mac?("bestemming: "+j.mac):"geen bestemming ingesteld"
+}).catch(function(){})}
+
+function wolPost(body){
+fetch("wol",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:body})
+.then(function(r){return r.text()}).then(function(t){
+document.getElementById("wol-status").textContent=t;logline("wol",t,1);wolLoad()})}
+
+document.getElementById("wol-save").onclick=function(){
+wolPost("mac="+encodeURIComponent(document.getElementById("wol-mac").value))}
+document.getElementById("wol-send").onclick=function(){
+var m=document.getElementById("wol-mac").value;
+wolPost(m?("mac="+encodeURIComponent(m)+"&send=1"):"send=1")}
 
 /* ---- de console ---- */
 /* Nieuwste bovenaan en hoogstens 40 regels. Zonder die grens groeit dit venster
@@ -5058,6 +5100,8 @@ void WebTask::routes() {
   _server->on("/poller", HTTP_POST, web_route_poller);
   _server->on("/openhop.json", HTTP_GET, web_route_openhopjson);
   _server->on("/openhop", HTTP_POST, web_route_openhop);
+  _server->on("/wol.json", HTTP_GET, web_route_woljson);
+  _server->on("/wol", HTTP_POST, web_route_wol);
   _server->on("/repeater_targets.json", HTTP_GET, web_route_targetsjson);
   _server->on("/repeater/target", HTTP_POST, web_route_target);
   /* De eigen web-login. POST-only, en achter dezelfde Basic-auth als de rest: dit
@@ -9074,4 +9118,54 @@ void WebTask::handleWebCredReset() {
 
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", "{\"ok\":1,\"reset\":1}");
+}
+
+/* GET /wol.json -- wat staat er als bestemming. */
+void WebTask::handleWolJson() {
+  if (!requireAuth()) return;
+  char mac[24];
+  wol_mac_text(mac, sizeof(mac));
+  snprintf(g_json, sizeof(g_json), "{\"mac\":\"%s\"}", mac);
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* POST /wol   mac=<mac|ip|uit>  &  send=1
+ *
+ * Eén formulier voor drie dingen, want dat is hoe je het gebruikt: een MAC
+ * invullen, een IP laten opzoeken, of gewoon wekken. Een IP wordt hier via ARP
+ * omgezet en als MAC bewaard -- wekken zelf kan nooit op IP, want een slapende
+ * kaart heeft geen IP-stack. */
+void WebTask::handleWol() {
+  if (!requireAuth()) return;
+  char v[64];
+  char msg[160];
+  msg[0] = 0;
+
+  if (getArg(*_server, "mac", v, sizeof(v)) && v[0]) {
+    bool lijkt_ip = true; int punten = 0;
+    for (const char* q = v; *q; q++) {
+      if (*q == '.') { punten++; continue; }
+      if (*q < '0' || *q > '9') { lijkt_ip = false; break; }
+    }
+    if (lijkt_ip && punten == 3) {
+      wol_resolve_ip(v, msg, sizeof(msg));
+    } else if (!wol_set_mac(v)) {
+      snprintf(msg, sizeof(msg), "mac verwacht 12 hexcijfers, of een IP-adres");
+    } else {
+      char mac[24]; wol_mac_text(mac, sizeof(mac));
+      snprintf(msg, sizeof(msg), "bestemming %s", wol_have_mac() ? mac : "uit");
+    }
+  }
+
+  if (getArg(*_server, "send", v, sizeof(v)) && v[0] == '1') {
+    char r[160];
+    wol_send(r, sizeof(r));
+    if (msg[0]) { size_t n = strlen(msg); snprintf(msg + n, sizeof(msg) - n, " | %s", r); }
+    else snprintf(msg, sizeof(msg), "%s", r);
+  }
+
+  if (!msg[0]) snprintf(msg, sizeof(msg), "niets te doen (mac= of send=1)");
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "text/plain", msg);
 }
