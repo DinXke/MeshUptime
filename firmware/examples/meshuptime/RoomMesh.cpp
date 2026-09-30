@@ -1,5 +1,6 @@
 #include "RoomMesh.h"
 #include "WolTask.h"
+#include "TakTask.h"
 #include "OpenHopTask.h"
 #include "TimeFmt.h"
 #include "PushTask.h"   /* v2.5.1: instant companion-push via _push->queueCompanion() */
@@ -920,6 +921,14 @@ void RoomMesh::onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint
                         packet->_snr,
                         packet->getPathHashCount(),
                         getRTCClock()->getCurrentTime());
+  /* v2.25.0: een advert met lat/lon ook naar de TAK-kaart. Kopieert alleen;
+   * TakTask verstuurt in zijn eigen ronde. */
+  if (parser.isValid() && parser.hasLatLon()) {
+    tak_queue_pos(id.pub_key, parser.hasName() ? parser.getName() : NULL, TAK_SRC_ADVERT,
+                  parser.getType(), parser.getLat(), parser.getLon(), -1,
+                  packet->_snr, packet->getPathHashCount(), false,
+                  getRTCClock()->getCurrentTime());
+  }
 }
 
 int RoomMesh::searchPeersByHash(const uint8_t* hash) {
@@ -2687,10 +2696,21 @@ bool RoomMesh::compMsgGet(int i, char* pub64, size_t pub_len, char* name, size_t
  * op de /companions.json-poll (tot ~1 min oud) hoeft te wachten. PushTask draagt
  * de betrouwbaarheid (retry/queue); hier alleen de momentopname doorgeven. */
 void RoomMesh::pushCompanionNow(int idx) {
-  if (_push == nullptr) return;
   if (idx < 0 || idx >= MAX_COMPANIONS || !_companions[idx].used) return;
   const Companion& c = _companions[idx];
   bool has_loc = !isnan(c.last_lat) && !isnan(c.last_lon);
+  /* v2.25.0: dezelfde momentopname naar TAK, ook als MeshManager niet
+   * ingesteld is. Een val, SOS of "geen beweging" van de laatste tien minuten
+   * gaat mee als noodmelding; een oud event blijft niet eindeloos rood. */
+  if (has_loc) {
+    uint32_t now_s = getRTCClock()->getCurrentTime();
+    bool alarm = c.fall_kind != FALL_KIND_NONE && c.fall_ts != 0 &&
+                 now_s >= c.fall_ts && now_s - c.fall_ts <= 600;
+    tak_queue_pos(c.pub_key, c.name, TAK_SRC_COMPANION, ADV_TYPE_CHAT,
+                  c.last_lat, c.last_lon, c.last_batt, INT16_MIN, -1, alarm,
+                  c.last_seen ? c.last_seen : now_s);
+  }
+  if (_push == nullptr) return;
   _push->queueCompanion(c.pub_key, has_loc, c.last_lat, c.last_lon,
                         c.last_seen, c.fall_ts, c.fall_kind, c.last_batt);
 }
@@ -4998,6 +5018,8 @@ void RoomMesh::handleCommand(uint32_t sender_timestamp, char* command, char* rep
     else { addServerPost(0, msg); strcpy(reply, "OK"); }
   } else if (memcmp(command, "sensornode ", 11) == 0) {
     handleSensorNodeCommand(command + 11, reply);
+  } else if (tak_handle_command(command, reply, 160, getRTCClock()->getCurrentTime())) {
+    /* TAK-uitgang (v2.25.0), zelfde reden als wol hieronder. */
   } else if (wol_handle_command(command, reply, 160)) {
     /* Wake-on-LAN. Hier en niet in WebTask, zodat serieel, de
      * webconsole en een DM over de mesh allemaal hetzelfde commando

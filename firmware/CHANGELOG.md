@@ -7,6 +7,33 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.25.0 — TAK: posities uit de mesh op de ATAK-kaart
+
+De node stuurt elke positie die hij leert als Cursor-on-Target naar een
+TAK-server (OpenTAKServer op het LAN, TCP 8088). Twee bronnen: adverts van
+andere nodes die een lat/lon meedragen, en de `#LOC`-berichten van de eigen
+companions (T1000-E). ATAK-CIV, WinTAK en iTAK zien ze dan als stippen op de
+kaart, met naam, batterij en SNR/hops in de opmerking.
+
+**Waarom op de node en niet op een host.** De node hoort de posities al. Een
+brug op een pc zou via COM4 (dat reset de node) of TCP 5000 (maar één client)
+moeten meeluisteren.
+
+**Val, SOS of geen beweging** van een companion in de laatste tien minuten gaat
+mee als ATAK-noodmelding (`b-a-o-tbl`, "911 Alert"), met een vaste uid per
+persoon zodat een herhaling de melding vervangt in plaats van er een bij te
+zetten.
+
+**Nooit wachten.** Eén blijvende lwIP-socket met O_NONBLOCK, zoals PushTask;
+wat de server terugstuurt (hij stuurt elk CoT naar elke client) wordt begrensd
+weggelezen. Een ring van acht plaatsen, één per afzender; loopt hij vol, dan
+valt de oudste en wordt dat geteld. Zonder NTP-sync gaat er niets weg.
+
+**Instellen** via serieel, de webconsole of een admin-DM:
+`tak host 10.10.30.109:8088`, `tak on`, `tak adverts on|off`, `tak stale <min>`,
+`tak test <lat> <lon>`; kaal `tak` geeft de stand. Bewaard in `/tak.cfg`,
+standaard uit.
+
 ## v2.22.0 — failover: valt openHop weg, dan repeteert de node zelf weer
 
 Laat je openHop het repeteren doen, dan hangt je dekking aan een container, een

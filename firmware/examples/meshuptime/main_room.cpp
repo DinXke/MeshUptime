@@ -15,6 +15,7 @@
 
 #include "RoomMesh.h"
 #include "WolTask.h"
+#include "TakTask.h"
 #include "DmCommands.h"
 #include "TimeFmt.h"
 #if defined(ESP32)
@@ -745,6 +746,7 @@ void setup() {
    * openHop spreekt met ONZE radio eronder. Standaard uit; de node blijft
    * alles doen wat hij deed. */
   wol_begin(SPIFFS);   /* Wake-on-LAN: bewaard MAC inlezen */
+  tak_begin(SPIFFS);   /* v2.25.0: TAK-uitgang, instellingen uit /tak.cfg */
   openhop_task.begin(&SPIFFS, &wifi_task, &the_mesh);
   the_mesh.setOpenHop(&openhop_task);
   web_task.setOpenHop(&openhop_task);
@@ -812,6 +814,7 @@ void loop() {
     poller.loop();   // v2.6.0: MeshManager-opdrachtwachtrij; niet-blokkerend, na de bewaking
     openhop_task.loop();  // v2.21.0: de openHop-brug; begrensde hap per ronde
     irc_task.loop(); // v2.9.0: IRC-sessies; accept + leesronde, keert altijd terug
+    tak_loop();      // v2.25.0: CoT naar de TAK-server; niet-blokkerend
   }
 #endif
 #ifdef DISPLAY_CLASS
