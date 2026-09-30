@@ -7,6 +7,14 @@ Getoond op het OLED-bootscherm, in de web-voettekst en via het `ver`-commando.
 Alleen de room-server-variant (`env:meshuptime_room`, build-flag `ROOM_SERVER_VARIANT`)
 tenzij anders vermeld; de sensor-variant (`env:meshuptime`) blijft de terugvalweg.
 
+## v2.25.1 — TAK-tab in de web-GUI
+
+Een eigen tabblad **tak** met aan/uit, server en poort, adverts aan/uit, de
+vervaltijd en een knop voor een testpunt, plus de live stand: verbonden of niet,
+aantal verstuurd en weggevallen, en welke positie het laatst weg ging. Nieuw
+eindpunt `GET /tak.json` voor die stand; opslaan gaat via `/cli` met dezelfde
+`tak`-commando's, zodat de controle op de invoer op één plek zit.
+
 ## v2.25.0 — TAK: posities uit de mesh op de ATAK-kaart
 
 De node stuurt elke positie die hij leert als Cursor-on-Target naar een

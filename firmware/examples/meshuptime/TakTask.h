@@ -69,6 +69,9 @@ void tak_queue_pos(const uint8_t* pub, const char* name, TakSrc src, uint8_t adv
 
 bool tak_enabled();
 
+/* De stand als JSON-object, voor de TAK-tab in de web-GUI (/tak.json). */
+void tak_status_json(char* out, size_t max);
+
 /* De CLI: 'tak', 'tak on|off', 'tak host <ip>[:poort]', 'tak port <n>',
  * 'tak adverts on|off', 'tak stale <min>', 'tak test <lat> <lon>'.
  * false = niet voor ons, zodat de aanroeper kan doorvallen. */

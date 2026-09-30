@@ -1,5 +1,6 @@
 #include "WebTask.h"
 #include "WolTask.h"
+#include "TakTask.h"
 #include "OpenHopTask.h"
 #include "WifiTask.h"
 #include "MonitorSensors.h"
@@ -462,6 +463,7 @@ void web_route_openhopjson()  { if (g_self) g_self->handleOpenHopJson(); }
 void web_route_openhop()      { if (g_self) g_self->handleOpenHop(); }
 void web_route_woljson()      { if (g_self) g_self->handleWolJson(); }
 void web_route_wol()          { if (g_self) g_self->handleWol(); }
+void web_route_takjson()      { if (g_self) g_self->handleTakJson(); }
 void web_route_targetsjson()  { if (g_self) g_self->handleTargetsJson(); }
 void web_route_target()       { if (g_self) g_self->handleTarget(); }
 void web_route_cfgjson()   { if (g_self) g_self->handleCfgJson(); }
@@ -1010,6 +1012,7 @@ letter-spacing:.13em;color:var(--muted)}
 <button id="tabcomp" data-p="7" hidden>companions</button>
 <button id="tabirc" data-p="8" hidden>irc</button>
 <button id="taboh" data-p="9">openhop</button>
+<button id="tabtak" data-p="10">tak</button>
 <button data-p="3">node</button>
 </nav>
 
@@ -2356,6 +2359,44 @@ overkant: <code>radio_type: modem_tcp</code> met <code>host</code> = het adres v
 leeg laten mag op een net waar je iedereen vertrouwt.</p>
 </section>
 
+<section id="p10" hidden>
+<h2>TAK-uitgang</h2>
+<p class="note"><b>Posities uit de mesh op de kaart van ATAK, WinTAK en iTAK.</b> Elke positie
+die deze node leert &mdash; een advert met lat/lon van een andere node, of een <code>#LOC</code>
+van een eigen companion &mdash; gaat als Cursor-on-Target naar een TAK-server, bv. OpenTAKServer
+op poort 8088. Er gaat niets over de radio: dit is een uitgang, geen zender.</p>
+<p class="note"><b>Val, SOS of geen beweging</b> van een companion in de laatste tien minuten gaat
+mee als noodmelding: in ATAK de rode banner, niet alleen een stip. Zonder NTP-sync gaat er niets
+weg &mdash; een positie met tijd 1970 is al vervallen voor ze aankomt.</p>
+<div id="tak-status" class="note">&hellip;</div>
+<div class="quick" style="margin-top:.4rem">
+<label style="align-self:center"><input type="checkbox" id="tak-on"> TAK aan</label>
+<span style="align-self:center;color:var(--muted);font-size:.8rem">server (IPv4):</span>
+<input id="tak-host" spellcheck="false" autocomplete="off" maxlength="15"
+ placeholder="10.10.30.109" style="width:9rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">poort:</span>
+<input id="tak-port" type="number" min="1" max="65535" style="width:6rem"></div>
+<div class="quick" style="margin-top:.4rem">
+<label style="align-self:center"><input type="checkbox" id="tak-adv"> adverts van andere nodes</label>
+<span style="align-self:center;color:var(--muted);font-size:.8rem">vervalt na (min):</span>
+<input id="tak-stale" type="number" min="2" max="1440" style="width:5rem">
+<button type="button" id="tak-save">opslaan</button>
+<button type="button" id="tak-ref">vernieuwen</button></div>
+<p class="note" style="margin-top:.6rem"><b>Testpunt.</b> Zet een stip "MeshUptime-test" op de
+kaart om de keten na te lopen, zonder op een advert te wachten.</p>
+<div class="quick" style="margin-top:.4rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">lat:</span>
+<input id="tak-tlat" spellcheck="false" autocomplete="off" placeholder="50.93080" style="width:7rem">
+<span style="align-self:center;color:var(--muted);font-size:.8rem">lon:</span>
+<input id="tak-tlon" spellcheck="false" autocomplete="off" placeholder="5.33780" style="width:7rem">
+<button type="button" id="tak-test">testpunt sturen</button></div>
+<p class="note"><b>Alleen een IP-adres</b>, geen hostnaam: dit is voor een server op het eigen LAN.
+Poort 8088 is gewone CoT over TCP, zonder certificaat. Alles hier gaat via dezelfde
+<code>tak</code>-commando's als de console: <code>tak</code>, <code>tak on|off</code>,
+<code>tak host &lt;ip&gt;[:poort]</code>, <code>tak adverts on|off</code>,
+<code>tak stale &lt;min&gt;</code>, <code>tak test &lt;lat&gt; &lt;lon&gt;</code>.</p>
+</section>
+
 <section id="p8" hidden>
 <h2>IRC-server &mdash; klassieke chatclients op het mesh</h2>
 <p class="why"><b>Wat dit is:</b> een gewone IRC-client (HexChat, irssi, WeeChat,
@@ -3158,7 +3199,8 @@ if(p=="5"){snodesLoad();refreshPickers()}
 if(p=="6"){botLoad()}
 if(p=="7"){companionsLoad()}
 if(p=="8"){ircLoad()}
-if(p=="9"){ohLoad()}}}
+if(p=="9"){ohLoad()}
+if(p=="10"){takLoad()}}}
 
 /* ---- de openHop-brug ---- */
 function ohLoad(){
@@ -3197,6 +3239,40 @@ var d=document.getElementById("oh-droogte").value;
 fetch("openhop",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},
 body:"failover="+fo+"&fo_hold="+encodeURIComponent(h)+"&droogte="+encodeURIComponent(d)})
 .then(function(r){return r.text()}).then(function(t){logline("openhop",t,1);ohLoad()})}
+
+/* ---- TAK-uitgang ---- */
+function takLoad(){
+fetch("tak.json").then(function(r){return r.ok?r.json():null}).then(function(j){
+if(!j){document.getElementById("tak-status").textContent="TAK niet beschikbaar";return}
+document.getElementById("tak-on").checked=!!j.on;
+document.getElementById("tak-adv").checked=!!j.adverts;
+var hi=document.getElementById("tak-host");if(document.activeElement!==hi){hi.value=j.host}
+var pi=document.getElementById("tak-port");if(document.activeElement!==pi){pi.value=j.port}
+var si=document.getElementById("tak-stale");if(document.activeElement!==si){si.value=j.stale}
+var st={off:"uit",nohost:"geen server",up:"verbonden",connecting:"verbinden",wait:"wacht op nieuwe poging"}[j.state]||j.state;
+document.getElementById("tak-status").innerHTML=
+"<b>"+esc(st)+"</b>"+(j.host?(" &middot; "+esc(j.host)+":"+j.port):"")+
+" &middot; verstuurd: "+j.sent+(j.lost?(" (weggevallen "+j.lost+")"):"")+
+" &middot; in de rij: "+j.queued+" &middot; verbindingen: "+j.connects+
+(j.last?("<br>laatst verstuurd: <b>"+esc(j.last)+"</b>"+(j.last_ts?(" om "+new Date(j.last_ts*1000).toLocaleTimeString()):"")):"")+
+(j.note?("<br><span style=\"color:var(--muted)\">"+esc(j.note)+"</span>"):"")}).catch(function(){})}
+
+document.getElementById("tak-save").onclick=function(){
+var h=document.getElementById("tak-host").value.trim();
+var p=document.getElementById("tak-port").value.trim();
+var cmds=[];
+if(h){cmds.push("tak host "+h+(p?(":"+p):""))}else if(p){cmds.push("tak port "+p)}
+cmds.push("tak adverts "+(document.getElementById("tak-adv").checked?"on":"off"));
+var s=document.getElementById("tak-stale").value.trim();if(s){cmds.push("tak stale "+s)}
+cmds.push("tak "+(document.getElementById("tak-on").checked?"on":"off"));
+cliSeq(cmds,function(){takLoad()})}
+
+document.getElementById("tak-ref").onclick=function(){takLoad()};
+
+document.getElementById("tak-test").onclick=function(){
+var a=document.getElementById("tak-tlat").value.trim()||"50.93080";
+var o=document.getElementById("tak-tlon").value.trim()||"5.33780";
+cli("tak test "+a+" "+o).then(function(){setTimeout(takLoad,1500)})}
 
 /* ---- Wake-on-LAN ---- */
 function wolLoad(){
@@ -5102,6 +5178,7 @@ void WebTask::routes() {
   _server->on("/openhop", HTTP_POST, web_route_openhop);
   _server->on("/wol.json", HTTP_GET, web_route_woljson);
   _server->on("/wol", HTTP_POST, web_route_wol);
+  _server->on("/tak.json", HTTP_GET, web_route_takjson);
   _server->on("/repeater_targets.json", HTTP_GET, web_route_targetsjson);
   _server->on("/repeater/target", HTTP_POST, web_route_target);
   /* De eigen web-login. POST-only, en achter dezelfde Basic-auth als de rest: dit
@@ -9126,6 +9203,15 @@ void WebTask::handleWolJson() {
   char mac[24];
   wol_mac_text(mac, sizeof(mac));
   snprintf(g_json, sizeof(g_json), "{\"mac\":\"%s\"}", mac);
+  _server->sendHeader("Cache-Control", "no-store");
+  _server->send(200, "application/json", g_json);
+}
+
+/* GET /tak.json -- de stand van de TAK-uitgang. Wijzigen gaat via /cli met de
+ * 'tak'-commando's, zodat de controle op de invoer op één plek zit. */
+void WebTask::handleTakJson() {
+  if (!requireAuth()) return;
+  tak_status_json(g_json, sizeof(g_json));
   _server->sendHeader("Cache-Control", "no-store");
   _server->send(200, "application/json", g_json);
 }

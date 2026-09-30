@@ -61,6 +61,10 @@ static uint16_t      _out_len = 0, _out_off = 0;
 /* stand */
 static uint32_t _sent = 0, _lost = 0, _connects = 0;
 static char     _note[40] = "";
+static char     _cur_name[32] = "";   /* wat nu in _out staat              */
+static char     _last_name[32] = "";  /* laatst volledig verstuurd         */
+static uint32_t _last_ts = 0;
+static uint32_t _cur_ts = 0;
 
 // ------------------------------------------------------------------ opslag
 static void takSave() {
@@ -263,6 +267,8 @@ static void buildCot(const TakPos& p) {
   if (n < 0 || n >= (int)sizeof(_out)) { _out_len = 0; return; }   /* te lang: niet half sturen */
   _out_len = (uint16_t)n;
   _out_off = 0;
+  snprintf(_cur_name, sizeof(_cur_name), "%s", p.name[0] ? p.name : uid);
+  _cur_ts = p.ts;
 }
 
 // ------------------------------------------------------------ verbinding
@@ -345,7 +351,12 @@ static void takPump() {
   int r = lwip_send(_sock, _out + _out_off, _out_len - _out_off, MSG_DONTWAIT);
   if (r > 0) {
     _out_off += r;
-    if (_out_off >= _out_len) { _out_len = _out_off = 0; _sent++; }
+    if (_out_off >= _out_len) {
+      _out_len = _out_off = 0;
+      _sent++;
+      memcpy(_last_name, _cur_name, sizeof(_last_name));
+      _last_ts = _cur_ts;
+    }
     return;
   }
   if (r < 0 && (errno == EWOULDBLOCK || errno == EAGAIN)) return;   /* volgende ronde */
@@ -377,6 +388,36 @@ void tak_loop() {
       break;
   }
 #endif
+}
+
+// ------------------------------------------------------------------- JSON
+/* Een naam uit de mesh kan alles bevatten; aanhalingstekens en backslashes
+ * zouden het JSON-object breken. */
+static size_t jsonEsc(char* dst, size_t max, const char* s) {
+  size_t n = 0;
+  if (max == 0) return 0;
+  for (; s && *s && n + 3 < max; s++) {
+    unsigned char c = (unsigned char)*s;
+    if (c == '"' || c == '\\') { dst[n++] = '\\'; dst[n++] = (char)c; }
+    else if (c >= 0x20) dst[n++] = (char)c;
+  }
+  dst[n] = 0;
+  return n;
+}
+
+void tak_status_json(char* out, size_t max) {
+  const char* st = !_on ? "off" : (_host[0] == 0 ? "nohost" :
+                   _st == TAK_UP ? "up" : _st == TAK_CONNECTING ? "connecting" : "wait");
+  char note[64], last[72];
+  jsonEsc(note, sizeof(note), _note);
+  jsonEsc(last, sizeof(last), _last_name);
+  snprintf(out, max,
+    "{\"on\":%d,\"host\":\"%s\",\"port\":%u,\"adverts\":%d,\"stale\":%u,"
+    "\"state\":\"%s\",\"sent\":%lu,\"lost\":%lu,\"queued\":%u,\"connects\":%lu,"
+    "\"note\":\"%s\",\"last\":\"%s\",\"last_ts\":%lu}",
+    _on ? 1 : 0, _host, _port, _adverts ? 1 : 0, _stale_min, st,
+    (unsigned long)_sent, (unsigned long)_lost, _count, (unsigned long)_connects,
+    note, last, (unsigned long)_last_ts);
 }
 
 // ------------------------------------------------------------------- CLI
